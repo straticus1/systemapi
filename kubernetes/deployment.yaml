@@ -1,0 +1,118 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: systemapi-secrets
+  namespace: systemapi-prod
+type: Opaque
+stringData:
+  jwt-secret: "afterdark-entertainment-systems-2024"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: systemapi
+  namespace: systemapi-prod
+  labels:
+    app: systemapi
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: systemapi
+  template:
+    metadata:
+      labels:
+        app: systemapi
+    spec:
+      imagePullSecrets:
+      - name: oci-registry
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
+      containers:
+      - name: systemapi
+        image: us-ashburn-1.ocir.io/idd2oizp8xvc/systemapi:v1.0.0
+        imagePullPolicy: Always
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          runAsNonRoot: true
+          runAsUser: 1001
+        ports:
+        - containerPort: 3003
+          name: http
+        env:
+        - name: NODE_ENV
+          value: "production"
+        - name: PORT
+          value: "3003"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3003
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 3003
+          initialDelaySeconds: 5
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: systemapi
+  namespace: systemapi-prod
+spec:
+  selector:
+    app: systemapi
+  ports:
+  - port: 3003
+    targetPort: 3003
+    name: http
+  type: ClusterIP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: systemapi
+  namespace: systemapi-prod
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - systemapi.io
+    - www.systemapi.io
+    secretName: systemapi-tls
+  rules:
+  - host: systemapi.io
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: systemapi
+            port:
+              number: 3003
+  - host: www.systemapi.io
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: systemapi
+            port:
+              number: 3003
