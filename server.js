@@ -34,6 +34,58 @@ app.use(cors({
 app.use(express.json());
 app.use(express.static('public'));
 
+// ==============================================================================
+// API PLAYGROUND SETUP (Optional - requires PostgreSQL and Redis)
+// ==============================================================================
+if (process.env.DB_PASSWORD && process.env.DB_PASSWORD !== '') {
+    try {
+        const { Pool } = require('pg');
+        const { createClient } = require('redis');
+        const createPlaygroundRouter = require('./playground/router');
+
+        // Database connection (if using PostgreSQL)
+        const dbPool = new Pool({
+            host: process.env.DB_HOST || 'localhost',
+            port: process.env.DB_PORT || 5432,
+            database: process.env.DB_NAME || 'systemapi',
+            user: process.env.DB_USER || 'systemapi',
+            password: process.env.DB_PASSWORD
+        });
+
+        // Redis connection
+        const redisClient = createClient({
+            url: process.env.REDIS_URL || 'redis://localhost:6379'
+        });
+
+        redisClient.connect().then(() => {
+            console.log('✓ Redis connected for playground');
+        }).catch(err => {
+            console.error('⚠ Redis connection failed:', err.message);
+        });
+
+        // Playground configuration
+        const playgroundConfig = {
+            db: dbPool,
+            redis: redisClient,
+            keycloakURL: process.env.KEYCLOAK_URL || 'https://aftercloak.io',
+            keycloakRealm: process.env.KEYCLOAK_REALM || 'afterdark',
+            keycloakClientID: process.env.KEYCLOAK_CLIENT_ID || 'systemapi',
+            apiSite: 'systemapi',
+            baseURL: process.env.API_BASE_URL || 'https://api.systemapi.io'
+        };
+
+        // Register playground routes
+        const playgroundRouter = createPlaygroundRouter(playgroundConfig);
+        app.use('/playground', playgroundRouter);
+
+        console.log('✓ API Playground initialized at /playground');
+    } catch (err) {
+        console.error('⚠ Playground initialization failed:', err.message);
+    }
+} else {
+    console.log('⚠ Playground not configured (DB_PASSWORD not set) - playground endpoints disabled');
+}
+
 // Health endpoint
 app.get('/health', (req, res) => {
     res.json({

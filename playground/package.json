@@ -1,0 +1,20 @@
+{
+  "name": "api-playground-express",
+  "version": "1.0.0",
+  "description": "API Playground module for Express.js",
+  "main": "playground/index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": ["api", "playground", "express", "rate-limiting"],
+  "author": "AfterDark Systems",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^4.18.2",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.11.3",
+    "redis": "^4.6.12",
+    "axios": "^1.6.5"
+  }
+}

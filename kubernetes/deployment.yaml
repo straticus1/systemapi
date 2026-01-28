@@ -47,6 +47,29 @@ spec:
           value: "production"
         - name: PORT
           value: "3003"
+        # Database Configuration (PostgreSQL)
+        - name: DB_HOST
+          value: "shared-postgres-host"  # TODO: Update with actual host
+        - name: DB_PORT
+          value: "5432"
+        - name: DB_NAME
+          value: "systemapi"
+        - name: DB_USER
+          value: "systemapi"
+        - name: DB_PASSWORD
+          value: ""  # Optional - set via secret when database is configured
+        # Redis Configuration
+        - name: REDIS_URL
+          value: "redis://shared-redis:6379"  # TODO: Update with actual Redis URL
+        # Keycloak/Auth Configuration
+        - name: KEYCLOAK_URL
+          value: "https://aftercloak.io"
+        - name: KEYCLOAK_REALM
+          value: "afterdark"
+        - name: KEYCLOAK_CLIENT_ID
+          value: "systemapi"
+        - name: API_BASE_URL
+          value: "https://api.systemapi.io"
         resources:
           requests:
             memory: "128Mi"
@@ -88,12 +111,14 @@ metadata:
   namespace: systemapi-prod
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
 spec:
   ingressClassName: nginx
   tls:
   - hosts:
     - systemapi.io
     - www.systemapi.io
+    - api.systemapi.io
     secretName: systemapi-tls
   rules:
   - host: systemapi.io
@@ -107,6 +132,16 @@ spec:
             port:
               number: 3003
   - host: www.systemapi.io
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: systemapi
+            port:
+              number: 3003
+  - host: api.systemapi.io
     http:
       paths:
       - path: /
