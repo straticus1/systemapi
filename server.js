@@ -86,6 +86,8 @@ if (process.env.DB_PASSWORD && process.env.DB_PASSWORD !== '') {
     console.log('⚠ Playground not configured (DB_PASSWORD not set) - playground endpoints disabled');
 }
 
+
+
 // Health endpoint
 app.get('/health', (req, res) => {
     res.json({
@@ -289,6 +291,79 @@ app.post('/api/v1/threat-intel/check', async (req, res) => {
     }
 });
 
+// Initialize FleetManager
+const { Pool } = require('pg');
+const FleetManager = require('./playground/fleet');
+
+let dbPool;
+if (process.env.DB_PASSWORD && process.env.DB_PASSWORD !== '') {
+    dbPool = new Pool({
+        host: process.env.DB_HOST || 'db.systemapi.io',
+        port: process.env.DB_PORT || 5432,
+        user: process.env.DB_USER || 'playground_user',
+        password: process.env.DB_PASSWORD,
+        database: process.env.DB_NAME || 'systemapi_playground',
+        ssl: { rejectUnauthorized: false }
+    });
+} else {
+    // Local fallback for development & verification
+    console.warn('⚠ Using local postgres DB settings (DB_PASSWORD not set).');
+    dbPool = new Pool({
+        connectionString: process.env.DATABASE_URL || 'postgres://localhost/postgres'
+    });
+}
+
+// Start server
+const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`SystemAPI.io listening on port ${PORT}`);
+    console.log(`Health check: http://localhost:${PORT}/health`);
+});
+
+// Attach WebSocket multiplexer onto the HTTP server
+console.log('Mounting SystemAPI.io Fleet Manager WebSockets...');
+const fleetManager = new FleetManager(server, dbPool);
+
+// Fleet REST Endpoints
+app.get('/api/v1/fleet', async (req, res) => {
+    // Simplified Auth for demo
+    const apiKey = req.headers['x-api-key'];
+    if (!apiKey) return res.status(401).json({error: 'Unauthorized'});
+
+    try {
+        const { rows } = await dbPool.query('SELECT * FROM playground_hosts ORDER BY last_seen_at DESC');
+        
+        // Attach live telemetry if connected
+        const enrichedHosts = rows.map(host => {
+            if (fleetManager && fleetManager.connectedAgents.has(host.host_id)) {
+                return { ...host, status: 'online' };
+            }
+            return host;
+        });
+
+        res.json({ hosts: enrichedHosts });
+    } catch (e) {
+        console.error(e);
+        // Fallback for missing local DB tables
+        res.json({ hosts: [] });
+    }
+});
+
+app.post('/api/v1/fleet/:hostId/execute', async (req, res) => {
+    const apiKey = req.headers['x-api-key'];
+    if (!apiKey) return res.status(401).json({error: 'Unauthorized'});
+
+    const { hostId } = req.params;
+    const { script, entitlements } = req.body;
+
+    const reqId = Date.now().toString();
+    try {
+        const result = await fleetManager.pushSysscript(hostId, script, entitlements || {}, reqId);
+        res.json({ success: true, message: 'Script dispatched and executed', request_id: reqId, result: result });
+    } catch (e) {
+        res.status(404).json({ error: e.message });
+    }
+});
+
 // 404 handler
 app.use((req, res) => {
     res.status(404).json({
@@ -307,8 +382,4 @@ app.use((err, req, res, next) => {
     });
 });
 
-// Start server
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`SystemAPI.io listening on port ${PORT}`);
-    console.log(`Health check: http://localhost:${PORT}/health`);
-});
+
