@@ -359,13 +359,3 @@ func (engine *SysscriptEngine) fsWrite(thread *starlark.Thread, b *starlark.Buil
 	return starlark.True, nil
 }
 
-// Placeholder stubs — implemented in sys_k3s.go (Plan 03)
-func (engine *SysscriptEngine) k3sNodes(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	return starlark.NewList(nil), nil
-}
-func (engine *SysscriptEngine) k3sPods(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	return starlark.NewList(nil), nil
-}
-func (engine *SysscriptEngine) k3sApply(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	return starlark.None, nil
-}
