@@ -67,7 +67,10 @@ func (engine *SysscriptEngine) buildSysModule() *starlarkstruct.Struct {
 
 	// sys.net
 	sysNet := starlark.StringDict{
-		"http_get": starlark.NewBuiltin("http_get", engine.netHTTPGet),
+		"http_get":    starlark.NewBuiltin("http_get", engine.netHTTPGet),
+		"dns_lookup":  starlark.NewBuiltin("dns_lookup", engine.netDNSLookup),
+		"reverse_dns": starlark.NewBuiltin("reverse_dns", engine.netReverseDNS),
+		"port_check":  starlark.NewBuiltin("port_check", engine.netPortCheck),
 	}
 
 	// sys.exec
@@ -115,6 +118,14 @@ func (engine *SysscriptEngine) buildSysModule() *starlarkstruct.Struct {
 		"encode": starlark.NewBuiltin("encode", engine.yamlEncode),
 	}
 
+	// sys.proc
+	sysProc := starlark.StringDict{
+		"list":  starlark.NewBuiltin("list", engine.procList),
+		"get":   starlark.NewBuiltin("get", engine.procGet),
+		"find":  starlark.NewBuiltin("find", engine.procFind),
+		"kill":  starlark.NewBuiltin("kill", engine.procKill),
+	}
+
 	sysDict := starlark.StringDict{
 		"net":        starlarkstruct.FromStringDict(starlark.String("net"), sysNet),
 		"exec":       starlarkstruct.FromStringDict(starlark.String("exec"), sysExec),
@@ -126,6 +137,7 @@ func (engine *SysscriptEngine) buildSysModule() *starlarkstruct.Struct {
 		"containers": starlarkstruct.FromStringDict(starlark.String("containers"), sysContainers),
 		"config":     starlarkstruct.FromStringDict(starlark.String("config"), sysConfig),
 		"yaml":       starlarkstruct.FromStringDict(starlark.String("yaml"), sysYAML),
+		"proc":       starlarkstruct.FromStringDict(starlark.String("proc"), sysProc),
 	}
 
 	return starlarkstruct.FromStringDict(starlark.String("sys"), sysDict)
