@@ -1,6 +1,9 @@
 package main
 
 import (
+	"log"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/shirou/gopsutil/v3/cpu"
@@ -12,12 +15,15 @@ import (
 
 // TelemetryPayload represents the physical state of the host
 type TelemetryPayload struct {
-	Timestamp   int64              `json:"timestamp"`
-	Host        HostInfo           `json:"host"`
-	CPU         CPUMetrics         `json:"cpu"`
-	Memory      MemoryMetrics      `json:"memory"`
-	Disk        []DiskMetrics      `json:"disk"`
-	Network     NetworkMetrics     `json:"network"`
+	Timestamp   int64                 `json:"timestamp"`
+	Host        HostInfo              `json:"host"`
+	CPU         CPUMetrics            `json:"cpu"`
+	Memory      MemoryMetrics         `json:"memory"`
+	Disk        []DiskMetrics         `json:"disk"`
+	Network     NetworkMetrics        `json:"network"`
+	Software    []SoftwareMetrics     `json:"software,omitempty"`
+	Docker      *DockerStatsTelemetry `json:"docker,omitempty"`
+	K3s         *K3sStatsTelemetry    `json:"k3s,omitempty"`
 }
 
 type HostInfo struct {
@@ -52,8 +58,174 @@ type NetworkMetrics struct {
 	BytesSent uint64 `json:"bytes_sent"`
 }
 
+// ContainerStatsTelemetry mirrors proto ContainerStats JSON shape (AGENT-06).
+// Note: rx_bytes and tx_bytes store cumulative byte counts, not per-second rates.
+type ContainerStatsTelemetry struct {
+	Id            string  `json:"id"`
+	Name          string  `json:"name"`
+	Image         string  `json:"image"`
+	State         string  `json:"state"`
+	CpuPct        float64 `json:"cpu_pct"`
+	MemUsedBytes  int64   `json:"mem_used_bytes"`
+	MemLimitBytes int64   `json:"mem_limit_bytes"`
+	MemPct        float64 `json:"mem_pct"`
+	RxBytes       uint64  `json:"rx_bytes"`
+	TxBytes       uint64  `json:"tx_bytes"`
+	RestartCount  int32   `json:"restart_count"`
+}
+
+// DockerStatsTelemetry mirrors proto DockerStats JSON shape (AGENT-06).
+type DockerStatsTelemetry struct {
+	Available         bool                      `json:"available"`
+	TotalContainers   int32                     `json:"total_containers"`
+	RunningContainers int32                     `json:"running_containers"`
+	Containers        []ContainerStatsTelemetry `json:"containers"`
+}
+
+// NodeInfoTelemetry mirrors proto NodeInfo JSON shape (AGENT-06).
+type NodeInfoTelemetry struct {
+	Name    string `json:"name"`
+	Role    string `json:"role"`
+	Status  string `json:"status"`
+	Version string `json:"version"`
+}
+
+// K3sStatsTelemetry mirrors proto K3SStats JSON shape (AGENT-06).
+type K3sStatsTelemetry struct {
+	Available   bool                `json:"available"`
+	TotalNodes  int32               `json:"total_nodes"`
+	ReadyNodes  int32               `json:"ready_nodes"`
+	TotalPods   int32               `json:"total_pods"`
+	RunningPods int32               `json:"running_pods"`
+	FailedPods  int32               `json:"failed_pods"`
+	Nodes       []NodeInfoTelemetry `json:"nodes"`
+}
+
 var lastNetStats []net.IOCountersStat
 var lastNetTime time.Time
+
+var lastSoftwareGather time.Time
+var cachedSoftware []SoftwareMetrics
+
+var dockerClientTelemetry *DockerClient
+var k3sClientTelemetry *K3sClient
+var telemetryClientsOnce sync.Once
+
+func ensureTelemetryClients() {
+	telemetryClientsOnce.Do(func() {
+		dockerClientTelemetry = NewDockerClient()
+		k3sClientTelemetry, _ = NewK3sClient() // nil if no kubeconfig (D-05: non-fatal)
+	})
+}
+
+// gatherDockerStats collects Docker container stats. Returns available=false on error (D-02).
+func gatherDockerStats() *DockerStatsTelemetry {
+	ensureTelemetryClients()
+	result := &DockerStatsTelemetry{}
+
+	containers, err := dockerClientTelemetry.ListContainers()
+	if err != nil {
+		log.Printf("[telemetry] Docker stats unavailable: %v", err)
+		result.Available = false
+		return result
+	}
+
+	result.Available = true
+	result.TotalContainers = int32(len(containers))
+
+	var running int32
+	for _, c := range containers {
+		if c.State == "running" {
+			running++
+		}
+		stats, err := dockerClientTelemetry.GetContainerStats(c.Id)
+		if err != nil {
+			log.Printf("[telemetry] container stats for %s: %v", c.Id, err)
+			continue
+		}
+		name := c.Id[:12] // short ID as fallback
+		if len(c.Id) < 12 {
+			name = c.Id
+		}
+		if len(c.Names) > 0 {
+			name = strings.TrimPrefix(c.Names[0], "/")
+		}
+		result.Containers = append(result.Containers, ContainerStatsTelemetry{
+			Id:            c.Id,
+			Name:          name,
+			Image:         c.Image,
+			State:         c.State,
+			CpuPct:        stats.CpuPct,
+			MemUsedBytes:  int64(stats.MemUsedBytes),
+			MemLimitBytes: int64(stats.MemLimitBytes),
+			MemPct:        stats.MemPct,
+			RxBytes:       stats.RxBytes,
+			TxBytes:       stats.TxBytes,
+		})
+	}
+	result.RunningContainers = running
+	return result
+}
+
+// gatherK3sStats collects k3s cluster state. Returns nil when k3s is unavailable (D-05).
+func gatherK3sStats() *K3sStatsTelemetry {
+	ensureTelemetryClients()
+	if k3sClientTelemetry == nil {
+		return nil // k3s not available (D-05)
+	}
+	result := &K3sStatsTelemetry{}
+
+	nodes, err := k3sClientTelemetry.ListNodes()
+	if err != nil {
+		log.Printf("[telemetry] k3s stats unavailable: %v", err)
+		result.Available = false
+		return result
+	}
+	result.Available = true
+	result.TotalNodes = int32(len(nodes))
+
+	for _, n := range nodes {
+		status := "NotReady"
+		for _, cond := range n.Status.Conditions {
+			if cond.Type == "Ready" && cond.Status == "True" {
+				status = "Ready"
+				result.ReadyNodes++
+				break
+			}
+		}
+		role := "worker"
+		for label := range n.Metadata.Labels {
+			if strings.HasPrefix(label, "node-role.kubernetes.io/") {
+				role = strings.TrimPrefix(label, "node-role.kubernetes.io/")
+				if role == "" {
+					role = "master"
+				}
+				break
+			}
+		}
+		result.Nodes = append(result.Nodes, NodeInfoTelemetry{
+			Name:    n.Metadata.Name,
+			Role:    role,
+			Status:  status,
+			Version: n.Status.NodeInfo.KubeletVersion,
+		})
+	}
+
+	pods, err := k3sClientTelemetry.ListPods("")
+	if err == nil {
+		result.TotalPods = int32(len(pods))
+		for _, p := range pods {
+			switch p.Status.Phase {
+			case "Running":
+				result.RunningPods++
+			case "Failed":
+				result.FailedPods++
+			}
+		}
+	}
+
+	return result
+}
 
 func gatherTelemetry() (TelemetryPayload, error) {
 	var payload TelemetryPayload
@@ -115,7 +287,7 @@ func gatherTelemetry() (TelemetryPayload, error) {
 	if err == nil && len(netStats) > 0 {
 		now := time.Now()
 		stat := netStats[0]
-		
+
 		if len(lastNetStats) > 0 {
 			duration := now.Sub(lastNetTime).Seconds()
 			if duration > 0 {
@@ -131,10 +303,25 @@ func gatherTelemetry() (TelemetryPayload, error) {
 				BytesSent: 0,
 			}
 		}
-		
+
 		lastNetStats = netStats
 		lastNetTime = now
 	}
+
+	// 6. Software Inventory
+	now := time.Now()
+	// Only scan installed software every 5 minutes to reduce IO overhead
+	if now.Sub(lastSoftwareGather) > 5*time.Minute {
+		cachedSoftware = gatherSoftware()
+		lastSoftwareGather = now
+	}
+	payload.Software = cachedSoftware
+
+	// 7. Docker stats (non-fatal, re-query every tick, no caching)
+	payload.Docker = gatherDockerStats()
+
+	// 8. k3s stats (non-fatal, re-query every tick)
+	payload.K3s = gatherK3sStats()
 
 	return payload, nil
 }
