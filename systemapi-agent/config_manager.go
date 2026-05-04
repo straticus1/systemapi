@@ -89,6 +89,23 @@ func (cm *ConfigManager) RenderTemplate(name string, vars map[string]interface{}
 				}
 				return val
 			},
+			// toYAMLList renders a []interface{} as inline YAML list: ["a", "b"]
+			"toYAMLList": func(v interface{}) string {
+				items, ok := v.([]interface{})
+				if !ok || len(items) == 0 {
+					return "[]"
+				}
+				var b bytes.Buffer
+				b.WriteString("[")
+				for i, item := range items {
+					if i > 0 {
+						b.WriteString(", ")
+					}
+					b.WriteString(fmt.Sprintf("%q", fmt.Sprintf("%v", item)))
+				}
+				b.WriteString("]")
+				return b.String()
+			},
 		}).
 		Option("missingkey=zero").
 		Parse(string(data))
