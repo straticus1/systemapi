@@ -82,6 +82,11 @@ func (engine *SysscriptEngine) buildSysModule() *starlarkstruct.Struct {
 	sysFS := starlark.StringDict{
 		"read":  starlark.NewBuiltin("read", engine.fsRead),
 		"write": starlark.NewBuiltin("write", engine.fsWrite),
+		"stat":  starlark.NewBuiltin("stat", engine.fsStat),
+		"glob":  starlark.NewBuiltin("glob", engine.fsGlob),
+		"mkdir": starlark.NewBuiltin("mkdir", engine.fsMkdir),
+		"rm":    starlark.NewBuiltin("rm", engine.fsRm),
+		"chmod": starlark.NewBuiltin("chmod", engine.fsChmod),
 	}
 
 	// Advanced Modules (Stubs)
@@ -118,6 +123,30 @@ func (engine *SysscriptEngine) buildSysModule() *starlarkstruct.Struct {
 		"encode": starlark.NewBuiltin("encode", engine.yamlEncode),
 	}
 
+	// sys.json
+	sysJSON := starlark.StringDict{
+		"parse":        starlark.NewBuiltin("parse", engine.jsonParse),
+		"encode":       starlark.NewBuiltin("encode", engine.jsonEncode),
+		"encode_pretty": starlark.NewBuiltin("encode_pretty", engine.jsonEncodePretty),
+	}
+
+	// sys.ini
+	sysINI := starlark.StringDict{
+		"parse":  starlark.NewBuiltin("parse", engine.iniParse),
+		"encode": starlark.NewBuiltin("encode", engine.iniEncode),
+		"get":    starlark.NewBuiltin("get", engine.iniGet),
+	}
+
+	// sys.services
+	sysSvc := starlark.StringDict{
+		"start":   starlark.NewBuiltin("start", engine.svcStart),
+		"stop":    starlark.NewBuiltin("stop", engine.svcStop),
+		"restart": starlark.NewBuiltin("restart", engine.svcRestart),
+		"enable":  starlark.NewBuiltin("enable", engine.svcEnable),
+		"disable": starlark.NewBuiltin("disable", engine.svcDisable),
+		"status":  starlark.NewBuiltin("status", engine.svcStatus),
+	}
+
 	// sys.proc
 	sysProc := starlark.StringDict{
 		"list":  starlark.NewBuiltin("list", engine.procList),
@@ -137,7 +166,10 @@ func (engine *SysscriptEngine) buildSysModule() *starlarkstruct.Struct {
 		"containers": starlarkstruct.FromStringDict(starlark.String("containers"), sysContainers),
 		"config":     starlarkstruct.FromStringDict(starlark.String("config"), sysConfig),
 		"yaml":       starlarkstruct.FromStringDict(starlark.String("yaml"), sysYAML),
-		"proc":       starlarkstruct.FromStringDict(starlark.String("proc"), sysProc),
+		"proc":     starlarkstruct.FromStringDict(starlark.String("proc"), sysProc),
+		"json":     starlarkstruct.FromStringDict(starlark.String("json"), sysJSON),
+		"ini":      starlarkstruct.FromStringDict(starlark.String("ini"), sysINI),
+		"services": starlarkstruct.FromStringDict(starlark.String("services"), sysSvc),
 	}
 
 	return starlarkstruct.FromStringDict(starlark.String("sys"), sysDict)
