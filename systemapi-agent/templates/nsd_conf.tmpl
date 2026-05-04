@@ -1,0 +1,29 @@
+# nsd.conf — rendered by systemapi-agent sysscript
+# Generated: {{ .generated_at }}
+
+server:
+    server-count: {{ default "1" .server_count }}
+    ip-address: {{ default "0.0.0.0" .ip_address }}
+    port: {{ default "53" .port }}
+    username: {{ default "nsd" .username }}
+    logfile: "{{ default "/var/log/nsd.log" .logfile }}"
+    pidfile: "{{ default "/run/nsd/nsd.pid" .pidfile }}"
+    zonesdir: "{{ default "/etc/nsd" .zonesdir }}"
+    database: "{{ default "/var/lib/nsd/nsd.db" .database }}"
+    xfrdfile: "{{ default "/var/lib/nsd/xfrd.state" .xfrdfile }}"
+
+    hide-version: {{ default "yes" .hide_version }}
+    refuse-any: {{ default "yes" .refuse_any }}
+    minimal-responses: {{ default "yes" .minimal_responses }}
+
+remote-control:
+    control-enable: {{ default "yes" .control_enable }}
+    control-interface: {{ default "127.0.0.1" .control_interface }}
+
+{{ range .zones }}
+zone:
+    name: "{{ .name }}"
+    zonefile: "{{ .zonefile }}"
+    {{ if .notify }}notify: {{ .notify }} NOKEY{{ end }}
+    {{ if .request_xfr }}request-xfr: {{ .request_xfr }} NOKEY{{ end }}
+{{ end }}

@@ -1,0 +1,29 @@
+# Postfix main.cf — rendered by systemapi-agent sysscript
+# Generated: {{ .generated_at }}
+
+myhostname = {{ .hostname }}
+mydomain = {{ .domain }}
+myorigin = $mydomain
+inet_interfaces = {{ default "all" .inet_interfaces }}
+inet_protocols = {{ default "ipv4" .inet_protocols }}
+
+# TLS
+smtpd_tls_cert_file = {{ default "/etc/ssl/certs/ssl-cert-snakeoil.pem" .tls_cert }}
+smtpd_tls_key_file  = {{ default "/etc/ssl/private/ssl-cert-snakeoil.key" .tls_key }}
+smtpd_use_tls = {{ default "yes" .smtpd_use_tls }}
+smtp_tls_security_level = {{ default "may" .smtp_tls_security_level }}
+
+# Relay
+relayhost = {{ .relayhost }}
+mynetworks = {{ default "127.0.0.0/8 [::ffff:127.0.0.0]/104 [::1]/128" .mynetworks }}
+
+# Mailbox
+home_mailbox = {{ default "Maildir/" .home_mailbox }}
+mailbox_size_limit = {{ default "0" .mailbox_size_limit }}
+recipient_delimiter = {{ default "+" .recipient_delimiter }}
+
+# Aliases
+alias_maps = {{ default "hash:/etc/aliases" .alias_maps }}
+alias_database = {{ default "hash:/etc/aliases" .alias_database }}
+
+smtpd_relay_restrictions = permit_mynetworks permit_sasl_authenticated defer_unauth_destination

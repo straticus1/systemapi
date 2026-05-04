@@ -1,0 +1,38 @@
+# dnsscience config.yaml — rendered by systemapi-agent sysscript
+# Generated: {{ .generated_at }}
+
+server:
+  host: {{ default "0.0.0.0" .server_host }}
+  port: {{ default "8000" .server_port }}
+  workers: {{ default "4" .workers }}
+  debug: {{ default "false" .debug }}
+
+database:
+  url: {{ .database_url }}
+  pool_size: {{ default "10" .db_pool_size }}
+  max_overflow: {{ default "20" .db_max_overflow }}
+
+redis:
+  url: {{ default "redis://localhost:6379/0" .redis_url }}
+  ttl: {{ default "300" .redis_ttl }}
+
+grpc:
+  host: {{ default "localhost" .grpc_host }}
+  port: {{ default "50051" .grpc_port }}
+
+celery:
+  broker: {{ default "amqp://guest:guest@localhost:5672//" .celery_broker }}
+  result_backend: {{ default "redis://localhost:6379/1" .celery_result_backend }}
+
+enrichment:
+  enabled: {{ default "true" .enrichment_enabled }}
+  max_concurrent: {{ default "50" .enrichment_max_concurrent }}
+  timeout_seconds: {{ default "30" .enrichment_timeout }}
+
+api:
+  rate_limit: {{ default "100" .api_rate_limit }}
+  rate_window: {{ default "60" .api_rate_window }}
+  jwt_secret: {{ .jwt_secret }}
+  allowed_origins:
+    {{ range .allowed_origins }}- {{ . }}
+    {{ end }}

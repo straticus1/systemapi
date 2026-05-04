@@ -1,0 +1,41 @@
+# unbound.conf — rendered by systemapi-agent sysscript
+# Generated: {{ .generated_at }}
+
+server:
+    verbosity: {{ default "1" .verbosity }}
+    interface: {{ default "127.0.0.1" .interface }}
+    port: {{ default "53" .port }}
+    do-ip4: {{ default "yes" .do_ip4 }}
+    do-ip6: {{ default "no" .do_ip6 }}
+    do-udp: {{ default "yes" .do_udp }}
+    do-tcp: {{ default "yes" .do_tcp }}
+
+    # Access control
+    {{ range .access_control }}
+    access-control: {{ . }}
+    {{ end }}
+
+    # DNSSEC
+    auto-trust-anchor-file: "{{ default "/var/lib/unbound/root.key" .trust_anchor_file }}"
+
+    # Caching
+    cache-max-ttl: {{ default "86400" .cache_max_ttl }}
+    cache-min-ttl: {{ default "300" .cache_min_ttl }}
+    neg-cache-size: {{ default "4m" .neg_cache_size }}
+
+    # Logging
+    logfile: "{{ default "" .logfile }}"
+    log-queries: {{ default "no" .log_queries }}
+
+    # Threads / performance
+    num-threads: {{ default "2" .num_threads }}
+    msg-cache-slabs: {{ default "4" .msg_cache_slabs }}
+    rrset-cache-slabs: {{ default "4" .rrset_cache_slabs }}
+    infra-cache-slabs: {{ default "4" .infra_cache_slabs }}
+    key-cache-slabs: {{ default "4" .key_cache_slabs }}
+
+forward-zone:
+    name: "."
+    {{ range .forwarders }}
+    forward-addr: {{ . }}
+    {{ end }}

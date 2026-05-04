@@ -1,0 +1,34 @@
+// named.conf — rendered by systemapi-agent sysscript
+// Generated: {{ .generated_at }}
+
+options {
+    directory         "{{ default "/var/cache/bind" .directory }}";
+    listen-on         { {{ default "127.0.0.1" .listen_on }}; };
+    listen-on-v6      { {{ default "::1" .listen_on_v6 }}; };
+    allow-query       { {{ default "localhost" .allow_query }}; };
+    allow-recursion   { {{ default "localhost" .allow_recursion }}; };
+    forwarders        { {{ range .forwarders }}{{ . }}; {{ end }} };
+    forward           {{ default "first" .forward }};
+    dnssec-validation {{ default "auto" .dnssec_validation }};
+    recursion         {{ default "yes" .recursion }};
+};
+
+logging {
+    channel default_log {
+        file "{{ default "/var/log/named/named.log" .log_file }}" versions 3 size 5m;
+        severity {{ default "info" .log_severity }};
+        print-time yes;
+        print-severity yes;
+        print-category yes;
+    };
+    category default { default_log; };
+};
+
+{{ range .zones }}
+zone "{{ .name }}" IN {
+    type {{ .type }};
+    {{ if .file }}file "{{ .file }}";{{ end }}
+    {{ if .masters }}masters { {{ range .masters }}{{ . }};{{ end }} };{{ end }}
+    allow-transfer { {{ default "none" .allow_transfer }}; };
+};
+{{ end }}

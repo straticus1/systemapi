@@ -1,0 +1,42 @@
+# go-email-services config.yaml — rendered by systemapi-agent sysscript
+# Generated: {{ .generated_at }}
+
+server:
+  host: {{ default "0.0.0.0" .server_host }}
+  port: {{ default "8080" .server_port }}
+  tls: {{ default "false" .tls_enabled }}
+  tls_cert: {{ default "" .tls_cert }}
+  tls_key: {{ default "" .tls_key }}
+
+smtp:
+  host: {{ default "localhost" .smtp_host }}
+  port: {{ default "25" .smtp_port }}
+  username: {{ default "" .smtp_username }}
+  password: {{ default "" .smtp_password }}
+  from_address: {{ .from_address }}
+  from_name: {{ default "AfterDark Systems" .from_name }}
+  starttls: {{ default "true" .starttls }}
+  auth: {{ default "plain" .smtp_auth }}
+
+database:
+  driver: {{ default "postgres" .db_driver }}
+  dsn: {{ .db_dsn }}
+  max_open: {{ default "10" .db_max_open }}
+  max_idle: {{ default "5" .db_max_idle }}
+
+queue:
+  type: {{ default "redis" .queue_type }}
+  url: {{ default "redis://localhost:6379/2" .queue_url }}
+  workers: {{ default "4" .queue_workers }}
+  retry_max: {{ default "3" .retry_max }}
+  retry_backoff: {{ default "60" .retry_backoff }}
+
+rate_limit:
+  enabled: {{ default "true" .rate_limit_enabled }}
+  per_minute: {{ default "60" .rate_limit_per_minute }}
+  per_hour: {{ default "500" .rate_limit_per_hour }}
+
+logging:
+  level: {{ default "info" .log_level }}
+  format: {{ default "json" .log_format }}
+  output: {{ default "stdout" .log_output }}

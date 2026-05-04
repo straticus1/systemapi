@@ -17,22 +17,25 @@ import (
 
 // Entitlements define what the current script is permitted to do
 type Entitlements struct {
-	AllowFSWrite     []string `json:"allow_fs_write"`
-	AllowFSRead      []string `json:"allow_fs_read"`
-	AllowNetOutbound []string `json:"allow_net_outbound"`
-	AllowExec        bool     `json:"allow_exec"`
+	AllowFSWrite       []string `json:"allow_fs_write"`
+	AllowFSRead        []string `json:"allow_fs_read"`
+	AllowNetOutbound   []string `json:"allow_net_outbound"`
+	AllowExec          bool     `json:"allow_exec"`
+	AllowConfigWrite   []string `json:"allow_config_write"`   // paths allowed for atomic config writes
+	AllowServiceReload []string `json:"allow_service_reload"` // service names allowed to reload
 }
 
 // SysscriptEngine wraps the Starlark execution
 type SysscriptEngine struct {
 	Entitlements *Entitlements
+	cm           *ConfigManager
 }
 
 func NewSysscriptEngine(perms *Entitlements) *SysscriptEngine {
 	if perms == nil {
 		perms = &Entitlements{} // default deny all
 	}
-	return &SysscriptEngine{Entitlements: perms}
+	return &SysscriptEngine{Entitlements: perms, cm: &ConfigManager{}}
 }
 
 // Execute runs a snippet of Starlark code to completion and returns its printed output and return value
@@ -61,7 +64,7 @@ func (engine *SysscriptEngine) Execute(scriptSource string) (string, error) {
 
 // buildSysModule assembles the `sys` object with nested `sys.fs`, `sys.net`, etc.
 func (engine *SysscriptEngine) buildSysModule() *starlarkstruct.Struct {
-	
+
 	// sys.net
 	sysNet := starlark.StringDict{
 		"http_get": starlark.NewBuiltin("http_get", engine.netHTTPGet),
@@ -96,6 +99,22 @@ func (engine *SysscriptEngine) buildSysModule() *starlarkstruct.Struct {
 		"run": starlark.NewBuiltin("run", engine.containersRun),
 	}
 
+	// sys.config
+	sysConfig := starlark.StringDict{
+		"write":    starlark.NewBuiltin("write", engine.configWrite),
+		"template": starlark.NewBuiltin("template", engine.configTemplate),
+		"validate": starlark.NewBuiltin("validate", engine.configValidate),
+		"reload":   starlark.NewBuiltin("reload", engine.configReload),
+		"backup":   starlark.NewBuiltin("backup", engine.configBackup),
+		"restore":  starlark.NewBuiltin("restore", engine.configRestore),
+	}
+
+	// sys.yaml
+	sysYAML := starlark.StringDict{
+		"parse":  starlark.NewBuiltin("parse", engine.yamlParse),
+		"encode": starlark.NewBuiltin("encode", engine.yamlEncode),
+	}
+
 	sysDict := starlark.StringDict{
 		"net":        starlarkstruct.FromStringDict(starlark.String("net"), sysNet),
 		"exec":       starlarkstruct.FromStringDict(starlark.String("exec"), sysExec),
@@ -105,6 +124,8 @@ func (engine *SysscriptEngine) buildSysModule() *starlarkstruct.Struct {
 		"events":     starlarkstruct.FromStringDict(starlark.String("events"), sysEvents),
 		"packages":   starlarkstruct.FromStringDict(starlark.String("packages"), sysPackages),
 		"containers": starlarkstruct.FromStringDict(starlark.String("containers"), sysContainers),
+		"config":     starlarkstruct.FromStringDict(starlark.String("config"), sysConfig),
+		"yaml":       starlarkstruct.FromStringDict(starlark.String("yaml"), sysYAML),
 	}
 
 	return starlarkstruct.FromStringDict(starlark.String("sys"), sysDict)
