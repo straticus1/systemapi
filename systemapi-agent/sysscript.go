@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -23,42 +25,77 @@ type Entitlements struct {
 	AllowExec          bool     `json:"allow_exec"`
 	AllowConfigWrite   []string `json:"allow_config_write"`   // paths allowed for atomic config writes
 	AllowServiceReload []string `json:"allow_service_reload"` // service names allowed to reload
+	AllowContainers    bool     `json:"allow_containers"`
+	AllowK3s           bool     `json:"allow_k3s"`
 }
 
 // SysscriptEngine wraps the Starlark execution
 type SysscriptEngine struct {
 	Entitlements *Entitlements
 	cm           *ConfigManager
+	dockerClient *DockerClient
+	k3sClient    *K3sClient
 }
 
 func NewSysscriptEngine(perms *Entitlements) *SysscriptEngine {
 	if perms == nil {
 		perms = &Entitlements{} // default deny all
 	}
-	return &SysscriptEngine{Entitlements: perms, cm: &ConfigManager{}}
+	engine := &SysscriptEngine{Entitlements: perms, cm: &ConfigManager{}}
+	if perms.AllowContainers {
+		engine.dockerClient = NewDockerClient()
+	}
+	if perms.AllowK3s {
+		var err error
+		engine.k3sClient, err = NewK3sClient()
+		if err != nil {
+			log.Printf("[sysscript] k3s client init failed: %v", err)
+		}
+	}
+	return engine
 }
 
 // Execute runs a snippet of Starlark code to completion and returns its printed output and return value
 func (engine *SysscriptEngine) Execute(scriptSource string) (string, error) {
 	var outBuffer bytes.Buffer
 
+	const scriptsBase = "/etc/systemapi/scripts"
+	cache := make(map[string]starlark.StringDict)
+	var loadFn func(*starlark.Thread, string) (starlark.StringDict, error)
+	loadFn = func(thread *starlark.Thread, module string) (starlark.StringDict, error) {
+		if g, ok := cache[module]; ok {
+			return g, nil
+		}
+		// T-03-01: path traversal protection
+		resolved := filepath.Clean(filepath.Join(scriptsBase, module))
+		if !strings.HasPrefix(resolved, scriptsBase+string(os.PathSeparator)) && resolved != scriptsBase {
+			return nil, fmt.Errorf("load(%q): path traversal not allowed", module)
+		}
+		src, err := os.ReadFile(resolved)
+		if err != nil {
+			return nil, fmt.Errorf("load(%q): %w", module, err) // D-09: fail fast
+		}
+		mt := &starlark.Thread{Name: "load " + module, Load: loadFn} // Pitfall 5: sub-thread needs Load too
+		g, err := starlark.ExecFile(mt, module, src, nil)
+		if err != nil {
+			return nil, err
+		}
+		cache[module] = g
+		return g, nil
+	}
+
 	thread := &starlark.Thread{
 		Name:  "Sysscript",
 		Print: func(_ *starlark.Thread, msg string) { outBuffer.WriteString(msg + "\n") },
+		Load:  loadFn,
 	}
 
-	// Build the builtins based on entitlements
 	sysModule := engine.buildSysModule()
-
-	predeclared := starlark.StringDict{
-		"sys": sysModule,
-	}
-
+	predeclared := starlark.StringDict{"sys": sysModule}
 	_, err := starlark.ExecFile(thread, "sysscript.star", scriptSource, predeclared)
 	if err != nil {
 		return outBuffer.String(), err
 	}
-
 	return outBuffer.String(), nil
 }
 
@@ -102,9 +139,6 @@ func (engine *SysscriptEngine) buildSysModule() *starlarkstruct.Struct {
 	}
 	sysPackages := starlark.StringDict{
 		"install": starlark.NewBuiltin("install", engine.packagesInstall),
-	}
-	sysContainers := starlark.StringDict{
-		"run": starlark.NewBuiltin("run", engine.containersRun),
 	}
 
 	// sys.config
@@ -156,20 +190,41 @@ func (engine *SysscriptEngine) buildSysModule() *starlarkstruct.Struct {
 	}
 
 	sysDict := starlark.StringDict{
-		"net":        starlarkstruct.FromStringDict(starlark.String("net"), sysNet),
-		"exec":       starlarkstruct.FromStringDict(starlark.String("exec"), sysExec),
-		"fs":         starlarkstruct.FromStringDict(starlark.String("fs"), sysFS),
-		"alerts":     starlarkstruct.FromStringDict(starlark.String("alerts"), sysAlerts),
-		"security":   starlarkstruct.FromStringDict(starlark.String("security"), sysSecurity),
-		"events":     starlarkstruct.FromStringDict(starlark.String("events"), sysEvents),
-		"packages":   starlarkstruct.FromStringDict(starlark.String("packages"), sysPackages),
-		"containers": starlarkstruct.FromStringDict(starlark.String("containers"), sysContainers),
-		"config":     starlarkstruct.FromStringDict(starlark.String("config"), sysConfig),
-		"yaml":       starlarkstruct.FromStringDict(starlark.String("yaml"), sysYAML),
+		"net":      starlarkstruct.FromStringDict(starlark.String("net"), sysNet),
+		"exec":     starlarkstruct.FromStringDict(starlark.String("exec"), sysExec),
+		"fs":       starlarkstruct.FromStringDict(starlark.String("fs"), sysFS),
+		"alerts":   starlarkstruct.FromStringDict(starlark.String("alerts"), sysAlerts),
+		"security": starlarkstruct.FromStringDict(starlark.String("security"), sysSecurity),
+		"events":   starlarkstruct.FromStringDict(starlark.String("events"), sysEvents),
+		"packages": starlarkstruct.FromStringDict(starlark.String("packages"), sysPackages),
+		"config":   starlarkstruct.FromStringDict(starlark.String("config"), sysConfig),
+		"yaml":     starlarkstruct.FromStringDict(starlark.String("yaml"), sysYAML),
 		"proc":     starlarkstruct.FromStringDict(starlark.String("proc"), sysProc),
 		"json":     starlarkstruct.FromStringDict(starlark.String("json"), sysJSON),
 		"ini":      starlarkstruct.FromStringDict(starlark.String("ini"), sysINI),
 		"services": starlarkstruct.FromStringDict(starlark.String("services"), sysSvc),
+	}
+
+	// D-11: containers namespace absent when not entitled
+	if engine.Entitlements.AllowContainers {
+		sysContainers := starlark.StringDict{
+			"list":    starlark.NewBuiltin("list", engine.containersList),
+			"stats":   starlark.NewBuiltin("stats", engine.containersStats),
+			"stop":    starlark.NewBuiltin("stop", engine.containersStop),
+			"start":   starlark.NewBuiltin("start", engine.containersStart),
+			"restart": starlark.NewBuiltin("restart", engine.containersRestart),
+		}
+		sysDict["containers"] = starlarkstruct.FromStringDict(starlark.String("containers"), sysContainers)
+	}
+
+	// D-11: k3s namespace absent when not entitled
+	if engine.Entitlements.AllowK3s {
+		sysK3s := starlark.StringDict{
+			"nodes": starlark.NewBuiltin("nodes", engine.k3sNodes),
+			"pods":  starlark.NewBuiltin("pods", engine.k3sPods),
+			"apply": starlark.NewBuiltin("apply", engine.k3sApply),
+		}
+		sysDict["k3s"] = starlarkstruct.FromStringDict(starlark.String("k3s"), sysK3s)
 	}
 
 	return starlarkstruct.FromStringDict(starlark.String("sys"), sysDict)
@@ -302,4 +357,30 @@ func (engine *SysscriptEngine) fsWrite(thread *starlark.Thread, b *starlark.Buil
 		return starlark.None, err
 	}
 	return starlark.True, nil
+}
+
+// Placeholder stubs — implemented in sys_containers.go (Plan 02) and sys_k3s.go (Plan 03)
+func (engine *SysscriptEngine) containersList(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	return starlark.NewList(nil), nil
+}
+func (engine *SysscriptEngine) containersStats(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	return starlark.None, nil
+}
+func (engine *SysscriptEngine) containersStop(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	return starlark.None, nil
+}
+func (engine *SysscriptEngine) containersStart(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	return starlark.None, nil
+}
+func (engine *SysscriptEngine) containersRestart(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	return starlark.None, nil
+}
+func (engine *SysscriptEngine) k3sNodes(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	return starlark.NewList(nil), nil
+}
+func (engine *SysscriptEngine) k3sPods(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	return starlark.NewList(nil), nil
+}
+func (engine *SysscriptEngine) k3sApply(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	return starlark.None, nil
 }
