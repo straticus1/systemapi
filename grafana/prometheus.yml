@@ -1,0 +1,17 @@
+# Prometheus configuration for SystemAPI.io
+# Save this as prometheus.yml and run: prometheus --config.file=prometheus.yml
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'systemapi'
+    static_configs:
+      - targets: ['localhost:3003']
+        labels:
+          service: 'systemapi-io'
+          environment: 'production'
+
+    metrics_path: '/metrics'
+    scrape_interval: 10s
