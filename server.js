@@ -8,9 +8,69 @@ const cors = require('cors');
 const helmet = require('helmet');
 const compression = require('compression');
 const morgan = require('morgan');
+const session = require('express-session');
+const promClient = require('prom-client');
+require('dotenv').config({ path: '.env.production' });
 
 const app = express();
 const PORT = process.env.PORT || 3003;
+
+// Prometheus metrics registry
+const register = new promClient.Registry();
+promClient.collectDefaultMetrics({ register });
+
+// Custom metrics
+const hostTotalGauge = new promClient.Gauge({
+    name: 'systemapi_hosts_total',
+    help: 'Total number of registered hosts',
+    registers: [register]
+});
+
+const hostOnlineGauge = new promClient.Gauge({
+    name: 'systemapi_hosts_online',
+    help: 'Number of hosts currently online',
+    registers: [register]
+});
+
+const hostOfflineGauge = new promClient.Gauge({
+    name: 'systemapi_hosts_offline',
+    help: 'Number of hosts currently offline',
+    registers: [register]
+});
+
+const cpuUsageGauge = new promClient.Gauge({
+    name: 'systemapi_cpu_usage_percent',
+    help: 'CPU usage percentage per host',
+    labelNames: ['host_id', 'hostname'],
+    registers: [register]
+});
+
+const memoryUsageGauge = new promClient.Gauge({
+    name: 'systemapi_memory_usage_percent',
+    help: 'Memory usage percentage per host',
+    labelNames: ['host_id', 'hostname'],
+    registers: [register]
+});
+
+const diskUsageGauge = new promClient.Gauge({
+    name: 'systemapi_disk_usage_percent',
+    help: 'Disk usage percentage per host',
+    labelNames: ['host_id', 'hostname', 'path'],
+    registers: [register]
+});
+
+const alertsActiveGauge = new promClient.Gauge({
+    name: 'systemapi_alerts_active',
+    help: 'Number of active alerts',
+    registers: [register]
+});
+
+const executionsTotal = new promClient.Counter({
+    name: 'systemapi_executions_total',
+    help: 'Total number of sysscript executions',
+    labelNames: ['status'],
+    registers: [register]
+});
 
 // Threat intel source URLs (pull from cached data, not paid APIs)
 const DNSSCIENCE_API = process.env.DNSSCIENCE_API_URL || 'https://api.dnsscience.io';
@@ -26,12 +86,30 @@ app.use(cors({
     origin: [
         /\.afterdarksys\.com$/,
         /\.systemapi\.io$/,
+        /\.auth\.afterdarksys\.com$/,
         'http://localhost:3000',
+        'http://localhost:5173', // Vite dev server
         'https://systemapi.io'
     ],
     credentials: true
 }));
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Session middleware for OAuth
+app.use(session({
+    secret: process.env.SESSION_SECRET || 'default-secret-change-me',
+    name: process.env.SESSION_COOKIE_NAME || 'systemapi-io_session',
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+        secure: process.env.SESSION_COOKIE_SECURE === 'true' || process.env.NODE_ENV === 'production',
+        httpOnly: process.env.SESSION_COOKIE_HTTPONLY !== 'false',
+        sameSite: process.env.SESSION_COOKIE_SAMESITE || 'lax',
+        maxAge: parseInt(process.env.SESSION_MAX_AGE || '86400') * 1000 // Default 24 hours
+    }
+}));
+
 app.use(express.static('public'));
 
 // ==============================================================================
@@ -88,13 +166,44 @@ if (process.env.DB_PASSWORD && process.env.DB_PASSWORD !== '') {
 
 
 
+// OAuth routes
+const oauthRouter = require('./routes/oauth');
+app.use('/oauth', oauthRouter);
+
+// Prometheus metrics endpoint
+app.get('/metrics', async (req, res) => {
+    try {
+        // Update metrics from database
+        const { rows } = await dbPool.query(`
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN status = 'online' THEN 1 ELSE 0 END) as online,
+                SUM(CASE WHEN status = 'offline' THEN 1 ELSE 0 END) as offline
+            FROM playground_hosts
+        `);
+
+        if (rows[0]) {
+            hostTotalGauge.set(parseInt(rows[0].total) || 0);
+            hostOnlineGauge.set(parseInt(rows[0].online) || 0);
+            hostOfflineGauge.set(parseInt(rows[0].offline) || 0);
+        }
+
+        res.set('Content-Type', register.contentType);
+        res.end(await register.metrics());
+    } catch (error) {
+        console.error('Error generating metrics:', error);
+        res.status(500).send('Error generating metrics');
+    }
+});
+
 // Health endpoint
 app.get('/health', (req, res) => {
     res.json({
         status: 'healthy',
         service: 'SystemAPI.io',
         timestamp: new Date().toISOString(),
-        version: '1.0.0'
+        version: '1.0.0',
+        authenticated: !!req.session.user
     });
 });
 
@@ -321,17 +430,42 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 
 // Attach WebSocket multiplexer onto the HTTP server
 console.log('Mounting SystemAPI.io Fleet Manager WebSockets...');
-const fleetManager = new FleetManager(server, dbPool);
+const prometheusMetrics = {
+    cpuUsageGauge,
+    memoryUsageGauge,
+    diskUsageGauge,
+    alertsActiveGauge,
+    executionsTotal
+};
+const fleetManager = new FleetManager(server, dbPool, 'systemapi', prometheusMetrics);
 
 // Fleet REST Endpoints
 app.get('/api/v1/fleet', async (req, res) => {
-    // Simplified Auth for demo
+    // Check for session auth first, then fall back to API key
+    const isSessionAuth = req.session && req.session.user;
     const apiKey = req.headers['x-api-key'];
-    if (!apiKey) return res.status(401).json({error: 'Unauthorized'});
+
+    if (!isSessionAuth && !apiKey) {
+        return res.status(401).json({
+            error: 'Unauthorized',
+            message: 'Please log in or provide an API key'
+        });
+    }
+
+    // If using API key, validate it
+    if (!isSessionAuth && apiKey) {
+        const keyData = await fleetManager.verifyApiKey(apiKey);
+        if (!keyData) {
+            return res.status(403).json({
+                error: 'Forbidden',
+                message: 'Invalid API key'
+            });
+        }
+    }
 
     try {
         const { rows } = await dbPool.query('SELECT * FROM playground_hosts ORDER BY last_seen_at DESC');
-        
+
         // Attach live telemetry if connected
         const enrichedHosts = rows.map(host => {
             if (fleetManager && fleetManager.connectedAgents.has(host.host_id)) {
@@ -340,7 +474,10 @@ app.get('/api/v1/fleet', async (req, res) => {
             return host;
         });
 
-        res.json({ hosts: enrichedHosts });
+        res.json({
+            hosts: enrichedHosts,
+            user: isSessionAuth ? req.session.user : null
+        });
     } catch (e) {
         console.error(e);
         // Fallback for missing local DB tables
@@ -348,9 +485,56 @@ app.get('/api/v1/fleet', async (req, res) => {
     }
 });
 
-app.post('/api/v1/fleet/:hostId/execute', async (req, res) => {
+app.get('/api/v1/fleet/:hostId/software', async (req, res) => {
+    const isSessionAuth = req.session && req.session.user;
     const apiKey = req.headers['x-api-key'];
-    if (!apiKey) return res.status(401).json({error: 'Unauthorized'});
+
+    if (!isSessionAuth && !apiKey) return res.status(401).json({ error: 'Unauthorized' });
+
+    try {
+        const { rows } = await dbPool.query('SELECT * FROM playground_host_software WHERE host_id = $1 ORDER BY name ASC', [req.params.hostId]);
+        res.json({ software: rows });
+    } catch (e) {
+        res.json({ software: [] });
+    }
+});
+
+app.get('/api/v1/fleet/:hostId/cves', async (req, res) => {
+    const isSessionAuth = req.session && req.session.user;
+    const apiKey = req.headers['x-api-key'];
+
+    if (!isSessionAuth && !apiKey) return res.status(401).json({ error: 'Unauthorized' });
+
+    try {
+        const { rows } = await dbPool.query('SELECT * FROM playground_host_cves WHERE host_id = $1 ORDER BY discovered_at DESC', [req.params.hostId]);
+        res.json({ cves: rows });
+    } catch (e) {
+        res.json({ cves: [] });
+    }
+});
+
+app.post('/api/v1/fleet/:hostId/execute', async (req, res) => {
+    // Check for session auth first, then fall back to API key
+    const isSessionAuth = req.session && req.session.user;
+    const apiKey = req.headers['x-api-key'];
+
+    if (!isSessionAuth && !apiKey) {
+        return res.status(401).json({
+            error: 'Unauthorized',
+            message: 'Please log in or provide an API key'
+        });
+    }
+
+    // If using API key, validate it
+    if (!isSessionAuth && apiKey) {
+        const keyData = await fleetManager.verifyApiKey(apiKey);
+        if (!keyData) {
+            return res.status(403).json({
+                error: 'Forbidden',
+                message: 'Invalid API key'
+            });
+        }
+    }
 
     const { hostId } = req.params;
     const { script, entitlements } = req.body;
@@ -358,7 +542,13 @@ app.post('/api/v1/fleet/:hostId/execute', async (req, res) => {
     const reqId = Date.now().toString();
     try {
         const result = await fleetManager.pushSysscript(hostId, script, entitlements || {}, reqId);
-        res.json({ success: true, message: 'Script dispatched and executed', request_id: reqId, result: result });
+        res.json({
+            success: true,
+            message: 'Script dispatched and executed',
+            request_id: reqId,
+            result: result,
+            executed_by: isSessionAuth ? req.session.user.email : 'api_key'
+        });
     } catch (e) {
         res.status(404).json({ error: e.message });
     }

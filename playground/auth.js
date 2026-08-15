@@ -1,11 +1,12 @@
 /**
  * Authentication for API Playground (Express.js)
- * Supports both Keycloak/JWT tokens and API keys
+ * Supports both Authentik/JWT tokens and API keys
  */
 
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
+const { Issuer } = require('openid-client');
 
 class AuthManager {
   constructor(keycloakURL, keycloakRealm, keycloakClientID, apiSite, dbPool) {
@@ -15,6 +16,22 @@ class AuthManager {
     this.apiSite = apiSite;
     this.db = dbPool;
     this.jwksURI = `${keycloakURL}/realms/${keycloakRealm}/protocol/openid-connect/certs`;
+    this.oidcClient = null;
+    this.initOIDC();
+  }
+
+  /**
+   * Initialize OIDC client for proper JWT verification
+   */
+  async initOIDC() {
+    try {
+      const authentikIssuer = process.env.AUTHENTIK_ISSUER || `${this.keycloakURL}/realms/${this.keycloakRealm}`;
+      const issuer = await Issuer.discover(authentikIssuer);
+      this.oidcClient = issuer;
+      console.log('✓ OIDC client initialized for JWT verification');
+    } catch (error) {
+      console.warn('⚠ OIDC discovery failed, JWT verification will be limited:', error.message);
+    }
   }
 
   /**
@@ -163,14 +180,13 @@ class AuthManager {
   }
 
   /**
-   * Verify Keycloak JWT token
+   * Verify JWT token with proper signature validation using JWKS
    * @param {string} token - JWT token
-   * @returns {Object|null} Decoded payload or null
+   * @returns {Promise<Object|null>} Decoded payload or null
    */
-  verifyKeycloakToken(token) {
+  async verifyJWTToken(token) {
     try {
-      // In production, you should fetch JWKS from Keycloak and verify signature
-      // For now, we'll decode without verification (NOT SECURE FOR PRODUCTION!)
+      // First decode to get header and payload
       const decoded = jwt.decode(token, { complete: true });
 
       if (!decoded) {
@@ -181,15 +197,47 @@ class AuthManager {
 
       // Check expiration
       if (payload.exp && Date.now() / 1000 > payload.exp) {
+        console.warn('JWT token expired');
         return null;
       }
 
-      // Check realm and issuer
-      const expectedIssuer = `${this.keycloakURL}/realms/${this.keycloakRealm}`;
-      if (payload.iss !== expectedIssuer) {
+      // If we have OIDC client, use proper signature verification
+      if (this.oidcClient) {
+        try {
+          const keystore = await this.oidcClient.keystore(true); // Force refresh
+          const key = keystore.get({ kid: decoded.header.kid, alg: decoded.header.alg });
+
+          if (!key) {
+            console.warn('No matching key found in JWKS for kid:', decoded.header.kid);
+            return null;
+          }
+
+          // Verify signature
+          jwt.verify(token, key.toPEM(), {
+            algorithms: [decoded.header.alg],
+            issuer: payload.iss
+          });
+
+          console.log('✓ JWT signature verified');
+          return payload;
+        } catch (verifyError) {
+          console.warn('JWT signature verification failed:', verifyError.message);
+          return null;
+        }
+      }
+
+      // Fallback: Check issuer (less secure, but better than nothing)
+      const expectedIssuers = [
+        `${this.keycloakURL}/realms/${this.keycloakRealm}`,
+        process.env.AUTHENTIK_ISSUER
+      ].filter(Boolean);
+
+      if (!expectedIssuers.includes(payload.iss)) {
+        console.warn('JWT issuer mismatch. Expected:', expectedIssuers, 'Got:', payload.iss);
         return null;
       }
 
+      console.warn('⚠ JWT verified without signature check (OIDC client not available)');
       return payload;
     } catch (error) {
       console.warn('JWT verification failed:', error.message);
@@ -200,15 +248,15 @@ class AuthManager {
   /**
    * Get user ID from JWT token
    * @param {string} token - JWT token
-   * @returns {string|null} user_id or null
+   * @returns {Promise<string|null>} user_id or null
    */
-  getUserFromToken(token) {
-    const payload = this.verifyKeycloakToken(token);
+  async getUserFromToken(token) {
+    const payload = await this.verifyJWTToken(token);
     if (!payload) {
       return null;
     }
 
-    // Keycloak uses 'sub' as user ID
+    // Authentik/Keycloak uses 'sub' as user ID
     return payload.sub || payload.user_id || null;
   }
 
@@ -243,7 +291,7 @@ class AuthManager {
         const authHeader = req.headers.authorization;
         if (authHeader && authHeader.startsWith('Bearer ')) {
           const token = authHeader.substring(7);
-          userId = this.getUserFromToken(token);
+          userId = await this.getUserFromToken(token);
         }
       }
 

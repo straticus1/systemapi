@@ -10,14 +10,15 @@ const url = require('url');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 
 class FleetManager {
-    constructor(server, db, apiSite = 'systemapi') {
+    constructor(server, db, apiSite = 'systemapi', prometheusMetrics = null) {
         this.wss = new WebSocket.Server({ noServer: true });
         this.db = db;
         this.apiSite = apiSite;
-        
+        this.metrics = prometheusMetrics; // Prometheus metrics object
+
         // In-memory cache of connected clients: map[host_id] -> ws
         this.connectedAgents = new Map();
-        
+
         // In-memory cache of connected dashboard users listening to terminals
         this.terminalSubscribers = new Map(); // host_id -> Dashboard WebSocket
 
@@ -132,11 +133,15 @@ class FleetManager {
             }
             return null;
         } catch (e) {
-            console.warn('DB Error verifying key (local mock active):', e.message);
-            // Local fallback bypass so dev server WebSockets don't crash
-            if (secretProvided && secretProvided.startsWith('ak_live_')) {
-                return { key_id: secretProvided.split('.')[0], user_id: 'demo_user_fallback' };
+            console.warn('DB Error verifying key:', e.message);
+            // SECURITY: Only allow demo key when DB is unavailable (dev/testing only)
+            // In production, DB failures should reject authentication
+            if (process.env.NODE_ENV !== 'production' && secretProvided === 'ak_live_1234.demo') {
+                console.warn('⚠️ DEVELOPMENT MODE: Using demo key bypass (DB unavailable)');
+                return { key_id: 'ak_live_1234', user_id: 'demo_user_fallback' };
             }
+            // Production: reject all keys if DB is down
+            console.error('🚨 SECURITY: Rejecting API key due to DB unavailability');
             return null;
         }
     }
@@ -223,29 +228,69 @@ class FleetManager {
             const hostname = payload.host.hostname || 'unknown';
             const os = payload.host.os || 'unknown';
             const platform = payload.host.platform || 'unknown';
-            
+
             // Register or update host
             const res = await this.db.query(`
                 INSERT INTO playground_hosts (key_id, api_site, hostname, os, platform, status, last_seen_at)
                 VALUES ($1, $2, $3, $4, $5, 'online', CURRENT_TIMESTAMP)
-                ON CONFLICT (key_id, api_site) DO UPDATE 
+                ON CONFLICT (key_id, api_site) DO UPDATE
                 SET status = 'online', last_seen_at = CURRENT_TIMESTAMP
                 RETURNING host_id
             `, [keyId, this.apiSite, hostname, os, platform]);
-            
+
             hostId = res.rows[0].host_id;
             this.connectedAgents.set(hostId, ws);
         } else {
             await this.db.query(`UPDATE playground_hosts SET last_seen_at = CURRENT_TIMESTAMP WHERE host_id = $1`, [hostId]);
         }
 
-        // 2. AI Anomaly Detection (Baseline Evaluation)
+        // 2. Export telemetry to Prometheus
+        this.exportTelemetryToPrometheus(hostId, payload);
+
+        // 3. AI Anomaly Detection (Baseline Evaluation)
         this.analyzeForAnomalies(hostId, payload);
 
-        // 3. Traditional Rules Evaluation (Alerting Engine)
+        // 4. Traditional Rules Evaluation (Alerting Engine)
         await this.evaluateRules(userId, hostId, payload);
-        
+
+        // 5. Software Inventory & CVE Check
+        if (payload.software && payload.software.length > 0) {
+            this.processSoftwareInventory(hostId, payload.software).catch(e => {
+                console.error('[Software Inventory] Error processing software:', e.message);
+            });
+        }
+
         return hostId;
+    }
+
+    // Export real-time telemetry to Prometheus metrics
+    exportTelemetryToPrometheus(hostId, telemetry) {
+        if (!this.metrics) return;
+
+        const hostname = telemetry.host?.hostname || 'unknown';
+
+        try {
+            // CPU metrics
+            if (telemetry.cpu && typeof telemetry.cpu.usage_percent === 'number') {
+                this.metrics.cpuUsageGauge.labels(hostId, hostname).set(telemetry.cpu.usage_percent);
+            }
+
+            // Memory metrics
+            if (telemetry.memory && typeof telemetry.memory.used_percent === 'number') {
+                this.metrics.memoryUsageGauge.labels(hostId, hostname).set(telemetry.memory.used_percent);
+            }
+
+            // Disk metrics
+            if (telemetry.disk && Array.isArray(telemetry.disk)) {
+                telemetry.disk.forEach(disk => {
+                    if (typeof disk.used_percent === 'number') {
+                        this.metrics.diskUsageGauge.labels(hostId, hostname, disk.path).set(disk.used_percent);
+                    }
+                });
+            }
+        } catch (error) {
+            console.error('[Prometheus] Error exporting metrics:', error.message);
+        }
     }
 
     // Stub for Local AI Baseline Evaluation
@@ -378,6 +423,70 @@ class FleetManager {
 
         await this.darkStorage.send(command);
         console.log(`[DarkStorage] Successfully WORM-locked Sysscript audit log -> ${objectKey}`);
+    }
+
+    async processSoftwareInventory(hostId, softwareList) {
+        if (!this.db) return;
+
+        for (const sw of softwareList) {
+            try {
+                const swName = sw.name || 'unknown';
+                const swVersion = sw.version || 'unknown';
+                
+                const res = await this.db.query(`
+                    INSERT INTO playground_host_software (host_id, name, version, architecture, last_detected_at)
+                    VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+                    ON CONFLICT (host_id, name, version) DO UPDATE
+                    SET last_detected_at = CURRENT_TIMESTAMP
+                    RETURNING id, (xmax = 0) AS inserted
+                `, [hostId, swName, swVersion, sw.architecture || '']);
+                
+                // If this is a newly inserted software version for this host, check for CVEs
+                if (res.rows[0].inserted) {
+                    this.checkDarkAPIForCVEs(hostId, swName, swVersion).catch(e => {
+                        console.error(`[DarkAPI] Failed checking CVEs for ${swName} v${swVersion}:`, e.message);
+                    });
+                }
+            } catch (err) {
+                console.error('[Software Inventory] Upsert failed:', err.message);
+            }
+        }
+    }
+
+    async checkDarkAPIForCVEs(hostId, name, version) {
+        if (!process.env.DARKAPI_KEY) {
+            // Mock some CVEs if no key is provided for demonstration
+            if (name.toLowerCase().includes('openssh') && version.startsWith('8.')) {
+                await this.saveCVE(hostId, name, version, 'CVE-2023-38408', 'High', 'Remote Code Execution in ssh-agent');
+            }
+            return;
+        }
+        
+        const DARKAPI_URL = process.env.DARKAPI_URL || 'https://api.darkapi.io';
+        try {
+            const response = await axios.get(`${DARKAPI_URL}/v1/cve/software/${encodeURIComponent(name)}/${encodeURIComponent(version)}`, {
+                headers: { 'X-API-Key': process.env.DARKAPI_KEY }
+            });
+            
+            const vulnerabilities = response.data.cves || [];
+            for (const vuln of vulnerabilities) {
+                await this.saveCVE(hostId, name, version, vuln.id, vuln.severity, vuln.description);
+            }
+        } catch (error) {
+            console.error(`[DarkAPI] Error fetching CVEs for ${name}:`, error.message);
+        }
+    }
+
+    async saveCVE(hostId, name, version, cveId, severity, description) {
+        try {
+            await this.db.query(`
+                INSERT INTO playground_host_cves (host_id, software_name, software_version, cve_id, severity, description, discovered_at)
+                VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)
+                ON CONFLICT (host_id, software_name, software_version, cve_id) DO NOTHING
+            `, [hostId, name, version, cveId, severity || 'Unknown', description || '']);
+        } catch (e) {
+            console.error('[DarkAPI] Failed saving CVE to DB:', e.message);
+        }
     }
     
     // Remote method to push a Sysscript to an agent and wait for output

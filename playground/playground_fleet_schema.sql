@@ -61,3 +61,32 @@ CREATE TABLE IF NOT EXISTS playground_script_executions (
     error_message TEXT,
     executed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
+
+-- 5. Software Inventory
+CREATE TABLE IF NOT EXISTS playground_host_software (
+    id SERIAL PRIMARY KEY,
+    host_id UUID REFERENCES playground_hosts(host_id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    version VARCHAR(255) NOT NULL,
+    architecture VARCHAR(50),
+    last_detected_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT idx_host_software_unique UNIQUE(host_id, name, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_software_host ON playground_host_software(host_id);
+
+-- 6. Software Vulnerabilities (CVEs)
+CREATE TABLE IF NOT EXISTS playground_host_cves (
+    id SERIAL PRIMARY KEY,
+    host_id UUID REFERENCES playground_hosts(host_id) ON DELETE CASCADE,
+    software_name VARCHAR(255) NOT NULL,
+    software_version VARCHAR(255) NOT NULL,
+    cve_id VARCHAR(50) NOT NULL,
+    severity VARCHAR(50),
+    description TEXT,
+    discovered_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT idx_host_cves_unique UNIQUE(host_id, software_name, software_version, cve_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cves_host ON playground_host_cves(host_id);
+
