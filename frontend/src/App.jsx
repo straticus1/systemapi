@@ -30,6 +30,12 @@ const AppLayout = ({ children }) => (
 
 function App() {
   const isAuthenticated = useAppStore(state => state.isAuthenticated);
+  const checkSession = useAppStore(state => state.checkSession);
+
+  // Check for OAuth session on mount
+  useEffect(() => {
+    checkSession();
+  }, []);
 
   return (
     <BrowserRouter>

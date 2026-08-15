@@ -21,6 +21,14 @@ export const FleetAPI = {
     const res = await api.get('/api/v1/fleet');
     return res.data;
   },
+  getSoftware: async (hostId) => {
+    const res = await api.get(`/api/v1/fleet/${hostId}/software`);
+    return res.data;
+  },
+  getCVEs: async (hostId) => {
+    const res = await api.get(`/api/v1/fleet/${hostId}/cves`);
+    return res.data;
+  },
   executeScript: async (hostId, script, entitlements = { allow_exec: false }) => {
     const res = await api.post(`/api/v1/fleet/${hostId}/execute`, { script, entitlements });
     return res.data;

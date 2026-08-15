@@ -114,6 +114,23 @@ const FleetDashboard = () => {
 
 const HostCard = ({ host, onConnect, onDiagnostic }) => {
   const isOnline = host.status === 'online';
+  const [expanded, setExpanded] = useState(false);
+  const [software, setSoftware] = useState([]);
+  const [cves, setCves] = useState([]);
+  const [isLoadingExtras, setIsLoadingExtras] = useState(false);
+
+  useEffect(() => {
+     if (expanded) {
+        setIsLoadingExtras(true);
+        Promise.all([
+            FleetAPI.getSoftware(host.host_id),
+            FleetAPI.getCVEs(host.host_id)
+        ]).then(([sw, cv]) => {
+            if (sw?.software) setSoftware(sw.software);
+            if (cves?.cves) setCves(cv.cves);
+        }).finally(() => setIsLoadingExtras(false));
+     }
+  }, [expanded, host.host_id]);
   
   // Format uptime (minutes to human readable)
   const lastSeenDate = new Date(host.last_seen_at);
@@ -221,6 +238,9 @@ run()`;
       </div>
       
       <div style={{ padding: '16px 20px', borderTop: '1px solid var(--border-light)', display: 'flex', gap: '8px' }}>
+         <button onClick={() => setExpanded(!expanded)} className="btn btn-ghost" style={{ flex: 1 }}>
+            {expanded ? 'Hide Info' : 'Show Info'}
+         </button>
          <button onClick={onConnect} disabled={!isOnline} className="btn btn-primary" style={{ flex: 1, opacity: isOnline ? 1 : 0.5 }}>
             <TerminalSquare size={16} /> Web PTY
          </button>
@@ -259,6 +279,45 @@ run()`;
              </div>
          </div>
       </div>
+      
+      {expanded && (
+        <div style={{ padding: '20px', borderTop: '1px solid var(--border-light)', background: 'rgba(0,0,0,0.3)', maxHeight: '300px', overflowY: 'auto' }}>
+            <h4 style={{ color: 'var(--accent-cyan)', marginBottom: '12px' }}>Software & CVE Inventory</h4>
+            {isLoadingExtras ? (
+                <div style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>Loading inventory...</div>
+            ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+                    {cves.length > 0 && (
+                        <div>
+                            <h5 style={{ color: 'var(--accent-red)', marginBottom: '8px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                <ShieldAlert size={14} /> Found {cves.length} Vulnerabilities
+                            </h5>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                                {cves.map(c => (
+                                    <div key={c.id} style={{ fontSize: '0.8rem', background: 'rgba(255,0,0,0.1)', padding: '8px', borderRadius: '4px', borderLeft: '3px solid var(--accent-red)' }}>
+                                        <strong>{c.cve_id}</strong> - {c.software_name} v{c.software_version}
+                                        <div style={{ color: 'var(--text-muted)', marginTop: '4px' }}>{c.description?.substring(0,100)}...</div>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+                    
+                    <div>
+                        <h5 style={{ color: 'var(--text-muted)', marginBottom: '8px' }}>Installed Software</h5>
+                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px' }}>
+                            {software.length > 0 ? software.map(s => (
+                                <div key={s.id} style={{ fontSize: '0.75rem', padding: '6px', background: 'rgba(255,255,255,0.05)', borderRadius: '4px' }}>
+                                    <div style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}><strong>{s.name}</strong></div>
+                                    <div style={{ color: 'var(--text-muted)' }}>v{s.version}</div>
+                                </div>
+                            )) : <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>No software detected yet.</div>}
+                        </div>
+                    </div>
+                </div>
+            )}
+        </div>
+      )}
     </div>
   );
 };
