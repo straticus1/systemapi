@@ -26,6 +26,8 @@ SystemAPI.io now exports Prometheus metrics that can be visualized in Grafana.
 - `nodejs_heap_size_total_bytes` - Heap size
 - And many more...
 
+Import `grafana/dashboards/fleet.json`. `systemapi_alerts_active` is the process-wide count of open alerts, not a per-tenant series.
+
 ## Quick Setup
 
 ### 1. Start Prometheus

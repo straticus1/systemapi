@@ -32,5 +32,9 @@ export const FleetAPI = {
   executeScript: async (hostId, script, entitlements = { allow_exec: false }) => {
     const res = await api.post(`/api/v1/fleet/${hostId}/execute`, { script, entitlements });
     return res.data;
+  },
+  openTicket: async (hostId, purpose) => {
+    const res = await api.post('/api/v1/ws-ticket', { host_id: hostId, purpose });
+    return res.data;
   }
 };

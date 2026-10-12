@@ -3,6 +3,7 @@
  * Provides system monitoring, infrastructure management, and automation APIs
  */
 
+const fs = require('fs');
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -11,6 +12,27 @@ const morgan = require('morgan');
 const session = require('express-session');
 const promClient = require('prom-client');
 require('dotenv').config({ path: '.env.production' });
+
+// Threats: a production process that signs session cookies with a published
+// default, and a database TLS dial that skips certificate checks. Does NOT
+// print SESSION_SECRET. DB_SSL=disable is the local opt-out; a custom CA is
+// DB_SSL_CA. rejectUnauthorized is never false.
+const DEFAULT_SESSION_SECRET = 'default-secret-change-me';
+if (process.env.NODE_ENV === 'production') {
+    if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET === DEFAULT_SESSION_SECRET) {
+        console.error('[control] SESSION_SECRET is missing or still the default; refusing to start');
+        process.exit(1);
+    }
+} else if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET === DEFAULT_SESSION_SECRET) {
+    console.warn('[control] SESSION_SECRET is the default; set a real secret before production');
+}
+
+function dbSsl(env) {
+    if (env.DB_SSL === 'disable') return false;
+    const ssl = { rejectUnauthorized: true, minVersion: 'TLSv1.3' };
+    if (env.DB_SSL_CA) ssl.ca = fs.readFileSync(env.DB_SSL_CA);
+    return ssl;
+}
 
 const app = express();
 const PORT = process.env.PORT || 3003;
@@ -81,7 +103,8 @@ app.use(helmet({
     contentSecurityPolicy: false
 }));
 app.use(compression());
-app.use(morgan('combined'));
+morgan.token('urlpath', (req) => req.path || '-');
+app.use(morgan(':remote-addr - :remote-user [:date[clf]] ":method :urlpath HTTP/:http-version" :status :res[content-length] ":referrer" ":user-agent"'));
 app.use(cors({
     origin: [
         /\.afterdarksys\.com$/,
@@ -93,12 +116,12 @@ app.use(cors({
     ],
     credentials: true
 }));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '256kb' }));
+app.use(express.urlencoded({ extended: true, limit: '256kb' }));
 
 // Session middleware for OAuth
 app.use(session({
-    secret: process.env.SESSION_SECRET || 'default-secret-change-me',
+    secret: process.env.SESSION_SECRET || DEFAULT_SESSION_SECRET,
     name: process.env.SESSION_COOKIE_NAME || 'systemapi-io_session',
     resave: false,
     saveUninitialized: false,
@@ -412,7 +435,7 @@ if (process.env.DB_PASSWORD && process.env.DB_PASSWORD !== '') {
         user: process.env.DB_USER || 'playground_user',
         password: process.env.DB_PASSWORD,
         database: process.env.DB_NAME || 'systemapi_playground',
-        ssl: { rejectUnauthorized: false }
+        ssl: dbSsl(process.env)
     });
 } else {
     // Local fallback for development & verification
@@ -435,123 +458,22 @@ const prometheusMetrics = {
     memoryUsageGauge,
     diskUsageGauge,
     alertsActiveGauge,
-    executionsTotal
+    executionsTotal,
+    hostTotalGauge,
+    hostOnlineGauge,
+    hostOfflineGauge
 };
 const fleetManager = new FleetManager(server, dbPool, 'systemapi', prometheusMetrics);
-
-// Fleet REST Endpoints
-app.get('/api/v1/fleet', async (req, res) => {
-    // Check for session auth first, then fall back to API key
-    const isSessionAuth = req.session && req.session.user;
-    const apiKey = req.headers['x-api-key'];
-
-    if (!isSessionAuth && !apiKey) {
-        return res.status(401).json({
-            error: 'Unauthorized',
-            message: 'Please log in or provide an API key'
-        });
-    }
-
-    // If using API key, validate it
-    if (!isSessionAuth && apiKey) {
-        const keyData = await fleetManager.verifyApiKey(apiKey);
-        if (!keyData) {
-            return res.status(403).json({
-                error: 'Forbidden',
-                message: 'Invalid API key'
-            });
-        }
-    }
-
-    try {
-        const { rows } = await dbPool.query('SELECT * FROM playground_hosts ORDER BY last_seen_at DESC');
-
-        // Attach live telemetry if connected
-        const enrichedHosts = rows.map(host => {
-            if (fleetManager && fleetManager.connectedAgents.has(host.host_id)) {
-                return { ...host, status: 'online' };
-            }
-            return host;
-        });
-
-        res.json({
-            hosts: enrichedHosts,
-            user: isSessionAuth ? req.session.user : null
-        });
-    } catch (e) {
-        console.error(e);
-        // Fallback for missing local DB tables
-        res.json({ hosts: [] });
-    }
-});
-
-app.get('/api/v1/fleet/:hostId/software', async (req, res) => {
-    const isSessionAuth = req.session && req.session.user;
-    const apiKey = req.headers['x-api-key'];
-
-    if (!isSessionAuth && !apiKey) return res.status(401).json({ error: 'Unauthorized' });
-
-    try {
-        const { rows } = await dbPool.query('SELECT * FROM playground_host_software WHERE host_id = $1 ORDER BY name ASC', [req.params.hostId]);
-        res.json({ software: rows });
-    } catch (e) {
-        res.json({ software: [] });
-    }
-});
-
-app.get('/api/v1/fleet/:hostId/cves', async (req, res) => {
-    const isSessionAuth = req.session && req.session.user;
-    const apiKey = req.headers['x-api-key'];
-
-    if (!isSessionAuth && !apiKey) return res.status(401).json({ error: 'Unauthorized' });
-
-    try {
-        const { rows } = await dbPool.query('SELECT * FROM playground_host_cves WHERE host_id = $1 ORDER BY discovered_at DESC', [req.params.hostId]);
-        res.json({ cves: rows });
-    } catch (e) {
-        res.json({ cves: [] });
-    }
-});
-
-app.post('/api/v1/fleet/:hostId/execute', async (req, res) => {
-    // Check for session auth first, then fall back to API key
-    const isSessionAuth = req.session && req.session.user;
-    const apiKey = req.headers['x-api-key'];
-
-    if (!isSessionAuth && !apiKey) {
-        return res.status(401).json({
-            error: 'Unauthorized',
-            message: 'Please log in or provide an API key'
-        });
-    }
-
-    // If using API key, validate it
-    if (!isSessionAuth && apiKey) {
-        const keyData = await fleetManager.verifyApiKey(apiKey);
-        if (!keyData) {
-            return res.status(403).json({
-                error: 'Forbidden',
-                message: 'Invalid API key'
-            });
-        }
-    }
-
-    const { hostId } = req.params;
-    const { script, entitlements } = req.body;
-
-    const reqId = Date.now().toString();
-    try {
-        const result = await fleetManager.pushSysscript(hostId, script, entitlements || {}, reqId);
-        res.json({
-            success: true,
-            message: 'Script dispatched and executed',
-            request_id: reqId,
-            result: result,
-            executed_by: isSessionAuth ? req.session.user.email : 'api_key'
-        });
-    } catch (e) {
-        res.status(404).json({ error: e.message });
-    }
+const control = require('./controlplane');
+try {
+    control.attach(app, fleetManager, process.env);
+} catch (err) {
+    console.error('[control] signer failed:', err.message);
+    process.exit(1);
+}
+control.boot(fleetManager, process.env).catch((err) => {
+    console.error('[control] boot failed:', err.message);
+    if (process.env.NODE_ENV === 'production') process.exit(1);
 });
 
 // 404 handler

@@ -96,3 +96,14 @@ func TestThreadLoadSuccess(t *testing.T) {
 		t.Logf("load failed (expected on machines without /etc/systemapi/scripts/): %v", err)
 	}
 }
+
+func TestExecRunExpandsStringList(t *testing.T) {
+	engine := newTestEngine(&Entitlements{AllowExec: true})
+	out, err := engine.Execute("r = sys.exec.run(\"echo\", [\"hello\", \"world\"])\nprint(r[\"output\"])\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "hello world") {
+		t.Fatalf("output %q", out)
+	}
+}

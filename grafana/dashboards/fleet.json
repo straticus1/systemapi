@@ -1,0 +1,84 @@
+{
+  "uid": "systemapi-fleet",
+  "title": "SystemAPI Fleet",
+  "description": "Queries the names exported by server.js. systemapi_alerts_active is the process-wide count of open alerts.",
+  "tags": ["systemapi"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "editable": true,
+  "links": [],
+  "annotations": { "list": [] },
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Hosts",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "refId": "A", "expr": "systemapi_hosts_total" }]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Online",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "refId": "A", "expr": "systemapi_hosts_online" }]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Offline",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "refId": "A", "expr": "systemapi_hosts_offline" }]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Executions",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "refId": "A", "expr": "sum by (status) (systemapi_executions_total)" }]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Open alerts",
+      "description": "Process-wide count of alerts with status open. Not filtered by tenant.",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "refId": "A", "expr": "systemapi_alerts_active" }]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "CPU percent",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "refId": "A", "expr": "systemapi_cpu_usage_percent", "legendFormat": "{{hostname}}" }]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Memory percent",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "refId": "A", "expr": "systemapi_memory_usage_percent", "legendFormat": "{{hostname}}" }]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Disk percent",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "refId": "A", "expr": "systemapi_disk_usage_percent", "legendFormat": "{{hostname}} {{path}}" }]
+    }
+  ]
+}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -27,6 +28,52 @@ type Entitlements struct {
 	AllowServiceReload []string `json:"allow_service_reload"` // service names allowed to reload
 	AllowContainers    bool     `json:"allow_containers"`
 	AllowK3s           bool     `json:"allow_k3s"`
+}
+
+// UnmarshalJSON accepts the control plane's clamped entitlement object.
+// A JSON boolean for a path list grants no paths. It does not mean allow-all.
+// AllowExec, AllowContainers, and AllowK3s stay booleans and fail closed
+// when the value is not a boolean.
+func (e *Entitlements) UnmarshalJSON(b []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	e.AllowFSWrite = entitlementPaths(raw["allow_fs_write"])
+	e.AllowFSRead = entitlementPaths(raw["allow_fs_read"])
+	e.AllowNetOutbound = entitlementPaths(raw["allow_net_outbound"])
+	e.AllowConfigWrite = entitlementPaths(raw["allow_config_write"])
+	e.AllowServiceReload = entitlementPaths(raw["allow_service_reload"])
+	e.AllowExec = entitlementBool(raw["allow_exec"])
+	e.AllowContainers = entitlementBool(raw["allow_containers"])
+	e.AllowK3s = entitlementBool(raw["allow_k3s"])
+	return nil
+}
+
+func entitlementPaths(raw json.RawMessage) []string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var flag bool
+	if err := json.Unmarshal(raw, &flag); err == nil {
+		return nil
+	}
+	var paths []string
+	if err := json.Unmarshal(raw, &paths); err != nil {
+		return nil
+	}
+	return paths
+}
+
+func entitlementBool(raw json.RawMessage) bool {
+	if len(raw) == 0 || string(raw) == "null" {
+		return false
+	}
+	var flag bool
+	if err := json.Unmarshal(raw, &flag); err != nil {
+		return false
+	}
+	return flag
 }
 
 // SysscriptEngine wraps the Starlark execution
@@ -159,8 +206,8 @@ func (engine *SysscriptEngine) buildSysModule() *starlarkstruct.Struct {
 
 	// sys.json
 	sysJSON := starlark.StringDict{
-		"parse":        starlark.NewBuiltin("parse", engine.jsonParse),
-		"encode":       starlark.NewBuiltin("encode", engine.jsonEncode),
+		"parse":         starlark.NewBuiltin("parse", engine.jsonParse),
+		"encode":        starlark.NewBuiltin("encode", engine.jsonEncode),
 		"encode_pretty": starlark.NewBuiltin("encode_pretty", engine.jsonEncodePretty),
 	}
 
@@ -183,10 +230,10 @@ func (engine *SysscriptEngine) buildSysModule() *starlarkstruct.Struct {
 
 	// sys.proc
 	sysProc := starlark.StringDict{
-		"list":  starlark.NewBuiltin("list", engine.procList),
-		"get":   starlark.NewBuiltin("get", engine.procGet),
-		"find":  starlark.NewBuiltin("find", engine.procFind),
-		"kill":  starlark.NewBuiltin("kill", engine.procKill),
+		"list": starlark.NewBuiltin("list", engine.procList),
+		"get":  starlark.NewBuiltin("get", engine.procGet),
+		"find": starlark.NewBuiltin("find", engine.procFind),
+		"kill": starlark.NewBuiltin("kill", engine.procKill),
 	}
 
 	sysDict := starlark.StringDict{
@@ -249,26 +296,48 @@ func (engine *SysscriptEngine) execRun(thread *starlark.Thread, b *starlark.Buil
 
 	var cmdArgs []string
 	for i := 1; i < args.Len(); i++ {
-		strArg, ok := args.Index(i).(starlark.String)
-		if ok {
-			cmdArgs = append(cmdArgs, string(strArg))
-		}
+		cmdArgs = expandExecArg(cmdArgs, args.Index(i))
 	}
 
 	cmd := exec.Command(string(cmdStr), cmdArgs...)
 	out, err := cmd.CombinedOutput()
-	
+
 	resultDict := starlark.NewDict(0)
-	
+
 	if err != nil {
 		resultDict.SetKey(starlark.String("error"), starlark.String(err.Error()))
 	} else {
 		resultDict.SetKey(starlark.String("error"), starlark.None)
 	}
-	
+
 	resultDict.SetKey(starlark.String("output"), starlark.String(string(out)))
-	
+
 	return resultDict, nil
+}
+
+// expandExecArg keeps positional strings and flattens a list or tuple of
+// strings. Non-strings are ignored. This is how diagnostics pass argv.
+func expandExecArg(dst []string, v starlark.Value) []string {
+	switch x := v.(type) {
+	case starlark.String:
+		return append(dst, string(x))
+	case *starlark.List:
+		for i := 0; i < x.Len(); i++ {
+			if s, ok := x.Index(i).(starlark.String); ok {
+				dst = append(dst, string(s))
+			}
+		}
+		return dst
+	case starlark.Tuple:
+		for i := 0; i < x.Len(); i++ {
+			if s, ok := x.Index(i).(starlark.String); ok {
+				dst = append(dst, string(s))
+			}
+		}
+		return dst
+	default:
+		return dst
+	}
 }
 
 // sys.net.http_get(url)
@@ -302,7 +371,7 @@ func (engine *SysscriptEngine) netHTTPGet(thread *starlark.Thread, b *starlark.B
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
-	
+
 	resultDict := starlark.NewDict(0)
 	resultDict.SetKey(starlark.String("status_code"), starlark.MakeInt(resp.StatusCode))
 	resultDict.SetKey(starlark.String("body"), starlark.String(string(body)))
@@ -358,4 +427,3 @@ func (engine *SysscriptEngine) fsWrite(thread *starlark.Thread, b *starlark.Buil
 	}
 	return starlark.True, nil
 }
-

@@ -1,8 +1,6 @@
 # SystemAPI.io - API Playground Implementation Summary
 
-## ✅ Implementation Complete
-
-The API Playground for systemapi.io has been fully implemented and is ready for production deployment after database configuration.
+This file is a historical note. It is not product status, and the playground is not a production deployment. The wired surface is described in `FEATURES_COMPLETE.md`.
 
 ---
 

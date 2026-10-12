@@ -30,7 +30,7 @@ class AuthManager {
       this.oidcClient = issuer;
       console.log('✓ OIDC client initialized for JWT verification');
     } catch (error) {
-      console.warn('⚠ OIDC discovery failed, JWT verification will be limited:', error.message);
+      console.warn('⚠ OIDC discovery failed; JWT verification rejects tokens:', error.message);
     }
   }
 
@@ -180,65 +180,52 @@ class AuthManager {
   }
 
   /**
-   * Verify JWT token with proper signature validation using JWKS
+   * Verify a JWT against the discovered issuer.
+   * Threats: alg=none, a header-chosen algorithm, and a token accepted with
+   * no signature when discovery failed. Allowlist is RS256, ES256, EdDSA.
+   * Does NOT mint tokens. Audience is OIDC_AUDIENCE or the configured client id.
    * @param {string} token - JWT token
    * @returns {Promise<Object|null>} Decoded payload or null
    */
   async verifyJWTToken(token) {
     try {
-      // First decode to get header and payload
       const decoded = jwt.decode(token, { complete: true });
+      if (!decoded || !decoded.header || !decoded.payload) return null;
 
-      if (!decoded) {
+      const allowed = ['RS256', 'ES256', 'EdDSA'];
+      if (!allowed.includes(decoded.header.alg)) {
+        console.warn('JWT algorithm rejected');
+        return null;
+      }
+      if (!this.oidcClient) {
+        console.warn('JWT rejected: OIDC client unavailable');
         return null;
       }
 
-      const payload = decoded.payload;
-
-      // Check expiration
-      if (payload.exp && Date.now() / 1000 > payload.exp) {
-        console.warn('JWT token expired');
-        return null;
-      }
-
-      // If we have OIDC client, use proper signature verification
-      if (this.oidcClient) {
-        try {
-          const keystore = await this.oidcClient.keystore(true); // Force refresh
-          const key = keystore.get({ kid: decoded.header.kid, alg: decoded.header.alg });
-
-          if (!key) {
-            console.warn('No matching key found in JWKS for kid:', decoded.header.kid);
-            return null;
-          }
-
-          // Verify signature
-          jwt.verify(token, key.toPEM(), {
-            algorithms: [decoded.header.alg],
-            issuer: payload.iss
-          });
-
-          console.log('✓ JWT signature verified');
-          return payload;
-        } catch (verifyError) {
-          console.warn('JWT signature verification failed:', verifyError.message);
-          return null;
-        }
-      }
-
-      // Fallback: Check issuer (less secure, but better than nothing)
       const expectedIssuers = [
         `${this.keycloakURL}/realms/${this.keycloakRealm}`,
         process.env.AUTHENTIK_ISSUER
       ].filter(Boolean);
-
-      if (!expectedIssuers.includes(payload.iss)) {
-        console.warn('JWT issuer mismatch. Expected:', expectedIssuers, 'Got:', payload.iss);
+      if (!expectedIssuers.includes(decoded.payload.iss)) {
+        console.warn('JWT issuer rejected');
         return null;
       }
 
-      console.warn('⚠ JWT verified without signature check (OIDC client not available)');
-      return payload;
+      const keystore = await this.oidcClient.keystore(true);
+      const key = keystore.get({ kid: decoded.header.kid, alg: decoded.header.alg });
+      if (!key) {
+        console.warn('No matching key found in JWKS');
+        return null;
+      }
+
+      const audience = process.env.OIDC_AUDIENCE || this.keycloakClientID;
+      const options = {
+        algorithms: allowed,
+        issuer: expectedIssuers,
+        clockTolerance: 30
+      };
+      if (audience) options.audience = audience;
+      return jwt.verify(token, key.toPEM(), options);
     } catch (error) {
       console.warn('JWT verification failed:', error.message);
       return null;

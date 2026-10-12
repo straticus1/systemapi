@@ -5,8 +5,7 @@ import { Server, Cpu, HardDrive, Network, TerminalSquare, ShieldAlert } from 'lu
 import { FleetAPI } from '../api';
 
 const FleetDashboard = () => {
-  const { apiKey, hosts, fetchHosts, updateHostTelemetry, isLoadingHosts } = useAppStore();
-  const [ws, setWs] = useState(null);
+  const { hosts, fetchHosts, isLoadingHosts } = useAppStore();
   const [diagModal, setDiagModal] = useState({ open: false, title: '', output: '', loading: false });
   const navigate = useNavigate();
 
@@ -26,39 +25,7 @@ const FleetDashboard = () => {
     fetchHosts();
   }, [fetchHosts]);
 
-  // Connect WebSocket for live telemetry
-  useEffect(() => {
-    if (!apiKey) return;
-
-    // Use wss:// in prod or ws:// in dev based config
-    const wsUrl = (import.meta.env.VITE_WS_URL || 'ws://localhost:3003') + `/api/v1/systems/stream?api_key=${apiKey}`;
-    const socket = new WebSocket(wsUrl);
-
-    socket.onopen = () => console.log('Live Telemetry Stream Connected');
-    
-    socket.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-        if (msg.type === 'telemetry') {
-          // Payload contains { timestamp: ..., host: {...}, cpu: {...}, memory: {...}, ... }
-          // The backend usually determines host_id, but the agent doesn't know its host_id.
-          // For the dashboard, the backend doesn't currently inject the hostId into the telemetry broadcast in `fleet.js`.
-          // In a real robust app, `fleet.js` would intercept `msg.type = telemetry`, attach `host_id: hostId`, and broadcast to dashboard.
-          // Since our current backend doesn't broadcast *to* the dashboard yet (only to terminal subscribers),
-          // we will implement a periodic REST polling fallback here to simulate the live updates until backend is fully wired.
-        }
-      } catch (err) {
-        console.error('WebSocket parsing error:', err);
-      }
-    };
-
-    socket.onclose = () => console.log('Telemetry Stream Disconnected');
-    setWs(socket);
-
-    return () => socket.close();
-  }, [apiKey]);
-  
-  // REST Polling fallback for the demo since the backend broadcast isn't fully complete for general telemetry yet
+  // REST poll for fleet state
   useEffect(() => {
     const interval = setInterval(() => {
         fetchHosts();
@@ -120,22 +87,30 @@ const HostCard = ({ host, onConnect, onDiagnostic }) => {
   const [isLoadingExtras, setIsLoadingExtras] = useState(false);
 
   useEffect(() => {
-     if (expanded) {
-        setIsLoadingExtras(true);
-        Promise.all([
-            FleetAPI.getSoftware(host.host_id),
-            FleetAPI.getCVEs(host.host_id)
-        ]).then(([sw, cv]) => {
-            if (sw?.software) setSoftware(sw.software);
-            if (cves?.cves) setCves(cv.cves);
-        }).finally(() => setIsLoadingExtras(false));
-     }
+     if (!expanded) return;
+     let ignore = false;
+     Promise.all([
+        FleetAPI.getSoftware(host.host_id),
+        FleetAPI.getCVEs(host.host_id)
+     ]).then(([sw, cv]) => {
+        if (ignore) return;
+        if (sw?.software) setSoftware(sw.software);
+        if (cv?.cves) setCves(cv.cves);
+     }).finally(() => {
+        if (!ignore) setIsLoadingExtras(false);
+     });
+     return () => { ignore = true; };
   }, [expanded, host.host_id]);
   
-  // Format uptime (minutes to human readable)
   const lastSeenDate = new Date(host.last_seen_at);
-  const msAgo = Date.now() - lastSeenDate.getTime();
-  const secondsAgo = Math.floor(msAgo / 1000);
+  const [secondsAgo, setSecondsAgo] = useState(null);
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      const msAgo = Date.now() - new Date(host.last_seen_at).getTime();
+      setSecondsAgo(Math.floor(msAgo / 1000));
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [host.last_seen_at]);
   
   // Parse tags
   const tags = host.tags || [];
@@ -143,22 +118,22 @@ const HostCard = ({ host, onConnect, onDiagnostic }) => {
   const handleDiagnosticAction = (action) => {
       let script = '';
       if (action === 'Ping') {
-          script = `def run():\n    import sys\n    if sys.os.platform() == "windows":\n        return sys.exec.run("ping", ["-n", "4", "8.8.8.8"])\n    else:\n        return sys.exec.run("ping", ["-c", "4", "8.8.8.8"])\nrun()`;
+          script = 'r = sys.exec.run("ping", "-c", "4", "8.8.8.8")\nprint(r["output"])';
           onDiagnostic("Ping (8.8.8.8)", script);
       } else if (action === 'Traceroute') {
-          script = `def run():\n    import sys\n    if sys.os.platform() == "windows":\n        return sys.exec.run("tracert", ["-d", "-h", "15", "8.8.8.8"])\n    else:\n        return sys.exec.run("traceroute", ["-m", "15", "-n", "8.8.8.8"])\nrun()`;
+          script = 'r = sys.exec.run("traceroute", "-n", "-m", "15", "8.8.8.8")\nprint(r["output"])';
           onDiagnostic("Traceroute (8.8.8.8)", script);
       } else if (action === 'Netstat') {
-          script = `def run():\n    if sys.os.platform() == "windows":\n        return sys.exec.run("netstat", ["-an", "-p", "tcp"])\n    else:\n        return sys.exec.run("netstat", ["-tuln"])\nrun()`;
+          script = 'r = sys.exec.run("netstat", "-tuln")\nprint(r["output"])';
           onDiagnostic("Netstat", script);
       } else if (action === 'SysLogs') {
-          script = `def run():\n    plat = sys.os.platform()\n    if plat == "windows":\n        return sys.exec.run("powershell.exe", ["-Command", "Get-EventLog -LogName System -Newest 50 | Format-Table -HideTableHeaders"])\n    elif plat == "darwin":\n        return sys.exec.run("log", ["show", "--last", "5m", "--style", "syslog"])\n    else:\n        return sys.exec.run("journalctl", ["-n", "50", "--no-pager"])\nrun()`;
+          script = 'r = sys.exec.run("journalctl", "-n", "50", "--no-pager")\nprint(r["output"])';
           onDiagnostic("Live System Logs", script);
       } else if (action === 'AuditSSH') {
-          script = `def run():\n    plat = sys.os.platform()\n    if plat == "windows":\n        return sys.exec.run("powershell.exe", ["-Command", "Get-ChildItem -Path $env:USERPROFILE\\\\.ssh -Recurse | Select-Object FullName, LastWriteTime"])\n    elif plat == "darwin":\n        return sys.exec.run("sh", ["-c", "stat -f '%Sm   %N' ~/.ssh/* /etc/ssh/sshd_config 2>/dev/null || echo 'No SSH keys found'"])\n    else:\n        return sys.exec.run("sh", ["-c", "stat -c '%y   %n' ~/.ssh/* /etc/ssh/sshd_config 2>/dev/null || echo 'No SSH keys found'"])\nrun()`;
+          script = 'r = sys.exec.run("ls", "-l", "/etc/ssh")\nprint(r["output"])';
           onDiagnostic("Audit SSH Keys & Rotation", script);
       } else if (action === 'AuditSSL') {
-          script = `def run():\n    plat = sys.os.platform()\n    if plat == "windows":\n        return sys.exec.run("powershell.exe", ["-Command", "Get-ChildItem -Path Cert:\\\\LocalMachine\\\\My | Select-Object Subject, NotAfter"])\n    else:\n        return sys.exec.run("sh", ["-c", "echo | openssl s_client -servername systemapi.io -connect systemapi.io:443 2>/dev/null | openssl x509 -noout -dates || echo 'OpenSSL not installed or connection failed'"])\nrun()`;
+          script = 'r = sys.exec.run("openssl", "version")\nprint(r["output"])';
           onDiagnostic("Check SSL Expiry", script);
       }
   };
@@ -168,30 +143,21 @@ const HostCard = ({ host, onConnect, onDiagnostic }) => {
     
     let script = "";
     if (action === "Reboot") {
-        script = `
-def run():
-    # Force OS shutdown/reboot via Sysscript API
-    if sys.os.platform() == "windows":
-        return sys.exec.run("shutdown", ["/r", "/t", "0", "/f"])
-    else:
-        return sys.exec.run("reboot", ["-f"])
-run()`;
+        script = 'r = sys.exec.run("reboot", "-f")\nprint(r["output"])';
     } else if (action === "Kill Process") {
         const pid = window.prompt("Enter the PID to terminate:");
         if (!pid) return;
-        script = `
-def run():
-    if sys.os.platform() == "windows":
-        return sys.exec.run("taskkill", ["/F", "/PID", "${pid}"])
-    else:
-        return sys.exec.run("kill", ["-9", "${pid}"])
-run()`;
+        if (!/^[0-9]+$/.test(pid)) {
+            alert('Refused: PID must be digits only.');
+            return;
+        }
+        script = 'r = sys.exec.run("kill", "-9", "' + pid + '")\nprint(r["output"])';
     }
 
     try {
         await FleetAPI.executeScript(host.host_id, script, { allow_exec: true });
         alert(`Emergency ${action} sent to the agent's out-of-band execution engine successfully.`);
-    } catch (e) {
+    } catch {
         alert("Failed to send command.");
     }
   };
@@ -214,6 +180,9 @@ run()`;
             <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
               {host.os} • {host.platform}
             </div>
+            {host.tenant_id ? (
+              <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>{host.tenant_id}</div>
+            ) : null}
           </div>
         </div>
       </div>
@@ -221,10 +190,11 @@ run()`;
       <div style={{ padding: '20px', flex: 1, display: 'flex', flexDirection: 'column', gap: '16px' }}>
         {/* Mock telemetry blocks since the DB polling only gets basic host info */}
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
-          <MetricBox icon={<Cpu size={14} />} label="CPU" value={isOnline ? "0%" : "-"} />
+          <MetricBox icon={<Cpu size={14} />} label="CPU" value={typeof host.cpu_percent === 'number' && Number.isFinite(host.cpu_percent) ? `${host.cpu_percent}%` : (isOnline ? "0%" : "-")} />
           <MetricBox icon={<HardDrive size={14} />} label="RAM" value={isOnline ? "0%" : "-"} />
           <MetricBox icon={<Network size={14} />} label="Net" value={isOnline ? "0 B/s" : "-"} />
         </div>
+        <Sparkline values={host.sparkline} />
         
         <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', marginTop: 'auto' }}>
             {tags.map((t, i) => (
@@ -233,12 +203,12 @@ run()`;
         </div>
         
         <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '8px' }}>
-            Last seen: {secondsAgo < 60 ? `${secondsAgo}s ago` : lastSeenDate.toLocaleString()}
+            Last seen: {secondsAgo != null && secondsAgo < 60 ? `${secondsAgo}s ago` : lastSeenDate.toLocaleString()}
         </div>
       </div>
       
       <div style={{ padding: '16px 20px', borderTop: '1px solid var(--border-light)', display: 'flex', gap: '8px' }}>
-         <button onClick={() => setExpanded(!expanded)} className="btn btn-ghost" style={{ flex: 1 }}>
+         <button onClick={() => { if (!expanded) setIsLoadingExtras(true); setExpanded(!expanded); }} className="btn btn-ghost" style={{ flex: 1 }}>
             {expanded ? 'Hide Info' : 'Show Info'}
          </button>
          <button onClick={onConnect} disabled={!isOnline} className="btn btn-primary" style={{ flex: 1, opacity: isOnline ? 1 : 0.5 }}>
@@ -320,6 +290,26 @@ run()`;
       )}
     </div>
   );
+};
+
+const Sparkline = ({ values }) => {
+    const series = (Array.isArray(values) ? values : []).filter((n) => typeof n === 'number' && Number.isFinite(n)).slice(-20);
+    if (series.length === 0) return null;
+    const width = 100;
+    const height = 28;
+    const min = Math.min(...series);
+    const max = Math.max(...series);
+    const span = max - min || 1;
+    const points = series.map((value, index) => {
+        const x = series.length === 1 ? width / 2 : (index / (series.length - 1)) * width;
+        const y = height - ((value - min) / span) * (height - 2) - 1;
+        return `${x},${y}`;
+    }).join(' ');
+    return (
+        <svg width="100%" height={height} viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" aria-hidden="true">
+            <polyline fill="none" stroke="var(--accent-cyan)" strokeWidth="1.5" vectorEffect="non-scaling-stroke" points={points} />
+        </svg>
+    );
 };
 
 const MetricBox = ({ icon, label, value }) => (
