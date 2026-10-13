@@ -1,6 +1,6 @@
 import React from 'react';
 import { useAppStore } from '../store';
-import { Activity, ShieldCheck, LogOut, User } from 'lucide-react';
+import { LogOut, User } from 'lucide-react';
 
 const Topbar = () => {
   const hosts = useAppStore(state => state.hosts);
@@ -22,18 +22,6 @@ const Topbar = () => {
           <span style={{ fontSize: '0.85rem', color: 'var(--accent-green)', fontWeight: 500 }}>
             {onlineCount}/{hosts.length} Nodes Online
           </span>
-        </div>
-
-        {/* System Status Indicators */}
-        <div style={{ display: 'flex', gap: '16px', color: 'var(--text-muted)' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }} title="WebSocket Telemetry Connected">
-            <Activity size={16} />
-            <span style={{ fontSize: '0.85rem' }}>Stream Active</span>
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }} title="Zero-Trust Enforced">
-            <ShieldCheck size={16} color="var(--accent-cyan)" />
-            <span style={{ fontSize: '0.85rem', color: 'var(--text-main)' }}>Secure</span>
-          </div>
         </div>
 
         {/* User Info & Logout */}

@@ -18,7 +18,7 @@ export const Sidebar = () => {
         <SidebarLink to="/containers" icon={<Box size={20} />} label="Containers" />
         <SidebarLink to="/access" icon={<KeyRound size={20} />} label="Access Keys" />
         <SidebarLink to="/scripts" icon={<Terminal size={20} />} label="Sysscript IDE" />
-        <SidebarLink to="/alerts" icon={<Settings size={20} />} label="Alert Rules" />
+        <SidebarLink to="/alerts" icon={<Settings size={20} />} label="Alerts" />
       </nav>
 
       <div style={{ padding: '24px' }}>

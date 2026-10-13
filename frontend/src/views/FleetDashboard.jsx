@@ -1,8 +1,9 @@
 import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAppStore } from '../store';
-import { Server, Cpu, HardDrive, Network, TerminalSquare, ShieldAlert } from 'lucide-react';
+import { Server, Cpu, TerminalSquare, ShieldAlert } from 'lucide-react';
 import { FleetAPI } from '../api';
+import { cpuLabel, scriptOutcome } from '../format';
 
 const FleetDashboard = () => {
   const { hosts, fetchHosts, isLoadingHosts } = useAppStore();
@@ -13,8 +14,8 @@ const FleetDashboard = () => {
     setDiagModal({ open: true, title: `${title} on ${hostname}`, output: '', loading: true });
     try {
         const res = await FleetAPI.executeScript(hostId, script, { allow_exec: true });
-        const out = res.result?.output || res.result?.error || 'No output returned.';
-        setDiagModal(prev => ({ ...prev, output: out, loading: false }));
+        const { success, data } = scriptOutcome(res);
+        setDiagModal(prev => ({ ...prev, output: success ? data : 'Diagnostic failed: ' + data, loading: false }));
     } catch (e) {
         setDiagModal(prev => ({ ...prev, output: 'Diagnostic failed: ' + e.message, loading: false }));
     }
@@ -70,7 +71,7 @@ const FleetDashboard = () => {
                     <button onClick={() => setDiagModal({ open: false, title: '', output: '', loading: false })} style={{ background: 'none', border: 'none', color: 'white', cursor: 'pointer', fontSize: '1.2rem' }}>✕</button>
                 </div>
                 <div style={{ padding: '20px', background: '#000', fontFamily: 'monospace', minHeight: '300px', maxHeight: '600px', overflowY: 'auto', color: '#0f0', whiteSpace: 'pre-wrap', lineHeight: '1.4' }}>
-                    {diagModal.loading ? "> Deploying diagnostic Sysscript to Agent...\n> Waiting for secure WebSocket execution callback..." : diagModal.output}
+                    {diagModal.loading ? "> Running diagnostic on the agent..." : diagModal.output}
                 </div>
             </div>
          </div>
@@ -131,10 +132,10 @@ const HostCard = ({ host, onConnect, onDiagnostic }) => {
           onDiagnostic("Live System Logs", script);
       } else if (action === 'AuditSSH') {
           script = 'r = sys.exec.run("ls", "-l", "/etc/ssh")\nprint(r["output"])';
-          onDiagnostic("Audit SSH Keys & Rotation", script);
+          onDiagnostic("List /etc/ssh", script);
       } else if (action === 'AuditSSL') {
           script = 'r = sys.exec.run("openssl", "version")\nprint(r["output"])';
-          onDiagnostic("Check SSL Expiry", script);
+          onDiagnostic("OpenSSL Version", script);
       }
   };
 
@@ -155,8 +156,8 @@ const HostCard = ({ host, onConnect, onDiagnostic }) => {
     }
 
     try {
-        await FleetAPI.executeScript(host.host_id, script, { allow_exec: true });
-        alert(`Emergency ${action} sent to the agent's out-of-band execution engine successfully.`);
+        const { success, data } = scriptOutcome(await FleetAPI.executeScript(host.host_id, script, { allow_exec: true }));
+        alert(success ? `${action} ran on ${host.hostname}.` : `${action} failed on ${host.hostname}: ${data}`);
     } catch {
         alert("Failed to send command.");
     }
@@ -188,12 +189,8 @@ const HostCard = ({ host, onConnect, onDiagnostic }) => {
       </div>
       
       <div style={{ padding: '20px', flex: 1, display: 'flex', flexDirection: 'column', gap: '16px' }}>
-        {/* Mock telemetry blocks since the DB polling only gets basic host info */}
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
-          <MetricBox icon={<Cpu size={14} />} label="CPU" value={typeof host.cpu_percent === 'number' && Number.isFinite(host.cpu_percent) ? `${host.cpu_percent}%` : (isOnline ? "0%" : "-")} />
-          <MetricBox icon={<HardDrive size={14} />} label="RAM" value={isOnline ? "0%" : "-"} />
-          <MetricBox icon={<Network size={14} />} label="Net" value={isOnline ? "0 B/s" : "-"} />
-        </div>
+        {/* The fleet list carries only the latest cpu.usage_percent sample and its recent series. */}
+        <MetricBox icon={<Cpu size={14} />} label="CPU" value={cpuLabel(host)} />
         <Sparkline values={host.sparkline} />
         
         <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', marginTop: 'auto' }}>
@@ -237,9 +234,9 @@ const HostCard = ({ host, onConnect, onDiagnostic }) => {
                  
                  <div style={{ borderTop: '1px solid var(--border-light)', margin: '6px 0' }}></div>
                  
-                 <div style={{ fontSize: '0.7rem', color: '#b967ff', marginBottom: '4px', textTransform: 'uppercase', padding: '0 6px', letterSpacing: '0.5px' }}>Security & Crypto</div>
-                 <button onClick={() => handleDiagnosticAction("AuditSSH")} className="btn btn-ghost" style={{ width: '100%', justifyContent: 'flex-start', padding: '6px', fontSize: '0.85rem' }}>Audit SSH Keys</button>
-                 <button onClick={() => handleDiagnosticAction("AuditSSL")} className="btn btn-ghost" style={{ width: '100%', justifyContent: 'flex-start', padding: '6px', fontSize: '0.85rem' }}>Check SSL Expiry</button>
+                 <div style={{ fontSize: '0.7rem', color: '#b967ff', marginBottom: '4px', textTransform: 'uppercase', padding: '0 6px', letterSpacing: '0.5px' }}>Security</div>
+                 <button onClick={() => handleDiagnosticAction("AuditSSH")} className="btn btn-ghost" style={{ width: '100%', justifyContent: 'flex-start', padding: '6px', fontSize: '0.85rem' }}>List /etc/ssh</button>
+                 <button onClick={() => handleDiagnosticAction("AuditSSL")} className="btn btn-ghost" style={{ width: '100%', justifyContent: 'flex-start', padding: '6px', fontSize: '0.85rem' }}>OpenSSL Version</button>
 
                  <div style={{ borderTop: '1px solid var(--border-light)', margin: '6px 0' }}></div>
                  
