@@ -31,16 +31,17 @@ These calls exist in code. Nothing else in the suite calls across repositories.
    - `GET /v1/systemapi/audit/verify` → `GET /api/v1/audit/verify`
 4. `opensah ready` uses `LookPath` for `sahlink`, `sahconnect`, and `sahapi`. A missing `adssh` is reported and does not fail the check.
 5. `sahlink run -- COMMAND` starts `COMMAND`. It does not call systemapi, computeapi, or adssh.
+6. `ADSSH_SAH` is a switch inside adssh. It defaults off. Unset, `on`, and any value other than `1`, `true`, or `yes` leave it off. When it is on, `adssh sah` reads one `sah/1` JSON frame from stdin and writes one JSON response. `hello` does not execute a command. `execute` runs the command with `exec` and no shell, and only after a loaded policy allows it. No loaded policy returns `policy_required`. `sahconnect ssh` does not set `ADSSH_SAH` and does not add arguments. The response field `handoff` is `not_wired`. A `lease_id` on the frame does not authorize the command.
 
 No SAH module imports `github.com/afterdarksys/adssh`. The systemapi agent does not import adssh. Break-glass stays a child process (`adssh/docs/systemapi-embed.md`).
 
-Device login stays in `controlplane/oauth.js`. Dashboard login stays Authentik at `https://auth.afterdarksys.com`, client `systemapi-io-client`. An Authentik access token is not the CLI bearer. sahapi does not serve OAuth.
+Device login stays in `controlplane/oauth.js`. `adssh identity device login` is a client of that server. It stores an opaque bearer and sets the session user with no groups. It does not import OIDC groups. Dashboard login stays Authentik at `https://auth.afterdarksys.com`, client `systemapi-io-client`. An Authentik access token is not the CLI bearer. sahapi does not serve OAuth.
 
 `adssh admin serve` is the local admin API. It is not a second public API.
 
 ## Not wired
 
-A machine provisioned by computeapi does not enroll in systemapi. These tools do not hand adssh a systemapi lease. The design sentence "computeapi provisions, the machine enrolls through systemapi, adssh executes under policy and a lease" is not an implementation.
+A machine provisioned by computeapi does not enroll in systemapi. These tools do not hand adssh a systemapi lease. The design sentence "computeapi provisions, the machine enrolls through systemapi, adssh executes under policy and a lease" is not an implementation. The `ADSSH_SAH` switch does not perform that handoff.
 
 Wired compute adapters are Vast.ai and io.net. There is no Azure, Amazon, Google, or Oracle compute adapter. Storage provider names are not compute adapters. There is no k3s allocator and no bare-metal allocator. macOS is not a managed platform. The agent has Darwin software-inventory and PTY branches only.
 
