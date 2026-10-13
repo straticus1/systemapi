@@ -260,45 +260,8 @@ app.get('/', (req, res) => {
     });
 });
 
-// Systems API
-app.get('/api/v1/systems', (req, res) => {
-    res.json({
-        message: 'Systems API',
-        endpoints: [
-            'GET /api/v1/systems - List systems',
-            'GET /api/v1/systems/:id - Get system details',
-            'POST /api/v1/systems - Create system',
-            'PUT /api/v1/systems/:id - Update system',
-            'DELETE /api/v1/systems/:id - Delete system'
-        ]
-    });
-});
-
-// Monitoring API
-app.get('/api/v1/monitoring', (req, res) => {
-    res.json({
-        message: 'Monitoring API',
-        endpoints: [
-            'GET /api/v1/monitoring/metrics - Get metrics',
-            'GET /api/v1/monitoring/alerts - List alerts',
-            'POST /api/v1/monitoring/alerts - Create alert',
-            'GET /api/v1/monitoring/dashboards - List dashboards'
-        ]
-    });
-});
-
-// Automation API
-app.get('/api/v1/automation', (req, res) => {
-    res.json({
-        message: 'Automation API',
-        endpoints: [
-            'GET /api/v1/automation/workflows - List workflows',
-            'POST /api/v1/automation/workflows - Create workflow',
-            'POST /api/v1/automation/execute - Execute automation',
-            'GET /api/v1/automation/jobs - List jobs'
-        ]
-    });
-});
+// Area index routes for systems, monitoring and automation
+require('./routes/catalog').mountCatalog(app);
 
 // =============================================================================
 // THREAT INTELLIGENCE API - Pulls from DNSScience/DarkAPI cached data
