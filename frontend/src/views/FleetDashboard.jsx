@@ -70,7 +70,7 @@ const FleetDashboard = () => {
                     <h3>{diagModal.title}</h3>
                     <button onClick={() => setDiagModal({ open: false, title: '', output: '', loading: false })} style={{ background: 'none', border: 'none', color: 'white', cursor: 'pointer', fontSize: '1.2rem' }}>✕</button>
                 </div>
-                <div style={{ padding: '20px', background: '#000', fontFamily: 'monospace', minHeight: '300px', maxHeight: '600px', overflowY: 'auto', color: '#0f0', whiteSpace: 'pre-wrap', lineHeight: '1.4' }}>
+                <div style={{ padding: '20px', background: 'var(--bg-darker)', fontFamily: 'monospace', minHeight: '300px', maxHeight: '600px', overflowY: 'auto', color: 'var(--text-code)', whiteSpace: 'pre-wrap', lineHeight: '1.4' }}>
                     {diagModal.loading ? "> Running diagnostic on the agent..." : diagModal.output}
                 </div>
             </div>
@@ -171,7 +171,7 @@ const HostCard = ({ host, onConnect, onDiagnostic }) => {
             width: '40px', height: '40px', borderRadius: '8px', 
             background: 'rgba(255,255,255,0.05)', display: 'flex', alignItems: 'center', justifyContent: 'center' 
           }}>
-            <Server size={20} color={isOnline ? 'var(--accent-cyan)' : 'var(--text-muted)'} />
+            <Server size={20} color={isOnline ? 'var(--accent)' : 'var(--text-muted)'} />
           </div>
           <div>
             <h3 style={{ fontSize: '1.1rem', marginBottom: '4px', display: 'flex', alignItems: 'center', gap: '8px' }}>
@@ -226,22 +226,22 @@ const HostCard = ({ host, onConnect, onDiagnostic }) => {
                 padding: '8px', width: '200px', zIndex: 10,
                 boxShadow: '0 4px 12px rgba(0,0,0,0.5)'
              }}>
-                 <div style={{ fontSize: '0.7rem', color: 'var(--accent-cyan)', marginBottom: '4px', textTransform: 'uppercase', padding: '0 6px', letterSpacing: '0.5px' }}>Diagnostics</div>
+                 <div style={{ fontSize: '0.7rem', color: 'var(--accent)', marginBottom: '4px', textTransform: 'uppercase', padding: '0 6px', letterSpacing: '0.5px' }}>Diagnostics</div>
                  <button onClick={() => handleDiagnosticAction("Ping")} className="btn btn-ghost" style={{ width: '100%', justifyContent: 'flex-start', padding: '6px', fontSize: '0.85rem' }}>Ping (8.8.8.8)</button>
                  <button onClick={() => handleDiagnosticAction("Traceroute")} className="btn btn-ghost" style={{ width: '100%', justifyContent: 'flex-start', padding: '6px', fontSize: '0.85rem' }}>Traceroute (8.8.8.8)</button>
                  <button onClick={() => handleDiagnosticAction("Netstat")} className="btn btn-ghost" style={{ width: '100%', justifyContent: 'flex-start', padding: '6px', fontSize: '0.85rem' }}>Netstat Map</button>
-                 <button onClick={() => handleDiagnosticAction("SysLogs")} className="btn btn-ghost" style={{ width: '100%', justifyContent: 'flex-start', padding: '6px', fontSize: '0.85rem', color: 'var(--accent-cyan)' }}>Fetch System Logs</button>
+                 <button onClick={() => handleDiagnosticAction("SysLogs")} className="btn btn-ghost" style={{ width: '100%', justifyContent: 'flex-start', padding: '6px', fontSize: '0.85rem', color: 'var(--accent)' }}>Fetch System Logs</button>
                  
                  <div style={{ borderTop: '1px solid var(--border-light)', margin: '6px 0' }}></div>
                  
-                 <div style={{ fontSize: '0.7rem', color: '#b967ff', marginBottom: '4px', textTransform: 'uppercase', padding: '0 6px', letterSpacing: '0.5px' }}>Security</div>
+                 <div style={{ fontSize: '0.7rem', color: 'var(--accent)', marginBottom: '4px', textTransform: 'uppercase', padding: '0 6px', letterSpacing: '0.5px' }}>Security</div>
                  <button onClick={() => handleDiagnosticAction("AuditSSH")} className="btn btn-ghost" style={{ width: '100%', justifyContent: 'flex-start', padding: '6px', fontSize: '0.85rem' }}>List /etc/ssh</button>
                  <button onClick={() => handleDiagnosticAction("AuditSSL")} className="btn btn-ghost" style={{ width: '100%', justifyContent: 'flex-start', padding: '6px', fontSize: '0.85rem' }}>OpenSSL Version</button>
 
                  <div style={{ borderTop: '1px solid var(--border-light)', margin: '6px 0' }}></div>
                  
                  <div style={{ fontSize: '0.7rem', color: 'var(--accent-red)', marginBottom: '4px', textTransform: 'uppercase', padding: '0 6px', letterSpacing: '0.5px' }}>Destructive</div>
-                 <button onClick={() => handleEmergencyAction("Kill Process")} className="btn btn-ghost" style={{ width: '100%', justifyContent: 'flex-start', color: '#ffcc00', padding: '6px', fontSize: '0.85rem' }}>Kill Rogue PID</button>
+                 <button onClick={() => handleEmergencyAction("Kill Process")} className="btn btn-ghost" style={{ width: '100%', justifyContent: 'flex-start', color: 'var(--accent-amber)', padding: '6px', fontSize: '0.85rem' }}>Kill Rogue PID</button>
                  <button onClick={() => handleEmergencyAction("Reboot")} className="btn btn-ghost" style={{ width: '100%', justifyContent: 'flex-start', color: 'var(--accent-red)', padding: '6px', fontSize: '0.85rem', marginTop: '4px' }}>Force Reboot OS</button>
              </div>
          </div>
@@ -249,7 +249,7 @@ const HostCard = ({ host, onConnect, onDiagnostic }) => {
       
       {expanded && (
         <div style={{ padding: '20px', borderTop: '1px solid var(--border-light)', background: 'rgba(0,0,0,0.3)', maxHeight: '300px', overflowY: 'auto' }}>
-            <h4 style={{ color: 'var(--accent-cyan)', marginBottom: '12px' }}>Software & CVE Inventory</h4>
+            <h4 style={{ color: 'var(--accent)', marginBottom: '12px' }}>Software & CVE Inventory</h4>
             {isLoadingExtras ? (
                 <div style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>Loading inventory...</div>
             ) : (
@@ -261,7 +261,7 @@ const HostCard = ({ host, onConnect, onDiagnostic }) => {
                             </h5>
                             <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
                                 {cves.map(c => (
-                                    <div key={c.id} style={{ fontSize: '0.8rem', background: 'rgba(255,0,0,0.1)', padding: '8px', borderRadius: '4px', borderLeft: '3px solid var(--accent-red)' }}>
+                                    <div key={c.id} style={{ fontSize: '0.8rem', background: 'var(--accent-red-soft)', padding: '8px', borderRadius: '4px', borderLeft: '3px solid var(--accent-red)' }}>
                                         <strong>{c.cve_id}</strong> - {c.software_name} v{c.software_version}
                                         <div style={{ color: 'var(--text-muted)', marginTop: '4px' }}>{c.description?.substring(0,100)}...</div>
                                     </div>
@@ -304,7 +304,7 @@ const Sparkline = ({ values }) => {
     }).join(' ');
     return (
         <svg width="100%" height={height} viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" aria-hidden="true">
-            <polyline fill="none" stroke="var(--accent-cyan)" strokeWidth="1.5" vectorEffect="non-scaling-stroke" points={points} />
+            <polyline fill="none" stroke="var(--accent)" strokeWidth="1.5" vectorEffect="non-scaling-stroke" points={points} />
         </svg>
     );
 };

@@ -46,7 +46,7 @@ const SysscriptsView = () => {
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
       <div style={{ padding: '24px', borderBottom: '1px solid var(--border-light)' }}>
         <h1 style={{ marginBottom: '8px', display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <Terminal color="var(--accent-blue)" /> Sysscript Studio
+          <Terminal color="var(--accent)" /> Sysscript Studio
         </h1>
         <p style={{ color: 'var(--text-muted)' }}>
           Write a Starlark script and run it on one host.
@@ -82,7 +82,7 @@ const SysscriptsView = () => {
                     {result.success ? <CheckCircle2 size={16} color="var(--accent-green)" /> : <XCircle size={16} color="var(--accent-red)" />}
                     {result.success ? 'Execution Successful' : 'Execution Failed'}
                 </div>
-                <div style={{ padding: '16px', flex: 1, overflowY: 'auto', fontFamily: 'monospace', fontSize: '0.9rem', color: result.success ? '#e5e7eb' : 'var(--accent-red)', whiteSpace: 'pre-wrap' }}>
+                <div style={{ padding: '16px', flex: 1, overflowY: 'auto', fontFamily: 'monospace', fontSize: '0.9rem', color: result.success ? 'var(--text-code)' : 'var(--accent-red)', whiteSpace: 'pre-wrap' }}>
                     {typeof result.data === 'string' ? result.data : JSON.stringify(result.data, null, 2)}
                 </div>
              </div>

@@ -8,7 +8,7 @@ const ContainersView = () => (
   <div style={{ padding: '24px', flex: 1, overflowY: 'auto' }}>
     <div style={{ marginBottom: '32px' }}>
       <h1 style={{ marginBottom: '8px', display: 'flex', alignItems: 'center', gap: '8px' }}>
-        <Box color="var(--accent-purple)" /> Containers
+        <Box color="var(--accent)" /> Containers
       </h1>
     </div>
     <div className="glass-panel" style={{ padding: '40px', textAlign: 'center', color: 'var(--text-muted)' }}>

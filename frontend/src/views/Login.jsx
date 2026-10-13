@@ -71,8 +71,8 @@ const Login = () => {
     <div className="app-container" style={{ alignItems: 'center', justifyContent: 'center' }}>
       <div className="glass-panel" style={{ padding: '40px', width: '100%', maxWidth: '420px' }}>
         <div style={{ textAlign: 'center', marginBottom: '32px' }}>
-          <ShieldAlert size={48} color="var(--accent-cyan)" />
-          <h1 style={{ marginTop: '16px' }} className="text-gradient">SystemAPI.io</h1>
+          <ShieldAlert size={48} color="var(--accent)" />
+          <h1 style={{ marginTop: '16px' }}>SystemAPI.io</h1>
           <p style={{ color: 'var(--text-muted)' }}>Zero-Trust Fleet Management</p>
         </div>
 

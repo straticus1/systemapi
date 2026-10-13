@@ -17,7 +17,7 @@ const Topbar = () => {
       
       <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
         {/* Fleet Health Indicator */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', background: 'rgba(16, 185, 129, 0.1)', padding: '6px 12px', borderRadius: '20px', border: '1px solid rgba(16, 185, 129, 0.2)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', background: 'var(--accent-green-soft)', padding: '6px 12px', borderRadius: '20px', border: '1px solid var(--border-light)' }}>
           <span className="status-indicator status-online"></span>
           <span style={{ fontSize: '0.85rem', color: 'var(--accent-green)', fontWeight: 500 }}>
             {onlineCount}/{hosts.length} Nodes Online
@@ -31,7 +31,7 @@ const Topbar = () => {
               {user.picture ? (
                 <img src={user.picture} alt={user.name} style={{ width: '28px', height: '28px', borderRadius: '50%' }} />
               ) : (
-                <div style={{ width: '28px', height: '28px', borderRadius: '50%', background: 'var(--accent-cyan)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <div style={{ width: '28px', height: '28px', borderRadius: '50%', background: 'var(--accent)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                   <User size={16} />
                 </div>
               )}
@@ -39,18 +39,8 @@ const Topbar = () => {
             </div>
             <button
               onClick={logout}
-              style={{
-                background: 'rgba(239, 68, 68, 0.1)',
-                border: '1px solid rgba(239, 68, 68, 0.3)',
-                color: 'var(--accent-red)',
-                padding: '6px 12px',
-                borderRadius: '6px',
-                cursor: 'pointer',
-                display: 'flex',
-                alignItems: 'center',
-                gap: '6px',
-                fontSize: '0.85rem'
-              }}
+              className="btn btn-danger"
+              style={{ padding: '6px 12px', fontSize: '0.85rem' }}
               title="Logout"
             >
               <LogOut size={14} />
@@ -62,18 +52,8 @@ const Topbar = () => {
         {authMethod === 'api_key' && (
           <button
             onClick={logout}
-            style={{
-              background: 'rgba(239, 68, 68, 0.1)',
-              border: '1px solid rgba(239, 68, 68, 0.3)',
-              color: 'var(--accent-red)',
-              padding: '6px 12px',
-              borderRadius: '6px',
-              cursor: 'pointer',
-              display: 'flex',
-              alignItems: 'center',
-              gap: '6px',
-              fontSize: '0.85rem'
-            }}
+            className="btn btn-danger"
+            style={{ padding: '6px 12px', fontSize: '0.85rem' }}
             title="Clear API Key"
           >
             <LogOut size={14} />

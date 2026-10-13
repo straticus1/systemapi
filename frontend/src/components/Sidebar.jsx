@@ -9,8 +9,8 @@ export const Sidebar = () => {
   return (
     <aside className="sidebar">
       <div style={{ padding: '24px', display: 'flex', alignItems: 'center', gap: '12px', borderBottom: '1px solid var(--border-light)' }}>
-        <ShieldAlert size={28} color="var(--accent-cyan)" />
-        <span style={{ fontSize: '1.2rem', fontWeight: 600 }} className="text-gradient">SystemAPI</span>
+        <ShieldAlert size={28} color="var(--accent)" />
+        <span style={{ fontSize: '1.2rem', fontWeight: 600 }}>SystemAPI</span>
       </div>
 
       <nav style={{ padding: '24px 12px', display: 'flex', flexDirection: 'column', gap: '8px', flex: 1 }}>
@@ -41,8 +41,8 @@ const SidebarLink = ({ to, icon, label }) => (
       borderRadius: '8px',
       textDecoration: 'none',
       color: isActive ? 'white' : 'var(--text-muted)',
-      background: isActive ? 'rgba(0, 240, 255, 0.1)' : 'transparent',
-      borderLeft: isActive ? '3px solid var(--accent-cyan)' : '3px solid transparent',
+      background: isActive ? 'var(--accent-soft)' : 'transparent',
+      borderLeft: isActive ? '3px solid var(--accent)' : '3px solid transparent',
       transition: 'all 0.2s'
     })}
   >
