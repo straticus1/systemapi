@@ -2,7 +2,7 @@
 
 Status: 2026-10-12. This file is the contract for how the SAH names join. Tool commands live in each tool's `docs/usage.md`. If a tool README and this file disagree about what is wired, this file wins.
 
-**sah** means Service Automation Hum. `adssh` is the development name of the execution shell. The binary, the module `github.com/afterdarksys/adssh`, `adssh-mcp`, `~/.adssh`, and the GitHub repo `afterdarksys/adssh` stay on that name until a rename is explicit.
+**sah** means Service Automation Hub. The hub encompasses the platform and the suite of utilities. `adssh` is the development name of the execution shell. The binary, the module `github.com/afterdarksys/adssh`, `adssh-mcp`, `~/.adssh`, and the GitHub repo `afterdarksys/adssh` stay on that name until a rename is explicit.
 
 ## Names
 
