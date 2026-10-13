@@ -1,6 +1,6 @@
 # SystemAPI.io - Feature Roadmap & Enhancement Proposals
 
-The sections below are a historical proposal list from before the control plane. They are not product status. In particular, DarkStorage is not the audit of record, and nothing in this file is a completed integration. The wired surface is described in `FEATURES_COMPLETE.md`.
+The sections below are a historical proposal list from before the control plane. They are not product status. In particular, DarkStorage is not the audit of record, and nothing in this file is a completed integration. The wired surface is described in `README.md`.
 
 ## Current Data Available
 

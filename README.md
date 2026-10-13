@@ -1,60 +1,73 @@
-# SystemAPI.io - The Execution Control Plane
+# SystemAPI
 
-SystemAPI.io is a globally distributed, Zero-Trust Execution Control Plane. It consists of a centrally managed Node.js backend (`fleet.js`) mapping to a React frontend (`FleetDashboard`), and thousands of lightweight Go Agents (`systemapi-agent`) deployed across the fleet.
+A control plane for running scripts on your own hosts. A Node.js server
+(`server.js`, `controlplane/`, `playground/fleet.js`) talks to a Go agent
+(`systemapi-agent/`) that dials out over a WebSocket, and a React dashboard
+(`frontend/`) sits on top. Scripts are Starlark ("Sysscripts") and every run
+carries explicit entitlements.
 
-Instead of writing custom bash scripts for every server, SystemAPI utilizes **Sysscripts** (a restricted, Turing-complete subset of Python called Starlark). You push a Sysscript from the Dashboard, and the Go Agent executes it securely on the edge.
+## What is wired
 
-## Architecture Highlights
+- Control plane in `controlplane/`: tenants, hosts, Ed25519-signed leases on
+  every command, single-use WebSocket tickets, an audit hash chain in
+  PostgreSQL, scopes, schedules, sealed webhooks, playbooks.
+- An API key with no scope rows has no scopes. `SYSTEMAPI_REQUIRE_SCOPES=0` is
+  an explicit migration escape that grants operator; leave it unset.
+- Outbound agent in `systemapi-agent/`. It phones home and does not open a
+  listening port or an SSH listener.
+- Dashboard in `frontend/`: fleet list with real CPU samples, Sysscript IDE,
+  web terminal (opened with a single-use ticket), alert events. Containers and
+  SSH key distribution are not wired and say so.
+- CLI in `cli/systemapi.js`; the key goes only in an `X-API-Key` header.
+- Username-first OAuth2 device login in `controlplane/oauth.js`. Google and
+  GitHub linking needs an admin whitelist row. API keys remain the machine
+  credential.
+- Ansible and Terraform drivers in `drivers/`. They call REST, not SSH.
+- Grafana dashboard `grafana/dashboards/fleet.json`. `systemapi_alerts_active`
+  is the process-wide count of open alerts. There are no Grafana alert rules.
+- Alerts: the control plane raises z-score anomalies on CPU and memory and posts
+  them to tenant webhooks. `sys.alerts.push` in a script is logged on the agent
+  only.
+- When `DARKSTORAGE_ACCESS_KEY` and `DARKSTORAGE_SECRET_KEY` are set, each
+  script result's SHA-256 is also written to the `systemapi-audits` S3 bucket.
+  The PostgreSQL audit chain is the record of truth.
+- CVE lookup runs only when `DARKAPI_KEY` is set. Nothing invents CVE ids.
 
-- **Starlark Playbook Engine**: Agents execute Sysscripts in memory. Standard library capabilities like `sys.exec.run` or `sys.os.list_dir` are strictly governed by granular Entitlement JSON scopes.
-- **Zero-Trust WebPTY**: The Dashboard provides a pure xterm.js reverse-shell to any node. Traffic flows via secure WebSockets through the `fleet.js` proxy—the agent never opens a listening port.
-- **WORM Audit Logging**: Every executed playbook, keystroke, and telemetry result is cryptographically hashed and streamed directly to an S3-compatible **DarkStorage.io** backend.
-- **Incident Response Hooks**: Real-time server telemetry anomalies natively trigger SMS and Voice alarms through internal **Adstelco.io** REST hooks.
+`modules/` used to hold unwired quantum-crypto, blockchain and fake ML code.
+It was removed; do not put it back.
 
----
+## Run it locally
 
-## 🚀 Quick Start
-
-### 1. Start the Fleet Manager (Node.js)
-
-The Fleet Manager routes PTY streams, validates API keys, and evaluates real-time telemetry from connected agents.
-
-```bash
-npm install
-npm run start
-```
-
-### 2. Start the Fleet Dashboard (React)
-
-The single-pane-of-glass UI for managing host telemetry, executing Sysscripts, and zero-trust terminal access.
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-### 3. Deploy the Go Agent
-
-The Go Agent connects outbound to the Fleet Manager WebSocket. It features a completely headless mode for background execution using `systemd`.
-
-```bash
-cd systemapi-agent
-go build -o agent .
-./agent --api-key ak_live_1234.demo --server ws://localhost:3003/api/v1/systems/stream
-```
-
----
-
-## Expanding the Agent (`systemd`)
-
-For production fleet expansion, use the standard `systemd` setup script to install the background worker on any Linux target.
+Node 22.12 or newer and Go 1.25.7 or newer (see `systemapi-agent/go.mod`).
 
 ```bash
-sudo ./deploy_agent.sh --api-key ak_live_1234.demo
+npm ci && npm start            # control plane on :3003
+cd frontend && npm ci && npm run dev
+cd systemapi-agent && go build -o systemapi-agent . && \
+  SYSTEMAPI_API_KEY=<key> ./systemapi-agent --tenant <tenant>
 ```
 
-## Documentation
+`SESSION_SECRET` must be set in production or the server refuses to start.
+Database TLS is on by default (`DB_SSL=disable` opts out, `DB_SSL_CA` adds a
+CA). The playground routes under `/playground` need `DB_PASSWORD` and Redis.
 
-- **REST Endpoints & WebSockets**: Read `api_docs.md`
-- **Sysscript Go API Reference**: Read `cli_docs.md`
+## Checks
+
+```bash
+npm test                                   # control plane, drivers, route catalog
+cd frontend && npm run lint && npm test && npm run build
+cd systemapi-agent && go vet ./... && go test ./...
+```
+
+## Images
+
+Build images on linux/amd64 or with `docker buildx --platform linux/amd64`.
+An image built natively on Apple Silicon fails on amd64 nodes with
+`exec format error`.
+
+## More
+
+- `api_docs.md`: REST and WebSocket routes.
+- `cli_docs.md`: agent flags, CLI commands, Sysscript modules and entitlements.
+- `SECURITY_REVIEW.md`: controls that hold and known residuals.
+- `docs/sah-suite.md`: how SystemAPI fits the wider suite.
