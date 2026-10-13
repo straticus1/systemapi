@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -108,7 +109,7 @@ func (engine *SysscriptEngine) netPortCheck(thread *starlark.Thread, b *starlark
 		timeoutMs = 2000
 	}
 
-	addr := fmt.Sprintf("%s:%d", host, port)
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
 	start := time.Now()
 	conn, err := net.DialTimeout("tcp", addr, time.Duration(timeoutMs)*time.Millisecond)
 	latency := int(time.Since(start).Milliseconds())
