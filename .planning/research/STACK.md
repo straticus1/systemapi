@@ -1,12 +1,12 @@
-# Technology Stack: SystemAPI.io v2.0 — New Capabilities
+# Technology Stack: SystemAPI.io v2.0 - New Capabilities
 
 **Project:** SystemAPI.io v2.0 Next-Gen Systems Management
 **Researched:** 2026-04-28
-**Scope:** Go agent additions only — Node.js server and React frontend stack unchanged.
+**Scope:** Go agent additions only - Node.js server and React frontend stack unchanged.
 
 ---
 
-## Existing Agent Stack (Validated — Do Not Re-research)
+## Existing Agent Stack (Validated - Do Not Re-research)
 
 | Package | Version | CGO? | Role |
 |---------|---------|------|------|
@@ -21,17 +21,17 @@
 
 | Library | Version | CGO? | Notes |
 |---------|---------|------|-------|
-| `github.com/hillu/go-yara/v4` | v4.3.4 | **YES — HARD REQUIREMENT** | Wraps libyara C library. Requires libyara 4.3 headers + GCC at build time. |
+| `github.com/hillu/go-yara/v4` | v4.3.4 | **YES - HARD REQUIREMENT** | Wraps libyara C library. Requires libyara 4.3 headers + GCC at build time. |
 
-**Why this library:** Only production-grade YARA binding for Go. YARA-X (the Rust rewrite) has no Go bindings. There is no pure-Go YARA engine — `gyp` (VirusTotal/gyp) only parses YARA rule syntax into an AST, it cannot execute rules against files.
+**Why this library:** Only production-grade YARA binding for Go. YARA-X (the Rust rewrite) has no Go bindings. There is no pure-Go YARA engine - `gyp` (VirusTotal/gyp) only parses YARA rule syntax into an AST, it cannot execute rules against files.
 
 **Static binary constraint: BROKEN without explicit workaround.** YARA introduces a CGO dependency that makes standard `CGO_ENABLED=0` static builds impossible for the YARA-enabled binary. Resolution options:
 
-1. **Recommended — Split binary:** Compile a second agent variant (`systemapi-agent-security`) with YARA enabled and `CGO_ENABLED=1`. The base agent stays pure-Go static. The security agent is distributed separately and only required when `sys.security` entitlements are declared.
-2. **Alternative — Static libyara:** Use `-tags yara_static -ldflags="-extldflags '-static'"` with a pre-built static libyara. Works on Linux/macOS but Windows requires MSYS2/MinGW. Cross-compilation requires a cross-toolchain with target libyara pre-built for each GOOS/GOARCH — significant CI complexity.
-3. **Alternative — Stub with exec:** Keep the base binary pure-Go, invoke `yara` CLI tool via `sys.exec.run` if present on the host. Lower fidelity but zero CGO.
+1. **Recommended - Split binary:** Compile a second agent variant (`systemapi-agent-security`) with YARA enabled and `CGO_ENABLED=1`. The base agent stays pure-Go static. The security agent is distributed separately and only required when `sys.security` entitlements are declared.
+2. **Alternative - Static libyara:** Use `-tags yara_static -ldflags="-extldflags '-static'"` with a pre-built static libyara. Works on Linux/macOS but Windows requires MSYS2/MinGW. Cross-compilation requires a cross-toolchain with target libyara pre-built for each GOOS/GOARCH - significant CI complexity.
+3. **Alternative - Stub with exec:** Keep the base binary pure-Go, invoke `yara` CLI tool via `sys.exec.run` if present on the host. Lower fidelity but zero CGO.
 
-**Cross-compilation:** go-yara supports linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, and windows/amd64 — but each target requires a cross-compiling GCC toolchain and a pre-built libyara for that target. See `README.cross-building.md` in the go-yara repo.
+**Cross-compilation:** go-yara supports linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, and windows/amd64 - but each target requires a cross-compiling GCC toolchain and a pre-built libyara for that target. See `README.cross-building.md` in the go-yara repo.
 
 **Confidence:** HIGH (pkg.go.dev verified, v4.3.4 published Jul 2025)
 
@@ -45,11 +45,11 @@
 | `github.com/docker/docker/api/types/container` | same module | No | Container config/inspect types used alongside the client. |
 | `github.com/google/go-containerregistry/pkg/crane` | v0.21.5 | **No** | Pure-Go OCI registry pull/push without requiring a running Docker daemon. Use for image inspection, pulling to tarball. |
 
-**Why docker/docker client:** This is the canonical Go client for the Docker Engine API (12,458+ importers). It is pure Go — communicates over the Docker socket, no CGO. Covers: ContainerList, ContainerCreate, ContainerStart, ContainerStop, ContainerRemove, ContainerLogs, ContainerExec, ImagePull, ImagePush, ImageList, RegistryLogin.
+**Why docker/docker client:** This is the canonical Go client for the Docker Engine API (12,458+ importers). It is pure Go - communicates over the Docker socket, no CGO. Covers: ContainerList, ContainerCreate, ContainerStart, ContainerStop, ContainerRemove, ContainerLogs, ContainerExec, ImagePull, ImagePush, ImageList, RegistryLogin.
 
 **Why go-containerregistry (crane):** Handles OCI image pull/push directly against registries (no daemon required). Useful for environments where Docker is present but `dockerd` is not running, or for implementing `sys.containers.pull` without daemon dependency. Apache-2.0, pure Go, maintained by Google.
 
-**Note on `+incompatible`:** `github.com/docker/docker` has not migrated to Go modules properly (still v28 on the v1 module path). This is normal for this package — all major Docker tooling uses it this way. Pin to a specific version in `go.mod`.
+**Note on `+incompatible`:** `github.com/docker/docker` has not migrated to Go modules properly (still v28 on the v1 module path). This is normal for this package - all major Docker tooling uses it this way. Pin to a specific version in `go.mod`.
 
 **Security note (confirmed):** pkg.go.dev flags 2 known vulnerabilities (GO-2026-4883, GO-2026-4887) against v28.5.2 as of research date. Check `go vuln` before shipping and update to latest patch.
 
@@ -71,14 +71,14 @@ No external library required. Implement via `os/exec` + platform detection.
 **Pattern:** Detect platform once at agent startup via `gopsutil/v4/host.PlatformInformation()`, store in agent state, then select the correct package manager command at `sys.packages.install` call time. This mirrors how tools like Ansible's `package` module work.
 
 **Package manager mapping:**
-- `PlatformFamily == "debian"` → `apt-get install -y <name>`
-- `PlatformFamily == "rhel"` → `dnf install -y <name>` (or `yum` on older RHEL)
-- `GOOS == "darwin"` → `brew install <name>`
-- `GOOS == "windows"` → `winget install --id <name> -e`
+- `PlatformFamily == "debian"` -> `apt-get install -y <name>`
+- `PlatformFamily == "rhel"` -> `dnf install -y <name>` (or `yum` on older RHEL)
+- `GOOS == "darwin"` -> `brew install <name>`
+- `GOOS == "windows"` -> `winget install --id <name> -e`
 
-**Note on gopsutil v3 → v4 upgrade:** The existing agent uses v3.24.5. v4.26.3 (Mar 2026) is the current stable — same pure-Go, same API surface with context-aware variants. Upgrade is low-risk. Import path changes from `gopsutil/v3/...` to `gopsutil/v4/...`.
+**Note on gopsutil v3 -> v4 upgrade:** The existing agent uses v3.24.5. v4.26.3 (Mar 2026) is the current stable - same pure-Go, same API surface with context-aware variants. Upgrade is low-risk. Import path changes from `gopsutil/v3/...` to `gopsutil/v4/...`.
 
-**Cross-compilation:** No issues — pure Go, platform selection happens at runtime not compile time.
+**Cross-compilation:** No issues - pure Go, platform selection happens at runtime not compile time.
 
 **Confidence:** HIGH
 
@@ -91,17 +91,17 @@ No external library required. Implement via `os/exec` + platform detection.
 | `github.com/coreos/go-systemd/v22/dbus` | v22.7.0 | **No** | Linux | systemd control via D-Bus. StartUnit, StopUnit, RestartUnit, ListUnits, GetUnitProperties. |
 | `github.com/godbus/dbus/v5` | v5.2.2 | **No** | Linux | go-systemd depends on this internally. May be needed directly for subscription/watch. |
 | `golang.org/x/sys/windows/svc/mgr` | part of x/sys | **No** | Windows | Windows SCM: Connect, OpenService, Start, Control (Stop/Pause), Query, ListServices. |
-| stdlib `os/exec` (launchctl) | stdlib | No | macOS | No Go library needed — `launchctl load/unload/start/stop/list` is the native interface. |
+| stdlib `os/exec` (launchctl) | stdlib | No | macOS | No Go library needed - `launchctl load/unload/start/stop/list` is the native interface. |
 
 **Why go-systemd/dbus over godbus/dbus directly:** `go-systemd/dbus` provides a high-level typed API specifically for systemd (StartUnitContext, StopUnitContext, GetAllPropertiesContext, SubscribeUnitsContext). Using godbus/dbus raw requires constructing D-Bus method calls manually.
 
-**CGO caveat in go-systemd:** The `sdjournal` subpackage requires CGO — but we only need the `dbus` subpackage, which is pure Go. Import only `github.com/coreos/go-systemd/v22/dbus`, never `sdjournal`.
+**CGO caveat in go-systemd:** The `sdjournal` subpackage requires CGO - but we only need the `dbus` subpackage, which is pure Go. Import only `github.com/coreos/go-systemd/v22/dbus`, never `sdjournal`.
 
 **macOS launchctl strategy:** `launchctl list | grep <label>` for status, `launchctl load /Library/LaunchDaemons/<plist>` for enable, `launchctl start <label>` for start. Implement via `os/exec`. No library needed.
 
-**Windows SCM strategy:** `golang.org/x/sys/windows/svc/mgr` provides `Connect() → OpenService(name) → Start() / Control(svc.Stop) / Query()`. Already an indirect dependency via gopsutil.
+**Windows SCM strategy:** `golang.org/x/sys/windows/svc/mgr` provides `Connect() -> OpenService(name) -> Start() / Control(svc.Stop) / Query()`. Already an indirect dependency via gopsutil.
 
-**Cross-compilation:** go-systemd and godbus are Linux-only at runtime but compile cleanly for all GOOS — use build constraints (`//go:build linux`) to guard usage. x/sys/windows compiles only on windows.
+**Cross-compilation:** go-systemd and godbus are Linux-only at runtime but compile cleanly for all GOOS - use build constraints (`//go:build linux`) to guard usage. x/sys/windows compiles only on windows.
 
 **Confidence:** HIGH (go-systemd v22.7.0 Jan 2026 verified; godbus v5.2.2 Dec 2025 verified)
 
@@ -117,7 +117,7 @@ No external library required. Implement via `os/exec` + platform detection.
 
 **Windows signal caveat:** POSIX signals do not exist on Windows. `SendSignal` on Windows only works for SIGKILL equivalent (TerminateProcess). `Suspend/Resume` map to NtSuspendProcess/NtResumeProcess.
 
-**Upgrade action:** Bump existing `gopsutil/v3` to `gopsutil/v4` — same effort benefits both telemetry and process management.
+**Upgrade action:** Bump existing `gopsutil/v3` to `gopsutil/v4` - same effort benefits both telemetry and process management.
 
 **Confidence:** HIGH (pkg.go.dev v4.26.3 Mar 2026 verified)
 
@@ -129,7 +129,7 @@ No external library required. Implement via `os/exec` + platform detection.
 |---------|---------|------|-------------|-------|
 | `github.com/fsnotify/fsnotify` | v1.9.0 | **No** | inotify (Linux), kqueue (macOS), ReadDirectoryChangesW (Windows) | Cross-platform FS event watcher. Pure Go via x/sys syscall wrappers. |
 
-**Why fsnotify:** Standard Go ecosystem choice (13,659+ importers). Handles all three OS backends without CGO. API is simple — `NewWatcher()`, `watcher.Add(path)`, range over `watcher.Events` channel. Events: Create, Write, Remove, Rename, Chmod.
+**Why fsnotify:** Standard Go ecosystem choice (13,659+ importers). Handles all three OS backends without CGO. API is simple - `NewWatcher()`, `watcher.Add(path)`, range over `watcher.Events` channel. Events: Create, Write, Remove, Rename, Chmod.
 
 **Recursive watching:** fsnotify v1.x does NOT support recursive directory watching natively (must call `Add` on each subdirectory). For `sys.events.listen` on a tree, implement a helper that walks and adds subdirs, then handles Create events to add newly-created subdirs.
 
@@ -146,15 +146,15 @@ No external library required. Implement via `os/exec` + platform detection.
 | `go.etcd.io/bbolt` | v1.4.3 | **No** | Pure-Go embedded B+tree key/value store. ACID transactions. Single file on disk. No external process needed. |
 
 **Why bbolt over SQLite (mattn/go-sqlite3 requires CGO) or file-based JSON:**
-- SQLite via `mattn/go-sqlite3` requires CGO — breaks static binary constraint.
-- File-based JSON with `os.WriteFile` has no atomic transaction semantics — risk of corruption on agent crash mid-write.
+- SQLite via `mattn/go-sqlite3` requires CGO - breaks static binary constraint.
+- File-based JSON with `os.WriteFile` has no atomic transaction semantics - risk of corruption on agent crash mid-write.
 - bbolt is pure Go, embedded, ACID, and used in production at scale (etcd, Consul use it). Single `.db` file per agent.
 
-**Why not modernc.org/sqlite (pure-Go SQLite):** bbolt is simpler and more appropriate for the use case (key/value state, not relational queries). `modernc.org/sqlite` is an option if structured queries are needed — it is pure Go with no CGO — but bbolt is lighter.
+**Why not modernc.org/sqlite (pure-Go SQLite):** bbolt is simpler and more appropriate for the use case (key/value state, not relational queries). `modernc.org/sqlite` is an option if structured queries are needed - it is pure Go with no CGO - but bbolt is lighter.
 
 **State store schema design:**
-- Bucket: `sysscript_state` → key: `<script_id>` → value: JSON blob `{applied_at, desired_state, last_hash}`
-- Bucket: `host_facts` → key: `<fact_name>` → value: serialized fact
+- Bucket: `sysscript_state` -> key: `<script_id>` -> value: JSON blob `{applied_at, desired_state, last_hash}`
+- Bucket: `host_facts` -> key: `<fact_name>` -> value: serialized fact
 
 **Windows support:** bbolt works on Windows. File locking is enforced (exclusive write lock). Works correctly on all target platforms.
 
@@ -164,13 +164,13 @@ No external library required. Implement via `os/exec` + platform detection.
 
 ## Capability 8: Declarative State Convergence (Ansible-like Idempotency)
 
-No external library required — this is a pattern, not a package.
+No external library required - this is a pattern, not a package.
 
 **Pattern:** Implement a `Converge(desired StateSnapshot) (changed bool, err error)` function per resource type. Each converge function follows:
 1. **Read current state** (using gopsutil, os/exec, docker client, etc.)
 2. **Diff against desired state** (compare struct fields or hashes)
 3. **If drift detected, apply changes** (install package, start service, write file, etc.)
-4. **Re-read and verify** (optional but recommended — "test-after-apply")
+4. **Re-read and verify** (optional but recommended - "test-after-apply")
 5. **Return `changed=true/false`** so the Starlark script can report what happened
 
 **Starlark integration pattern:**
@@ -184,7 +184,7 @@ result = sys.state.ensure({
 print("changed:", result.changed)
 ```
 
-**State hash for drift detection:** Store SHA-256 of last-applied desired state in bbolt. On next run, hash current desired state spec. If hashes match and verification passes, skip — idempotent with O(1) skip cost.
+**State hash for drift detection:** Store SHA-256 of last-applied desired state in bbolt. On next run, hash current desired state spec. If hashes match and verification passes, skip - idempotent with O(1) skip cost.
 
 **No external convergence library needed:** Puppet/CFEngine/Salt all have their own DSLs. For SystemAPI.io, the convergence logic lives in the Go agent's `sys.state` module with bbolt as backing store and Starlark as the expression layer.
 
@@ -194,7 +194,7 @@ print("changed:", result.changed)
 
 ## Capability 9: Cross-Compilation Targets
 
-**Current agent:** `go 1.25.7` (go.mod). This is ahead of any Go release I can verify — treat as `go 1.24` semantically for compatibility purposes. All libraries below are verified compatible with Go 1.20+.
+**Current agent:** `go 1.25.7` (go.mod). This is ahead of any Go release I can verify - treat as `go 1.24` semantically for compatibility purposes. All libraries below are verified compatible with Go 1.20+.
 
 | Target | Notes |
 |--------|-------|
@@ -247,7 +247,7 @@ require (
     // Upgraded (already present as v3)
     github.com/shirou/gopsutil/v4 v4.26.3
 
-    // New additions — pure Go
+    // New additions - pure Go
     github.com/docker/docker         v28.5.2+incompatible
     github.com/google/go-containerregistry v0.21.5
     github.com/coreos/go-systemd/v22 v22.7.0
@@ -255,7 +255,7 @@ require (
     github.com/fsnotify/fsnotify     v1.9.0
     go.etcd.io/bbolt                 v1.4.3
 
-    // New addition — CGO required, security binary only
+    // New addition - CGO required, security binary only
     github.com/hillu/go-yara/v4      v4.3.4
 )
 ```

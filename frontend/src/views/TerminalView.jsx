@@ -165,7 +165,7 @@ const TerminalView = () => {
               {host?.hostname || hostId}
             </h2>
             <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-              {host?.os} {host?.platform} • Secure PTY Tunnel
+              {host?.os} {host?.platform} / PTY session
             </div>
           </div>
         </div>

@@ -2,7 +2,7 @@
 
 **Domain:** Fleet systems management platform (Ansible/Terraform alternative)
 **Researched:** 2026-04-28
-**Confidence:** HIGH — based on direct codebase inspection, existing stub analysis, schema review, and domain knowledge of Ansible/Chef/Puppet ecosystem patterns
+**Confidence:** HIGH - based on direct codebase inspection, existing stub analysis, schema review, and domain knowledge of Ansible/Chef/Puppet ecosystem patterns
 
 ---
 
@@ -10,9 +10,9 @@
 
 Each feature area is assessed against three axes:
 
-- **Table Stakes** — What operators expect. Missing = product feels broken or untrustworthy.
-- **Differentiators** — What makes SystemAPI.io better than Ansible/Chef/Puppet. These are the "why switch" reasons.
-- **Anti-Features** — Complexity traps that add implementation cost without user value, or that violate the project's core model (WebSocket-only, Starlark-sandboxed, single binary).
+- **Table Stakes** - What operators expect. Missing = product feels broken or untrustworthy.
+- **Differentiators** - What makes SystemAPI.io better than Ansible/Chef/Puppet. These are the "why switch" reasons.
+- **Anti-Features** - Complexity traps that add implementation cost without user value, or that violate the project's core model (WebSocket-only, Starlark-sandboxed, single binary).
 
 Dependencies between features are noted where one feature's value depends on another being present.
 
@@ -26,7 +26,7 @@ The flagship value proposition of v2.0. Sysscripts already run imperatively; thi
 
 | Behavior | Why Expected | Complexity |
 |----------|--------------|------------|
-| Convergence mode: script declares desired state, engine applies only what changed | This IS the Ansible replacement promise — without it the product is just remote exec | High |
+| Convergence mode: script declares desired state, engine applies only what changed | This IS the Ansible replacement promise - without it the product is just remote exec | High |
 | Idempotent execution: running the same script twice produces the same result | Standard contract of all config management tools | Medium |
 | Dry-run / preview mode: show what WOULD change before applying | Ansible's `--check` flag. Operators won't run blind on production | Medium |
 | Execution report: what was changed, what was already correct, what failed | Terraform's plan/apply output pattern. Required for audit | Medium |
@@ -37,11 +37,11 @@ The flagship value proposition of v2.0. Sysscripts already run imperatively; thi
 
 | Feature | Value Proposition | Complexity |
 |---------|-------------------|------------|
-| Convergence runs in the agent (no control node) | Ansible requires a control machine with SSH access. SystemAPI agents converge themselves via WebSocket. Zero inbound ports. | Low — agent-local execution is already the model |
+| Convergence runs in the agent (no control node) | Ansible requires a control machine with SSH access. SystemAPI agents converge themselves via WebSocket. Zero inbound ports. | Low - agent-local execution is already the model |
 | Real-time convergence status streamed back | Ansible shows output only after completion. WebSocket lets you watch each step converge live. | Medium |
-| Script-level entitlements on convergence runs | Ansible has no per-playbook capability sandboxing. A Sysscript must declare exactly what it needs. | Low — entitlements already exist |
-| Starlark convergence = Python-readable, no YAML | Ansible YAML is notoriously fragile (indentation errors, quoting). Starlark is deterministic and has real control flow. | Low — Starlark is already the engine |
-| Single binary — no Python, no pip, no virtualenv on managed host | Ansible requires Python on every managed node. SystemAPI agent is a static Go binary. | Low — already achieved |
+| Script-level entitlements on convergence runs | Ansible has no per-playbook capability sandboxing. A Sysscript must declare exactly what it needs. | Low - entitlements already exist |
+| Starlark convergence = Python-readable, no YAML | Ansible YAML is notoriously fragile (indentation errors, quoting). Starlark is deterministic and has real control flow. | Low - Starlark is already the engine |
+| Single binary - no Python, no pip, no virtualenv on managed host | Ansible requires Python on every managed node. SystemAPI agent is a static Go binary. | Low - already achieved |
 
 ### Anti-Features
 
@@ -68,20 +68,20 @@ Stubs exist in `sys_advanced.go`. Must become real implementations.
 
 | Behavior | Why Expected | Complexity |
 |----------|--------------|------------|
-| YARA rule scanning of files/directories | Security teams require signature-based detection. Without it the "security scanning" claim is empty. | High — requires CGo or pure-Go YARA library |
-| CVE matching against installed software inventory | CVE alerting already has DB tables (`playground_host_cves`). Users expect this to actually fire. | Medium — NVD/OSV feed integration |
+| YARA rule scanning of files/directories | Security teams require signature-based detection. Without it the "security scanning" claim is empty. | High - requires CGo or pure-Go YARA library |
+| CVE matching against installed software inventory | CVE alerting already has DB tables (`playground_host_cves`). Users expect this to actually fire. | Medium - NVD/OSV feed integration |
 | Alert push on scan findings | `sys.alerts.push` stub exists. Must actually send back through the WebSocket. | Medium |
-| Per-scan entitlement enforcement | A script must declare `allow_security_scan` to invoke YARA or memory scan — no implicit elevated privilege | Low |
+| Per-scan entitlement enforcement | A script must declare `allow_security_scan` to invoke YARA or memory scan - no implicit elevated privilege | Low |
 | Scan results persisted and queryable | One-time scan output that isn't stored is useless for compliance and trending. | Medium |
 
 ### Differentiators
 
 | Feature | Value Proposition | Complexity |
 |---------|-------------------|------------|
-| Memory scanning of running processes | Detects injected shellcode, reflective DLL injection. Most SIEM tools don't reach into process memory from a management agent. | Very High — platform-specific (Linux: `/proc/PID/mem`, macOS: `vm_read`, Windows: `ReadProcessMemory`) |
+| Memory scanning of running processes | Detects injected shellcode, reflective DLL injection. Most SIEM tools don't reach into process memory from a management agent. | Very High - platform-specific (Linux: `/proc/PID/mem`, macOS: `vm_read`, Windows: `ReadProcessMemory`) |
 | Real-time file-change triggered YARA scan | Watch a directory with `sys.events.listen`, auto-scan new/modified files. Combines Feature 7 (FS watch) with security scanning. | High |
 | YARA rules as Sysscript-managed config | Operators can push new YARA rules via Sysscript to update detection without redeploying the agent. | Medium |
-| Tie CVE alerts to package management | When `sys.packages.install` installs a version, auto-check it against the CVE DB. | Medium — requires Feature 3 integration |
+| Tie CVE alerts to package management | When `sys.packages.install` installs a version, auto-check it against the CVE DB. | Medium - requires Feature 3 integration |
 
 ### Anti-Features
 
@@ -109,21 +109,21 @@ Stub in `sys_advanced.go`: `packagesInstall` logs and returns true.
 
 | Behavior | Why Expected | Complexity |
 |----------|--------------|------------|
-| Install a named package | The stub already promises this. Must actually invoke the right package manager for the host's platform. | Medium — platform detection exists via gopsutil |
+| Install a named package | The stub already promises this. Must actually invoke the right package manager for the host's platform. | Medium - platform detection exists via gopsutil |
 | Remove/uninstall a package | Install without remove is half a feature. Config management requires both. | Medium |
-| Query installed packages (list) | Required for inventory, CVE matching, and drift detection. | Low — `gatherSoftware()` already exists in telemetry |
+| Query installed packages (list) | Required for inventory, CVE matching, and drift detection. | Low - `gatherSoftware()` already exists in telemetry |
 | Check if package is installed | Needed for idempotent convergence: "install nginx if not installed" | Low |
-| Pin a version (install specific version) | Production ops require version pinning to avoid surprise upgrades | Medium — package manager APIs differ |
-| Cross-platform: dnf (RHEL/Rocky), apt (Debian/Ubuntu), brew (macOS), winget (Windows) | The four target platforms are explicit in PROJECT.md | High — four separate code paths |
+| Pin a version (install specific version) | Production ops require version pinning to avoid surprise upgrades | Medium - package manager APIs differ |
+| Cross-platform: dnf (RHEL/Rocky), apt (Debian/Ubuntu), brew (macOS), winget (Windows) | The four target platforms are explicit in PROJECT.md | High - four separate code paths |
 
 ### Differentiators
 
 | Feature | Value Proposition | Complexity |
 |---------|-------------------|------------|
-| Package install with entitlement audit trail | Every `sys.packages.install` call logged with who triggered it, what package, what version — Ansible has no built-in per-package audit trail | Low — execution audit table already exists |
+| Package install with entitlement audit trail | Every `sys.packages.install` call logged with who triggered it, what package, what version - Ansible has no built-in per-package audit trail | Low - execution audit table already exists |
 | Fleet-wide package inventory with CVE overlay | Show all hosts, what packages they have, which have known CVEs. Ansible requires a separate role + Lynis/OpenSCAP. | Medium |
 | Install-time CVE check with optional block | Before installing, check OSV for known vulns in requested version. Block or warn based on policy. | Medium |
-| Package diff across fleet | "These 12 hosts have nginx 1.24, these 3 have 1.22.1 — here's the CVE delta" | Medium |
+| Package diff across fleet | "These 12 hosts have nginx 1.24, these 3 have 1.22.1 - here's the CVE delta" | Medium |
 
 ### Anti-Features
 
@@ -136,7 +136,7 @@ Stub in `sys_advanced.go`: `packagesInstall` logs and returns true.
 
 ### Dependencies
 
-- Depends on: Platform detection (via gopsutil `host.Info()` — already in telemetry)
+- Depends on: Platform detection (via gopsutil `host.Info()` - already in telemetry)
 - Depends on: Entitlements system (new `allow_packages` entitlement needed)
 - Enables: **Security Scanning** CVE-on-install check
 - Enables: **Drift Detection** package version tracking
@@ -151,20 +151,20 @@ Not yet stubbed. Complete new `sys.services` module.
 
 | Behavior | Why Expected | Complexity |
 |----------|--------------|------------|
-| Start / stop / restart a service | Core config management primitive. Without this, deploying a package and starting it requires raw `sys.exec.run`. | Low — thin wrapper around systemctl/launchctl/sc.exe |
+| Start / stop / restart a service | Core config management primitive. Without this, deploying a package and starting it requires raw `sys.exec.run`. | Low - thin wrapper around systemctl/launchctl/sc.exe |
 | Enable / disable (persist across reboots) | Start without enable is half the operation for long-running services | Low |
 | Status query: is the service running, its PID, its restart count | Required for convergence check ("is nginx up?") and health monitoring | Low |
 | List all services (running and stopped) | Inventory and audit requirement | Low |
-| Cross-platform: systemd (Linux), launchd (macOS), SCM (Windows) | PROJECT.md lists all three explicitly | Medium — three code paths |
+| Cross-platform: systemd (Linux), launchd (macOS), SCM (Windows) | PROJECT.md lists all three explicitly | Medium - three code paths |
 
 ### Differentiators
 
 | Feature | Value Proposition | Complexity |
 |---------|-------------------|------------|
-| Service convergence in Sysscript | `services.ensure("nginx", state="running", enabled=True)` — idempotent single call | Low once service primitives exist |
+| Service convergence in Sysscript | `services.ensure("nginx", state="running", enabled=True)` - idempotent single call | Low once service primitives exist |
 | Service restart on config file change | Combined with `sys.fs.watch` (Feature 7): write a config, detect the change, restart the service automatically | Medium |
-| Service failure alert integration | If a service that was `ensure`d running goes offline, push an alert via `sys.alerts` | Medium — requires periodic health check loop in agent |
-| Unified status across fleet | Dashboard shows all services across all hosts in one view, not per-host SSH one-at-a-time | Low — server aggregates telemetry |
+| Service failure alert integration | If a service that was `ensure`d running goes offline, push an alert via `sys.alerts` | Medium - requires periodic health check loop in agent |
+| Unified status across fleet | Dashboard shows all services across all hosts in one view, not per-host SSH one-at-a-time | Low - server aggregates telemetry |
 
 ### Anti-Features
 
@@ -192,19 +192,19 @@ Not yet stubbed. New `sys.process` module.
 
 | Behavior | Why Expected | Complexity |
 |----------|--------------|------------|
-| List all processes (PID, name, CPU%, memory, user) | Every config management and security tool can enumerate processes | Low — gopsutil `process` package already available |
+| List all processes (PID, name, CPU%, memory, user) | Every config management and security tool can enumerate processes | Low - gopsutil `process` package already available |
 | Kill a process by PID | Basic process management. Required for remediation scripts. | Low |
-| Send arbitrary signal (SIGTERM, SIGHUP, SIGKILL, SIGUSR1) | SIGHUP for config reload, SIGUSR1 for log rotation — standard ops patterns | Low on Linux/macOS; Windows signals are different |
-| Per-process resource usage (CPU, memory, open files, network connections) | Needed for identifying runaway processes and resource leak detection | Low — gopsutil covers this |
+| Send arbitrary signal (SIGTERM, SIGHUP, SIGKILL, SIGUSR1) | SIGHUP for config reload, SIGUSR1 for log rotation - standard ops patterns | Low on Linux/macOS; Windows signals are different |
+| Per-process resource usage (CPU, memory, open files, network connections) | Needed for identifying runaway processes and resource leak detection | Low - gopsutil covers this |
 | Find process by name | Operators write `kill process named "runaway_worker"` not `kill PID 48291` | Low |
 
 ### Differentiators
 
 | Feature | Value Proposition | Complexity |
 |---------|-------------------|------------|
-| Scriptable process remediation | "If any process is using >90% CPU for >5 minutes, send SIGTERM, wait 10s, then SIGKILL" — fully expressible in Starlark | Low once primitives exist |
+| Scriptable process remediation | "If any process is using >90% CPU for >5 minutes, send SIGTERM, wait 10s, then SIGKILL" - fully expressible in Starlark | Low once primitives exist |
 | Process list as convergence input | Convergence script can assert "exactly one nginx worker should be running" and enforce it | Medium |
-| Correlated with security scanning | List processes, then `sys.security.scan_memory(pid)` on unknown PIDs | Low — both modules present |
+| Correlated with security scanning | List processes, then `sys.security.scan_memory(pid)` on unknown PIDs | Low - both modules present |
 
 ### Anti-Features
 
@@ -217,7 +217,7 @@ Not yet stubbed. New `sys.process` module.
 ### Dependencies
 
 - Depends on: gopsutil (already imported in telemetry)
-- Depends on: Entitlements (new `allow_process_kill` entitlement — signal/kill must be separately gated from list)
+- Depends on: Entitlements (new `allow_process_kill` entitlement - signal/kill must be separately gated from list)
 - Pairs with: **Security Scanning** (scan memory of suspicious processes)
 - Pairs with: **Service Management** (kill and restart pattern)
 
@@ -231,7 +231,7 @@ Stub in `sys_advanced.go`: `containersRun` logs and returns true.
 
 | Behavior | Why Expected | Complexity |
 |----------|--------------|------------|
-| List containers (running and stopped) | Every container tool shows a container list. Non-negotiable baseline. | Low — Docker API via unix socket |
+| List containers (running and stopped) | Every container tool shows a container list. Non-negotiable baseline. | Low - Docker API via unix socket |
 | Run a container (image, env, ports, volumes, restart policy) | The stub promises this. Must actually call Docker. | Medium |
 | Stop / kill a container | Run without stop is not usable. | Low |
 | Remove a container | Cleanup is required for convergence. | Low |
@@ -246,10 +246,10 @@ Stub in `sys_advanced.go`: `containersRun` logs and returns true.
 
 | Feature | Value Proposition | Complexity |
 |---------|-------------------|------------|
-| Starlark-scripted container convergence | `containers.ensure("nginx", image="nginx:1.25", state="running", ports={"80":"80"})` — idempotent, declarative. Docker Compose requires a separate file format. | Medium |
-| Cross-host container fleet view | See all containers across all managed hosts in one dashboard view. Docker Desktop only shows local. Portainer requires a separate agent. | Low — server aggregates |
-| Container CVE scanning via sys.security + sys.containers | Pull an image manifest, check layers against OSV/NVD, surface vulnerable base images | High — requires image layer parsing |
-| No Kubernetes required | SystemAPI manages containers directly without a k8s cluster. For small-to-medium fleets, k8s is overkill. | Low — explicitly out of scope per PROJECT.md |
+| Starlark-scripted container convergence | `containers.ensure("nginx", image="nginx:1.25", state="running", ports={"80":"80"})` - idempotent, declarative. Docker Compose requires a separate file format. | Medium |
+| Cross-host container fleet view | See all containers across all managed hosts in one dashboard view. Docker Desktop only shows local. Portainer requires a separate agent. | Low - server aggregates |
+| Container CVE scanning via sys.security + sys.containers | Pull an image manifest, check layers against OSV/NVD, surface vulnerable base images | High - requires image layer parsing |
+| No Kubernetes required | SystemAPI manages containers directly without a k8s cluster. For small-to-medium fleets, k8s is overkill. | Low - explicitly out of scope per PROJECT.md |
 
 ### Anti-Features
 
@@ -278,22 +278,22 @@ Existing: `sys.fs.read` and `sys.fs.write` are implemented. All other operations
 
 | Behavior | Why Expected | Complexity |
 |----------|--------------|------------|
-| `stat(path)` — size, mtime, permissions, owner | Required to write any convergence check: "does this file exist, is it the right size?" | Low |
-| `glob(pattern)` — list matching files | Essential for any script operating on a set of files | Low |
-| `mkdir(path, recursive)` — create directories | Writing a file to a non-existent directory path is a common pattern | Low |
-| `rm(path, recursive)` — remove files/directories | Convergence requires removing files that should not exist | Low — requires entitlement enforcement |
-| `chmod(path, mode)` — change permissions | Config files often require specific permissions (ssh keys = 0600) | Low — Linux/macOS only; Windows has ACLs |
-| `chown(path, user, group)` — change ownership | Service config files often must be owned by the service user | Low |
-| `diff(path_a, path_b)` — compare two files | Required for drift detection: "is this file different from what we deployed?" | Low |
-| `watch(path, callback)` — notify on file change | Required for reactive automation: write config, detect change, restart service | High — platform-specific (inotify/kqueue/ReadDirectoryChangesW) |
+| `stat(path)` - size, mtime, permissions, owner | Required to write any convergence check: "does this file exist, is it the right size?" | Low |
+| `glob(pattern)` - list matching files | Essential for any script operating on a set of files | Low |
+| `mkdir(path, recursive)` - create directories | Writing a file to a non-existent directory path is a common pattern | Low |
+| `rm(path, recursive)` - remove files/directories | Convergence requires removing files that should not exist | Low - requires entitlement enforcement |
+| `chmod(path, mode)` - change permissions | Config files often require specific permissions (ssh keys = 0600) | Low - Linux/macOS only; Windows has ACLs |
+| `chown(path, user, group)` - change ownership | Service config files often must be owned by the service user | Low |
+| `diff(path_a, path_b)` - compare two files | Required for drift detection: "is this file different from what we deployed?" | Low |
+| `watch(path, callback)` - notify on file change | Required for reactive automation: write config, detect change, restart service | High - platform-specific (inotify/kqueue/ReadDirectoryChangesW) |
 
 ### Differentiators
 
 | Feature | Value Proposition | Complexity |
 |---------|-------------------|------------|
 | `sys.fs.diff` integrated with drift detection | Detect that a config file was manually edited and show the exact diff in the dashboard | Low once diff exists |
-| `sys.fs.watch` triggering Starlark callbacks | React to file changes in real-time without polling. Ansible has no equivalent — it's push-only, not event-driven. | High |
-| Entitlement-gated `rm -rf` equivalents | Unrestricted recursive delete is dangerous. SystemAPI enforces path-prefix allowlist on every destructive FS operation. | Low — extends existing entitlement model |
+| `sys.fs.watch` triggering Starlark callbacks | React to file changes in real-time without polling. Ansible has no equivalent - it's push-only, not event-driven. | High |
+| Entitlement-gated `rm -rf` equivalents | Unrestricted recursive delete is dangerous. SystemAPI enforces path-prefix allowlist on every destructive FS operation. | Low - extends existing entitlement model |
 
 ### Anti-Features
 
@@ -306,7 +306,7 @@ Existing: `sys.fs.read` and `sys.fs.write` are implemented. All other operations
 
 ### Dependencies
 
-- Depends on: Entitlements (all destructive operations — `rm`, `chmod`, `chown` — gated separately from reads)
+- Depends on: Entitlements (all destructive operations - `rm`, `chmod`, `chown` - gated separately from reads)
 - `watch` depends on: platform event APIs (inotify on Linux, kqueue on macOS, ReadDirectoryChangesW on Windows)
 - Enables: **Service Management** "write config then restart" pattern
 - Enables: **Security Scanning** real-time file scan on creation
@@ -322,19 +322,19 @@ Not yet stubbed. New `sys.network` module.
 
 | Behavior | Why Expected | Complexity |
 |----------|--------------|------------|
-| List network interfaces (name, IP, MAC, state up/down) | Any server management tool can show interface state | Low — gopsutil net.Interfaces() |
-| List active connections (TCP/UDP, local/remote addr, PID, state) | Security baseline: "what is this host connected to right now?" | Low — gopsutil net.Connections() |
-| List listening ports | Audit surface: "what ports are open on this host?" | Low — subset of connections |
-| Firewall rule query (iptables/nftables on Linux, pf on macOS, Windows Firewall) | Security compliance requires knowing firewall state | High — three very different APIs |
+| List network interfaces (name, IP, MAC, state up/down) | Any server management tool can show interface state | Low - gopsutil net.Interfaces() |
+| List active connections (TCP/UDP, local/remote addr, PID, state) | Security baseline: "what is this host connected to right now?" | Low - gopsutil net.Connections() |
+| List listening ports | Audit surface: "what ports are open on this host?" | Low - subset of connections |
+| Firewall rule query (iptables/nftables on Linux, pf on macOS, Windows Firewall) | Security compliance requires knowing firewall state | High - three very different APIs |
 | DNS lookup (forward and reverse) | Diagnostic tool: "can this host resolve this name from here?" | Low |
 
 ### Differentiators
 
 | Feature | Value Proposition | Complexity |
 |---------|-------------------|------------|
-| Fleet-wide "open ports" view | See across all hosts which ports are listening — one view. Nmap runs require network access; this runs inside each host. | Low — server aggregates |
-| Connection to threat intel correlation | Active connections cross-referenced against threat intel (DarkAPI/OTX already in v1.0) | Medium — data join on server side |
-| Firewall rule convergence via Sysscript | `network.firewall.ensure_rule("allow", "tcp", "80", "0.0.0.0/0")` — idempotent firewall management | High — platform-specific |
+| Fleet-wide "open ports" view | See across all hosts which ports are listening - one view. Nmap runs require network access; this runs inside each host. | Low - server aggregates |
+| Connection to threat intel correlation | Active connections cross-referenced against threat intel (DarkAPI/OTX already in v1.0) | Medium - data join on server side |
+| Firewall rule convergence via Sysscript | `network.firewall.ensure_rule("allow", "tcp", "80", "0.0.0.0/0")` - idempotent firewall management | High - platform-specific |
 
 ### Anti-Features
 
@@ -347,7 +347,7 @@ Not yet stubbed. New `sys.network` module.
 
 ### Dependencies
 
-- Depends on: gopsutil (net package — already imported)
+- Depends on: gopsutil (net package - already imported)
 - Depends on: Platform detection for firewall rule management
 - Depends on: Entitlements (new `allow_network_manage` for any mutating operations)
 - Integrates with: **Threat Intel API** (v1.0 already built) for connection correlation
@@ -362,11 +362,11 @@ Not yet implemented. Foundational for the Ansible replacement claim.
 
 | Behavior | Why Expected | Complexity |
 |----------|--------------|------------|
-| Record "desired state" when a Sysscript is applied to a host | Must know what was intended to detect drift from it | Medium — state store schema needed |
+| Record "desired state" when a Sysscript is applied to a host | Must know what was intended to detect drift from it | Medium - state store schema needed |
 | Compare current state to last desired state on demand or on schedule | This is the drift check. Runs as a scheduled Sysscript or server-initiated poll | Medium |
 | Report which items have drifted: packages (version changed), services (stopped), files (content changed) | A drift report without specifics is useless for remediation | Medium |
-| Alert when drift detected (integrate with `sys.alerts`) | Passive detection that nobody sees is wasted effort | Low — once alerts are a real push |
-| Convergence to fix drift: re-apply the last desired state | The operator should be able to click "converge" to fix the drift | Medium — depends on Feature 1 |
+| Alert when drift detected (integrate with `sys.alerts`) | Passive detection that nobody sees is wasted effort | Low - once alerts are a real push |
+| Convergence to fix drift: re-apply the last desired state | The operator should be able to click "converge" to fix the drift | Medium - depends on Feature 1 |
 
 ### Differentiators
 
@@ -374,8 +374,8 @@ Not yet implemented. Foundational for the Ansible replacement claim.
 |---------|-------------------|------------|
 | Automatic drift detection without a separate tool | Ansible requires Ansible Lint + Tower/AWX for drift; Puppet/Chef have separate compliance modules. SystemAPI does it natively. | Medium |
 | Drift shown in fleet dashboard | Per-host drift status visible alongside CPU/memory. Ansible Tower shows this but costs $. | Low once drift data exists |
-| Drift remediation one click | "This host has drifted. Converge now." — one button, no manual re-run of playbook. | Low once convergence exists |
-| File content drift uses `sys.fs.diff` | Shows the actual diff of what changed, not just "file changed" | Low — integrates Feature 7 |
+| Drift remediation one click | "This host has drifted. Converge now." - one button, no manual re-run of playbook. | Low once convergence exists |
+| File content drift uses `sys.fs.diff` | Shows the actual diff of what changed, not just "file changed" | Low - integrates Feature 7 |
 
 ### Anti-Features
 
@@ -405,19 +405,19 @@ This is a cross-cutting concern, not a separate module. Every feature above must
 
 | Behavior | Why Expected | Complexity |
 |----------|--------------|------------|
-| Agent compiles and runs on linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, windows/amd64 | PROJECT.md constraint. Operators managing mixed fleets cannot use a Linux-only tool. | Medium — build matrix + CI |
-| Package manager auto-detection: dnf vs apt vs brew vs winget | Operator writes `sys.packages.install("nginx")` once; the agent picks the right tool | Medium — platform detect already in gopsutil |
+| Agent compiles and runs on linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, windows/amd64 | PROJECT.md constraint. Operators managing mixed fleets cannot use a Linux-only tool. | Medium - build matrix + CI |
+| Package manager auto-detection: dnf vs apt vs brew vs winget | Operator writes `sys.packages.install("nginx")` once; the agent picks the right tool | Medium - platform detect already in gopsutil |
 | Service manager auto-detection: systemd vs launchd vs SCM | Same concern as package manager | Medium |
-| SELinux context handling on RHEL/Rocky | Writing files to SELinux-managed paths without correct context labels causes permission failures | High — requires semanage/restorecon awareness |
+| SELinux context handling on RHEL/Rocky | Writing files to SELinux-managed paths without correct context labels causes permission failures | High - requires semanage/restorecon awareness |
 | AppArmor awareness on Debian/Ubuntu | AppArmor profiles can block legitimate agent operations | Medium |
-| Windows: PowerShell and WMI access for operations without native Go equivalent | Some Windows management tasks have no non-PowerShell path | Medium — `sys.exec.run("powershell.exe", "-Command", ...)` pattern |
+| Windows: PowerShell and WMI access for operations without native Go equivalent | Some Windows management tasks have no non-PowerShell path | Medium - `sys.exec.run("powershell.exe", "-Command", ...)` pattern |
 
 ### Differentiators
 
 | Feature | Value Proposition | Complexity |
 |---------|-------------------|------------|
-| True single-binary cross-platform agent | No Python, no Ruby, no .NET runtime on managed host. CGO disabled where possible to keep binary static. | Medium — watch CGO dependencies |
-| Unified Sysscript API across platforms | Operator writes one script; platform differences handled inside the agent, not in the script. Ansible requires separate roles per OS. | High — all module implementations must abstract platform differences |
+| True single-binary cross-platform agent | No Python, no Ruby, no .NET runtime on managed host. CGO disabled where possible to keep binary static. | Medium - watch CGO dependencies |
+| Unified Sysscript API across platforms | Operator writes one script; platform differences handled inside the agent, not in the script. Ansible requires separate roles per OS. | High - all module implementations must abstract platform differences |
 | SELinux/AppArmor integration rather than fighting it | Most tools either disable SELinux or ignore it. Correct context labeling on file writes means managed hosts stay compliant. | High |
 
 ### Anti-Features
@@ -444,16 +444,16 @@ Stub exists: `sys.events.listen` in `sys_advanced.go` logs and returns true.
 
 | Behavior | Why Expected | Complexity |
 |----------|--------------|------------|
-| Subscribe to file system change events | Foundation for reactive automation: file written → restart service | High — platform kernel APIs |
-| Subscribe to process creation/exit events | Security: detect when an unexpected binary executes | High — auditd/BSM/ETW |
-| Callback invoked in Starlark with event data | The stub takes a callback. It must actually call it with event details (path, event type, PID) | High — requires running Starlark callbacks from a Go goroutine safely |
+| Subscribe to file system change events | Foundation for reactive automation: file written -> restart service | High - platform kernel APIs |
+| Subscribe to process creation/exit events | Security: detect when an unexpected binary executes | High - auditd/BSM/ETW |
+| Callback invoked in Starlark with event data | The stub takes a callback. It must actually call it with event details (path, event type, PID) | High - requires running Starlark callbacks from a Go goroutine safely |
 | Event delivery to agent's WebSocket if no callback | Events can also be pushed back to the dashboard without a local handler | Medium |
 
 ### Differentiators
 
 | Feature | Value Proposition | Complexity |
 |---------|-------------------|------------|
-| Event-driven Sysscripts | "When any .conf file in /etc/nginx changes, run the nginx config test and reload if valid" — no polling, no cron. Ansible has no equivalent. | High |
+| Event-driven Sysscripts | "When any .conf file in /etc/nginx changes, run the nginx config test and reload if valid" - no polling, no cron. Ansible has no equivalent. | High |
 | Cross-platform event normalization | Linux inotify events, macOS kqueue/FSEvents, Windows ETW all surface through the same `sys.events.listen` API | Very High |
 
 ### Anti-Features
@@ -482,10 +482,10 @@ Currently `sys.alerts.push` logs to the agent's stdout. It must actually push ba
 
 | Behavior | Why Expected | Complexity |
 |----------|--------------|------------|
-| `sys.alerts.push(severity, message, metadata)` sends a WebSocket message to FleetManager | Every other feature in v2.0 produces events that need alerting. The alert pipe must work. | Low — agent has the WebSocket connection; add a channel to send alert messages |
-| Alert stored in database and visible in alerts view | The alerts view already exists in the frontend. Alert records must be persisted. | Low — `playground_alerts` schema exists |
+| `sys.alerts.push(severity, message, metadata)` sends a WebSocket message to FleetManager | Every other feature in v2.0 produces events that need alerting. The alert pipe must work. | Low - agent has the WebSocket connection; add a channel to send alert messages |
+| Alert stored in database and visible in alerts view | The alerts view already exists in the frontend. Alert records must be persisted. | Low - `playground_alerts` schema exists |
 | Alert includes host_id, script_id, and custom payload | Operators need to know which host and which script triggered the alert | Low |
-| Deduplication / rate limiting on alert push | A runaway script could call `sys.alerts.push` in a tight loop | Medium — deduplicate on (host_id, message_hash) within a time window |
+| Deduplication / rate limiting on alert push | A runaway script could call `sys.alerts.push` in a tight loop | Medium - deduplicate on (host_id, message_hash) within a time window |
 
 ### Anti-Features
 
@@ -504,35 +504,35 @@ Currently `sys.alerts.push` logs to the agent's stdout. It must actually push ba
 ## Cross-Feature Dependencies Map
 
 ```
-sys.alerts.push (real)  <── every feature that emits an alert
-       ↑
-Drift Detection  ────────── Declarative State Mgmt
-       ↑                           ↑
-Package Mgmt  ──────────────── Service Mgmt
-       ↑                           ↑
-Platform Support (cross-cutting) ──┘
-       ↑
-Security Scanning  ──── sys.fs.watch (Events)
-       ↑                      ↑
+sys.alerts.push (real)  <-- every feature that emits an alert
+       ^
+Drift Detection  ---------- Declarative State Mgmt
+       ^                           ^
+Package Mgmt  ---------------- Service Mgmt
+       ^                           ^
+Platform Support (cross-cutting) --'
+       ^
+Security Scanning  ---- sys.fs.watch (Events)
+       ^                      ^
 Process Mgmt            FS Extended
-       ↑
+       ^
 Container Mgmt
-       ↑
+       ^
 Network Mgmt
 ```
 
 **Build order implied by dependencies:**
 
-1. sys.alerts.push (real) — everything else alerts through this
-2. sys.fs extended + sys.events.listen — used by multiple features
-3. Package Management + Service Management — frequently paired
-4. Process Management — relatively independent
-5. Container Management — independent, uses Docker API
-6. Network Management — independent
-7. Security Scanning — depends on fs.watch, can alert
-8. Declarative State Management — depends on all primitives existing
-9. Drift Detection — depends on declarative state + all primitives
-10. Platform support validation — runs through the whole matrix
+1. sys.alerts.push (real) - everything else alerts through this
+2. sys.fs extended + sys.events.listen - used by multiple features
+3. Package Management + Service Management - frequently paired
+4. Process Management - relatively independent
+5. Container Management - independent, uses Docker API
+6. Network Management - independent
+7. Security Scanning - depends on fs.watch, can alert
+8. Declarative State Management - depends on all primitives existing
+9. Drift Detection - depends on declarative state + all primitives
+10. Platform support validation - runs through the whole matrix
 
 ---
 
@@ -541,29 +541,29 @@ Network Mgmt
 For a shippable v2.0 milestone that delivers the Ansible replacement promise:
 
 **Must ship (required for the core value proposition):**
-1. sys.alerts.push — real WebSocket push (unblocks all other alerting)
-2. Package management — install/remove/check/list (cross-platform)
-3. Service management — start/stop/enable/disable/status (cross-platform)
-4. Filesystem extended — stat, glob, mkdir, rm, chmod, chown, diff
-5. Declarative convergence mode — idempotent, dry-run, execution report
-6. Drift detection — at least package and service state
+1. sys.alerts.push - real WebSocket push (unblocks all other alerting)
+2. Package management - install/remove/check/list (cross-platform)
+3. Service management - start/stop/enable/disable/status (cross-platform)
+4. Filesystem extended - stat, glob, mkdir, rm, chmod, chown, diff
+5. Declarative convergence mode - idempotent, dry-run, execution report
+6. Drift detection - at least package and service state
 
 **Should ship (high value, reasonable complexity):**
-7. Process management — list, kill, signal
-8. Container management — run, stop, list, logs, pull, images
-9. Security scanning — YARA file scan, CVE matching (memory scan deferred)
+7. Process management - list, kill, signal
+8. Container management - run, stop, list, logs, pull, images
+9. Security scanning - YARA file scan, CVE matching (memory scan deferred)
 
 **Can defer (high complexity, lower urgency):**
-10. sys.events.listen — real file watch (very high complexity; use polling for v2.0 drift detection instead)
-11. Firewall rule management — read-only for v2.0; mutations in v2.1
-12. Memory scanning — Very High complexity; defer to v2.1
+10. sys.events.listen - real file watch (very high complexity; use polling for v2.0 drift detection instead)
+11. Firewall rule management - read-only for v2.0; mutations in v2.1
+12. Memory scanning - Very High complexity; defer to v2.1
 
 ## Sources
 
 - Direct codebase inspection: `systemapi-agent/sysscript.go`, `systemapi-agent/sys_advanced.go`, `systemapi-agent/telemetry.go`, `playground/fleet.js`, `playground/playground_fleet_schema.sql`
 - PROJECT.md milestone requirements and technical constraints
 - FEATURE_ROADMAP.md existing planning
-- Domain knowledge: Ansible/Chef/Puppet/Terraform ecosystem (HIGH confidence — well-documented design patterns from these tools' own documentation and community discourse)
-- gopsutil library capabilities (HIGH confidence — directly imported in telemetry.go)
-- Docker Engine API patterns (HIGH confidence — well-documented REST/unix-socket API)
-- YARA rule engine capabilities (HIGH confidence — established open-source tool with documented Go bindings)
+- Domain knowledge: Ansible/Chef/Puppet/Terraform ecosystem (HIGH confidence - well-documented design patterns from these tools' own documentation and community discourse)
+- gopsutil library capabilities (HIGH confidence - directly imported in telemetry.go)
+- Docker Engine API patterns (HIGH confidence - well-documented REST/unix-socket API)
+- YARA rule engine capabilities (HIGH confidence - established open-source tool with documented Go bindings)

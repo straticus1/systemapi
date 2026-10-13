@@ -159,9 +159,9 @@ if (process.env.DB_PASSWORD && process.env.DB_PASSWORD !== '') {
         });
 
         redisClient.connect().then(() => {
-            console.log('✓ Redis connected for playground');
+            console.log('Redis connected for playground');
         }).catch(err => {
-            console.error('⚠ Redis connection failed:', err.message);
+            console.error('Redis connection failed:', err.message);
         });
 
         // Playground configuration
@@ -179,12 +179,12 @@ if (process.env.DB_PASSWORD && process.env.DB_PASSWORD !== '') {
         const playgroundRouter = createPlaygroundRouter(playgroundConfig);
         app.use('/playground', playgroundRouter);
 
-        console.log('✓ API Playground initialized at /playground');
+        console.log('API Playground initialized at /playground');
     } catch (err) {
-        console.error('⚠ Playground initialization failed:', err.message);
+        console.error('Playground initialization failed:', err.message);
     }
 } else {
-    console.log('⚠ Playground not configured (DB_PASSWORD not set) - playground endpoints disabled');
+    console.warn('Playground not configured (DB_PASSWORD not set) - playground endpoints disabled');
 }
 
 
@@ -402,7 +402,7 @@ if (process.env.DB_PASSWORD && process.env.DB_PASSWORD !== '') {
     });
 } else {
     // Local fallback for development & verification
-    console.warn('⚠ Using local postgres DB settings (DB_PASSWORD not set).');
+    console.warn('Using local postgres DB settings (DB_PASSWORD not set).');
     dbPool = new Pool({
         connectionString: process.env.DATABASE_URL || 'postgres://localhost/postgres'
     });

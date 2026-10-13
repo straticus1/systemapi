@@ -62,7 +62,7 @@ Access Grafana at: http://localhost:3001 (default login: admin/admin)
 
 ### 3. Add Prometheus as a Data Source
 
-1. Go to Configuration → Data Sources
+1. Go to Configuration -> Data Sources
 2. Click "Add data source"
 3. Select "Prometheus"
 4. Set URL to: `http://localhost:9090` (or `http://host.docker.internal:9090` if using Docker)

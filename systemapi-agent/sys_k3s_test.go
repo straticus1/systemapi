@@ -369,7 +369,7 @@ func TestNamespaceValidation(t *testing.T) {
 		}
 	}
 
-	// Also test via ListPods with malicious namespace — expect error containing "invalid namespace"
+	// Also test via ListPods with malicious namespace - expect error containing "invalid namespace"
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"items":[]}`))

@@ -37,7 +37,7 @@ docker buildx build \
   --load \
   .
 
-echo -e "${GREEN}✓ Build complete${NC}"
+echo -e "${GREEN}OK: Build complete${NC}"
 echo ""
 
 echo -e "${BLUE}Step 2: Pushing to OCI Registry...${NC}"

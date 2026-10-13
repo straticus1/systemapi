@@ -6,8 +6,8 @@ Date: 2026-10-12. This is a reading of the control plane, the agent, the CLI, an
 
 From `/Users/ryan/development/systemapi.io`:
 
-- `node --test tests/drivers.test.js` — 10 passed.
-- `node --test tests/controlplane.test.js` — 16 passed.
+- `node --test tests/drivers.test.js` - 10 passed.
+- `node --test tests/controlplane.test.js` - 16 passed.
 
 The agent `go test ./...` was green in the previous session and was not re-run here. The dashboard was not opened in a browser. Vite's production build was the earlier frontend check. No live agent dialed this control plane.
 

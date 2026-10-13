@@ -156,7 +156,7 @@ func (engine *SysscriptEngine) procGet(thread *starlark.Thread, b *starlark.Buil
 	}
 	p, err := process.NewProcess(int32(pid))
 	if err != nil {
-		return starlark.None, nil // not found → None
+		return starlark.None, nil // not found -> None
 	}
 	return procToDict(p)
 }

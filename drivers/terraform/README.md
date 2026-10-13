@@ -4,8 +4,8 @@ Reads one host from the SystemAPI fleet API through Terraform's built-in `extern
 
 Set these in the environment before `terraform plan` or `terraform apply`:
 
-- `SYSTEMAPI_URL` — API base URL. A single trailing slash is stripped.
-- `SYSTEMAPI_API_KEY` — sent only as the `X-API-Key` header.
+- `SYSTEMAPI_URL` - API base URL. A single trailing slash is stripped.
+- `SYSTEMAPI_API_KEY` - sent only as the `X-API-Key` header.
 
 `SYSTEMAPI_TENANT` is optional and is not printed. Do not put the API key in a `.tf` file, a `TF_VAR_`, or on the command line.
 

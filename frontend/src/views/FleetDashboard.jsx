@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAppStore } from '../store';
-import { Server, Cpu, TerminalSquare, ShieldAlert } from 'lucide-react';
+import { Server, Cpu, TerminalSquare, ShieldAlert, X } from 'lucide-react';
 import { FleetAPI } from '../api';
 import { cpuLabel, scriptOutcome } from '../format';
 
@@ -68,7 +68,7 @@ const FleetDashboard = () => {
             <div className="glass-panel" style={{ width: '700px', maxWidth: '90%', display: 'flex', flexDirection: 'column' }}>
                 <div style={{ padding: '20px', borderBottom: '1px solid var(--border-light)', display: 'flex', justifyContent: 'space-between' }}>
                     <h3>{diagModal.title}</h3>
-                    <button onClick={() => setDiagModal({ open: false, title: '', output: '', loading: false })} style={{ background: 'none', border: 'none', color: 'white', cursor: 'pointer', fontSize: '1.2rem' }}>✕</button>
+                    <button onClick={() => setDiagModal({ open: false, title: '', output: '', loading: false })} style={{ background: 'none', border: 'none', color: 'var(--text-main)', cursor: 'pointer' }} aria-label="Close"><X size={18} /></button>
                 </div>
                 <div style={{ padding: '20px', background: 'var(--bg-darker)', fontFamily: 'monospace', minHeight: '300px', maxHeight: '600px', overflowY: 'auto', color: 'var(--text-code)', whiteSpace: 'pre-wrap', lineHeight: '1.4' }}>
                     {diagModal.loading ? "> Running diagnostic on the agent..." : diagModal.output}
@@ -179,7 +179,7 @@ const HostCard = ({ host, onConnect, onDiagnostic }) => {
               <span className={`status-indicator ${isOnline ? 'status-online' : 'status-offline'}`}></span>
             </h3>
             <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-              {host.os} • {host.platform}
+              {host.os} / {host.platform}
             </div>
             {host.tenant_id ? (
               <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>{host.tenant_id}</div>

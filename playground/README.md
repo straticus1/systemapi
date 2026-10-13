@@ -75,7 +75,7 @@ const playgroundConfig = {
 app.use('/playground', playgroundRouter(playgroundConfig));
 
 app.listen(3000, () => {
-  console.log('✓ API Playground initialized at /playground');
+  console.log('API Playground initialized at /playground');
 });
 ```
 
@@ -156,4 +156,4 @@ psql -U systemapi -d systemapi_db -f playground_schema.sql
 
 ## License
 
-Copyright © 2026 AfterDark Systems. All rights reserved.
+Copyright (c) 2026 AfterDark Systems. All rights reserved.

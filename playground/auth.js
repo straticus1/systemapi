@@ -28,9 +28,9 @@ class AuthManager {
       const authentikIssuer = process.env.AUTHENTIK_ISSUER || `${this.keycloakURL}/realms/${this.keycloakRealm}`;
       const issuer = await Issuer.discover(authentikIssuer);
       this.oidcClient = issuer;
-      console.log('✓ OIDC client initialized for JWT verification');
+      console.log('OIDC client initialized for JWT verification');
     } catch (error) {
-      console.warn('⚠ OIDC discovery failed; JWT verification rejects tokens:', error.message);
+      console.warn('OIDC discovery failed; JWT verification rejects tokens:', error.message);
     }
   }
 
