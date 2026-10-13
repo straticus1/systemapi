@@ -6,7 +6,9 @@ require (
 	github.com/creack/pty v1.1.24
 	github.com/gorilla/websocket v1.5.3
 	github.com/shirou/gopsutil/v3 v3.24.5
+	github.com/vishvananda/netlink v1.3.1
 	go.starlark.net v0.0.0-20260210143700-b62fd896b91b
+	golang.org/x/sys v0.42.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -17,6 +19,6 @@ require (
 	github.com/shoenig/go-m1cpu v0.2.0 // indirect
 	github.com/tklauser/go-sysconf v0.3.16 // indirect
 	github.com/tklauser/numcpus v0.11.0 // indirect
+	github.com/vishvananda/netns v0.0.5 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
-	golang.org/x/sys v0.42.0 // indirect
 )

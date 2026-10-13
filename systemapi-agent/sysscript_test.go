@@ -107,3 +107,106 @@ func TestExecRunExpandsStringList(t *testing.T) {
 		t.Fatalf("output %q", out)
 	}
 }
+
+func TestHostModulesAbsentWithoutGrant(t *testing.T) {
+	engine := newTestEngine(&Entitlements{})
+	for _, name := range []string{"disk", "linux", "procfs", "k8s"} {
+		_, err := engine.Execute("print(sys." + name + ")\n")
+		if err == nil || !strings.Contains(err.Error(), "has no ."+name) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+}
+
+func TestLinuxModulesFollowHost(t *testing.T) {
+	engine := newTestEngine(&Entitlements{AllowLinux: true})
+	_, err := engine.Execute("print(type(sys.linux))\n")
+	if hostLinux() {
+		if err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	if err == nil || !strings.Contains(err.Error(), "has no .linux") {
+		t.Fatal(err)
+	}
+}
+
+func TestK8sModulePresentWithoutClient(t *testing.T) {
+	engine := newTestEngine(&Entitlements{AllowK8s: true})
+	out, err := engine.Execute("print(type(sys.k8s))\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "struct") {
+		t.Fatalf("%q", out)
+	}
+}
+
+func TestPackagesStayRegistered(t *testing.T) {
+	engine := newTestEngine(&Entitlements{})
+	out, err := engine.Execute("print(type(sys.packages))\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "struct") {
+		t.Fatalf("%q", out)
+	}
+}
+
+func TestNetWritesFailBeforeHost(t *testing.T) {
+	engine := newTestEngine(&Entitlements{AllowNetManage: []string{"eth0"}})
+	cases := []struct {
+		script string
+		want   string
+	}{
+		{"sys.net.set_address(\"wlan0\", \"10.0.0.2/32\")\n", "interface not allowed"},
+		{"sys.net.set_address(\"eth0\", \"not-a-cidr\")\n", "cidr rejected"},
+		{"sys.net.set_route(\"eth0\", \"not-a-gateway\")\n", "gateway rejected"},
+		{"sys.net.set_dns(\"eth0\", [\"dns.example\"])\n", "nameserver rejected"},
+		{"sys.net.set_dns(\"wlan0\", [\"1.1.1.1\"])\n", "interface not allowed"},
+	}
+	for _, tc := range cases {
+		_, err := engine.Execute(tc.script)
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("%s: %v", tc.script, err)
+		}
+	}
+}
+
+func TestNetLinksRequireLinux(t *testing.T) {
+	if hostLinux() {
+		t.Skip("netlink read is live on linux")
+	}
+	engine := newTestEngine(&Entitlements{})
+	_, err := engine.Execute("sys.net.links()\n")
+	if err == nil || !strings.Contains(err.Error(), "requires linux") {
+		t.Fatal(err)
+	}
+}
+
+func TestHostPolicyBeforeLinuxCall(t *testing.T) {
+	if !hostLinux() {
+		t.Skip("disk and procfs are absent off linux")
+	}
+	engine := newTestEngine(&Entitlements{
+		AllowLinux:        true,
+		AllowMountTargets: []string{"/mnt"},
+		AllowSysctl:       []string{"kernel.core_pattern"},
+	})
+	cases := []struct {
+		script string
+		want   string
+	}{
+		{"sys.disk.usage(\"relative\")\n", "path not allowed"},
+		{"sys.disk.mount(\"tmpfs\", \"/etc/passwd\", \"tmpfs\", False)\n", "mount target"},
+		{"sys.procfs.read(\"../meminfo\")\n", "procfs path not allowed"},
+		{"sys.procfs.sysctl_set(\"kernel.core_pattern\", \"x\")\n", "sysctl not allowed"},
+	}
+	for _, tc := range cases {
+		_, err := engine.Execute(tc.script)
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("%s: %v", tc.script, err)
+		}
+	}
+}

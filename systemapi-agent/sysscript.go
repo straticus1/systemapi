@@ -28,12 +28,22 @@ type Entitlements struct {
 	AllowServiceReload []string `json:"allow_service_reload"` // service names allowed to reload
 	AllowContainers    bool     `json:"allow_containers"`
 	AllowK3s           bool     `json:"allow_k3s"`
+	AllowLinux         bool     `json:"allow_linux"`
+	AllowK8s           bool     `json:"allow_k8s"`
+	AllowPackages      []string `json:"allow_packages"`
+	AllowImages        []string `json:"allow_images"`
+	AllowK3sNamespaces []string `json:"allow_k3s_namespaces"`
+	AllowK8sNamespaces []string `json:"allow_k8s_namespaces"`
+	AllowNetManage     []string `json:"allow_net_manage"`
+	AllowMountTargets  []string `json:"allow_mount_targets"`
+	AllowSysctl        []string `json:"allow_sysctl"`
 }
 
 // UnmarshalJSON accepts the control plane's clamped entitlement object.
 // A JSON boolean for a path list grants no paths. It does not mean allow-all.
 // AllowExec, AllowContainers, and AllowK3s stay booleans and fail closed
-// when the value is not a boolean.
+// when the value is not a boolean. A JSON boolean for a new list grants
+// nothing. "*" is dropped. Hard-denied sysctls are dropped even if named.
 func (e *Entitlements) UnmarshalJSON(b []byte) error {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(b, &raw); err != nil {
@@ -47,6 +57,15 @@ func (e *Entitlements) UnmarshalJSON(b []byte) error {
 	e.AllowExec = entitlementBool(raw["allow_exec"])
 	e.AllowContainers = entitlementBool(raw["allow_containers"])
 	e.AllowK3s = entitlementBool(raw["allow_k3s"])
+	e.AllowLinux = entitlementBool(raw["allow_linux"])
+	e.AllowK8s = entitlementBool(raw["allow_k8s"])
+	e.AllowPackages = entitlementExactList(raw["allow_packages"])
+	e.AllowImages = entitlementExactList(raw["allow_images"])
+	e.AllowK3sNamespaces = entitlementExactList(raw["allow_k3s_namespaces"])
+	e.AllowK8sNamespaces = entitlementExactList(raw["allow_k8s_namespaces"])
+	e.AllowNetManage = entitlementExactList(raw["allow_net_manage"])
+	e.AllowMountTargets = entitlementExactList(raw["allow_mount_targets"])
+	e.AllowSysctl = dropDeniedSysctl(entitlementExactList(raw["allow_sysctl"]))
 	return nil
 }
 
@@ -76,12 +95,43 @@ func entitlementBool(raw json.RawMessage) bool {
 	return flag
 }
 
+// entitlementExactList keeps short exact strings. A JSON boolean, "*",
+// "..", and control characters grant nothing.
+func entitlementExactList(raw json.RawMessage) []string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var flag bool
+	if err := json.Unmarshal(raw, &flag); err == nil {
+		return nil
+	}
+	var items []string
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if !exactItemOK(item) {
+			continue
+		}
+		out = append(out, item)
+		if len(out) >= listCap {
+			break
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // SysscriptEngine wraps the Starlark execution
 type SysscriptEngine struct {
 	Entitlements *Entitlements
 	cm           *ConfigManager
 	dockerClient *DockerClient
 	k3sClient    *K3sClient
+	k8sClient    *K3sClient
 }
 
 func NewSysscriptEngine(perms *Entitlements) *SysscriptEngine {
@@ -97,6 +147,13 @@ func NewSysscriptEngine(perms *Entitlements) *SysscriptEngine {
 		engine.k3sClient, err = NewK3sClient()
 		if err != nil {
 			log.Printf("[sysscript] k3s client init failed: %v", err)
+		}
+	}
+	if perms.AllowK8s {
+		var err error
+		engine.k8sClient, err = NewK8sClient()
+		if err != nil {
+			log.Printf("[sysscript] k8s client init failed: %v", err)
 		}
 	}
 	return engine
@@ -155,6 +212,14 @@ func (engine *SysscriptEngine) buildSysModule() *starlarkstruct.Struct {
 		"dns_lookup":  starlark.NewBuiltin("dns_lookup", engine.netDNSLookup),
 		"reverse_dns": starlark.NewBuiltin("reverse_dns", engine.netReverseDNS),
 		"port_check":  starlark.NewBuiltin("port_check", engine.netPortCheck),
+		"links":       starlark.NewBuiltin("links", engine.netLinks),
+		"addresses":   starlark.NewBuiltin("addresses", engine.netAddresses),
+		"routes":      starlark.NewBuiltin("routes", engine.netRoutes),
+		"set_address": starlark.NewBuiltin("set_address", engine.netSetAddress),
+		"set_route":   starlark.NewBuiltin("set_route", engine.netSetRoute),
+		"link_up":     starlark.NewBuiltin("link_up", engine.netLinkUp),
+		"link_down":   starlark.NewBuiltin("link_down", engine.netLinkDown),
+		"set_dns":     starlark.NewBuiltin("set_dns", engine.netSetDNS),
 	}
 
 	// sys.exec
@@ -260,18 +325,42 @@ func (engine *SysscriptEngine) buildSysModule() *starlarkstruct.Struct {
 			"stop":    starlark.NewBuiltin("stop", engine.containersStop),
 			"start":   starlark.NewBuiltin("start", engine.containersStart),
 			"restart": starlark.NewBuiltin("restart", engine.containersRestart),
+			"inspect": starlark.NewBuiltin("inspect", engine.containersInspect),
+			"logs":    starlark.NewBuiltin("logs", engine.containersLogs),
+			"run":     starlark.NewBuiltin("run", engine.containersRun),
+			"exec":    starlark.NewBuiltin("exec", engine.containersExec),
 		}
 		sysDict["containers"] = starlarkstruct.FromStringDict(starlark.String("containers"), sysContainers)
 	}
 
 	// D-11: k3s namespace absent when not entitled
 	if engine.Entitlements.AllowK3s {
-		sysK3s := starlark.StringDict{
-			"nodes": starlark.NewBuiltin("nodes", engine.k3sNodes),
-			"pods":  starlark.NewBuiltin("pods", engine.k3sPods),
-			"apply": starlark.NewBuiltin("apply", engine.k3sApply),
-		}
-		sysDict["k3s"] = starlarkstruct.FromStringDict(starlark.String("k3s"), sysK3s)
+		sysDict["k3s"] = engine.kubeModule("k3s")
+	}
+	if engine.Entitlements.AllowK8s {
+		sysDict["k8s"] = engine.kubeModule("k8s")
+	}
+	if engine.Entitlements.AllowLinux && hostLinux() {
+		sysDict["linux"] = starlarkstruct.FromStringDict(starlark.String("linux"), starlark.StringDict{
+			"os_release": starlark.NewBuiltin("os_release", engine.linuxOSRelease),
+			"uname":      starlark.NewBuiltin("uname", engine.linuxUname),
+			"hostname":   starlark.NewBuiltin("hostname", engine.linuxHostname),
+			"uptime":     starlark.NewBuiltin("uptime", engine.linuxUptime),
+			"users":      starlark.NewBuiltin("users", engine.linuxUsers),
+			"groups":     starlark.NewBuiltin("groups", engine.linuxGroups),
+		})
+		sysDict["disk"] = starlarkstruct.FromStringDict(starlark.String("disk"), starlark.StringDict{
+			"mounts":        starlark.NewBuiltin("mounts", engine.diskMounts),
+			"usage":         starlark.NewBuiltin("usage", engine.diskUsage),
+			"block_devices": starlark.NewBuiltin("block_devices", engine.diskBlockDevices),
+			"mount":         starlark.NewBuiltin("mount", engine.diskMount),
+			"umount":        starlark.NewBuiltin("umount", engine.diskUmount),
+		})
+		sysDict["procfs"] = starlarkstruct.FromStringDict(starlark.String("procfs"), starlark.StringDict{
+			"read":       starlark.NewBuiltin("read", engine.procfsRead),
+			"sysctl_get": starlark.NewBuiltin("sysctl_get", engine.procfsSysctlGet),
+			"sysctl_set": starlark.NewBuiltin("sysctl_set", engine.procfsSysctlSet),
+		})
 	}
 
 	return starlarkstruct.FromStringDict(starlark.String("sys"), sysDict)

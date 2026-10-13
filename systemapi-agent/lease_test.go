@@ -239,6 +239,25 @@ func TestEntitlementsBoolGrantsNoPaths(t *testing.T) {
 	if len(listed.AllowFSRead) != 1 || listed.AllowFSRead[0] != "/etc" || listed.AllowExec {
 		t.Fatalf("%+v", listed)
 	}
+	if cmd.Entitlements.AllowLinux || cmd.Entitlements.AllowK8s || cmd.Entitlements.AllowPackages != nil || cmd.Entitlements.AllowImages != nil || cmd.Entitlements.AllowSysctl != nil || cmd.Entitlements.AllowNetManage != nil || cmd.Entitlements.AllowMountTargets != nil || cmd.Entitlements.AllowK3sNamespaces != nil || cmd.Entitlements.AllowK8sNamespaces != nil {
+		t.Fatalf("missing lists must stay empty: %+v", cmd.Entitlements)
+	}
+	var host Entitlements
+	hostRaw := []byte(`{"allow_images":true,"allow_packages":["*","curl"],"allow_sysctl":["kernel.core_pattern","net.ipv4.ip_forward"],"allow_linux":true,"allow_k8s":"yes"}`)
+	if err := json.Unmarshal(hostRaw, &host); err != nil {
+		t.Fatal(err)
+	}
+	if host.AllowImages != nil || len(host.AllowPackages) != 1 || host.AllowPackages[0] != "curl" || host.AllowLinux != true || host.AllowK8s {
+		t.Fatalf("%+v", host)
+	}
+	for _, item := range host.AllowSysctl {
+		if item == "kernel.core_pattern" {
+			t.Fatal("denied sysctl kept")
+		}
+	}
+	if len(host.AllowSysctl) != 1 || host.AllowSysctl[0] != "net.ipv4.ip_forward" {
+		t.Fatalf("%v", host.AllowSysctl)
+	}
 }
 
 func TestBreakglassDoesNotPassRestricted(t *testing.T) {

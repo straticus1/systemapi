@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -93,7 +95,7 @@ func NewDockerClient() *DockerClient {
 // isValidContainerID validates that a container ID is safe to use in a URL path.
 // T-03-06: prevents path injection via / and .. sequences.
 func isValidContainerID(id string) bool {
-	if len(id) == 0 || len(id) > 128 {
+	if len(id) == 0 || len(id) > 128 || strings.Contains(id, "..") {
 		return false
 	}
 	for _, r := range id {
@@ -221,4 +223,304 @@ func (dc *DockerClient) doContainerPost(url, op string) error {
 	default:
 		return fmt.Errorf("docker %s: unexpected status %d", op, resp.StatusCode)
 	}
+}
+
+// Threats: inspect, logs, run, and exec fail closed. Run builds the host
+// config itself: no privileged, no host network, no host PID, no mounts,
+// no docker socket, and no user HostConfig. Output over the cap is an
+// error. Bodies are not logged. A bad id never reaches HTTP.
+
+type dockerInspectBody struct {
+	Id   string `json:"Id"`
+	Name string `json:"Name"`
+	Config struct {
+		Image string `json:"Image"`
+	} `json:"Config"`
+	State struct {
+		Status string `json:"Status"`
+	} `json:"State"`
+}
+
+func (dc *DockerClient) Inspect(id string) (map[string]string, error) {
+	if dc == nil || dc.client == nil {
+		return nil, fmt.Errorf("docker client not initialized")
+	}
+	if !isValidContainerID(id) {
+		return nil, fmt.Errorf("invalid container id")
+	}
+	url := fmt.Sprintf("%s/%s/containers/%s/json", dc.baseURL, dockerAPIVersion, id)
+	resp, err := dc.client.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("docker inspect: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := readLimited(resp.Body, dockerBodyCap)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("docker inspect: unexpected status %d", resp.StatusCode)
+	}
+	var raw dockerInspectBody
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("docker inspect: decode: %w", err)
+	}
+	status := raw.State.Status
+	return map[string]string{
+		"id":     raw.Id,
+		"name":   strings.TrimPrefix(raw.Name, "/"),
+		"image":  raw.Config.Image,
+		"state":  status,
+		"status": status,
+	}, nil
+}
+
+func (dc *DockerClient) Logs(id string) (string, error) {
+	if dc == nil || dc.client == nil {
+		return "", fmt.Errorf("docker client not initialized")
+	}
+	if !isValidContainerID(id) {
+		return "", fmt.Errorf("invalid container id")
+	}
+	url := fmt.Sprintf("%s/%s/containers/%s/logs?stdout=1&stderr=1&tail=200", dc.baseURL, dockerAPIVersion, id)
+	resp, err := dc.client.Get(url)
+	if err != nil {
+		return "", fmt.Errorf("docker logs: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := readLimited(resp.Body, outputCap)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("docker logs: unexpected status %d", resp.StatusCode)
+	}
+	return demuxDocker(body)
+}
+
+func (dc *DockerClient) Run(image string, cmd []string) (string, error) {
+	if dc == nil || dc.client == nil {
+		return "", fmt.Errorf("docker client not initialized")
+	}
+	if !imageAllowed(image) {
+		return "", fmt.Errorf("image not allowed")
+	}
+	if len(cmd) > 0 {
+		if err := validateArgv(cmd); err != nil {
+			return "", err
+		}
+	}
+	id, err := dc.createContainer(image, cmd)
+	if err != nil {
+		return "", err
+	}
+	if !isValidContainerID(id) {
+		return "", fmt.Errorf("invalid container id")
+	}
+	if err := dc.StartContainer(id); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+func (dc *DockerClient) createContainer(image string, cmd []string) (string, error) {
+	body := struct {
+		Image      string   `json:"Image"`
+		Cmd        []string `json:"Cmd,omitempty"`
+		HostConfig struct {
+			Privileged  bool     `json:"Privileged"`
+			NetworkMode string   `json:"NetworkMode"`
+			PidMode     string   `json:"PidMode"`
+			Binds       []string `json:"Binds"`
+			Mounts      []string `json:"Mounts"`
+			CapDrop     []string `json:"CapDrop"`
+			SecurityOpt []string `json:"SecurityOpt"`
+		} `json:"HostConfig"`
+	}{
+		Image: image,
+	}
+	if len(cmd) > 0 {
+		body.Cmd = cmd
+	}
+	body.HostConfig.Privileged = false
+	body.HostConfig.NetworkMode = "bridge"
+	body.HostConfig.PidMode = ""
+	body.HostConfig.CapDrop = []string{"ALL"}
+	body.HostConfig.SecurityOpt = []string{"no-new-privileges:true"}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return "", err
+	}
+	url := fmt.Sprintf("%s/%s/containers/create", dc.baseURL, dockerAPIVersion)
+	resp, err := dc.client.Post(url, "application/json", bytes.NewReader(raw))
+	if err != nil {
+		return "", fmt.Errorf("docker create: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, err := readLimited(resp.Body, dockerBodyCap)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusCreated {
+		return "", fmt.Errorf("docker create: unexpected status %d", resp.StatusCode)
+	}
+	var created struct {
+		Id string `json:"Id"`
+	}
+	if err := json.Unmarshal(respBody, &created); err != nil {
+		return "", fmt.Errorf("docker create: decode: %w", err)
+	}
+	return created.Id, nil
+}
+
+func (dc *DockerClient) Exec(id string, cmd []string) (string, error) {
+	if dc == nil || dc.client == nil {
+		return "", fmt.Errorf("docker client not initialized")
+	}
+	if !isValidContainerID(id) {
+		return "", fmt.Errorf("invalid container id")
+	}
+	if len(cmd) == 0 {
+		return "", fmt.Errorf("command required")
+	}
+	if err := validateArgv(cmd); err != nil {
+		return "", err
+	}
+	payload, err := json.Marshal(map[string]any{
+		"AttachStdout": true,
+		"AttachStderr": true,
+		"Tty":          false,
+		"Cmd":          cmd,
+	})
+	if err != nil {
+		return "", err
+	}
+	createURL := fmt.Sprintf("%s/%s/containers/%s/exec", dc.baseURL, dockerAPIVersion, id)
+	resp, err := dc.client.Post(createURL, "application/json", bytes.NewReader(payload))
+	if err != nil {
+		return "", fmt.Errorf("docker exec: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, err := readLimited(resp.Body, dockerBodyCap)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("docker exec: unexpected status %d", resp.StatusCode)
+	}
+	var created struct {
+		Id string `json:"Id"`
+	}
+	if err := json.Unmarshal(respBody, &created); err != nil {
+		return "", fmt.Errorf("docker exec: decode: %w", err)
+	}
+	if !isValidContainerID(created.Id) {
+		return "", fmt.Errorf("invalid exec id")
+	}
+	startPath := fmt.Sprintf("/%s/exec/%s/start", dockerAPIVersion, created.Id)
+	startBody := []byte(`{"Detach":false,"Tty":false}`)
+	var stream []byte
+	if dc.useUnixExec() {
+		stream, err = dc.execUnix(startPath, startBody)
+		if err != nil {
+			return "", err
+		}
+	} else {
+		stream, err = dc.execHTTP(dc.baseURL+startPath, startBody)
+		if err != nil {
+			return "", err
+		}
+	}
+	return demuxDocker(stream)
+}
+
+func (dc *DockerClient) useUnixExec() bool {
+	return dc.socketPath != "" && dc.baseURL == "http://localhost"
+}
+
+func (dc *DockerClient) execHTTP(url string, body []byte) ([]byte, error) {
+	client := &http.Client{Transport: dc.client.Transport, Timeout: 15 * time.Second}
+	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("docker exec: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, err := readLimited(resp.Body, outputCap)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusSwitchingProtocols {
+		return nil, fmt.Errorf("docker exec: unexpected status %d", resp.StatusCode)
+	}
+	return raw, nil
+}
+
+func (dc *DockerClient) execUnix(path string, body []byte) ([]byte, error) {
+	conn, err := net.DialTimeout("unix", dc.socketPath, 15*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("docker exec: %w", err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
+		return nil, err
+	}
+	var req bytes.Buffer
+	fmt.Fprintf(&req, "POST %s HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n", path, len(body))
+	req.Write(body)
+	if _, err := req.WriteTo(conn); err != nil {
+		return nil, fmt.Errorf("docker exec: %w", err)
+	}
+	raw, err := readLimited(conn, dockerBodyCap)
+	if err != nil {
+		return nil, err
+	}
+	return parseDockerHTTP(raw)
+}
+
+func parseDockerHTTP(raw []byte) ([]byte, error) {
+	idx := bytes.Index(raw, []byte("\r\n\r\n"))
+	if idx < 0 {
+		return nil, fmt.Errorf("docker exec: bad response")
+	}
+	header := raw[:idx]
+	line := header
+	if nl := bytes.Index(header, []byte("\r\n")); nl >= 0 {
+		line = header[:nl]
+	}
+	status := string(line)
+	if !strings.Contains(status, " 200 ") && !strings.Contains(status, " 101 ") {
+		return nil, fmt.Errorf("docker exec: unexpected status")
+	}
+	return raw[idx+4:], nil
+}
+
+func demuxDocker(body []byte) (string, error) {
+	if len(body) == 0 {
+		return "", nil
+	}
+	var out []byte
+	for len(body) > 0 {
+		if len(body) < 8 {
+			return "", fmt.Errorf("docker stream: short frame")
+		}
+		stream := body[0]
+		size := binary.BigEndian.Uint32(body[4:8])
+		if size > outputCap {
+			return "", fmt.Errorf("body exceeds cap")
+		}
+		body = body[8:]
+		if int(size) > len(body) {
+			return "", fmt.Errorf("docker stream: short frame")
+		}
+		frame := body[:size]
+		body = body[size:]
+		if stream != 1 && stream != 2 {
+			continue
+		}
+		if len(out)+len(frame) > outputCap {
+			return "", fmt.Errorf("body exceeds cap")
+		}
+		out = append(out, frame...)
+	}
+	return string(out), nil
 }

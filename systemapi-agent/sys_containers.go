@@ -103,3 +103,99 @@ func containerActionResult(err error) (starlark.Value, error) {
 	}
 	return result, nil
 }
+
+func (engine *SysscriptEngine) containersInspect(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var id string
+	if err := starlark.UnpackArgs("inspect", args, kwargs, "id", &id); err != nil {
+		return starlark.None, err
+	}
+	if !isValidContainerID(id) {
+		return starlark.None, fmt.Errorf("invalid container id")
+	}
+	if engine.dockerClient == nil {
+		return starlark.None, fmt.Errorf("docker client not initialized")
+	}
+	info, err := engine.dockerClient.Inspect(id)
+	if err != nil {
+		return starlark.None, err
+	}
+	return starlarkDict(info)
+}
+
+func (engine *SysscriptEngine) containersLogs(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var id string
+	if err := starlark.UnpackArgs("logs", args, kwargs, "id", &id); err != nil {
+		return starlark.None, err
+	}
+	if !isValidContainerID(id) {
+		return starlark.None, fmt.Errorf("invalid container id")
+	}
+	if engine.dockerClient == nil {
+		return starlark.None, fmt.Errorf("docker client not initialized")
+	}
+	text, err := engine.dockerClient.Logs(id)
+	if err != nil {
+		return starlark.None, err
+	}
+	return starlark.String(text), nil
+}
+
+func (engine *SysscriptEngine) containersRun(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var image string
+	var cmd *starlark.List
+	if err := starlark.UnpackArgs("run", args, kwargs, "image", &image, "cmd?", &cmd); err != nil {
+		return starlark.None, err
+	}
+	if !imageAllowed(image) || !exactGrant(engine.Entitlements.AllowImages, image) {
+		return starlark.None, fmt.Errorf("image not allowed")
+	}
+	argv, err := listStrings(cmd)
+	if err != nil {
+		return starlark.None, err
+	}
+	if len(argv) > 0 {
+		if err := validateArgv(argv); err != nil {
+			return starlark.None, err
+		}
+	}
+	if engine.dockerClient == nil {
+		return starlark.None, fmt.Errorf("docker client not initialized")
+	}
+	id, err := engine.dockerClient.Run(image, argv)
+	if err != nil {
+		return starlark.None, err
+	}
+	return starlark.String(id), nil
+}
+
+func (engine *SysscriptEngine) containersExec(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var id string
+	var cmd *starlark.List
+	if err := starlark.UnpackArgs("exec", args, kwargs, "id", &id, "cmd", &cmd); err != nil {
+		return starlark.None, err
+	}
+	if !isValidContainerID(id) {
+		return starlark.None, fmt.Errorf("invalid container id")
+	}
+	if cmd == nil {
+		return starlark.None, fmt.Errorf("command required")
+	}
+	argv, err := listStrings(cmd)
+	if err != nil {
+		return starlark.None, err
+	}
+	if len(argv) == 0 {
+		return starlark.None, fmt.Errorf("command required")
+	}
+	if err := validateArgv(argv); err != nil {
+		return starlark.None, err
+	}
+	if engine.dockerClient == nil {
+		return starlark.None, fmt.Errorf("docker client not initialized")
+	}
+	text, err := engine.dockerClient.Exec(id, argv)
+	if err != nil {
+		return starlark.None, err
+	}
+	return starlark.String(text), nil
+}

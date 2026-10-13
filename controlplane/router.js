@@ -1,6 +1,7 @@
 // Threats: missing auth, query-string API keys, cross-tenant object access,
-// and a viewer running exec. Each handler authenticates. Unknown hosts in
-// another tenant are 404. Does NOT expire API keys; that stays in the key store.
+// and a viewer running exec. A non-admin must not receive allow_k8s or an
+// image list, and "*" is not copied as allow-all. Each handler authenticates.
+// Unknown hosts in another tenant are 404. Does NOT expire API keys; that stays in the key store.
 // OAuth access tokens are session principals. Device and IdP secrets stay in
 // controlplane/oauth.js and are not written to the audit log.
 'use strict';
@@ -21,7 +22,7 @@ const SCRIPT_MAX = 64 * 1024;
 const COOLDOWN_MS = 5 * 60 * 1000;
 const USER_RE = /^[a-zA-Z0-9][a-zA-Z0-9._@-]{0,128}$/;
 const formBody = express.urlencoded({ extended: false, limit: '8kb' });
-const ENTITLEMENTS = [
+const BOOL_ENTITLEMENTS = [
   'allow_fs_write',
   'allow_fs_read',
   'allow_net_outbound',
@@ -31,6 +32,17 @@ const ENTITLEMENTS = [
   'allow_containers',
   'allow_k3s'
 ];
+const HOST_BOOL_ENTITLEMENTS = ['allow_linux', 'allow_k8s'];
+const LIST_ENTITLEMENTS = [
+  'allow_packages',
+  'allow_images',
+  'allow_k3s_namespaces',
+  'allow_k8s_namespaces',
+  'allow_net_manage',
+  'allow_mount_targets',
+  'allow_sysctl'
+];
+const DENIED_SYSCTL = new Set(['kernel.core_pattern', 'kernel.modprobe', 'kernel.hotplug']);
 
 function http(status, code) {
   const err = new Error(code);
@@ -199,15 +211,40 @@ function requireScope(fleet, principal, tenantId, scope) {
   }
 }
 
+function clampList(value) {
+  if (!Array.isArray(value)) return [];
+  const out = [];
+  for (const item of value) {
+    if (typeof item !== 'string') continue;
+    if (item.length === 0 || item.length > 256) continue;
+    if (item.includes('*') || item.includes('..') || item.includes('\0') || item.includes('\n') || item.includes('\r')) continue;
+    out.push(item);
+    if (out.length >= 32) break;
+  }
+  return out;
+}
+
 function clampEntitlements(requested, scopes) {
   const out = {};
-  for (const key of ENTITLEMENTS) out[key] = false;
-  if (!requested || typeof requested !== 'object') return out;
+  for (const key of BOOL_ENTITLEMENTS) out[key] = false;
+  for (const key of HOST_BOOL_ENTITLEMENTS) out[key] = false;
+  for (const key of LIST_ENTITLEMENTS) out[key] = [];
+  if (!requested || typeof requested !== 'object' || Array.isArray(requested)) return out;
   const admin = hasScope(scopes, 'admin');
-  for (const key of ENTITLEMENTS) {
+  for (const key of BOOL_ENTITLEMENTS) {
     if (!requested[key]) continue;
     if (key === 'allow_exec' && hasScope(scopes, 'exec:run')) out[key] = true;
     else if (admin) out[key] = true;
+  }
+  if (admin) {
+    for (const key of HOST_BOOL_ENTITLEMENTS) {
+      if (requested[key] === true) out[key] = true;
+    }
+    for (const key of LIST_ENTITLEMENTS) {
+      let items = clampList(requested[key]);
+      if (key === 'allow_sysctl') items = items.filter((item) => !DENIED_SYSCTL.has(item));
+      out[key] = items;
+    }
   }
   return out;
 }

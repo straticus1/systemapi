@@ -2,25 +2,35 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"gopkg.in/yaml.v3"
 )
 
 // K3sClient communicates with the Kubernetes API using TLS from kubeconfig.
+// k3s and k8s share this type. The script never receives the kubeconfig.
 type K3sClient struct {
 	client    *http.Client
 	serverURL string
+	tlsConfig *tls.Config
 }
+
+const kubeCallTimeout = 15 * time.Second
+
+const k3sKubeconfigPath = "/etc/rancher/k3s/k3s.yaml"
 
 // kubeconfig represents the minimal kubeconfig YAML structure.
 type kubeconfig struct {
@@ -76,20 +86,26 @@ type K8sPod struct {
 	} `json:"status"`
 }
 
-// NewK3sClient creates a client from kubeconfig.
-// Per D-04: tries /etc/rancher/k3s/k3s.yaml first, then KUBECONFIG env var.
+// NewK3sClient reads only /etc/rancher/k3s/k3s.yaml. It does not fall back to KUBECONFIG.
 func NewK3sClient() (*K3sClient, error) {
-	kubeconfigPath := "/etc/rancher/k3s/k3s.yaml"
-	if _, err := os.Stat(kubeconfigPath); os.IsNotExist(err) {
-		kubeconfigPath = os.Getenv("KUBECONFIG")
-		if kubeconfigPath == "" {
-			return nil, fmt.Errorf("no kubeconfig found: /etc/rancher/k3s/k3s.yaml missing and KUBECONFIG not set")
-		}
-	}
+	return newKubeClient(k3sKubeconfigPath)
+}
 
-	data, err := os.ReadFile(kubeconfigPath)
+// NewK8sClient reads KUBECONFIG and nothing else.
+func NewK8sClient() (*K3sClient, error) {
+	path := os.Getenv("KUBECONFIG")
+	if path == "" {
+		return nil, fmt.Errorf("KUBECONFIG not set")
+	}
+	return newKubeClient(path)
+}
+
+// Threats: TLS minimum is 1.3 and certificate verification stays on.
+// InsecureSkipVerify is never set. The kubeconfig is not returned to the script.
+func newKubeClient(path string) (*K3sClient, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("read kubeconfig: %w", err)
+		return nil, fmt.Errorf("read kubeconfig %s: %w", path, err)
 	}
 
 	var kc kubeconfig
@@ -100,7 +116,6 @@ func NewK3sClient() (*K3sClient, error) {
 		return nil, fmt.Errorf("kubeconfig missing clusters or users")
 	}
 
-	// Decode base64-encoded PEM certs (Pitfall 3 from RESEARCH.md)
 	caCertPEM, err := base64.StdEncoding.DecodeString(kc.Clusters[0].Cluster.CertificateAuthorityData)
 	if err != nil {
 		return nil, fmt.Errorf("decode CA cert: %w", err)
@@ -115,22 +130,24 @@ func NewK3sClient() (*K3sClient, error) {
 	}
 
 	caCertPool := x509.NewCertPool()
-	caCertPool.AppendCertsFromPEM(caCertPEM)
+	if !caCertPool.AppendCertsFromPEM(caCertPEM) {
+		return nil, fmt.Errorf("kubeconfig CA cert rejected")
+	}
 	tlsCert, err := tls.X509KeyPair(clientCertPEM, clientKeyPEM)
 	if err != nil {
 		return nil, fmt.Errorf("load TLS keypair: %w", err)
 	}
 
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			RootCAs:      caCertPool,
-			Certificates: []tls.Certificate{tlsCert},
-		},
+	tlsConfig := &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		RootCAs:      caCertPool,
+		Certificates: []tls.Certificate{tlsCert},
 	}
-
+	transport := &http.Transport{TLSClientConfig: tlsConfig}
 	return &K3sClient{
-		client:    &http.Client{Transport: transport, Timeout: 10 * time.Second},
+		client:    &http.Client{Transport: transport, Timeout: kubeCallTimeout},
 		serverURL: kc.Clusters[0].Cluster.Server,
+		tlsConfig: tlsConfig,
 	}, nil
 }
 
@@ -341,5 +358,281 @@ func normalizeYAMLForJSON(v interface{}) interface{} {
 		return out
 	default:
 		return v
+	}
+}
+
+// Threats: list and get decode name and namespace only, so env and data
+// secrets in the API body are dropped. Logs and exec are capped and are not
+// logged. The error stream fails the call. An empty namespace is rejected
+// here. This does not grant cluster-admin and does not disable TLS verification.
+
+type kubeObjectMeta struct {
+	Metadata struct {
+		Name      string `json:"name"`
+		Namespace string `json:"namespace"`
+	} `json:"metadata"`
+}
+
+type kubeObjectList struct {
+	Items []kubeObjectMeta `json:"items"`
+}
+
+func (kc *K3sClient) requireClient() error {
+	if kc == nil || kc.client == nil {
+		return fmt.Errorf("kube client not initialized")
+	}
+	return nil
+}
+
+func kubeResourceNames(kind, name, namespace string) (string, error) {
+	if namespace == "" {
+		return "", fmt.Errorf("namespace required")
+	}
+	if !isValidNamespace(namespace) {
+		return "", fmt.Errorf("invalid namespace: %q", namespace)
+	}
+	if name != "" && !dns1123Name(name) {
+		return "", fmt.Errorf("name not allowed")
+	}
+	api, err := kubeAPI(kind)
+	if err != nil {
+		return "", err
+	}
+	path, err := resourcePath(api, kind, namespace)
+	if err != nil {
+		return "", err
+	}
+	if name != "" {
+		path += "/" + name
+	}
+	return path, nil
+}
+
+func (kc *K3sClient) kubeDo(method, path string, max int) ([]byte, int, error) {
+	if err := kc.requireClient(); err != nil {
+		return nil, 0, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), kubeCallTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, method, kc.serverURL+path, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	resp, err := kc.client.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("kube %s: %w", method, err)
+	}
+	defer resp.Body.Close()
+	body, err := readLimited(resp.Body, max)
+	if err != nil {
+		return nil, resp.StatusCode, err
+	}
+	return body, resp.StatusCode, nil
+}
+
+func kubeMetaMap(item kubeObjectMeta) map[string]string {
+	return map[string]string{
+		"name":      item.Metadata.Name,
+		"namespace": item.Metadata.Namespace,
+	}
+}
+
+// ListResource returns name and namespace for one namespaced kind.
+// An empty namespace is an error. More than kubeItemCap items is an error.
+func (kc *K3sClient) ListResource(kind, namespace string) ([]map[string]string, error) {
+	path, err := kubeResourceNames(kind, "", namespace)
+	if err != nil {
+		return nil, err
+	}
+	body, status, err := kc.kubeDo(http.MethodGet, path, kubeListCap)
+	if err != nil {
+		return nil, err
+	}
+	if status < 200 || status >= 300 {
+		return nil, fmt.Errorf("kube list: unexpected status %d", status)
+	}
+	var list kubeObjectList
+	if err := json.Unmarshal(body, &list); err != nil {
+		return nil, fmt.Errorf("kube list: decode: %w", err)
+	}
+	if len(list.Items) > kubeItemCap {
+		return nil, fmt.Errorf("too many items")
+	}
+	out := make([]map[string]string, 0, len(list.Items))
+	for _, item := range list.Items {
+		out = append(out, kubeMetaMap(item))
+	}
+	return out, nil
+}
+
+// GetResource returns name and namespace. Other object fields are discarded.
+func (kc *K3sClient) GetResource(kind, name, namespace string) (map[string]string, error) {
+	if name == "" {
+		return nil, fmt.Errorf("name not allowed")
+	}
+	path, err := kubeResourceNames(kind, name, namespace)
+	if err != nil {
+		return nil, err
+	}
+	body, status, err := kc.kubeDo(http.MethodGet, path, kubeListCap)
+	if err != nil {
+		return nil, err
+	}
+	if status < 200 || status >= 300 {
+		return nil, fmt.Errorf("kube get: unexpected status %d", status)
+	}
+	var item kubeObjectMeta
+	if err := json.Unmarshal(body, &item); err != nil {
+		return nil, fmt.Errorf("kube get: decode: %w", err)
+	}
+	return kubeMetaMap(item), nil
+}
+
+// DeleteResource accepts 200, 202, and 204.
+func (kc *K3sClient) DeleteResource(kind, name, namespace string) error {
+	if name == "" {
+		return fmt.Errorf("name not allowed")
+	}
+	path, err := kubeResourceNames(kind, name, namespace)
+	if err != nil {
+		return err
+	}
+	_, status, err := kc.kubeDo(http.MethodDelete, path, kubeListCap)
+	if err != nil {
+		return err
+	}
+	switch status {
+	case http.StatusOK, http.StatusAccepted, http.StatusNoContent:
+		return nil
+	default:
+		return fmt.Errorf("kube delete: unexpected status %d", status)
+	}
+}
+
+// PodLogs reads a capped pod log. container may be empty.
+func (kc *K3sClient) PodLogs(namespace, name, container string) (string, error) {
+	if namespace == "" {
+		return "", fmt.Errorf("namespace required")
+	}
+	if !isValidNamespace(namespace) {
+		return "", fmt.Errorf("invalid namespace: %q", namespace)
+	}
+	if !dns1123Name(name) {
+		return "", fmt.Errorf("name not allowed")
+	}
+	if container != "" && !dns1123Name(container) {
+		return "", fmt.Errorf("name not allowed")
+	}
+	q := url.Values{}
+	q.Set("tailLines", "200")
+	if container != "" {
+		q.Set("container", container)
+	}
+	path := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s/log?%s", namespace, name, q.Encode())
+	body, status, err := kc.kubeDo(http.MethodGet, path, outputCap)
+	if err != nil {
+		return "", err
+	}
+	if status != http.StatusOK {
+		return "", fmt.Errorf("kube logs: unexpected status %d", status)
+	}
+	return string(body), nil
+}
+
+// PodExec attaches to one pod command over the Kubernetes exec websocket.
+// Stream 3 is an error and discards any partial output.
+func (kc *K3sClient) PodExec(namespace, name string, cmd []string) (string, error) {
+	if namespace == "" {
+		return "", fmt.Errorf("namespace required")
+	}
+	if !isValidNamespace(namespace) {
+		return "", fmt.Errorf("invalid namespace: %q", namespace)
+	}
+	if !dns1123Name(name) {
+		return "", fmt.Errorf("name not allowed")
+	}
+	if len(cmd) == 0 {
+		return "", fmt.Errorf("command required")
+	}
+	if err := validateArgv(cmd); err != nil {
+		return "", err
+	}
+	if err := kc.requireClient(); err != nil {
+		return "", err
+	}
+	base, err := url.Parse(kc.serverURL)
+	if err != nil || base.Host == "" {
+		return "", fmt.Errorf("kube exec: bad server")
+	}
+	switch base.Scheme {
+	case "http":
+		base.Scheme = "ws"
+	case "https":
+		base.Scheme = "wss"
+	default:
+		return "", fmt.Errorf("kube exec: bad server")
+	}
+	q := url.Values{}
+	q.Set("stdout", "true")
+	q.Set("stderr", "true")
+	q.Set("tty", "false")
+	for _, arg := range cmd {
+		q.Add("command", arg)
+	}
+	base.Path = fmt.Sprintf("/api/v1/namespaces/%s/pods/%s/exec", namespace, name)
+	base.RawQuery = q.Encode()
+	dialer := websocket.Dialer{
+		TLSClientConfig:  kc.tlsConfig,
+		HandshakeTimeout: kubeCallTimeout,
+		Subprotocols:     []string{"v4.channel.k8s.io"},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), kubeCallTimeout)
+	defer cancel()
+	conn, resp, err := dialer.DialContext(ctx, base.String(), nil)
+	if resp != nil && resp.Body != nil {
+		_, copyErr := io.Copy(io.Discard, io.LimitReader(resp.Body, outputCap))
+		closeErr := resp.Body.Close()
+		if err == nil && copyErr != nil {
+			if conn != nil {
+				conn.Close()
+			}
+			return "", fmt.Errorf("kube exec: %w", copyErr)
+		}
+		if err == nil && closeErr != nil {
+			if conn != nil {
+				conn.Close()
+			}
+			return "", fmt.Errorf("kube exec: %w", closeErr)
+		}
+	}
+	if err != nil {
+		return "", fmt.Errorf("kube exec: %w", err)
+	}
+	defer conn.Close()
+	if err := conn.SetReadDeadline(time.Now().Add(kubeCallTimeout)); err != nil {
+		return "", err
+	}
+	var out strings.Builder
+	for {
+		_, msg, readErr := conn.ReadMessage()
+		if readErr != nil {
+			if websocket.IsCloseError(readErr, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived) || errors.Is(readErr, io.EOF) {
+				return out.String(), nil
+			}
+			return "", fmt.Errorf("kube exec: %w", readErr)
+		}
+		if len(msg) == 0 {
+			continue
+		}
+		payload := msg[1:]
+		switch msg[0] {
+		case 1, 2:
+			if out.Len()+len(payload) > outputCap {
+				return "", fmt.Errorf("body exceeds cap")
+			}
+			out.Write(payload)
+		case 3:
+			return "", fmt.Errorf("kube exec: %s", capText(string(payload), installErrCap))
+		}
 	}
 }

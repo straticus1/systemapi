@@ -64,30 +64,4 @@ func (engine *SysscriptEngine) eventsListen(thread *starlark.Thread, b *starlark
 	return starlark.True, nil
 }
 
-// --- sys.packages ---
 
-// sys.packages.install(name)
-func (engine *SysscriptEngine) packagesInstall(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	var name string
-	if err := starlark.UnpackArgs("install", args, kwargs, "name", &name); err != nil {
-		return starlark.None, err
-	}
-
-	log.Printf("[Package Management] Installing %s", name)
-	// Stub to wrap apt/dnf/brew/choco
-	return starlark.True, nil
-}
-
-// --- sys.containers ---
-
-// sys.containers.run(image)
-func (engine *SysscriptEngine) containersRun(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	var image string
-	if err := starlark.UnpackArgs("run", args, kwargs, "image", &image); err != nil {
-		return starlark.None, err
-	}
-
-	log.Printf("[Container Orchestration] Running %s", image)
-	// Stub to interact with local Docker daemon
-	return starlark.True, nil
-}

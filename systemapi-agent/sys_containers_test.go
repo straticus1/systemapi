@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/binary"
 	"encoding/json"
+	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -279,6 +281,7 @@ func TestContainerIDValidation(t *testing.T) {
 		{strings.Repeat("a", 129), false}, // too long
 		{"has space", false},
 		{"has/slash", false},
+		{"..", false},
 	}
 
 	for _, tc := range cases {
@@ -286,5 +289,259 @@ func TestContainerIDValidation(t *testing.T) {
 		if got != tc.valid {
 			t.Errorf("isValidContainerID(%q) = %v, want %v", tc.id, got, tc.valid)
 		}
+	}
+}
+
+func dockerFrame(stream byte, payload string) []byte {
+	buf := make([]byte, 8+len(payload))
+	buf[0] = stream
+	binary.BigEndian.PutUint32(buf[4:8], uint32(len(payload)))
+	copy(buf[8:], payload)
+	return buf
+}
+
+func TestContainersRunBuildsHostConfig(t *testing.T) {
+	var createBody []byte
+	var methods []string
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		methods = append(methods, r.Method+" "+r.URL.Path)
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/containers/create"):
+			body, err := io.ReadAll(io.LimitReader(r.Body, int64(dockerBodyCap)+1))
+			if err != nil {
+				t.Error(err)
+			}
+			if len(body) > dockerBodyCap {
+				t.Error("create body exceeds cap")
+			}
+			createBody = body
+			w.WriteHeader(http.StatusCreated)
+			if _, err := w.Write([]byte(`{"Id":"abc123"}`)); err != nil {
+				t.Error(err)
+			}
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/start"):
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	dc, srv := newTestDockerClient(handler)
+	defer srv.Close()
+	engine := newTestEngineWithDocker(dc)
+	engine.Entitlements.AllowImages = []string{"nginx:latest"}
+	out, err := engine.Execute("id = sys.containers.run(\"nginx:latest\")\nprint(id)\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(out) != "abc123" {
+		t.Fatalf("%q", out)
+	}
+	raw := string(createBody)
+	if strings.Contains(raw, "docker.sock") || strings.Contains(raw, `"Privileged":true`) {
+		t.Fatal(raw)
+	}
+	if !strings.Contains(raw, `"Privileged":false`) || !strings.Contains(raw, `"Binds":null`) || !strings.Contains(raw, `"Mounts":null`) {
+		t.Fatal(raw)
+	}
+	var body struct {
+		HostConfig struct {
+			Privileged  bool
+			NetworkMode string
+			PidMode     string
+			Binds       []string
+			Mounts      []string
+			CapDrop     []string
+			SecurityOpt []string
+		}
+	}
+	if err := json.Unmarshal(createBody, &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.HostConfig.Privileged || body.HostConfig.NetworkMode != "bridge" || body.HostConfig.PidMode != "" || body.HostConfig.Binds != nil || body.HostConfig.Mounts != nil {
+		t.Fatalf("%+v", body.HostConfig)
+	}
+	if len(body.HostConfig.CapDrop) != 1 || body.HostConfig.CapDrop[0] != "ALL" || !strings.Contains(strings.Join(body.HostConfig.SecurityOpt, ","), "no-new-privileges") {
+		t.Fatalf("%+v", body.HostConfig)
+	}
+	if strings.Contains(strings.Join(methods, "\n"), "DELETE") {
+		t.Fatal(methods)
+	}
+}
+
+func TestContainersRunStartFailureDoesNotDelete(t *testing.T) {
+	startHits := 0
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			t.Error("delete after failed start")
+		}
+		if strings.HasSuffix(r.URL.Path, "/containers/create") {
+			w.WriteHeader(http.StatusCreated)
+			w.Write([]byte(`{"Id":"abc123"}`))
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/start") {
+			startHits++
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		http.NotFound(w, r)
+	})
+	dc, srv := newTestDockerClient(handler)
+	defer srv.Close()
+	engine := newTestEngineWithDocker(dc)
+	engine.Entitlements.AllowImages = []string{"nginx:latest"}
+	_, err := engine.Execute("sys.containers.run(\"nginx:latest\")\n")
+	if err == nil || startHits != 1 {
+		t.Fatalf("err=%v startHits=%d", err, startHits)
+	}
+}
+
+func TestContainersRunRejectsBadCreateID(t *testing.T) {
+	startHits := 0
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/start") {
+			startHits++
+		}
+		if strings.HasSuffix(r.URL.Path, "/containers/create") {
+			w.WriteHeader(http.StatusCreated)
+			w.Write([]byte(`{"Id":".."}`))
+			return
+		}
+		http.NotFound(w, r)
+	})
+	dc, srv := newTestDockerClient(handler)
+	defer srv.Close()
+	engine := newTestEngineWithDocker(dc)
+	engine.Entitlements.AllowImages = []string{"nginx:latest"}
+	_, err := engine.Execute("sys.containers.run(\"nginx:latest\")\n")
+	if err == nil || !strings.Contains(err.Error(), "invalid container id") || startHits != 0 {
+		t.Fatalf("err=%v startHits=%d", err, startHits)
+	}
+}
+
+func TestContainersRunPolicyBeforeHTTP(t *testing.T) {
+	hits := 0
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusCreated)
+	})
+	dc, srv := newTestDockerClient(handler)
+	defer srv.Close()
+	engine := newTestEngineWithDocker(dc)
+	engine.Entitlements.AllowImages = []string{"*"}
+	_, err := engine.Execute("sys.containers.run(\"nginx:latest\")\n")
+	if err == nil || !strings.Contains(err.Error(), "image not allowed") || hits != 0 {
+		t.Fatalf("err=%v hits=%d", err, hits)
+	}
+	_, err = engine.Execute("sys.containers.run(\"nginx:latest\", (\"echo\",))\n")
+	if err == nil || hits != 0 {
+		t.Fatalf("tuple err=%v hits=%d", err, hits)
+	}
+}
+
+func TestContainersRunNilClient(t *testing.T) {
+	engine := newTestEngine(&Entitlements{AllowContainers: true, AllowImages: []string{"nginx:latest"}})
+	_, err := engine.Execute("sys.containers.run(\"nginx:latest\")\n")
+	if err == nil || !strings.Contains(err.Error(), "docker client not initialized") {
+		t.Fatal(err)
+	}
+}
+
+func TestContainersInspectAndLogs(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/json") {
+			w.Write([]byte(`{"Id":"abc123","Name":"/mycontainer","Config":{"Image":"nginx:latest","Env":["SECRET=nope"]},"State":{"Status":"running"}}`))
+			return
+		}
+		if strings.Contains(r.URL.Path, "/logs") {
+			w.Write(dockerFrame(1, "hello"))
+			return
+		}
+		http.NotFound(w, r)
+	})
+	dc, srv := newTestDockerClient(handler)
+	defer srv.Close()
+	engine := newTestEngineWithDocker(dc)
+	out, err := engine.Execute("info = sys.containers.inspect(\"abc123\")\nprint(info[\"id\"])\nprint(info[\"name\"])\nprint(info[\"image\"])\nprint(info[\"state\"])\nprint(\"env\" in info)\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "abc123") || !strings.Contains(out, "mycontainer") || !strings.Contains(out, "nginx:latest") || !strings.Contains(out, "running") || !strings.Contains(out, "False") || strings.Contains(out, "SECRET") {
+		t.Fatalf("%q", out)
+	}
+	out, err = engine.Execute("print(sys.containers.logs(\"abc123\"))\n")
+	if err != nil || strings.TrimSpace(out) != "hello" {
+		t.Fatalf("%q %v", out, err)
+	}
+}
+
+func TestContainersExecAndBadID(t *testing.T) {
+	hits := 0
+	startHits := 0
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if strings.HasSuffix(r.URL.Path, "/exec") && r.Method == http.MethodPost && !strings.Contains(r.URL.Path, "/exec/") {
+			w.WriteHeader(http.StatusCreated)
+			w.Write([]byte(`{"Id":"abc"}`))
+			return
+		}
+		if strings.Contains(r.URL.Path, "/exec/") && strings.HasSuffix(r.URL.Path, "/start") {
+			startHits++
+			w.Write(dockerFrame(1, "hello"))
+			return
+		}
+		http.NotFound(w, r)
+	})
+	dc, srv := newTestDockerClient(handler)
+	defer srv.Close()
+	engine := newTestEngineWithDocker(dc)
+	out, err := engine.Execute("print(sys.containers.exec(\"abc123\", [\"echo\", \"hi\"]))\n")
+	if err != nil || strings.TrimSpace(out) != "hello" || startHits != 1 {
+		t.Fatalf("%q %v start=%d", out, err, startHits)
+	}
+	before := hits
+	_, err = engine.Execute("sys.containers.exec(\"../x\", [\"echo\"])\n")
+	if err == nil || !strings.Contains(err.Error(), "invalid container id") || hits != before {
+		t.Fatalf("err=%v hits=%d before=%d", err, hits, before)
+	}
+}
+
+func TestContainersExecRejectsBadExecID(t *testing.T) {
+	startHits := 0
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/start") {
+			startHits++
+		}
+		if strings.HasSuffix(r.URL.Path, "/exec") {
+			w.WriteHeader(http.StatusCreated)
+			w.Write([]byte(`{"Id":".."}`))
+			return
+		}
+		http.NotFound(w, r)
+	})
+	dc, srv := newTestDockerClient(handler)
+	defer srv.Close()
+	engine := newTestEngineWithDocker(dc)
+	_, err := engine.Execute("sys.containers.exec(\"abc123\", [\"echo\"])\n")
+	if err == nil || !strings.Contains(err.Error(), "invalid exec id") || startHits != 0 {
+		t.Fatalf("err=%v start=%d", err, startHits)
+	}
+}
+
+func TestDockerStreamHelpers(t *testing.T) {
+	if _, err := demuxDocker([]byte{1, 0, 0, 0, 0, 0, 0, 1}); err == nil || !strings.Contains(err.Error(), "docker stream: short frame") {
+		t.Fatal(err)
+	}
+	frame := append(dockerFrame(3, "skip"), dockerFrame(1, "ok")...)
+	got, err := demuxDocker(frame)
+	if err != nil || got != "ok" {
+		t.Fatalf("%q %v", got, err)
+	}
+	body, err := parseDockerHTTP([]byte("HTTP/1.1 200 OK\r\n\r\nhello"))
+	if err != nil || string(body) != "hello" {
+		t.Fatalf("%q %v", body, err)
+	}
+	if _, err := parseDockerHTTP([]byte("HTTP/1.1 500 ERR\r\n\r\nx")); err == nil {
+		t.Fatal("accepted 500")
 	}
 }

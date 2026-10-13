@@ -11,7 +11,7 @@ const express = require('express');
 const session = require('express-session');
 
 const { MemoryRegistry } = require('../controlplane/registry');
-const { mount } = require('../controlplane/router');
+const { mount, clampEntitlements } = require('../controlplane/router');
 const { TEST_SEED, privateKeyFromSeed, rawPublicKey, buildSigner } = require('../controlplane/keys');
 const { issueLease, verifyLease, canonicalLease, payloadHash } = require('../controlplane/lease');
 const { tokenEqual, randomToken } = require('../controlplane/token');
@@ -19,7 +19,7 @@ const { demoKeyAllowed, agentAuthFromRequest, ticketFromRequest } = require('../
 const { validateSSHPublicKey } = require('../controlplane/sshkey');
 const { assertWebhookURL } = require('../controlplane/webhook');
 const { cronValid, cronMatches, zscore } = require('../controlplane/stats');
-const { OPERATOR, scopesForKeyRows } = require('../controlplane/authz');
+const { OPERATOR, scopesForKeyRows, scopesForRole } = require('../controlplane/authz');
 const { sealSecret, openSecret } = require('../controlplane/seal');
 const { refreshGauges } = require('../controlplane/index');
 const { startDevice, pollToken, completeExternal } = require('../controlplane/oauth');
@@ -1058,5 +1058,61 @@ test('cli login writes a mode 0600 token and prints only the verification URL', 
     server.close();
     fs.rmSync(tokenFile, { force: true });
     fs.rmSync(mismatchFile, { force: true });
+  }
+});
+
+test('clampEntitlements denies host lists to operators and stars to admins', () => {
+  const operator = scopesForRole('operator');
+  const op = clampEntitlements({
+    allow_exec: true,
+    allow_fs_write: true,
+    allow_k8s: true,
+    allow_linux: true,
+    allow_images: ['nginx:latest'],
+    allow_packages: ['nginx']
+  }, operator);
+  assert.equal(op.allow_exec, true);
+  assert.equal(typeof op.allow_exec, 'boolean');
+  assert.equal(op.allow_fs_write, false);
+  assert.equal(typeof op.allow_fs_write, 'boolean');
+  assert.equal(op.allow_k8s, false);
+  assert.equal(op.allow_linux, false);
+  assert.deepEqual(op.allow_images, []);
+  assert.deepEqual(op.allow_packages, []);
+
+  const admin = scopesForRole('admin');
+  const boolList = clampEntitlements({ allow_images: true, allow_packages: true }, admin);
+  assert.deepEqual(boolList.allow_images, []);
+  assert.deepEqual(boolList.allow_packages, []);
+
+  const long = 'a'.repeat(257);
+  const pkgs = [long];
+  for (let i = 0; i < 33; i++) pkgs.push('pkg' + i);
+  const filtered = clampEntitlements({
+    allow_images: ['nginx:latest', '*', 'a..b', 'bad\n', 1, ''],
+    allow_packages: pkgs,
+    allow_sysctl: ['kernel.core_pattern', 'kernel.modprobe', 'kernel.hotplug', 'net.ipv4.ip_forward'],
+    allow_linux: 'yes',
+    allow_k8s: true
+  }, admin);
+  assert.deepEqual(filtered.allow_images, ['nginx:latest']);
+  assert.equal(filtered.allow_packages.length, 32);
+  assert.equal(filtered.allow_packages[0], 'pkg0');
+  assert.equal(filtered.allow_packages[31], 'pkg31');
+  assert.equal(filtered.allow_packages.includes('pkg32'), false);
+  assert.equal(filtered.allow_packages.includes(long), false);
+  assert.deepEqual(filtered.allow_sysctl, ['net.ipv4.ip_forward']);
+  assert.equal(filtered.allow_linux, false);
+  assert.equal(filtered.allow_k8s, true);
+  assert.equal(filtered.allow_exec, false);
+
+  for (const requested of [null, 'yes', ['allow_exec']]) {
+    const denied = clampEntitlements(requested, admin);
+    assert.equal(denied.allow_exec, false);
+    assert.equal(denied.allow_linux, false);
+    assert.equal(denied.allow_k8s, false);
+    assert.deepEqual(denied.allow_images, []);
+    assert.deepEqual(denied.allow_packages, []);
+    assert.deepEqual(denied.allow_sysctl, []);
   }
 });
