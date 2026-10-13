@@ -774,7 +774,6 @@ async function listLinks(registry, userIds) {
 
 module.exports = {
   DEVICE_GRANT,
-  publicBase,
   startDevice,
   verifyPage,
   approveUserCode,

@@ -33,4 +33,4 @@ function readPlaybook(id) {
   return fs.readFileSync(file, 'utf8');
 }
 
-module.exports = { DIR, listPlaybooks, readPlaybook };
+module.exports = { listPlaybooks, readPlaybook };

@@ -88,13 +88,8 @@ function fail(error) {
 }
 
 module.exports = {
-  ACTIONS,
-  MAX_TTL_S,
-  SKEW_S,
-  sha256Hex,
   payloadHash,
   canonicalLease,
-  hashEqual,
   issueLease,
   verifyLease
 };

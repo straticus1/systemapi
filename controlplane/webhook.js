@@ -59,4 +59,4 @@ function assertWebhookURL(raw, env) {
   return url;
 }
 
-module.exports = { assertWebhookURL, parseIPv4, hostIPv4 };
+module.exports = { assertWebhookURL, hostIPv4 };

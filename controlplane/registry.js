@@ -979,10 +979,7 @@ async function createRegistry({ pool, env, logger = console }) {
 }
 
 module.exports = {
-  METRICS,
   MemoryRegistry,
-  PgRegistry,
   createRegistry,
-  publicHost,
   fingerprint
 };

@@ -50,7 +50,6 @@ function scopesForKeyRows(rows, env) {
 
 module.exports = {
   ALL,
-  VIEWER,
   OPERATOR,
   scopesForRole,
   hasScope,

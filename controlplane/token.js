@@ -27,4 +27,4 @@ function fingerprint(value) {
   return createHash('sha256').update(value).digest('hex');
 }
 
-module.exports = { MIN_BYTES, randomToken, tokenEqual, fingerprint };
+module.exports = { randomToken, tokenEqual, fingerprint };

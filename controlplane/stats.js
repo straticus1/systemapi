@@ -142,11 +142,8 @@ module.exports = {
   zscore,
   linearForecast,
   efficiency,
-  fieldMatch,
-  fieldValid,
   cronValid,
   cronMatches,
-  csvCell,
   toCSV,
   escapeLike,
   bucketName
