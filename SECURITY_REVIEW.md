@@ -53,6 +53,8 @@ The agent can emit telemetry before it has pinned the control public key. The se
 
 PTY input, resize, and stop are not covered by a new lease after `pty_start`. A second `pty_start` replaces the session. The timer is the lease expiry.
 
+Sessions use express-session's default in-memory store. They are lost on restart and are not shared between replicas. `server.js`.
+
 `modules/` no longer contains the unwired quantum, blockchain, machine-learning, and integration files. Do not put them back.
 
 ## Not claimed
