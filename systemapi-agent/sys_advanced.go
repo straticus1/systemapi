@@ -9,59 +9,37 @@ import (
 
 // --- sys.alerts ---
 
-// sys.alerts.push(severity, message)
+// sys.alerts.push(severity, message) writes the alert to the agent log only.
+// Nothing forwards it to the control plane yet, so it returns False to tell
+// the script the alert was not delivered.
 func (engine *SysscriptEngine) alertsPush(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	var severity, message string
 	if err := starlark.UnpackArgs("push", args, kwargs, "severity", &severity, "message", &message); err != nil {
 		return starlark.None, err
 	}
-
-	log.Printf("[Agent -> Dashboard Alert] Severity: %s | Message: %s", severity, message)
-	
-	// TODO: Actually send this alert back up the WebSocket to the Fleet Manager Rules Engine
-	
-	return starlark.True, nil
+	log.Printf("[sysscript alert, not forwarded] severity=%s message=%s", severity, message)
+	return starlark.False, nil
 }
 
-// --- sys.security ---
+// --- sys.security and sys.events ---
+// These names are reserved but have no implementation. They fail so a script
+// never mistakes a missing scanner for a clean result.
+
+func notImplemented(name string) error {
+	return fmt.Errorf("%s is not implemented in this agent", name)
+}
 
 // sys.security.yara_scan(path)
 func (engine *SysscriptEngine) securityYaraScan(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	var path string
-	if err := starlark.UnpackArgs("yara_scan", args, kwargs, "path", &path); err != nil {
-		return starlark.None, err
-	}
-
-	// Stub for DarkScan/YARA cgo compilation
-	return starlark.String(fmt.Sprintf("Simulated YARA scan clean: %s", path)), nil
+	return starlark.None, notImplemented("sys.security.yara_scan")
 }
 
 // sys.security.scan_memory(pid)
 func (engine *SysscriptEngine) securityScanMemory(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	var pid int
-	if err := starlark.UnpackArgs("scan_memory", args, kwargs, "pid", &pid); err != nil {
-		return starlark.None, err
-	}
-
-	// Stub for ADS Memory Forensics invocation
-	return starlark.String(fmt.Sprintf("Simulated Memory Forensic scan of PID %d complete", pid)), nil
+	return starlark.None, notImplemented("sys.security.scan_memory")
 }
-
-// --- sys.events ---
 
 // sys.events.listen(event_type, callback)
 func (engine *SysscriptEngine) eventsListen(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	var eventType string
-	var callback starlark.Callable
-	if err := starlark.UnpackArgs("listen", args, kwargs, "event_type", &eventType, "callback", &callback); err != nil {
-		return starlark.None, err
-	}
-
-	log.Printf("[eBPF/ETW Hook] Subscribed to %s", eventType)
-	
-	// Stub for native OS event hooking
-	
-	return starlark.True, nil
+	return starlark.None, notImplemented("sys.events.listen")
 }
-
-
