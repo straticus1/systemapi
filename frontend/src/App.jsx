@@ -35,7 +35,7 @@ function App() {
   // Check for OAuth session on mount
   useEffect(() => {
     checkSession();
-  }, []);
+  }, [checkSession]);
 
   return (
     <BrowserRouter>

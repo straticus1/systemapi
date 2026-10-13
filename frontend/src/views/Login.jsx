@@ -23,7 +23,7 @@ const Login = () => {
         // User is authenticated via OAuth, redirect to dashboard
         setApiKey('oauth_session'); // Use a placeholder to indicate OAuth auth
       }
-    } catch (err) {
+    } catch {
       // Not authenticated, show login options
     }
   };
