@@ -45,6 +45,9 @@ type ResponseMessage struct {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "verify-recording" {
+		os.Exit(runVerifyRecording(os.Args[2:], os.Stdout, os.Stderr))
+	}
 	serverURL := flag.String("server", "ws://localhost:3003/api/v1/systems/stream", "WebSocket stream URL")
 	apiKeyFlag := flag.String("api-key", "", "API key (visible in the process list); prefer SYSTEMAPI_API_KEY or --api-key-file")
 	apiKeyFileFlag := flag.String("api-key-file", "", "file holding the API key (mode 0600)")
@@ -55,8 +58,21 @@ func main() {
 	ptyAllowAgentUserFlag := flag.Bool("pty-allow-agent-user", false, "let a non-root agent run terminal:open shells as its own user (the shell can read the agent's key and state; recording is user_owned)")
 	ptyRecordFlag := flag.Bool("pty-record", true, "record every terminal session in an HMAC-chained file")
 	ptyRecordDirFlag := flag.String("pty-record-dir", "", "terminal recordings (default: "+ptyRootRecordDir+" as root, else <state dir>/recordings)")
+	ptyRecordMaxFlag := flag.Int64("pty-record-max-bytes", recordMaxBytesDefault, "end a terminal session once it has recorded this many bytes")
+	ptyRecordMinFreeFlag := flag.Uint64("pty-record-min-free", recordMinFreeDefault, "refuse a terminal session when the recording filesystem has less free space (bytes)")
 	flag.Parse()
-	ptyCfg = ptySettings{User: *ptyUserFlag, AllowAgentUser: *ptyAllowAgentUserFlag, Record: *ptyRecordFlag, RecordDir: *ptyRecordDirFlag}
+	if *ptyRecordMaxFlag <= 0 || *ptyRecordMinFreeFlag == 0 {
+		fmt.Fprintln(os.Stderr, "Error: --pty-record-max-bytes and --pty-record-min-free must be positive")
+		os.Exit(2)
+	}
+	ptyCfg = ptySettings{
+		User:           *ptyUserFlag,
+		AllowAgentUser: *ptyAllowAgentUserFlag,
+		Record:         *ptyRecordFlag,
+		RecordDir:      *ptyRecordDirFlag,
+		RecordMaxBytes: *ptyRecordMaxFlag,
+		RecordMinFree:  *ptyRecordMinFreeFlag,
+	}
 	if !ptyCfg.Record {
 		log.Printf("WARNING: terminal recording is OFF (--pty-record=false)")
 	}

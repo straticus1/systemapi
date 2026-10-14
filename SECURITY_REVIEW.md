@@ -57,6 +57,10 @@ Terminal sessions (sahconnect phase 1, 2026-10-14). Each session has a server-ge
 
 Recording is done by the agent: every input and output byte goes into an HMAC-chained, per-session file under a 0700 directory, keyed by a 0600 CSPRNG key only the agent reads. The final digest is in the `terminal_end` audit row. A record that cannot be opened, written, or kept up with refuses or ends the session; bytes are not dropped. Mode `user_owned` (non-root agent) means the shell's user holds the key and can rewrite the record; only the audit row's digest then shows what was recorded at the end. The recording file is not marked append-only in the filesystem, and root on the host can rewrite it and recompute the chain.
 
+Terminal follow-up (2026-10-14). The agent refuses `terminal:root` unless it records the session itself (`agent` mode), and the server forwards no client input until the session is announced, which is after the start audit row and the recording check. Ticket rate limits are per actor and host, with a separate budget for break-glass and `terminal:root`. Each recording is capped (`--pty-record-max-bytes`, 1 GiB) and a session is refused when the recording filesystem has less than `--pty-record-min-free` (1 GiB). `systemapi-agent verify-recording` checks a recording's chain, requires its end line, and compares the digest with the audit row. On Linux the agent waits for the shell with `waitid(WNOWAIT)`, signals its process group while the shell is still an unreaped zombie (so the group id cannot be reused), signals other session members through pidfds after re-checking their session id, and only then reaps. On other platforms it reaps first and a reused group id is possible; macOS is not managed.
+
+Residual (2026-10-14): cgroup-based containment for setsid/tmux escapes (follow-up).
+
 Terminal tickets live in process memory. They are lost on restart and are not shared between server nodes; run one node until phase 4 moves them to shared storage. `controlplane/tickets.js`.
 
 Sessions use express-session's default in-memory store. They are lost on restart and are not shared between replicas. `server.js`.

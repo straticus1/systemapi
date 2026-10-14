@@ -46,8 +46,11 @@ POST /api/v1/ws-ticket   {"host_id": "...", "purpose": "terminal:open" | "termin
   only. The shell runs as root.
 - Response: `{"ticket": "stk_...", "expires_at": "<iso8601>"}`. The ticket is
   single-use, valid 60 s, and bound to host and purpose.
-- `429 {"error": "rate_limited"}` when the host has had too many tickets in
-  the last minute (`SYSTEMAPI_TICKET_RATE_PER_HOST`, default 20).
+- `429 {"error": "rate_limited"}` when the caller has asked for too many
+  tickets for this host in the last minute. The budget is per caller and
+  host: `SYSTEMAPI_TICKET_RATE_PER_HOST` (default 20) for `terminal:open`, and
+  a separate `SYSTEMAPI_TICKET_RATE_PRIVILEGED` (default 20) for
+  `terminal:root` and break-glass.
 
 ## 3. Open the terminal
 
@@ -112,9 +115,15 @@ expires. A dead server therefore cannot leave a shell running for long.
   `adssh` and is also recorded by the agent.
 - If the record cannot be opened or written, or the recorder cannot keep up,
   the session is refused or ended. It never runs unrecorded and never drops
-  bytes. A refusal at start is `recording_unavailable`.
+  bytes. A refusal at start is `recording_unavailable`, including when the
+  recording filesystem has less than the configured free space (default
+  1 GiB). A session that reaches its recording size cap (default 1 GiB) ends
+  with `pty_exit` reason `stopped`; the audit row says `recording_size_limit`.
 - Until phase 2 policy exists, a `terminal:root` session whose recording is
-  not `agent` is refused with `recording_unavailable`.
+  not `agent` is refused with `recording_unavailable`. The agent and the
+  server both enforce this.
+- Nothing the client sends reaches the shell until `started` has been sent,
+  which is after the start audit row is written.
 - Phase 2 makes recording configurable per tenant and per user, with an admin
   lock.
 - **The server writes audit-chain records for:**
@@ -123,6 +132,8 @@ expires. A dead server therefore cannot leave a shell running for long.
     any privileged groups of the pty user;
   - session ended: session id, reason, exit code, duration, and the agent's
     final recording digest, record path and byte counts.
+- An operator checks a recording against its audit row with
+  `systemapi-agent verify-recording <file> --digest <hex>` on the host.
 - Audit rows hash every column (actor, host, tenant, action, payload), so
   rewriting who did something breaks verification.
 - Client frames are unchanged by recording.

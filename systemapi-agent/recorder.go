@@ -7,7 +7,9 @@
 // deletion or reorder breaks the chain. The final MAC (the digest) goes to
 // the control plane in pty_exit and lands in the audit chain. Writes are
 // queued with a byte cap; a full queue or a failed write ends the session
-// (fail closed). Does NOT protect against the agent's own user (root, or the
+// (fail closed). A session is capped at --pty-record-max-bytes recorded bytes
+// (ended with record_error recording_size_limit), and a session does not
+// start when the recording filesystem has less than --pty-record-min-free. Does NOT protect against the agent's own user (root, or the
 // agent user when --pty-allow-agent-user is set), who holds the key; does
 // NOT set the filesystem append-only attribute.
 package main
@@ -17,10 +19,14 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"flag"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -30,6 +36,14 @@ import (
 )
 
 const recordingKeyFile = "recording.key"
+
+const (
+	recordMaxBytesDefault = int64(1) << 30
+	recordMinFreeDefault  = uint64(1) << 30
+
+	recordErrFailed    = "recording_failed"
+	recordErrSizeLimit = "recording_size_limit"
+)
 
 var (
 	// recordQueueMax caps bytes waiting to be written to one recording.
@@ -66,7 +80,8 @@ type recorder struct {
 	failed   bool
 	bytesIn  int64
 	bytesOut int64
-	onFail   func()
+	maxBytes int64
+	onFail   func(code string)
 
 	// Owned by the writer goroutine until done is closed.
 	prev string
@@ -106,6 +121,17 @@ func loadRecordingKey(stateDir string) ([]byte, error) {
 	if !os.IsExist(err) {
 		return nil, err
 	}
+	key, err := readRecordingKey(path)
+	if err != nil {
+		return nil, err
+	}
+	recKey = key
+	return key, nil
+}
+
+// readRecordingKey reads a recording key file that must be a 0600 regular
+// file owned by the caller's uid.
+func readRecordingKey(path string) ([]byte, error) {
 	if err := checkPrivateFile(path, uint32(os.Geteuid())); err != nil {
 		return nil, err
 	}
@@ -117,7 +143,6 @@ func loadRecordingKey(stateDir string) ([]byte, error) {
 	if err != nil || len(key) != 32 {
 		return nil, errors.New("recording_key_malformed")
 	}
-	recKey = key
 	return key, nil
 }
 
@@ -142,7 +167,9 @@ func recordingMAC(key []byte, prev string, seq uint64, t int64, kind, b64 string
 // openRecorder creates <dir>/<session_id>.rec and writes the header line
 // synchronously, so a session never starts with a recording that cannot be
 // written.
-func openRecorder(dir, sessionID string, key []byte, header map[string]interface{}, onFail func()) (*recorder, error) {
+// maxBytes caps the session's recorded bytes; minFree is the free space the
+// recording filesystem must have at start.
+func openRecorder(dir, sessionID string, key []byte, header map[string]interface{}, maxBytes int64, minFree uint64, onFail func(code string)) (*recorder, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
@@ -152,19 +179,27 @@ func openRecorder(dir, sessionID string, key []byte, header map[string]interface
 	if err := os.Chmod(dir, 0o700); err != nil {
 		return nil, err
 	}
+	free, err := freeBytes(dir)
+	if err != nil {
+		return nil, err
+	}
+	if free < minFree {
+		return nil, errors.New("recording_disk_low")
+	}
 	path := filepath.Join(dir, sessionID+".rec")
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, err
 	}
 	r := &recorder{
-		key:    key,
-		path:   path,
-		f:      f,
-		ch:     make(chan recEntry, 8192),
-		done:   make(chan struct{}),
-		prev:   recordingSeed(key, sessionID),
-		onFail: onFail,
+		key:      key,
+		path:     path,
+		f:        f,
+		ch:       make(chan recEntry, 8192),
+		done:     make(chan struct{}),
+		prev:     recordingSeed(key, sessionID),
+		maxBytes: maxBytes,
+		onFail:   onFail,
 	}
 	meta, _ := json.Marshal(header)
 	if err := r.writeLine(recEntry{kind: "start", t: time.Now().UnixMilli(), data: meta}); err != nil {
@@ -196,7 +231,7 @@ func (r *recorder) loop() {
 		if r.err == nil {
 			if err := r.writeLine(e); err != nil {
 				r.err = err
-				r.fail()
+				r.fail(recordErrFailed)
 			}
 		}
 		r.mu.Lock()
@@ -205,14 +240,14 @@ func (r *recorder) loop() {
 	}
 }
 
-func (r *recorder) fail() {
+func (r *recorder) fail(code string) {
 	r.mu.Lock()
 	first := !r.failed
 	r.failed = true
 	cb := r.onFail
 	r.mu.Unlock()
 	if first && cb != nil {
-		cb()
+		cb(code)
 	}
 }
 
@@ -230,7 +265,12 @@ func (r *recorder) add(kind string, data []byte) bool {
 	}
 	if r.queued+len(data) > recordQueueMax {
 		r.mu.Unlock()
-		r.fail()
+		r.fail(recordErrFailed)
+		return false
+	}
+	if r.bytesIn+r.bytesOut+int64(len(data)) > r.maxBytes {
+		r.mu.Unlock()
+		r.fail(recordErrSizeLimit)
 		return false
 	}
 	e := recEntry{kind: kind, t: time.Now().UnixMilli(), data: append([]byte(nil), data...)}
@@ -238,7 +278,7 @@ func (r *recorder) add(kind string, data []byte) bool {
 	case r.ch <- e:
 	default:
 		r.mu.Unlock()
-		r.fail()
+		r.fail(recordErrFailed)
 		return false
 	}
 	r.queued += len(data)
@@ -285,13 +325,15 @@ func (r *recorder) finish(meta map[string]interface{}) (recSummary, error) {
 	failed := r.failed
 	r.mu.Unlock()
 	if err == nil && failed {
-		err = errors.New("recording_failed")
+		err = errors.New(recordErrFailed)
 	}
 	return sum, err
 }
 
 // verifyRecording replays the chain of one recording and returns its final
-// MAC. Any edit, deletion, insertion or reorder is an error.
+// MAC. Any edit, deletion, insertion or reorder is an error, and so is a file
+// that does not start with the session's start line or end with an end line
+// (a truncated or still-open recording).
 func verifyRecording(path string, key []byte, sessionID string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -300,6 +342,7 @@ func verifyRecording(path string, key []byte, sessionID string) (string, error) 
 	defer f.Close()
 	prev := recordingSeed(key, sessionID)
 	var seq uint64
+	last := ""
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 	for sc.Scan() {
@@ -315,7 +358,22 @@ func verifyRecording(path string, key []byte, sessionID string) (string, error) 
 		if !hmac.Equal([]byte(want), []byte(l.MAC)) {
 			return "", errors.New("recording_mac_mismatch")
 		}
+		if seq == 1 {
+			if l.Kind != "start" {
+				return "", errors.New("recording_no_start")
+			}
+			raw, err := base64.StdEncoding.DecodeString(l.B64)
+			var meta struct {
+				SessionID string `json:"session_id"`
+			}
+			if err != nil || json.Unmarshal(raw, &meta) != nil || meta.SessionID != sessionID {
+				return "", errors.New("recording_session_mismatch")
+			}
+		} else if last == "end" {
+			return "", errors.New("recording_data_after_end")
+		}
 		prev = l.MAC
+		last = l.Kind
 	}
 	if err := sc.Err(); err != nil {
 		return "", err
@@ -323,5 +381,71 @@ func verifyRecording(path string, key []byte, sessionID string) (string, error) 
 	if seq == 0 {
 		return "", errors.New("recording_empty")
 	}
+	if last != "end" {
+		return "", errors.New("recording_truncated")
+	}
 	return prev, nil
+}
+
+// runVerifyRecording implements `systemapi-agent verify-recording <file>
+// [--digest HEX] [--key PATH]`. It returns the process exit code: 0 when the
+// chain is valid, complete, and matches --digest if given; 1 otherwise; 2 on
+// bad usage.
+func runVerifyRecording(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("verify-recording", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	digest := fs.String("digest", "", "expected final digest (hex), e.g. from the terminal_end audit row")
+	keyPath := fs.String("key", "", "recording key (default: ~/.systemapi/"+recordingKeyFile+")")
+	var file string
+	rest := args
+	for {
+		if err := fs.Parse(rest); err != nil {
+			return 2
+		}
+		if fs.NArg() == 0 {
+			break
+		}
+		if file != "" {
+			fmt.Fprintln(stderr, "usage: systemapi-agent verify-recording <file> [--digest HEX] [--key PATH]")
+			return 2
+		}
+		file = fs.Arg(0)
+		rest = fs.Args()[1:]
+	}
+	if file == "" {
+		fmt.Fprintln(stderr, "usage: systemapi-agent verify-recording <file> [--digest HEX] [--key PATH]")
+		return 2
+	}
+	if *keyPath == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			fmt.Fprintf(stderr, "FAIL: %v\n", err)
+			return 1
+		}
+		*keyPath = filepath.Join(home, ".systemapi", recordingKeyFile)
+	}
+	key, err := readRecordingKey(*keyPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "FAIL: recording key: %v\n", err)
+		return 1
+	}
+	sessionID := strings.TrimSuffix(filepath.Base(file), ".rec")
+	if !sessionIDRe.MatchString(sessionID) {
+		fmt.Fprintln(stderr, "FAIL: file name is not <session_id>.rec")
+		return 1
+	}
+	got, err := verifyRecording(file, key, sessionID)
+	if err != nil {
+		fmt.Fprintf(stderr, "FAIL: %v\n", err)
+		return 1
+	}
+	if *digest != "" {
+		want := strings.ToLower(strings.TrimSpace(*digest))
+		if !hashHexRe.MatchString(want) || subtle.ConstantTimeCompare([]byte(want), []byte(got)) != 1 {
+			fmt.Fprintf(stderr, "FAIL: digest mismatch: recording %s\n", got)
+			return 1
+		}
+	}
+	fmt.Fprintf(stdout, "ok %s digest=%s\n", sessionID, got)
+	return 0
 }

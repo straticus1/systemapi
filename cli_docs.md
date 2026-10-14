@@ -24,6 +24,8 @@ SYSTEMAPI_API_KEY=<key> ./systemapi-agent \
 | `--pty-allow-agent-user` | `false` | Let a non-root agent run `terminal:open` shells as its own user. Without it a non-root agent refuses them. Risk: that shell can read the agent's API key, state and recording key, and ptrace the agent. Recordings are then `user_owned`. |
 | `--pty-record` | `true` | Record every input and output byte of each terminal session in an HMAC-chained file. `false` turns recording off (mode `off`). |
 | `--pty-record-dir` | `/var/lib/systemapi/recordings` as root, else `<state dir>/recordings` | One `<session_id>.rec` file per session, directory mode 0700. The HMAC key is `recording.key` (0600) in the state directory. |
+| `--pty-record-max-bytes` | 1 GiB | A session ends (`pty_exit` reason `stopped`, `record_error` `recording_size_limit`) once it has recorded this many bytes. |
+| `--pty-record-min-free` | 1 GiB | A session is refused (`recording_unavailable`) when the recording filesystem has less free space than this. |
 
 `terminal:root` sessions use their own lease action (`pty_root`), run as root,
 and need an agent running as root. The agent keeps 4 of its 32 session slots
@@ -31,6 +33,21 @@ for `terminal:root` and break-glass. Ending a session (stop, lease expiry,
 deadline, or the shell exiting) sends SIGHUP and then SIGKILL to its process
 group and, on Linux, to every process in its session. On SIGINT, SIGTERM or a
 lost connection the agent ends every session first.
+
+### Verify a recording
+
+```bash
+sudo systemapi-agent verify-recording /var/lib/systemapi/recordings/<session_id>.rec \
+  --digest <agent_exit.record.digest from the terminal_end audit row>
+```
+
+It replays the HMAC chain with the agent's key (`--key`, default
+`~/.systemapi/recording.key` of the user running it, so run it as the agent's
+user), requires the start line for that session id and the final `end` line,
+and compares the final digest with `--digest` when given. It prints
+`ok <session_id> digest=<hex>` and exits 0 when the recording is complete and
+untouched; a truncated, edited, reordered or renamed file, a wrong key, or a
+different digest exits 1. Bad usage exits 2.
 
 On dial it sends `Authorization: Bearer <key>`, `X-SystemAPI-Tenant`,
 `X-SystemAPI-Host-ID`, `X-SystemAPI-Hostname` and `X-SystemAPI-SSH-PubKey`

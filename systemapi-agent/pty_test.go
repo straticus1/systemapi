@@ -109,7 +109,10 @@ func newPTYHarness(t *testing.T) *ptyHarness {
 	}
 	prevCfg, prevEUID := ptyCfg, agentEUID
 	prevIn, prevRec := inputQueueMax, recordQueueMax
-	ptyCfg = ptySettings{Record: false, Shell: "/bin/sh", AllowAgentUser: true}
+	ptyCfg = ptySettings{Record: false, Shell: "/bin/sh", AllowAgentUser: true, RecordMinFree: 1}
+	// Tests run as an ordinary agent unless they say otherwise, even when
+	// the test process is root (the Linux container run).
+	agentEUID = func() int { return 1000 }
 	resetRecordingKeyCache()
 	t.Cleanup(func() {
 		stopAllSessions(5 * time.Second)
@@ -376,6 +379,12 @@ func TestPTYIdentityDropsToConfiguredUser(t *testing.T) {
 	me, err := user.Current()
 	if err != nil {
 		t.Fatalf("current user: %v", err)
+	}
+	if me.Uid == "0" {
+		// Running as root: drop to nobody instead of ourselves.
+		if me, err = user.Lookup("nobody"); err != nil {
+			t.Fatalf("nobody: %v", err)
+		}
 	}
 	id, code := resolvePTYIdentity("pty", ptySettings{User: me.Username}, 0)
 	if code != "" {
@@ -805,6 +814,7 @@ func TestPTYSetuidDropsToPTYUser(t *testing.T) {
 		t.Skip("needs root")
 	}
 	h := newPTYHarness(t)
+	agentEUID = os.Geteuid
 	nobody, err := user.Lookup("nobody")
 	if err != nil {
 		t.Skip("no nobody user")
@@ -829,4 +839,142 @@ func TestPTYSetuidDropsToPTYUser(t *testing.T) {
 	}
 	handlePTYInput(sid, []byte("exit 0\n"))
 	h.exitOf(t, sid, 5*time.Second)
+}
+
+func TestPTYRootRefusedWithoutAgentRecording(t *testing.T) {
+	h := newPTYHarness(t)
+	agentEUID = func() int { return 0 }
+	ptyCfg.Record = false
+	sid := h.start(t, "pty_root", inFuture(60*time.Second), inFuture(time.Hour))
+	if e := h.startErr(t, sid); e != "recording_unavailable" {
+		t.Fatalf("got %q", e)
+	}
+	if lookupSession(sid) != nil {
+		t.Fatal("root shell started unrecorded")
+	}
+}
+
+func TestPTYRecordingSizeCapEndsSession(t *testing.T) {
+	h := newPTYHarness(t)
+	ptyCfg.Record = true
+	ptyCfg.RecordDir = filepath.Join(h.dir, "rec")
+	ptyCfg.RecordMaxBytes = 100
+	sid := h.start(t, "pty", inFuture(60*time.Second), inFuture(time.Hour))
+	startedPayload(t, h, sid)
+	handlePTYInput(sid, []byte(strings.Repeat("x", 200)))
+	p := exitPayload(t, h, sid, 5*time.Second)
+	if p["reason"] != "stopped" || p["record_error"] != "recording_size_limit" {
+		t.Fatalf("exit %v", p)
+	}
+	rec := p["record"].(map[string]interface{})
+	if rec["bytes_in"].(float64)+rec["bytes_out"].(float64) > 100 {
+		t.Fatalf("recorded past the cap: %v", rec)
+	}
+}
+
+func TestPTYRecordingRefusedWhenDiskLow(t *testing.T) {
+	h := newPTYHarness(t)
+	ptyCfg.Record = true
+	ptyCfg.RecordDir = filepath.Join(h.dir, "rec")
+	ptyCfg.RecordMinFree = 1 << 62
+	sid := h.start(t, "pty", inFuture(60*time.Second), inFuture(time.Hour))
+	if e := h.startErr(t, sid); e != "recording_unavailable" {
+		t.Fatalf("got %q", e)
+	}
+	if lookupSession(sid) != nil {
+		t.Fatal("session started")
+	}
+}
+
+func TestVerifyRecordingCommand(t *testing.T) {
+	h := newPTYHarness(t)
+	ptyCfg.Record = true
+	ptyCfg.RecordDir = filepath.Join(h.dir, "rec")
+	sid := h.start(t, "pty", inFuture(60*time.Second), inFuture(time.Hour))
+	startedPayload(t, h, sid)
+	handlePTYInput(sid, []byte("echo VR$((1+1))\nexit 0\n"))
+	p := exitPayload(t, h, sid, 5*time.Second)
+	rec := p["record"].(map[string]interface{})
+	path, digest := rec["path"].(string), rec["digest"].(string)
+	keyPath := filepath.Join(h.dir, recordingKeyFile)
+
+	run := func(args ...string) (int, string) {
+		var stdout, stderr strings.Builder
+		code := runVerifyRecording(args, &stdout, &stderr)
+		return code, stdout.String() + stderr.String()
+	}
+	if code, out := run(path, "--key", keyPath); code != 0 || !strings.Contains(out, "digest="+digest) {
+		t.Fatalf("valid: %d %s", code, out)
+	}
+	if code, out := run(path, "--digest", digest, "--key", keyPath); code != 0 {
+		t.Fatalf("matching digest: %d %s", code, out)
+	}
+	if code, out := run("--key", keyPath, path, "--digest", strings.ToUpper(digest)); code != 0 {
+		t.Fatalf("flags before file, upper-case digest: %d %s", code, out)
+	}
+	if code, out := run(path, "--digest", strings.Repeat("0", 64), "--key", keyPath); code != 1 || !strings.Contains(out, "digest mismatch") {
+		t.Fatalf("wrong digest: %d %s", code, out)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	copyAs := func(body string) string {
+		p := filepath.Join(t.TempDir(), filepath.Base(path))
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	truncated := copyAs(strings.Join(lines[:len(lines)-1], "\n") + "\n")
+	if code, out := run(truncated, "--key", keyPath); code != 1 || !strings.Contains(out, "recording_truncated") {
+		t.Fatalf("truncated: %d %s", code, out)
+	}
+	tamperedLine := strings.Replace(lines[1], `"b64":"`, `"b64":"QQ`, 1)
+	tampered := copyAs(strings.Join(append([]string{lines[0], tamperedLine}, lines[2:]...), "\n") + "\n")
+	if code, out := run(tampered, "--key", keyPath); code != 1 || !strings.Contains(out, "recording_mac_mismatch") {
+		t.Fatalf("tampered: %d %s", code, out)
+	}
+	otherKey := filepath.Join(t.TempDir(), "k")
+	if err := os.WriteFile(otherKey, []byte(strings.Repeat("cd", 32)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := run(path, "--key", otherKey); code != 1 {
+		t.Fatal("wrong key verified")
+	}
+	renamed := filepath.Join(t.TempDir(), "pts_"+strings.Repeat("a", 32)+".rec")
+	if err := os.WriteFile(renamed, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := run(renamed, "--key", keyPath); code != 1 {
+		t.Fatal("recording verified under another session id")
+	}
+	if code, _ := run("--key", keyPath); code != 2 {
+		t.Fatal("missing file not a usage error")
+	}
+	if code, _ := run(path, path, "--key", keyPath); code != 2 {
+		t.Fatal("two files not a usage error")
+	}
+}
+
+func TestPTYNoSignalAfterReap(t *testing.T) {
+	h := newPTYHarness(t)
+	sid := h.start(t, "pty", inFuture(60*time.Second), inFuture(time.Hour))
+	s := lookupSession(sid)
+	if s == nil {
+		t.Fatal("not started")
+	}
+	handlePTYInput(sid, []byte("exit 0\n"))
+	h.exitOf(t, sid, 5*time.Second)
+	s.reapMu.Lock()
+	reaped := s.reaped
+	s.reapMu.Unlock()
+	if !reaped {
+		t.Fatal("not marked reaped")
+	}
+	if s.signalUnreaped(syscall.SIGKILL) {
+		t.Fatal("signalled a reaped process group")
+	}
 }

@@ -6,7 +6,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
-	"time"
+	"syscall"
 
 	"github.com/creack/pty"
 )
@@ -23,4 +23,8 @@ func checkPrivateFile(path string, owner uint32) error {
 	return errors.New("pty_unsupported")
 }
 
-func killTree(pid int, grace time.Duration) {}
+func signalTree(pgid int, sig syscall.Signal) bool { return false }
+
+func freeBytes(path string) (uint64, error) {
+	return 0, errors.New("pty_unsupported")
+}

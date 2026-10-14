@@ -29,6 +29,7 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/creack/pty"
@@ -102,6 +103,8 @@ type ptySettings struct {
 	AllowAgentUser bool
 	Record         bool
 	RecordDir      string
+	RecordMaxBytes int64  // 0 means recordMaxBytesDefault
+	RecordMinFree  uint64 // 0 means recordMinFreeDefault
 	Shell          string
 }
 
@@ -132,6 +135,9 @@ type ptySession struct {
 	ending    bool
 	inQueued  int
 	inClosed  bool
+
+	reapMu sync.Mutex
+	reaped bool
 }
 
 type ptyStartRequest struct {
@@ -489,7 +495,21 @@ func startPTYSession(out ptyOut, hostID, stateDir string, req ptyStartRequest, n
 	}
 
 	mode := recordingMode(ptyCfg, euid)
+	// A root shell runs only with agent recording, whatever the server says.
+	if req.Action == "pty_root" && mode != recordingAgent {
+		log.Printf("terminal:root refused: recording is %s, not agent", mode)
+		ptyStatusError(out, sid, "recording_unavailable")
+		return
+	}
 	if mode != recordingOff {
+		maxBytes := ptyCfg.RecordMaxBytes
+		if maxBytes <= 0 {
+			maxBytes = recordMaxBytesDefault
+		}
+		minFree := ptyCfg.RecordMinFree
+		if minFree == 0 {
+			minFree = recordMinFreeDefault
+		}
 		key, err := loadRecordingKey(stateDir)
 		if err != nil {
 			log.Printf("recording key unavailable: %v", err)
@@ -502,7 +522,7 @@ func startPTYSession(out ptyOut, hostID, stateDir string, req ptyStartRequest, n
 			"action":     req.Action,
 			"pty_user":   id.name,
 			"deadline":   req.DeadlineUnix,
-		}, func() { s.failRecording() })
+		}, maxBytes, minFree, s.failRecording)
 		if err != nil {
 			log.Printf("recording unavailable: %v", err)
 			ptyStatusError(out, sid, "recording_unavailable")
@@ -570,13 +590,31 @@ func startPTYSession(out ptyOut, hostID, stateDir string, req ptyStartRequest, n
 	}()
 
 	go func() {
-		_ = cmd.Wait()
+		pid := cmd.Process.Pid
+		if waitExitedNoReap(pid) {
+			// Linux: the shell is a zombie, so its PID and group id are still
+			// ours. Kill what it left behind, then reap.
+			s.killTree(ptyKillGrace)
+			s.reapMu.Lock()
+			_ = cmd.Wait()
+			s.reaped = true
+			s.reapMu.Unlock()
+		} else {
+			// Elsewhere there is no WNOWAIT: reap first, then signal the
+			// group while it still has members. macOS is not a managed
+			// platform; a reused group id is possible there.
+			_ = cmd.Wait()
+			s.reapMu.Lock()
+			s.reaped = true
+			s.reapMu.Unlock()
+			signalTree(pid, syscall.SIGHUP)
+			time.Sleep(ptyKillGrace)
+			signalTree(pid, syscall.SIGKILL)
+		}
 		code := -1
 		if cmd.ProcessState != nil {
 			code = cmd.ProcessState.ExitCode()
 		}
-		// Nothing the session started may outlive it.
-		killTree(cmd.Process.Pid, ptyKillGrace)
 		select {
 		case <-readerDone:
 		case <-time.After(ptyDrainTimeout):
@@ -603,7 +641,7 @@ func startPTYSession(out ptyOut, hostID, stateDir string, req ptyStartRequest, n
 			sum, err := s.rec.finish(map[string]interface{}{"reason": reason, "code": code})
 			payload["record"] = sum
 			if err != nil && recordErr == "" {
-				recordErr = "recording_failed"
+				recordErr = recordErrFailed
 			}
 		}
 		if recordErr != "" {
@@ -658,13 +696,13 @@ func (s *ptySession) queueInput(data []byte) {
 	}
 }
 
-func (s *ptySession) failRecording() {
+func (s *ptySession) failRecording(code string) {
 	s.mu.Lock()
 	if s.recordErr == "" {
-		s.recordErr = "recording_failed"
+		s.recordErr = code
 	}
 	s.mu.Unlock()
-	log.Printf("pty %s recording failed or fell behind; ending session", s.id)
+	log.Printf("pty %s ending session: %s", s.id, code)
 	s.end("stopped")
 }
 
@@ -705,8 +743,29 @@ func (s *ptySession) end(reason string) {
 	}
 	s.mu.Unlock()
 	if s.cmd != nil && s.cmd.Process != nil {
-		go killTree(s.cmd.Process.Pid, ptyKillGrace)
+		go s.killTree(ptyKillGrace)
 	}
+}
+
+// signalUnreaped signals the session's process tree only while the shell has
+// not been reaped, so its PID cannot belong to another process.
+func (s *ptySession) signalUnreaped(sig syscall.Signal) bool {
+	s.reapMu.Lock()
+	defer s.reapMu.Unlock()
+	if s.reaped {
+		return false
+	}
+	return signalTree(s.cmd.Process.Pid, sig)
+}
+
+// killTree sends SIGHUP to everything the session started, waits grace, then
+// sends SIGKILL to whatever is left.
+func (s *ptySession) killTree(grace time.Duration) {
+	if !s.signalUnreaped(syscall.SIGHUP) {
+		return
+	}
+	time.Sleep(grace)
+	s.signalUnreaped(syscall.SIGKILL)
 }
 
 // stopAllSessions ends every session with reason "stopped" and waits up to

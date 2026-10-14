@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
-	"time"
 
 	"github.com/creack/pty"
 )
@@ -82,25 +81,23 @@ func checkPrivateFile(path string, owner uint32) error {
 
 // signalTree sends sig to the process group pgid and to every process whose
 // session id is pgid (Linux only). It reports whether anything was signalled.
+// Callers hold the session's reap lock, so pgid still belongs to the shell
+// (running or a zombie) and cannot have been reused.
 func signalTree(pgid int, sig syscall.Signal) bool {
 	hit := syscall.Kill(-pgid, sig) == nil
 	for _, pid := range sessionMembers(pgid) {
-		if syscall.Kill(pid, sig) == nil {
+		if signalSessionMember(pid, pgid, sig) {
 			hit = true
 		}
 	}
 	return hit
 }
 
-// killTree sends SIGHUP to everything the session started, waits grace, then
-// sends SIGKILL to whatever is left.
-func killTree(pid int, grace time.Duration) {
-	if pid <= 1 {
-		return
+// freeBytes is the space available to the agent on path's filesystem.
+func freeBytes(path string) (uint64, error) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
+		return 0, err
 	}
-	if !signalTree(pid, syscall.SIGHUP) {
-		return
-	}
-	time.Sleep(grace)
-	signalTree(pid, syscall.SIGKILL)
+	return uint64(st.Bavail) * uint64(st.Bsize), nil
 }
