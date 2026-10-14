@@ -4,6 +4,7 @@ import { Terminal as XTerm } from 'xterm';
 import { FitAddon } from 'xterm-addon-fit';
 import { useAppStore } from '../store';
 import { FleetAPI } from '../api';
+import { terminalSocketURL, resizeFrameFor } from '../format';
 import { ArrowLeft, Terminal, Activity, AlertTriangle } from 'lucide-react';
 import 'xterm/css/xterm.css';
 
@@ -65,7 +66,7 @@ const TerminalView = () => {
 
     const attachSocket = (ticket) => {
       if (cancelled) return;
-      const wsUrl = (import.meta.env.VITE_WS_URL || 'ws://localhost:3003') + '/api/v1/systems/terminal/' + encodeURIComponent(hostId) + '?ticket=' + encodeURIComponent(ticket);
+      const wsUrl = terminalSocketURL(import.meta.env.VITE_WS_URL || 'ws://localhost:3003', hostId, ticket, term.rows, term.cols);
       socket = new WebSocket(wsUrl);
       socket.binaryType = 'arraybuffer';
 
@@ -81,11 +82,14 @@ const TerminalView = () => {
           try {
             const msg = JSON.parse(event.data);
             if (msg.type === 'pty_status') {
+              const resize = resizeFrameFor(msg.payload.status, term.rows, term.cols);
               if (msg.payload.status === 'starting') {
                 ptyActive = true;
                 setStatus('active');
                 term.reset();
-                socket.send(JSON.stringify({ type: 'pty_resize', rows: term.rows, cols: term.cols }));
+                socket.send(resize);
+              } else if (msg.payload.status === 'started') {
+                socket.send(resize);
               } else if (msg.payload.status === 'exited' || msg.payload.status === 'disconnected') {
                 setStatus('closed');
                 term.writeln('\r\n\x1b[33mSession Terminated by Remote Host.\x1b[0m');

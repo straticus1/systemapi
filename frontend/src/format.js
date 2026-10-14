@@ -15,3 +15,18 @@ export function scriptOutcome(res) {
   if (result.error) return { success: false, data: result.error };
   return { success: true, data: result.output || 'No output returned.' };
 }
+
+const termSize = (n) => Math.min(1000, Math.max(1, Number.isFinite(n) ? Math.trunc(n) : 1));
+
+// Terminal WebSocket URL; the initial size rides in the query so the shell
+// starts at the viewport size.
+export function terminalSocketURL(base, hostId, ticket, rows, cols) {
+  return `${base}/api/v1/systems/terminal/${encodeURIComponent(hostId)}?ticket=${encodeURIComponent(ticket)}&rows=${termSize(rows)}&cols=${termSize(cols)}`;
+}
+
+// The resize frame to send for a pty_status, or null. "started" resends the
+// size because the shell did not exist when "starting" arrived.
+export function resizeFrameFor(status, rows, cols) {
+  if (status !== 'starting' && status !== 'started') return null;
+  return JSON.stringify({ type: 'pty_resize', rows: termSize(rows), cols: termSize(cols) });
+}
