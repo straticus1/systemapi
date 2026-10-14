@@ -142,3 +142,22 @@ func TestTelemetryPayloadOmitEmpty(t *testing.T) {
 		t.Error("JSON should not contain k3s when nil")
 	}
 }
+
+// The enrolled --hostname is what the control plane resolves; telemetry
+// reports the OS hostname only in its own field.
+func TestTelemetryReportsEnrolledHostname(t *testing.T) {
+	p, err := gatherTelemetry("qa-e2e-mac")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Host.Hostname != "qa-e2e-mac" {
+		t.Fatalf("hostname %q", p.Host.Hostname)
+	}
+	raw, err := json.Marshal(p.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"hostname":"qa-e2e-mac"`) {
+		t.Fatalf("%s", raw)
+	}
+}

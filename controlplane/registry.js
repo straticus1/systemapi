@@ -174,7 +174,6 @@ class MemoryRegistry {
     if (!row) return;
     row.last_seen_at = new Date().toISOString();
     row.status = 'online';
-    if (fields.hostname) row.hostname = fields.hostname;
     if (fields.os) row.os = fields.os;
     if (fields.platform) row.platform = fields.platform;
   }
@@ -615,11 +614,10 @@ class PgRegistry {
   async touchHost(hostId, fields = {}) {
     await this.pool.query(
       `UPDATE cp_hosts SET last_seen_at = now(), status = 'online',
-         hostname = COALESCE($2, hostname),
-         os = COALESCE($3, os),
-         platform = COALESCE($4, platform)
+         os = COALESCE($2, os),
+         platform = COALESCE($3, platform)
        WHERE host_id = $1`,
-      [hostId, fields.hostname || null, fields.os || null, fields.platform || null]
+      [hostId, fields.os || null, fields.platform || null]
     );
   }
 

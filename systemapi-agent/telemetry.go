@@ -26,8 +26,11 @@ type TelemetryPayload struct {
 	K3s         *K3sStatsTelemetry    `json:"k3s,omitempty"`
 }
 
+// HostInfo.Hostname is the enrolled --hostname, the name the control plane
+// resolves. OSHostname is what the OS reports; it is informational only.
 type HostInfo struct {
-	Hostname string `json:"hostname"`
+	Hostname   string `json:"hostname"`
+	OSHostname string `json:"os_hostname,omitempty"`
 	OS       string `json:"os"`
 	Platform string `json:"platform"`
 	Uptime   uint64 `json:"uptime"`
@@ -227,15 +230,17 @@ func gatherK3sStats() *K3sStatsTelemetry {
 	return result
 }
 
-func gatherTelemetry() (TelemetryPayload, error) {
+func gatherTelemetry(enrolledHostname string) (TelemetryPayload, error) {
 	var payload TelemetryPayload
 	payload.Timestamp = time.Now().Unix()
 
 	// 1. Host Info
+	payload.Host.Hostname = enrolledHostname
 	hInfo, err := host.Info()
 	if err == nil {
 		payload.Host = HostInfo{
-			Hostname: hInfo.Hostname,
+			Hostname:   enrolledHostname,
+			OSHostname: hInfo.Hostname,
 			OS:       hInfo.OS,
 			Platform: hInfo.Platform,
 			Uptime:   hInfo.Uptime,
