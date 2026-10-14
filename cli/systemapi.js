@@ -241,7 +241,8 @@ async function login(argv) {
   } catch {
     fail(1, 'login_failed');
   }
-  if (verifyUrl.origin !== base.origin || verifyUrl.username || verifyUrl.password || verifyUrl.search || verifyUrl.hash) {
+  if (verifyUrl.origin !== base.origin || verifyUrl.pathname !== '/oauth/device/verify'
+    || verifyUrl.username || verifyUrl.password || verifyUrl.search || verifyUrl.hash) {
     fail(1, 'login_failed');
   }
   if (typeof userCode !== 'string' || !/^[BCDFGHJKLMNPQRSTVWXZ]{4}-[BCDFGHJKLMNPQRSTVWXZ]{4}$/.test(userCode)) fail(1, 'login_failed');

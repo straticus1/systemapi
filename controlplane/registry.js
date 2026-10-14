@@ -53,6 +53,43 @@ function publicWebhook(row) {
   };
 }
 
+// Appends one chained audit row inside the caller's transaction.
+async function auditInsert(client, entry) {
+  const prevRes = await client.query('SELECT row_hash FROM cp_audit ORDER BY seq DESC LIMIT 1 FOR UPDATE');
+  const prev = prevRes.rows[0] ? prevRes.rows[0].row_hash : GENESIS;
+  const payload = JSON.parse(canonicalJSON(entry.payload || {}));
+  const cols = {
+    tenant_id: entry.tenant_id || null,
+    host_id: entry.host_id || null,
+    actor: entry.actor || null,
+    action: entry.action,
+    payload
+  };
+  const hash = rowHash(prev, cols);
+  const ins = await client.query(
+    `INSERT INTO cp_audit (prev_hash, row_hash, tenant_id, host_id, actor, action, payload)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+     RETURNING seq, prev_hash, row_hash, tenant_id, host_id, actor, action, payload, created_at`,
+    [prev, hash, cols.tenant_id, cols.host_id, cols.actor, cols.action, JSON.stringify(payload)]
+  );
+  return ins.rows[0];
+}
+
+// The audit row for an SSO bind or unbind. The sub is recorded as a
+// fingerprint, never in clear.
+function ssoAuditEntry(tenantId, userId, sub, previous, actor) {
+  return {
+    tenant_id: tenantId,
+    actor,
+    action: sub === null ? 'sso_unbind' : 'sso_bind',
+    payload: {
+      user_id: userId,
+      sso_sub_fp: sub === null ? null : fingerprint(sub),
+      previous_fp: previous ? fingerprint(previous) : null
+    }
+  };
+}
+
 class MemoryRegistry {
   constructor(env = {}) {
     this.env = env;
@@ -73,8 +110,7 @@ class MemoryRegistry {
     this.securityEvents = [];
     this.securitySeq = 1;
     this.scopes = new Map();
-    this.ssoBindings = new Map();
-    this.software = [];
+        this.software = [];
     this.cves = [];
   }
 
@@ -125,40 +161,40 @@ class MemoryRegistry {
       .map((m) => ({ ...m }));
   }
 
-  async memberForSub(sub) {
-    if (typeof sub !== 'string' || sub.length === 0) return null;
-    for (const [userId, row] of this.ssoBindings) {
-      if (row.sso_sub === sub) return userId;
+  // Rows whose sso_sub is exactly this Authentik sub (byte-exact).
+  async membershipsForSub(sub) {
+    if (typeof sub !== 'string' || sub.length === 0) return [];
+    return this.members.filter((m) => m.sso_sub === sub).map((m) => ({ ...m }));
+  }
+
+  // Sets (or clears, with sub null) one membership row's sso_sub and appends
+  // the audit row; the row is put back if the audit write fails.
+  async setSsoSub({ tenantId, userId, sub, actor }) {
+    const row = this.members.find((m) => m.tenant_id === tenantId && m.user_id === userId);
+    if (!row) throw http(404, 'not_found');
+    if (sub !== null && this.members.some((m) => m.sso_sub === sub && m.user_id !== userId)) {
+      throw http(409, 'sso_sub_taken');
     }
-    return null;
-  }
-
-  async ssoBinding(userId) {
-    const row = this.ssoBindings.get(userId);
-    return row ? { ...row } : null;
-  }
-
-  async bindSso(userId, sub, boundBy) {
-    for (const [other, row] of this.ssoBindings) {
-      if (other !== userId && row.sso_sub === sub) throw http(409, 'sso_sub_taken');
+    const previous = row.sso_sub || null;
+    row.sso_sub = sub;
+    try {
+      await this.appendAudit(ssoAuditEntry(tenantId, userId, sub, previous, actor));
+    } catch (err) {
+      row.sso_sub = previous;
+      throw err;
     }
-    const row = { user_id: userId, sso_sub: sub, bound_by: boundBy, bound_at: new Date().toISOString() };
-    this.ssoBindings.set(userId, row);
-    return { ...row };
-  }
-
-  async unbindSso(userId) {
-    return this.ssoBindings.delete(userId);
+    return { tenant_id: tenantId, user_id: userId, bound: sub !== null };
   }
 
   async addMember(tenantId, userId, role, email) {
     if (!ROLES.has(role)) throw http(400, 'bad_role');
     if (!this.tenants.has(tenantId)) throw http(404, 'not_found');
     const idx = this.members.findIndex((m) => m.tenant_id === tenantId && m.user_id === userId);
-    const row = { tenant_id: tenantId, user_id: userId, email: email || null, role };
+    const prev = idx >= 0 ? this.members[idx] : null;
+    const row = { tenant_id: tenantId, user_id: userId, email: email || (prev ? prev.email : null), role, sso_sub: prev ? prev.sso_sub : null };
     if (idx >= 0) this.members[idx] = row;
     else this.members.push(row);
-    return row;
+    return { tenant_id: row.tenant_id, user_id: row.user_id, email: row.email, role: row.role };
   }
 
   decorate(row) {
@@ -544,44 +580,55 @@ class PgRegistry {
   // Identity is the member id only; email is display data, never a match key.
   async membershipsForUser(userId) {
     const res = await this.pool.query(
-      'SELECT tenant_id, user_id, email, role FROM cp_members WHERE user_id = $1',
+      'SELECT tenant_id, user_id, email, role, sso_sub FROM cp_members WHERE user_id = $1',
       [userId]
     );
     return res.rows;
   }
 
-  async memberForSub(sub) {
-    if (typeof sub !== 'string' || sub.length === 0) return null;
-    const res = await this.pool.query('SELECT user_id FROM cp_sso_bindings WHERE sso_sub = $1', [sub]);
-    return res.rows[0] ? res.rows[0].user_id : null;
-  }
-
-  async ssoBinding(userId) {
+  async membershipsForSub(sub) {
+    if (typeof sub !== 'string' || sub.length === 0) return [];
     const res = await this.pool.query(
-      'SELECT user_id, sso_sub, bound_by, bound_at FROM cp_sso_bindings WHERE user_id = $1',
-      [userId]
+      'SELECT tenant_id, user_id, email, role, sso_sub FROM cp_members WHERE sso_sub = $1',
+      [sub]
     );
-    return res.rows[0] || null;
+    return res.rows;
   }
 
-  async bindSso(userId, sub, boundBy) {
+  // One transaction: the binding and its audit-chain row land together or
+  // not at all. The advisory lock serializes binds, so the "one sub, one
+  // member id" check cannot race.
+  async setSsoSub({ tenantId, userId, sub, actor }) {
+    const client = await this.pool.connect();
     try {
-      const res = await this.pool.query(
-        `INSERT INTO cp_sso_bindings (user_id, sso_sub, bound_by) VALUES ($1, $2, $3)
-         ON CONFLICT (user_id) DO UPDATE SET sso_sub = EXCLUDED.sso_sub, bound_by = EXCLUDED.bound_by, bound_at = now()
-         RETURNING user_id, sso_sub, bound_by, bound_at`,
-        [userId, sub, boundBy]
+      await client.query('BEGIN');
+      await client.query("SELECT pg_advisory_xact_lock(hashtext('cp_members.sso_sub'))");
+      const cur = await client.query(
+        'SELECT sso_sub FROM cp_members WHERE tenant_id = $1 AND user_id = $2 FOR UPDATE',
+        [tenantId, userId]
       );
-      return res.rows[0];
+      if (!cur.rows[0]) throw http(404, 'not_found');
+      if (sub !== null) {
+        const taken = await client.query(
+          'SELECT 1 FROM cp_members WHERE sso_sub = $1 AND user_id <> $2 LIMIT 1',
+          [sub, userId]
+        );
+        if (taken.rowCount > 0) throw http(409, 'sso_sub_taken');
+      }
+      await client.query(
+        'UPDATE cp_members SET sso_sub = $3 WHERE tenant_id = $1 AND user_id = $2',
+        [tenantId, userId, sub]
+      );
+      await auditInsert(client, ssoAuditEntry(tenantId, userId, sub, cur.rows[0].sso_sub || null, actor));
+      await client.query('COMMIT');
+      return { tenant_id: tenantId, user_id: userId, bound: sub !== null };
     } catch (err) {
+      try { await client.query('ROLLBACK'); } catch { /* connection already failed */ }
       if (err.code === '23505') throw http(409, 'sso_sub_taken');
       throw err;
+    } finally {
+      client.release();
     }
-  }
-
-  async unbindSso(userId) {
-    const res = await this.pool.query('DELETE FROM cp_sso_bindings WHERE user_id = $1', [userId]);
-    return res.rowCount === 1;
   }
 
   async addMember(tenantId, userId, role, email) {
@@ -749,25 +796,9 @@ class PgRegistry {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
-      const prevRes = await client.query('SELECT row_hash FROM cp_audit ORDER BY seq DESC LIMIT 1 FOR UPDATE');
-      const prev = prevRes.rows[0] ? prevRes.rows[0].row_hash : GENESIS;
-      const payload = JSON.parse(canonicalJSON(entry.payload || {}));
-      const cols = {
-        tenant_id: entry.tenant_id || null,
-        host_id: entry.host_id || null,
-        actor: entry.actor || null,
-        action: entry.action,
-        payload
-      };
-      const hash = rowHash(prev, cols);
-      const ins = await client.query(
-        `INSERT INTO cp_audit (prev_hash, row_hash, tenant_id, host_id, actor, action, payload)
-         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-         RETURNING seq, prev_hash, row_hash, tenant_id, host_id, actor, action, payload, created_at`,
-        [prev, hash, cols.tenant_id, cols.host_id, cols.actor, cols.action, JSON.stringify(payload)]
-      );
+      const row = await auditInsert(client, entry);
       await client.query('COMMIT');
-      return ins.rows[0];
+      return row;
     } catch (err) {
       try { await client.query('ROLLBACK'); } catch { /* already closed */ }
       throw err;

@@ -20,6 +20,18 @@ CREATE TABLE IF NOT EXISTS cp_members (
 
 CREATE INDEX IF NOT EXISTS cp_members_user_idx ON cp_members (user_id);
 
+-- SSO identity is the Authentik sub only (provider sub_mode hashed_user_id:
+-- stable, opaque, not reassigned on an email or username change). NULL means
+-- the membership cannot be used through SSO until an admin binds it. The
+-- binding is per membership row, so a tenant admin can only bind rows of that
+-- tenant; a device login needs every row of the member bound to the same sub.
+-- Unique per tenant here; the application also refuses one sub on two member
+-- ids anywhere (bind holds an advisory lock), and the reader fails closed if
+-- it ever finds two.
+ALTER TABLE cp_members ADD COLUMN IF NOT EXISTS sso_sub TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS cp_members_tenant_sso_sub_idx ON cp_members (tenant_id, sso_sub) WHERE sso_sub IS NOT NULL;
+CREATE INDEX IF NOT EXISTS cp_members_sso_sub_idx ON cp_members (sso_sub) WHERE sso_sub IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS cp_hosts (
   host_id TEXT PRIMARY KEY,
   tenant_id TEXT NOT NULL REFERENCES cp_tenants(tenant_id),
@@ -151,18 +163,6 @@ ALTER TABLE cp_oauth_devices ADD COLUMN IF NOT EXISTS requester_ip TEXT;
 ALTER TABLE cp_oauth_devices ADD COLUMN IF NOT EXISTS requester_ua TEXT;
 CREATE INDEX IF NOT EXISTS cp_oauth_devices_user_idx ON cp_oauth_devices (user_id, status);
 CREATE UNIQUE INDEX IF NOT EXISTS cp_oauth_devices_state_idx ON cp_oauth_devices (state_hash) WHERE state_hash IS NOT NULL;
-
--- SSO identity: the Authentik sub (sub_mode hashed_user_id, immutable) bound
--- to one member id. One row per person, not per tenant membership, so one sub
--- can never resolve to two member ids and every membership of a person moves
--- together. Written only by the admin binding API or scripts/sso-bind.js,
--- both of which add an audit-chain row.
-CREATE TABLE IF NOT EXISTS cp_sso_bindings (
-  user_id TEXT PRIMARY KEY,
-  sso_sub TEXT NOT NULL UNIQUE,
-  bound_by TEXT NOT NULL,
-  bound_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
 
 CREATE TABLE IF NOT EXISTS cp_oauth_access (
   token_hash TEXT PRIMARY KEY,

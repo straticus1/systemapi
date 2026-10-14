@@ -69,11 +69,13 @@ function fleet() {
 function appFor(fm, sessionUser) {
   const app = express();
   app.use(express.json({ limit: '256kb' }));
-  app.use(express.urlencoded({ extended: false, limit: '8kb' }));
+  // Production-like: server.js parses forms with extended: true and does not
+  // store sessions nobody wrote to.
+  app.use(express.urlencoded({ extended: true, limit: '256kb' }));
   app.use(session({
     secret: 'test-secret-not-production',
     resave: false,
-    saveUninitialized: true
+    saveUninitialized: false
   }));
   if (sessionUser) {
     app.use((req, _res, next) => {
@@ -83,6 +85,15 @@ function appFor(fm, sessionUser) {
   }
   mount(app, fm);
   return app;
+}
+
+// Binds an Authentik sub to every membership row of userId (as an admin
+// would) and returns the session user Authentik would produce for it.
+async function ssoUser(fm, userId, extra = {}, sub = 'sub-' + userId) {
+  for (const m of await fm.registry.membershipsForUser(userId)) {
+    await fm.registry.setSsoSub({ tenantId: m.tenant_id, userId, sub, actor: 'test' });
+  }
+  return { id: sub, ...extra };
 }
 
 function listen(app) {
@@ -317,12 +328,14 @@ test('fleet routes reject query keys, hide other tenants, and refuse viewer exec
   }
 });
 
-test('a viewer session cannot execute and an empty session sees no hosts', async () => {
+test('a viewer session cannot execute and an unbound session is refused', async () => {
   const fm = fleet();
   await seed(fm);
   await fm.registry.addMember('acme', 'viewer-1', 'viewer', 'view@example');
-  const viewerApp = appFor(fm, { id: 'viewer-1', email: 'view@example', groups: [] });
-  const emptyApp = appFor(fm, { id: 'stranger', email: 's@example', groups: ['systemapi-admins'] });
+  const viewerApp = appFor(fm, await ssoUser(fm, 'viewer-1', { email: 'view@example', groups: [] }));
+  // Its email matches a member and it claims the admin group: still no sub
+  // binding, so it is refused.
+  const emptyApp = appFor(fm, { id: 'stranger', email: 'view@example', groups: ['systemapi-admins'] });
   const viewer = await listen(viewerApp);
   const empty = await listen(emptyApp);
   try {
@@ -334,8 +347,8 @@ test('a viewer session cannot execute and an empty session sees no hosts', async
     assert.equal(denied.status, 403);
     assert.equal(denied.body.error, 'scope_denied');
     const hosts = await call(`${empty.url}/api/v1/fleet`);
-    assert.equal(hosts.status, 200);
-    assert.deepEqual(hosts.body.hosts, []);
+    assert.equal(hosts.status, 403);
+    assert.equal(hosts.body.error, 'sso_unbound');
   } finally {
     viewer.server.close();
     empty.server.close();
@@ -473,7 +486,7 @@ test('webhook secrets are sealed and a missing key stores nothing', async () => 
 
   const fm = fleet();
   await seed(fm);
-  const { server, url } = await listen(appFor(fm, { id: 'user-1', email: 'a@example', groups: [] }));
+  const { server, url } = await listen(appFor(fm, await ssoUser(fm, 'user-1', { email: 'a@example', groups: [] })));
   try {
     const missing = await call(`${url}/api/v1/webhooks`, {
       method: 'POST',
@@ -508,6 +521,7 @@ test('webhook secrets are sealed and a missing key stores nothing', async () => 
 });
 
 const DEVICE_GRANT = 'urn:ietf:params:oauth:grant-type:device_code';
+const USER_CODE_SHAPE = /^[BCDFGHJKLMNPQRSTVWXZ]{4}-[BCDFGHJKLMNPQRSTVWXZ]{4}$/;
 
 function armPublic(fm, origin) {
   fm.env.NODE_ENV = 'test';
@@ -529,13 +543,15 @@ function postJson(url, pathname, body, headers) {
 // One browser: keeps the session cookie between requests.
 function browser() {
   let cookie = '';
-  return async function go(target, opts = {}) {
+  const go = async function go(target, opts = {}) {
     const headers = { ...(opts.headers || {}) };
     if (cookie) headers.cookie = cookie;
     const res = await fetch(target, { ...opts, headers });
     for (const line of res.headers.getSetCookie()) cookie = line.split(';')[0];
     return res;
   };
+  go.cookie = () => cookie;
+  return go;
 }
 
 function csrfIn(html) {
@@ -550,17 +566,28 @@ async function textOf(res) {
   }
 }
 
-// Loads the verify page in this browser, then submits its form fields.
-async function verifyAs(go, url, code, extra = {}) {
-  const pageRes = await go(url + '/oauth/device/verify?code=' + encodeURIComponent(code));
-  const csrf = csrfIn(await pageRes.text());
-  const form = new URLSearchParams({ code, csrf: csrf || '', ...extra });
-  return go(url + '/oauth/device/verify', {
+function postForm(go, target, fields) {
+  return go(target, {
     method: 'POST',
     redirect: 'manual',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: form.toString()
+    body: new URLSearchParams(fields).toString()
   });
+}
+
+// Loads the verify page in this browser and returns its CSRF token.
+async function pageCsrf(go, url) {
+  return csrfIn(await (await go(url + '/oauth/device/verify')).text());
+}
+
+// The whole browser flow: open the page, type the code, see the confirm page,
+// then press Yes (or a provider button when extra.provider is set).
+async function verifyAs(go, url, code, extra = { confirm: 'yes' }) {
+  const csrf = (await pageCsrf(go, url)) || '';
+  const confirm = await postForm(go, url + '/oauth/device/verify', { user_code: code, csrf });
+  if (confirm.status !== 200) return confirm;
+  await confirm.text();
+  return postForm(go, url + '/oauth/device/verify', { user_code: code, csrf, ...extra });
 }
 
 function runCli(args, env) {
@@ -580,7 +607,7 @@ function runCli(args, env) {
   });
 }
 
-test('oauth device start fails closed for unknown users and a bad public URL', async () => {
+test('oauth device start returns the RFC 8628 shape and fails closed', async () => {
   const fm = fleet();
   await seed(fm);
   const { server, url } = await listen(appFor(fm));
@@ -594,12 +621,8 @@ test('oauth device start fails closed for unknown users and a bad public URL', a
     for (const username of ['no-such-user', 'not a user', '', '../user-1', 'user-9']) {
       const denied = await postJson(url, '/oauth/device', { username });
       assert.equal(denied.status, 403, username);
-      assert.equal(denied.body.error, 'login_denied');
-      assert.equal(denied.body.verification_url, undefined);
+      assert.deepEqual(denied.body, { error: 'login_denied' });
     }
-    const bogus = await call(url + '/oauth/device/verify?code=' + 'a'.repeat(32));
-    assert.equal(bogus.status, 200);
-    assert.match(bogus.body, /Login denied/);
     assert.equal(deviceRows(fm).length, 0);
 
     const badPublic = [
@@ -619,113 +642,127 @@ test('oauth device start fails closed for unknown users and a bad public URL', a
     }
     assert.equal(deviceRows(fm).length, 0);
 
-    const forced = await postJson(url, '/oauth/device', { username: 'user-1', interval: 99 });
-    assert.equal(forced.status, 200);
-    assert.equal(forced.body.interval, 0);
-    assert.equal(forced.body.verification_url.includes('device_code'), false);
-    assert.equal(forced.body.verification_url.startsWith(url + '/oauth/device/verify?code='), true);
+    // Exactly the RFC 8628 fields the sahconnect client expects; no
+    // verification_uri_complete and no code in any URL.
+    const started = await call(url + '/oauth/device', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', 'user-agent': 'cli-test/1.0' },
+      body: 'username=user-1&interval=99'
+    });
+    assert.equal(started.status, 200);
+    assert.deepEqual(Object.keys(started.body).sort(), ['device_code', 'expires_in', 'interval', 'user_code', 'verification_uri']);
+    assert.equal(started.body.verification_uri, url + '/oauth/device/verify');
+    const uri = new URL(started.body.verification_uri);
+    assert.equal(uri.search + uri.hash + uri.username + uri.password, '');
+    assert.match(started.body.user_code, USER_CODE_SHAPE);
+    assert.match(started.body.user_code, /^[A-Z0-9-]{4,12}$/);
+    assert.equal(started.body.expires_in, 600);
+    assert.equal(started.body.interval, 0);
+    assert.equal(started.body.device_code.length >= 16, true);
+    const row = deviceRows(fm)[0];
+    assert.equal(row.requester_ua, 'cli-test/1.0');
+    assert.equal(typeof row.requester_ip, 'string');
+    assert.equal(JSON.stringify(row).includes(started.body.user_code.replace('-', '')), false);
+
+    // An anonymous GET, even carrying a code, gets the SSO link only: no
+    // session cookie, no CSRF token, no form, no code echoed.
+    const anon = await fetch(url + '/oauth/device/verify?code=' + encodeURIComponent(started.body.user_code));
+    const anonHtml = await anon.text();
+    assert.equal(anon.status, 200);
+    assert.deepEqual(anon.headers.getSetCookie(), []);
+    assert.equal(csrfIn(anonHtml), null);
+    assert.equal(anonHtml.includes('<form'), false);
+    assert.equal(anonHtml.includes(started.body.user_code), false);
+    const link = /href="([^"]+)">Sign in with After Dark SSO</.exec(anonHtml);
+    assert.ok(link);
+    const loginUrl = new URL(link[1].replace(/&amp;/g, '&'), url);
+    assert.equal(loginUrl.pathname, '/oauth/login');
+    assert.equal(loginUrl.searchParams.get('return_to'), '/oauth/device/verify');
+    assert.equal(row.status, 'pending');
   } finally {
     server.close();
   }
 });
 
-test('oauth yes login issues one bearer and rejects reuse, expiry, and viewer exec', async () => {
+test('oauth device login: the owner types the code, confirms, and gets one bearer', async () => {
   const fm = fleet();
   await seed(fm);
   await fm.registry.addMember('acme', 'viewer-1', 'viewer', 'view@example');
   await fm.registry.setScopes('ak_test', OPERATOR);
-  const { server, url } = await listen(appFor(fm, { id: 'user-1' }));
-  const viewerApp = await listen(appFor(fm, { id: 'viewer-1' }));
+  const { server, url } = await listen(appFor(fm, await ssoUser(fm, 'user-1')));
+  const viewerApp = await listen(appFor(fm, await ssoUser(fm, 'viewer-1')));
   armPublic(fm, url);
   const go = browser();
+  const poll = (deviceCode) => postJson(url, '/oauth/token', { grant_type: DEVICE_GRANT, device_code: deviceCode });
   try {
-    const started = await postJson(url, '/oauth/device', { username: 'user-1' });
-    const userCode = new URL(started.body.verification_url).searchParams.get('code');
-    const pending = await postJson(url, '/oauth/token', {
-      grant_type: DEVICE_GRANT,
-      device_code: started.body.device_code
+    const started = await call(url + '/oauth/device', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', 'user-agent': 'cli-test/2.0' },
+      body: 'username=user-1'
     });
-    assert.equal(pending.body.error, 'authorization_pending');
+    const userCode = started.body.user_code;
+    assert.equal((await poll(started.body.device_code)).body.error, 'authorization_pending');
 
-    const pageRes = await go(url + '/oauth/device/verify?code=' + encodeURIComponent(userCode));
+    // GET with ?code neither pre-fills nor approves.
+    const pageRes = await go(url + '/oauth/device/verify?code=' + encodeURIComponent(userCode) + '&confirm=yes');
     const html = await pageRes.text();
     assert.equal(pageRes.status, 200);
     assert.equal(pageRes.headers.get('referrer-policy'), 'no-referrer');
     assert.equal(pageRes.headers.get('cache-control'), 'no-store');
     assert.equal(pageRes.headers.get('x-content-type-options'), 'nosniff');
-    assert.match(html, /<button type="submit">Yes<\/button>/);
-    assert.match(html, /Only continue if you started this login yourself/);
+    assert.match(html, /name="user_code"/);
+    assert.equal(html.includes(userCode), false);
+    assert.equal(html.includes(userCode.replace('-', '')), false);
     assert.equal(html.includes('<script'), false);
     const csrf = csrfIn(html);
     assert.equal(typeof csrf, 'string');
-    for (let i = 0; i < 3; i += 1) {
-      const again = await go(url + '/oauth/device/verify?code=' + encodeURIComponent(userCode));
-      assert.equal(again.status, 200);
-      await again.text();
-    }
-    const still = await postJson(url, '/oauth/token', {
-      grant_type: DEVICE_GRANT,
-      device_code: started.body.device_code
-    });
-    assert.equal(still.body.error, 'authorization_pending');
+    assert.equal((await poll(started.body.device_code)).body.error, 'authorization_pending');
 
     // The code alone (the old bypass) and a missing or wrong CSRF token are refused.
-    const bare = await postJson(url, '/oauth/device/verify', { code: userCode });
+    const bare = await postJson(url, '/oauth/device/verify', { user_code: userCode, confirm: 'yes' });
     assert.equal(bare.status, 403);
     assert.equal(bare.body.error, 'csrf_denied');
-    const noCsrf = await textOf(await go(url + '/oauth/device/verify', {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: 'code=' + encodeURIComponent(userCode)
-    }));
+    const noCsrf = await textOf(await postForm(go, url + '/oauth/device/verify', { user_code: userCode, confirm: 'yes' }));
     assert.equal(noCsrf.status, 403);
     assert.equal(noCsrf.body.error, 'csrf_denied');
-    const wrongCsrf = await textOf(await go(url + '/oauth/device/verify', {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: 'code=' + encodeURIComponent(userCode) + '&csrf=' + 'x'.repeat(csrf.length)
-    }));
+    const wrongCsrf = await textOf(await postForm(go, url + '/oauth/device/verify', { user_code: userCode, csrf: 'x'.repeat(csrf.length) }));
     assert.equal(wrongCsrf.status, 403);
     assert.equal(wrongCsrf.body.error, 'csrf_denied');
-    const otherBrowser = await postJson(url, '/oauth/device/verify', { code: userCode, csrf });
+    const otherBrowser = await postJson(url, '/oauth/device/verify', { user_code: userCode, csrf, confirm: 'yes' });
     assert.equal(otherBrowser.status, 403);
     assert.equal(otherBrowser.body.error, 'csrf_denied');
-    const notYet = await postJson(url, '/oauth/token', {
-      grant_type: DEVICE_GRANT,
-      device_code: started.body.device_code
-    });
-    assert.equal(notYet.body.error, 'authorization_pending');
+    assert.equal((await poll(started.body.device_code)).body.error, 'authorization_pending');
 
-    const yes = await textOf(await verifyAs(go, url, userCode));
+    // Yes before the confirm page was shown in this session is refused.
+    const skipped = await textOf(await postForm(go, url + '/oauth/device/verify', { user_code: userCode, csrf, confirm: 'yes' }));
+    assert.equal(skipped.status, 403);
+    assert.equal(skipped.body.error, 'login_denied');
+
+    // Typing the code (any case, no dash) shows who asked, then Yes approves.
+    const typed = userCode.replace('-', '').toLowerCase();
+    const confirm = await textOf(await postForm(go, url + '/oauth/device/verify', { user_code: typed, csrf }));
+    assert.equal(confirm.status, 200);
+    assert.match(confirm.body, /Only continue if you started this login yourself/);
+    assert.match(confirm.body, /cli-test\/2\.0/);
+    assert.match(confirm.body, /From IP: <strong>[0-9a-f:.]+<\/strong>/);
+    assert.match(confirm.body, /Started: <strong>\d{4}-\d\d-\d\dT/);
+    assert.equal((await poll(started.body.device_code)).body.error, 'authorization_pending');
+    const yes = await textOf(await postForm(go, url + '/oauth/device/verify', { user_code: typed, csrf, confirm: 'yes' }));
     assert.equal(yes.status, 200);
     assert.match(yes.body, /Signed in/);
     assert.equal(yes.body.includes(userCode), false);
     assert.equal(yes.body.includes(started.body.device_code), false);
-    const reused = await textOf(await go(url + '/oauth/device/verify', {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ code: userCode, csrf }).toString()
-    }));
+    const reused = await textOf(await postForm(go, url + '/oauth/device/verify', { user_code: userCode, csrf }));
     assert.equal(reused.status, 403);
-    assert.equal(reused.body.error, 'login_denied');
+    assert.match(reused.body, /not accepted/);
 
-    const tokenRes = await postJson(url, '/oauth/token', {
-      grant_type: DEVICE_GRANT,
-      device_code: started.body.device_code
-    });
+    const tokenRes = await poll(started.body.device_code);
     assert.equal(tokenRes.status, 200);
     assert.equal(tokenRes.body.token_type, 'Bearer');
     assert.equal(tokenRes.body.expires_in, 3600);
     const access = tokenRes.body.access_token;
-    const again = await postJson(url, '/oauth/token', {
-      grant_type: DEVICE_GRANT,
-      device_code: started.body.device_code
-    });
-    assert.equal(again.body.error, 'invalid_grant');
-    const wrongGrant = await postJson(url, '/oauth/token', {
-      grant_type: 'authorization_code',
-      device_code: started.body.device_code
-    });
+    assert.equal((await poll(started.body.device_code)).body.error, 'invalid_grant');
+    const wrongGrant = await postJson(url, '/oauth/token', { grant_type: 'authorization_code', device_code: started.body.device_code });
     assert.equal(wrongGrant.status, 400);
     assert.equal(wrongGrant.body.error, 'unsupported_grant_type');
 
@@ -736,43 +773,20 @@ test('oauth yes login issues one bearer and rejects reuse, expiry, and viewer ex
     const spaced = await call(url + '/api/v1/fleet', { headers: { authorization: 'Bearer ' + access + ' x' } });
     assert.equal(spaced.status, 401);
     assert.equal(spaced.body.error, 'bearer_required');
-    const keyed = await call(url + '/api/v1/fleet', { headers: { 'x-api-key': 'good-key' } });
-    assert.equal(keyed.status, 200);
-    assert.equal(keyed.body.hosts[0].host_id, HOST_A);
 
-    const tampered = await textOf(await go(url + '/oauth/device/verify', {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ code: 'b'.repeat(32), csrf }).toString()
-    }));
-    assert.equal(tampered.status, 403);
-    assert.equal(tampered.body.error, 'login_denied');
-
+    // An expired code is refused like a wrong one, and the poll says expired.
     const expiring = await postJson(url, '/oauth/device', { username: 'user-1' });
-    const expiringCode = new URL(expiring.body.verification_url).searchParams.get('code');
     const pendingRow = deviceRows(fm).find((row) => row.status === 'pending');
     pendingRow.expires_at = new Date(Date.now() - 1000).toISOString();
-    const expiredYes = await textOf(await go(url + '/oauth/device/verify', {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ code: expiringCode, csrf }).toString()
-    }));
+    const expiredYes = await textOf(await verifyAs(go, url, expiring.body.user_code));
     assert.equal(expiredYes.status, 403);
-    assert.equal(expiredYes.body.error, 'login_denied');
-    const expiredPoll = await postJson(url, '/oauth/token', {
-      grant_type: DEVICE_GRANT,
-      device_code: expiring.body.device_code
-    });
-    assert.equal(expiredPoll.body.error, 'expired_token');
+    assert.match(expiredYes.body, /not accepted/);
+    assert.equal((await poll(expiring.body.device_code)).body.error, 'expired_token');
 
     const viewStart = await postJson(url, '/oauth/device', { username: 'viewer-1' });
-    const viewCode = new URL(viewStart.body.verification_url).searchParams.get('code');
-    const viewYes = await textOf(await verifyAs(browser(), viewerApp.url, viewCode));
+    const viewYes = await textOf(await verifyAs(browser(), viewerApp.url, viewStart.body.user_code));
     assert.equal(viewYes.status, 200);
-    const viewToken = await postJson(url, '/oauth/token', {
-      grant_type: DEVICE_GRANT,
-      device_code: viewStart.body.device_code
-    });
+    const viewToken = await poll(viewStart.body.device_code);
     const denied = await call(url + '/api/v1/fleet/' + HOST_A + '/execute', {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: 'Bearer ' + viewToken.body.access_token },
@@ -805,107 +819,131 @@ test('oauth yes login issues one bearer and rejects reuse, expiry, and viewer ex
   }
 });
 
-test('oauth device approval needs an SSO session that owns the member', async () => {
+test('oauth identity is the Authentik sub only: email or member-id matches are refused', async () => {
   const fm = fleet();
   await seed(fm);
   await fm.registry.addMember('acme', 'mail-1', 'operator', 'mail-1@example.test');
-  const anon = await listen(appFor(fm));
-  const other = await listen(appFor(fm, { id: 'user-2', email: 'u2@example.test', email_verified: true }));
-  const owner = await listen(appFor(fm, { id: 'user-1' }));
-  const unverified = await listen(appFor(fm, { id: 'sub-x', email: 'mail-1@example.test', email_verified: false }));
-  const verified = await listen(appFor(fm, { id: 'sub-x', email: 'mail-1@example.test', email_verified: true }));
+  const owner = await listen(appFor(fm, await ssoUser(fm, 'user-1')));
+  const other = await listen(appFor(fm, await ssoUser(fm, 'user-2', { email: 'u2@example.test' })));
+  const byEmail = { id: 'sub-x', email: 'mail-1@example.test', email_verified: true, name: 'mail-1' };
+  const emailOnly = await listen(appFor(fm, byEmail));
+  const idIsMember = await listen(appFor(fm, { id: 'mail-1', email: 'mail-1@example.test', email_verified: true }));
   armPublic(fm, owner.url);
   const poll = (deviceCode) => postJson(owner.url, '/oauth/token', { grant_type: DEVICE_GRANT, device_code: deviceCode });
   try {
-    const started = await postJson(owner.url, '/oauth/device', { username: 'user-1' });
-    const code = new URL(started.body.verification_url).searchParams.get('code');
-
-    // No session: the page offers SSO with a same-origin return path, no Yes.
-    const goAnon = browser();
-    const anonPage = await goAnon(anon.url + '/oauth/device/verify?code=' + encodeURIComponent(code));
-    const anonHtml = await anonPage.text();
-    assert.equal(anonPage.status, 200);
-    assert.equal(anonHtml.includes('>Yes<'), false);
-    const link = /href="([^"]+)">Sign in with After Dark SSO</.exec(anonHtml);
-    assert.ok(link);
-    const loginUrl = new URL(link[1].replace(/&amp;/g, '&'), anon.url);
-    assert.equal(loginUrl.origin, anon.url);
-    assert.equal(loginUrl.pathname, '/oauth/login');
-    const back = loginUrl.searchParams.get('return_to');
-    assert.equal(back, '/oauth/device/verify?code=' + encodeURIComponent(code));
-    assert.equal(safeReturnPath(back), back);
-    // ...no form carries a token, a forced POST is refused, and even past the
-    // CSRF check the approval itself refuses a missing or empty session.
-    assert.equal(csrfIn(anonHtml), null);
-    const anonPost = await textOf(await goAnon(anon.url + '/oauth/device/verify', {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ code, csrf: 'guess' }).toString()
-    }));
-    assert.equal(anonPost.status, 403);
-    assert.equal(anonPost.body.error, 'csrf_denied');
-    for (const nobody of [null, undefined, {}, { id: '' }, { email: 'user-1', email_verified: true }]) {
+    // Email (verified or not) and a sub equal to the member id do not match a
+    // NULL sso_sub: unbound page, no approval, no dashboard.
+    const mailStart = await postJson(owner.url, '/oauth/device', { username: 'mail-1' });
+    for (const app of [emailOnly, idIsMember]) {
+      const go = browser();
+      const res = await go(app.url + '/oauth/device/verify');
+      const html = await res.text();
+      assert.equal(res.status, 403);
+      assert.match(html, /not bound to a SystemAPI member/);
+      assert.equal(html.includes('name="user_code"'), false);
+      const forced = await textOf(await postForm(go, app.url + '/oauth/device/verify', {
+        user_code: mailStart.body.user_code, csrf: csrfIn(html), confirm: 'yes'
+      }));
+      assert.equal(forced.status, 403);
+      const dash = await call(app.url + '/api/v1/fleet');
+      assert.equal(dash.status, 403);
+      assert.equal(dash.body.error, 'sso_unbound');
+    }
+    for (const nobody of [null, undefined, {}, { id: '' }, byEmail, { id: 'mail-1' }, { email: 'mail-1@example.test', email_verified: true }]) {
       await assert.rejects(
-        () => approveUserCode(fm.registry, code, nobody),
+        () => approveUserCode(fm.registry, mailStart.body.user_code, nobody),
         (err) => err.status === 403 && err.code === 'login_denied'
       );
     }
-    assert.equal((await poll(started.body.device_code)).body.error, 'authorization_pending');
+    assert.equal((await poll(mailStart.body.device_code)).body.error, 'authorization_pending');
 
-    // A session for a different member: refused page, refused POST, no token.
-    const goOther = browser();
-    const otherStart = await postJson(owner.url, '/oauth/device', { username: 'user-2' });
-    const otherCode = new URL(otherStart.body.verification_url).searchParams.get('code');
-    const otherCsrf = csrfIn(await (await goOther(other.url + '/oauth/device/verify?code=' + encodeURIComponent(otherCode))).text());
-    assert.equal(typeof otherCsrf, 'string');
-    const otherPage = await goOther(other.url + '/oauth/device/verify?code=' + encodeURIComponent(code));
-    const otherHtml = await otherPage.text();
-    assert.equal(otherPage.status, 403);
-    assert.match(otherHtml, /login_denied/);
-    assert.match(otherHtml, /signed in as <strong>u2@example\.test<\/strong>; this login is for <strong>user-1<\/strong>/);
-    const otherPost = await textOf(await goOther(other.url + '/oauth/device/verify', {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ code, csrf: otherCsrf }).toString()
-    }));
-    assert.equal(otherPost.status, 403);
-    assert.equal(otherPost.body.error, 'login_denied');
-    assert.equal((await poll(started.body.device_code)).body.error, 'authorization_pending');
-
-    // GET never approves, whatever it carries.
-    const goOwner = browser();
-    const ownerHtml = await (await goOwner(owner.url + '/oauth/device/verify?code=' + encodeURIComponent(code))).text();
-    const ownerCsrf = csrfIn(ownerHtml);
-    const sneaky = await goOwner(owner.url + '/oauth/device/verify?code=' + encodeURIComponent(code)
-      + '&csrf=' + encodeURIComponent(ownerCsrf) + '&approve=1');
-    assert.equal(sneaky.status, 200);
-    await sneaky.text();
-    assert.equal((await poll(started.body.device_code)).body.error, 'authorization_pending');
-    assert.equal(deviceRows(fm).find((row) => row.user_id === 'user-1').status, 'pending');
-
-    // The owner approves; the token is issued once.
-    const ok = await textOf(await verifyAs(goOwner, owner.url, code));
+    // Once an admin binds sub-x to mail-1, that same session is accepted.
+    await fm.registry.setSsoSub({ tenantId: 'acme', userId: 'mail-1', sub: 'sub-x', actor: 'test' });
+    const ok = await textOf(await verifyAs(browser(), emailOnly.url, mailStart.body.user_code));
     assert.equal(ok.status, 200);
-    const token = await poll(started.body.device_code);
-    assert.equal(token.status, 200);
-    assert.equal(token.body.token_type, 'Bearer');
-
-    // Email maps to a member only when Authentik marked it verified.
-    const mailStart = await postJson(owner.url, '/oauth/device', { username: 'mail-1' });
-    const mailCode = new URL(mailStart.body.verification_url).searchParams.get('code');
-    const unverifiedPage = await browser()(unverified.url + '/oauth/device/verify?code=' + encodeURIComponent(mailCode));
-    assert.equal(unverifiedPage.status, 403);
-    await unverifiedPage.text();
-    const mailOk = await textOf(await verifyAs(browser(), verified.url, mailCode));
-    assert.equal(mailOk.status, 200);
     assert.equal((await poll(mailStart.body.device_code)).status, 200);
+    assert.equal((await call(emailOnly.url + '/api/v1/fleet')).status, 200);
 
-    assert.equal(await sessionOwnsUser(fm.registry, null, 'user-1'), false);
-    assert.equal(await sessionOwnsUser(fm.registry, { id: '' }, 'user-1'), false);
-    assert.equal(await sessionOwnsUser(fm.registry, { id: 'USER-1' }, 'user-1'), false);
-    assert.equal(await sessionOwnsUser(fm.registry, { id: 'user-1' }, 'user-1'), true);
+    // Byte-exact: case or whitespace variants of the sub never match.
+    assert.equal(await sessionOwnsUser(fm.registry, { id: 'SUB-X' }, 'mail-1'), false);
+    assert.equal(await sessionOwnsUser(fm.registry, { id: 'sub-x ' }, 'mail-1'), false);
+    assert.equal(await sessionOwnsUser(fm.registry, { id: 'sub-x' }, 'mail-1'), true);
+    assert.equal(await sessionOwnsUser(fm.registry, { id: 'sub-x' }, 'user-1'), false);
+    assert.equal(await sessionOwnsUser(fm.registry, null, 'mail-1'), false);
+
+    // A code that belongs to another member is refused like a wrong code, and
+    // the page does not name that member.
+    const otherStart = await postJson(owner.url, '/oauth/device', { username: 'user-2' });
+    const goOwner = browser();
+    const cross = await textOf(await verifyAs(goOwner, owner.url, otherStart.body.user_code));
+    assert.equal(cross.status, 403);
+    assert.match(cross.body, /not accepted/);
+    assert.equal(cross.body.includes('user-2'), false);
+    assert.equal((await poll(otherStart.body.device_code)).body.error, 'authorization_pending');
+    const theirs = await textOf(await verifyAs(browser(), other.url, otherStart.body.user_code));
+    assert.equal(theirs.status, 200);
+
+    // Every membership row must carry the sub: a second, unbound tenant row
+    // refuses the device login until that tenant binds it too.
+    await fm.registry.addMember('beta', 'user-1', 'viewer');
+    const twoTenants = await postJson(owner.url, '/oauth/device', { username: 'user-1' });
+    const half = await textOf(await verifyAs(browser(), owner.url, twoTenants.body.user_code));
+    assert.equal(half.status, 403);
+    assert.equal((await poll(twoTenants.body.device_code)).body.error, 'authorization_pending');
+    const dash = await call(owner.url + '/api/v1/fleet');
+    assert.equal(dash.status, 200);
+    assert.deepEqual(dash.body.hosts.map((h) => h.host_id), [HOST_A]);
+    await fm.registry.setSsoSub({ tenantId: 'beta', userId: 'user-1', sub: 'sub-user-1', actor: 'test' });
+    const full = await textOf(await verifyAs(browser(), owner.url, twoTenants.body.user_code));
+    assert.equal(full.status, 200);
   } finally {
-    for (const s of [anon, other, owner, unverified, verified]) s.server.close();
+    for (const s of [owner, other, emailOnly, idIsMember]) s.server.close();
+  }
+});
+
+test('device code entry is rate limited per session and per IP, and wrong codes invalidate', async () => {
+  const fm = fleet();
+  await seed(fm);
+  const { server, url } = await listen(appFor(fm, await ssoUser(fm, 'user-1')));
+  armPublic(fm, url);
+  const poll = (deviceCode) => postJson(url, '/oauth/token', { grant_type: DEVICE_GRANT, device_code: deviceCode });
+  try {
+    const started = await postJson(url, '/oauth/device', { username: 'user-1' });
+    const go = browser();
+    const csrf = await pageCsrf(go, url);
+    const wrong = ['BBBB-BBBB', 'not-a-code', '', 'ZZZZZZZZZ', 'AEIO-UAEI'];
+    for (const code of wrong) {
+      const res = await textOf(await postForm(go, url + '/oauth/device/verify', { user_code: code, csrf }));
+      assert.equal(res.status, 403, code);
+      assert.match(res.body, /not accepted/);
+    }
+    // Five failures: this member's pending logins are denied, and the session
+    // is locked out even for the right code.
+    assert.equal(deviceRows(fm)[0].status, 'denied');
+    assert.equal((await poll(started.body.device_code)).body.error, 'access_denied');
+    const locked = await textOf(await postForm(go, url + '/oauth/device/verify', { user_code: started.body.user_code, csrf }));
+    assert.equal(locked.status, 429);
+    assert.equal(locked.body.error, 'slow_down');
+
+    // Per IP: fresh sessions from the same address share a budget of 20.
+    for (let s = 0; s < 3; s += 1) {
+      const g = browser();
+      const c = await pageCsrf(g, url);
+      for (let i = 0; i < 5; i += 1) {
+        const res = await postForm(g, url + '/oauth/device/verify', { user_code: 'BBBB-BBBB', csrf: c });
+        assert.equal(res.status, 403);
+        await res.text();
+      }
+    }
+    const fresh = await postJson(url, '/oauth/device', { username: 'user-1' });
+    const g = browser();
+    const c = await pageCsrf(g, url);
+    const ipLocked = await textOf(await postForm(g, url + '/oauth/device/verify', { user_code: fresh.body.user_code, csrf: c }));
+    assert.equal(ipLocked.status, 429);
+    assert.equal(ipLocked.body.error, 'slow_down');
+    assert.equal((await poll(fresh.body.device_code)).body.error, 'authorization_pending');
+  } finally {
+    server.close();
   }
 });
 
@@ -913,19 +951,27 @@ test('the SSO return path cannot leave the origin', () => {
   const offsite = [
     'https://evil.example/', '//evil.example/x', '/\\evil.example', '/\\/evil.example',
     '\\\\evil.example', 'javascript:alert(1)', 'evil.example', '', null, 42, {},
-    '/ok\r\nLocation: https://evil.example', '/\t/evil.example', '/%0d%0a', 'x'.repeat(3000)
+    '/ok\r\nLocation: https://evil.example', '/\t/evil.example', '/%0d%0a', 'x'.repeat(3000),
+    // Dot segments resolve to "//evil.com" only after URL parsing.
+    '/.//evil.com', '/x/..//evil.com', '/%2e//evil.com', '/%2e%2e//evil.com', '/x/%2e%2e//evil.com',
+    '/./\\evil.com', '/%2E%2E/%2fevil.com', '/a/b/../..//evil.com'
   ];
   for (const value of offsite) {
     const out = safeReturnPath(value);
     assert.equal(out.startsWith('/'), true, String(value));
     assert.equal(out.startsWith('//'), false, String(value));
+    assert.equal(out.startsWith('/\\'), false, String(value));
     assert.equal(new URL(out, 'https://cp.example').origin, 'https://cp.example', String(value));
+  }
+  for (const value of ['/.//evil.com', '/x/..//evil.com', '/%2e//evil.com', '/%2e%2e//evil.com']) {
+    assert.equal(safeReturnPath(value), '/', value);
   }
   assert.equal(safeReturnPath('https://evil.example/'), '/');
   assert.equal(safeReturnPath('//evil.example/x'), '/');
   assert.equal(safeReturnPath('/\\evil.example'), '/');
   assert.equal(safeReturnPath('/ok\r\nLocation: x'), '/');
-  assert.equal(safeReturnPath('/oauth/device/verify?code=abc_-123'), '/oauth/device/verify?code=abc_-123');
+  assert.equal(safeReturnPath('/oauth/device/verify'), '/oauth/device/verify');
+  assert.equal(safeReturnPath('/dashboard?tab=hosts'), '/dashboard?tab=hosts');
   assert.equal(safeReturnPath('/dashboard#frag'), '/dashboard');
 });
 
@@ -943,6 +989,7 @@ test('oauth caps pending grants and the server owns the poll interval', async ()
     assert.equal(extra.status, 429);
     assert.equal(extra.body.error, 'slow_down');
     assert.equal(deviceRows(fm).length, 3);
+    assert.equal(new Set(deviceRows(fm).map((row) => row.user_code_hash)).size, 3);
   } finally {
     server.close();
   }
@@ -951,8 +998,9 @@ test('oauth caps pending grants and the server owns the poll interval', async ()
   await seed(slow);
   const env = { NODE_ENV: 'production', SYSTEMAPI_PUBLIC_URL: 'https://cp.example' };
   const now = 1700000000000;
-  const started = await startDevice(slow.registry, 'user-1', env, now);
+  const started = await startDevice(slow.registry, 'user-1', env, {}, now);
   assert.equal(started.interval, 5);
+  assert.equal(started.verification_uri, 'https://cp.example/oauth/device/verify');
   await assert.rejects(
     () => pollToken(slow.registry, started.device_code, env, now),
     (err) => err.code === 'authorization_pending'
@@ -967,14 +1015,106 @@ test('oauth caps pending grants and the server owns the poll interval', async ()
   );
 });
 
-test('oauth external login requires a whitelist and binds one subject', async () => {
+test('SSO binding is admin only, audited in the chain, and one sub per member', async () => {
+  const fm = fleet();
+  await seed(fm);
+  await fm.registry.addMember('acme', 'viewer-1', 'viewer');
+  await fm.registry.addMember('acme', 'mail-1', 'operator', 'mail-1@example.test');
+  const admin = await listen(appFor(fm, await ssoUser(fm, 'user-1')));
+  const viewer = await listen(appFor(fm, await ssoUser(fm, 'viewer-1')));
+  const bind = (base, tenant, user, body) => call(`${base}/api/v1/tenants/${tenant}/members/${user}/sso`, {
+    method: body === undefined ? 'DELETE' : 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body)
+  });
+  const rowOf = (tenant, user) => fm.registry.members.find((m) => m.tenant_id === tenant && m.user_id === user);
+  try {
+    const before = fm.registry.audit.length;
+    const refused = await bind(viewer.url, 'acme', 'mail-1', { sso_sub: 'sub-viewer-plant' });
+    assert.equal(refused.status, 403);
+    assert.equal(refused.body.error, 'scope_denied');
+    const unbindRefused = await bind(viewer.url, 'acme', 'user-1');
+    assert.equal(unbindRefused.status, 403);
+    assert.equal(rowOf('acme', 'mail-1').sso_sub, null);
+    assert.equal(rowOf('acme', 'user-1').sso_sub, 'sub-user-1');
+    const otherTenant = await bind(admin.url, 'beta', 'user-2', { sso_sub: 'sub-plant' });
+    assert.equal(otherTenant.status, 404);
+    const noMember = await bind(admin.url, 'acme', 'user-2', { sso_sub: 'sub-plant' });
+    assert.equal(noMember.status, 404);
+    for (const bad of [{}, { sso_sub: '' }, { sso_sub: 'has space' }, { sso_sub: 42 }, { sso_sub: 'x'.repeat(300) }]) {
+      const res = await bind(admin.url, 'acme', 'mail-1', bad);
+      assert.equal(res.status, 400, JSON.stringify(bad));
+      assert.equal(res.body.error, 'bad_sso_sub');
+    }
+    assert.equal(fm.registry.audit.length, before);
+
+    const subMail = 'a3f1c0ffee'.repeat(6) + 'beef';
+    const ok = await bind(admin.url, 'acme', 'mail-1', { sso_sub: subMail });
+    assert.equal(ok.status, 200);
+    assert.deepEqual(ok.body, { tenant_id: 'acme', user_id: 'mail-1', bound: true });
+    assert.equal(rowOf('acme', 'mail-1').sso_sub, subMail);
+    const last = fm.registry.audit[fm.registry.audit.length - 1];
+    assert.equal(last.action, 'sso_bind');
+    assert.equal(last.actor, 'user-1');
+    assert.equal(last.tenant_id, 'acme');
+    assert.equal(last.payload.user_id, 'mail-1');
+    assert.equal(last.payload.sso_sub_fp.length, 64);
+    assert.equal(JSON.stringify(fm.registry.audit).includes(subMail), false);
+    assert.equal((await fm.registry.verifyAudit()).ok, true);
+
+    // One sub, one member id: not on a second member in any tenant.
+    const twice = await bind(admin.url, 'acme', 'viewer-1', { sso_sub: subMail });
+    assert.equal(twice.status, 409);
+    assert.equal(twice.body.error, 'sso_sub_taken');
+    assert.equal(rowOf('acme', 'viewer-1').sso_sub, 'sub-viewer-1');
+    await assert.rejects(
+      () => fm.registry.setSsoSub({ tenantId: 'beta', userId: 'user-2', sub: subMail, actor: 'test' }),
+      (err) => err.status === 409 && err.code === 'sso_sub_taken'
+    );
+
+    // Unbinding is audited, and the sub stops working at once.
+    const mailApp = await listen(appFor(fm, { id: subMail }));
+    try {
+      assert.equal((await call(mailApp.url + '/api/v1/fleet')).status, 200);
+      const gone = await bind(admin.url, 'acme', 'mail-1');
+      assert.equal(gone.status, 200);
+      assert.equal(gone.body.bound, false);
+      assert.equal(fm.registry.audit[fm.registry.audit.length - 1].action, 'sso_unbind');
+      assert.equal((await call(mailApp.url + '/api/v1/fleet')).status, 403);
+    } finally {
+      mailApp.server.close();
+    }
+
+    // A failed audit write leaves the binding as it was.
+    const realAppend = fm.registry.appendAudit;
+    fm.registry.appendAudit = async () => { throw Object.assign(new Error('audit down'), { code: 'audit_down' }); };
+    await assert.rejects(() => fm.registry.setSsoSub({ tenantId: 'acme', userId: 'mail-1', sub: 'sub-z', actor: 'test' }));
+    assert.equal(rowOf('acme', 'mail-1').sso_sub, null);
+    fm.registry.appendAudit = realAppend;
+
+    // Server-side bootstrap for the first admin: same checks, same audit row.
+    const { run, ACTOR } = require('../scripts/sso-bind');
+    const boot = await run(['beta', 'user-2', 'sub-boot'], fm.registry);
+    assert.deepEqual(boot, { tenant_id: 'beta', user_id: 'user-2', bound: true });
+    assert.equal(fm.registry.audit[fm.registry.audit.length - 1].actor, ACTOR);
+    await assert.rejects(() => run(['beta', 'user-2'], fm.registry), (err) => err.code === 'usage');
+    await assert.rejects(() => run(['beta', 'nobody', 'sub-q'], fm.registry), (err) => err.status === 404);
+    await assert.rejects(() => run(['acme', 'mail-1', 'sub-boot'], fm.registry), (err) => err.code === 'sso_sub_taken');
+    assert.equal((await fm.registry.verifyAudit()).ok, true);
+  } finally {
+    admin.server.close();
+    viewer.server.close();
+  }
+});
+
+test('oauth external login requires a whitelist, the owner session, and binds one subject', async () => {
   const fm = fleet();
   await seed(fm);
   await fm.registry.addMember('acme', 'viewer-1', 'viewer');
   await fm.registry.addMember('acme', 'user-3', 'operator');
-  const admin = await listen(appFor(fm, { id: 'user-1' }));
-  const viewer = await listen(appFor(fm, { id: 'viewer-1' }));
-  const third = await listen(appFor(fm, { id: 'user-3' }));
+  const admin = await listen(appFor(fm, await ssoUser(fm, 'user-1')));
+  const viewer = await listen(appFor(fm, await ssoUser(fm, 'viewer-1')));
+  const third = await listen(appFor(fm, await ssoUser(fm, 'user-3')));
   const anon = await listen(appFor(fm));
   armPublic(fm, admin.url);
   const go = browser();
@@ -994,6 +1134,12 @@ test('oauth external login requires a whitelist and binds one subject', async ()
   };
   const idpToken = 'idp-token-canary-value';
   const subject = 'google-subject-canary-1';
+  const idp = (sub) => async (target) => {
+    if (String(target).includes('userinfo')) {
+      return { status: 200, text: async () => JSON.stringify({ sub }) };
+    }
+    return { status: 200, text: async () => JSON.stringify({ access_token: idpToken }) };
+  };
   try {
     const viewerWrite = await postJson(viewer.url, '/api/v1/oauth/links', { user_id: 'user-1', provider: 'google' });
     assert.equal(viewerWrite.status, 403);
@@ -1011,11 +1157,11 @@ test('oauth external login requires a whitelist and binds one subject', async ()
     assert.equal(created.body.subject, undefined);
 
     const started = await postJson(admin.url, '/oauth/device', { username: 'user-1' });
-    const userCode = new URL(started.body.verification_url).searchParams.get('code');
-    const plain = await go(admin.url + '/oauth/device/verify?code=' + encodeURIComponent(userCode));
-    const plainHtml = await plain.text();
-    const goCsrf = csrfIn(plainHtml);
-    assert.equal(plainHtml.includes('Continue with Google'), false);
+    const userCode = started.body.user_code;
+    const goCsrf = await pageCsrf(go, admin.url);
+    const plain = await textOf(await postForm(go, admin.url + '/oauth/device/verify', { user_code: userCode, csrf: goCsrf }));
+    assert.equal(plain.status, 200);
+    assert.equal(plain.body.includes('Continue with Google'), false);
     const unconfigured = await textOf(await jump(go, admin.url, userCode, 'google'));
     assert.equal(unconfigured.status, 403);
     assert.equal(unconfigured.body.error, 'link_denied');
@@ -1024,17 +1170,16 @@ test('oauth external login requires a whitelist and binds one subject', async ()
     fm.env.SYSTEMAPI_GOOGLE_CLIENT_SECRET = 'google-secret-canary';
     fm.env.SYSTEMAPI_GITHUB_CLIENT_ID = 'github-client-canary';
     fm.env.SYSTEMAPI_GITHUB_CLIENT_SECRET = 'github-secret-canary';
-    const offered = await fetch(admin.url + '/oauth/device/verify?code=' + encodeURIComponent(userCode));
-    const offeredHtml = await offered.text();
-    assert.match(offeredHtml, /Continue with Google/);
-    assert.equal(offeredHtml.includes('Continue with GitHub'), false);
-    assert.equal(offeredHtml.includes('google-secret-canary'), false);
-    assert.equal(offeredHtml.includes('github-secret-canary'), false);
+    const offered = await textOf(await postForm(go, admin.url + '/oauth/device/verify', { user_code: userCode, csrf: goCsrf }));
+    assert.match(offered.body, /Continue with Google/);
+    assert.equal(offered.body.includes('Continue with GitHub'), false);
+    assert.equal(offered.body.includes('google-secret-canary'), false);
+    assert.equal(offered.body.includes('github-secret-canary'), false);
 
     const garbage = await textOf(await jump(go, admin.url, userCode, 'google.evil'));
     assert.equal(garbage.status, 403);
     assert.equal(garbage.body.error, 'link_denied');
-    const noCsrfJump = await postJson(admin.url, '/oauth/device/verify', { code: userCode, provider: 'google' });
+    const noCsrfJump = await postJson(admin.url, '/oauth/device/verify', { user_code: userCode, provider: 'google' });
     assert.equal(noCsrfJump.status, 403);
     assert.equal(noCsrfJump.body.error, 'csrf_denied');
     const first = await jump(go, admin.url, userCode, 'google');
@@ -1043,37 +1188,25 @@ test('oauth external login requires a whitelist and binds one subject', async ()
     assert.equal(location.startsWith('https://accounts.google.com/o/oauth2/v2/auth?'), true);
     assert.equal(location.includes('google-secret-canary'), false);
     const state = new URL(location).searchParams.get('state');
-    const before = await postJson(admin.url, '/oauth/token', {
-      grant_type: DEVICE_GRANT,
-      device_code: started.body.device_code
-    });
-    assert.equal(before.body.error, 'authorization_pending');
+    const poll = (deviceCode) => postJson(admin.url, '/oauth/token', { grant_type: DEVICE_GRANT, device_code: deviceCode });
+    assert.equal((await poll(started.body.device_code)).body.error, 'authorization_pending');
 
     // A callback in a browser that did not start this login is refused, even
     // with a good IdP answer (the attacker sends the victim the IdP link).
-    fm.oauthFetch = async (target) => {
-      if (String(target).includes('userinfo')) {
-        return { status: 200, text: async () => JSON.stringify({ sub: subject }) };
-      }
-      return { status: 200, text: async () => JSON.stringify({ access_token: idpToken }) };
-    };
+    fm.oauthFetch = idp(subject);
     const foreign = await call(admin.url + '/oauth/google/callback?code=auth-code&state=' + encodeURIComponent(state));
     assert.equal(foreign.status, 403);
     assert.match(foreign.body, /Login denied/);
     assert.equal(fm.registry.oauthLinks.get('user-1\0google').subject, null);
-    const stillPending = await postJson(admin.url, '/oauth/token', {
-      grant_type: DEVICE_GRANT,
-      device_code: started.body.device_code
-    });
-    assert.equal(stillPending.body.error, 'authorization_pending');
+    assert.equal((await poll(started.body.device_code)).body.error, 'authorization_pending');
 
-    // First-use binding needs a session that owns the member: a browser with
-    // no SSO session cannot bind its own IdP account to user-1.
+    // A browser with no SSO session never gets a form token, so it cannot
+    // start the IdP round trip to bind its own IdP account to user-1.
     const goAnon = browser();
-    const anonJump = await jump(goAnon, anon.url, userCode, 'google');
-    assert.equal(anonJump.status, 302);
-    const anonBind = await textOf(await goAnon(anon.url + '/oauth/google/callback?code=auth-code&state=' + encodeURIComponent(stateOf(anonJump))));
-    assert.match(anonBind.body, /Login denied/);
+    assert.equal(await pageCsrf(goAnon, anon.url), null);
+    const anonJump = await textOf(await postForm(goAnon, anon.url + '/oauth/device/verify', { user_code: userCode, csrf: 'guess', provider: 'google' }));
+    assert.equal(anonJump.status, 403);
+    assert.equal(anonJump.body.error, 'csrf_denied');
     assert.equal(fm.registry.oauthLinks.get('user-1\0google').subject, null);
 
     const restart = await jump(go, admin.url, userCode, 'google');
@@ -1084,21 +1217,13 @@ test('oauth external login requires a whitelist and binds one subject', async ()
     const unknown = await fetch(admin.url + '/oauth/evil/callback?code=x&state=' + encodeURIComponent(state));
     assert.equal(unknown.status, 404);
 
-    fm.oauthFetch = async (target) => {
-      if (String(target).includes('userinfo')) {
-        return { status: 200, text: async () => JSON.stringify({ sub: subject }) };
-      }
-      return { status: 200, text: async () => JSON.stringify({ access_token: idpToken }) };
-    };
+    fm.oauthFetch = idp(subject);
     const bindJump = await jump(go, admin.url, userCode, 'google');
     const done = await textOf(await go(admin.url + '/oauth/google/callback?code=auth-code&state=' + encodeURIComponent(stateOf(bindJump))));
     assert.match(done.body, /Signed in/);
     assert.equal(done.body.includes(idpToken), false);
     assert.equal(done.body.includes(subject), false);
-    const tokenRes = await postJson(admin.url, '/oauth/token', {
-      grant_type: DEVICE_GRANT,
-      device_code: started.body.device_code
-    });
+    const tokenRes = await poll(started.body.device_code);
     assert.equal(tokenRes.status, 200);
     const listed = await call(admin.url + '/api/v1/oauth/links');
     assert.equal(listed.body.links.some((row) => row.user_id === 'user-1' && row.provider === 'google' && row.linked === true), true);
@@ -1107,43 +1232,23 @@ test('oauth external login requires a whitelist and binds one subject', async ()
     assert.equal(fm.registry.oauthLinks.get('user-1\0google').subject, subject);
 
     const mismatchStart = await postJson(admin.url, '/oauth/device', { username: 'user-1' });
-    const mismatchCode = new URL(mismatchStart.body.verification_url).searchParams.get('code');
-    fm.oauthFetch = async (target) => {
-      if (String(target).includes('userinfo')) {
-        return { status: 200, text: async () => JSON.stringify({ sub: 'other-subject-canary' }) };
-      }
-      return { status: 200, text: async () => JSON.stringify({ access_token: idpToken }) };
-    };
-    const mismatchJump = await jump(go, admin.url, mismatchCode, 'google');
+    fm.oauthFetch = idp('other-subject-canary');
+    const mismatchJump = await jump(go, admin.url, mismatchStart.body.user_code, 'google');
     const mismatchDone = await textOf(await go(admin.url + '/oauth/google/callback?code=auth-code&state=' + encodeURIComponent(stateOf(mismatchJump))));
     assert.match(mismatchDone.body, /Login denied/);
     assert.equal(fm.registry.oauthLinks.get('user-1\0google').subject, subject);
-    const mismatchPoll = await postJson(admin.url, '/oauth/token', {
-      grant_type: DEVICE_GRANT,
-      device_code: mismatchStart.body.device_code
-    });
-    assert.equal(mismatchPoll.body.error, 'authorization_pending');
+    assert.equal((await poll(mismatchStart.body.device_code)).body.error, 'authorization_pending');
 
     await postJson(admin.url, '/api/v1/oauth/links', { user_id: 'user-3', provider: 'google' });
     const second = await postJson(admin.url, '/oauth/device', { username: 'user-3' });
-    const secondCode = new URL(second.body.verification_url).searchParams.get('code');
-    fm.oauthFetch = async (target) => {
-      if (String(target).includes('userinfo')) {
-        return { status: 200, text: async () => JSON.stringify({ sub: subject }) };
-      }
-      return { status: 200, text: async () => JSON.stringify({ access_token: idpToken }) };
-    };
-    // user-1's session does not own user-3: the page refuses, and a forced
-    // POST with a valid CSRF token still cannot bind user-3's link.
-    const refusedPage = await go(admin.url + '/oauth/device/verify?code=' + encodeURIComponent(secondCode));
-    const refusedHtml = await refusedPage.text();
-    assert.equal(refusedPage.status, 403);
-    assert.match(refusedHtml, /login_denied/);
-    assert.match(refusedHtml, /signed in as <strong>user-1<\/strong>; this login is for <strong>user-3<\/strong>/);
-    assert.equal(csrfIn(refusedHtml), null);
-    const notOwner = await verifyAs(go, admin.url, secondCode, { provider: 'google', csrf: goCsrf });
-    const notOwnerDone = await textOf(await go(admin.url + '/oauth/google/callback?code=auth-code&state=' + encodeURIComponent(stateOf(notOwner))));
-    assert.match(notOwnerDone.body, /Login denied/);
+    const secondCode = second.body.user_code;
+    fm.oauthFetch = idp(subject);
+    // user-1's session does not own user-3: typing user-3's code is refused
+    // before any IdP redirect, so it cannot bind user-3's link.
+    const notOwner = await textOf(await jump(go, admin.url, secondCode, 'google'));
+    assert.equal(notOwner.status, 403);
+    assert.match(notOwner.body, /not accepted/);
+    assert.equal(notOwner.body.includes('user-3'), false);
     assert.equal(fm.registry.oauthLinks.get('user-3\0google').subject, null);
     // user-3's own session still cannot take a subject already bound to user-1.
     const secondJump = await jump(go3, third.url, secondCode, 'google');
@@ -1153,7 +1258,7 @@ test('oauth external login requires a whitelist and binds one subject', async ()
     assert.equal(fm.registry.oauthLinks.get('user-1\0google').subject, subject);
 
     const githubStart = await postJson(admin.url, '/oauth/device', { username: 'user-3' });
-    const githubCode = new URL(githubStart.body.verification_url).searchParams.get('code');
+    const githubCode = githubStart.body.user_code;
     const noGithub = await textOf(await jump(go3, third.url, githubCode, 'github'));
     assert.equal(noGithub.status, 403);
     assert.equal(noGithub.body.error, 'link_denied');
@@ -1173,8 +1278,7 @@ test('oauth external login requires a whitelist and binds one subject', async ()
     assert.equal(fm.registry.oauthLinks.get('user-3\0github').subject, '42');
 
     const hugeStart = await postJson(admin.url, '/oauth/device', { username: 'user-1' });
-    const hugeCode = new URL(hugeStart.body.verification_url).searchParams.get('code');
-    const hugeJump = await jump(go, admin.url, hugeCode, 'google');
+    const hugeJump = await jump(go, admin.url, hugeStart.body.user_code, 'google');
     const hugeState = stateOf(hugeJump);
     fm.oauthFetch = async (target) => {
       if (String(target).includes('userinfo')) {
@@ -1220,10 +1324,10 @@ test('oauth external login requires a whitelist and binds one subject', async ()
   }
 });
 
-test('cli login writes a mode 0600 token and prints only the verification URL', async () => {
+test('cli login writes a mode 0600 token and prints only the verification URI and user code', async () => {
   const fm = fleet();
   await seed(fm);
-  const { server, url } = await listen(appFor(fm, { id: 'user-1' }));
+  const { server, url } = await listen(appFor(fm, await ssoUser(fm, 'user-1')));
   const tokenFile = path.join(os.tmpdir(), 'systemapi-oauth-' + process.pid + '-' + Date.now());
   const mismatchFile = tokenFile + '-mismatch';
   let child;
@@ -1249,17 +1353,19 @@ test('cli login writes a mode 0600 token and prints only the verification URL', 
     });
     const closed = new Promise((resolve) => child.on('close', resolve));
     await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('login url timeout ' + stderr)), 5000);
+      const timer = setTimeout(() => reject(new Error('login prompt timeout ' + stderr)), 5000);
       child.stdout.on('data', (chunk) => {
         stdout += chunk.toString();
-        if (stdout.includes('/oauth/device/verify?code=')) {
+        if (stdout.split('\n').length >= 3) {
           clearTimeout(timer);
           resolve();
         }
       });
       child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
     });
-    const userCode = new URL(stdout.split('\n')[0]).searchParams.get('code');
+    const [uri, userCode] = stdout.split('\n');
+    assert.equal(uri, url + '/oauth/device/verify');
+    assert.match(userCode, USER_CODE_SHAPE);
     const yes = await verifyAs(browser(), url, userCode);
     assert.equal(yes.status, 200);
     const status = await Promise.race([
@@ -1271,9 +1377,9 @@ test('cli login writes a mode 0600 token and prints only the verification URL', 
     ]);
     assert.equal(status, 0, stderr + stdout);
     const lines = stdout.split('\n');
-    assert.equal(lines[1], 'approved');
-    assert.equal(lines[2], tokenFile);
-    assert.equal(lines[3], '');
+    assert.equal(lines[2], 'approved');
+    assert.equal(lines[3], tokenFile);
+    assert.equal(lines[4], '');
     assert.equal(stdout.includes('device_code'), false);
     assert.equal(stdout.includes('access_token'), false);
     assert.equal(stderr.includes('SYSTEMAPI_API_KEY'), false);
@@ -1413,7 +1519,7 @@ test('terminal:root is admin only and every ticket is audited', async () => {
   const fm = fleet();
   await seed(fm);
   await fm.registry.addMember('acme', 'op-1', 'operator', 'op@example');
-  const opApp = await listen(appFor(fm, { id: 'op-1', email: 'op@example', groups: [] }));
+  const opApp = await listen(appFor(fm, await ssoUser(fm, 'op-1', { email: 'op@example', groups: [] })));
   const adminApp = await listen(appFor(fm));
   await fm.registry.setScopes('ak_test', ['admin']);
   const ticket = (url, purpose, headers = {}) => call(`${url}/api/v1/ws-ticket`, {
@@ -1484,7 +1590,7 @@ test('ws-ticket is rate limited per actor and host, with a separate privileged b
   await seed(fm);
   await fm.registry.setScopes('ak_test', ['admin']);
   await fm.registry.addMember('acme', 'op-1', 'operator', 'op@example');
-  const opApp = await listen(appFor(fm, { id: 'op-1', email: 'op@example', groups: [] }));
+  const opApp = await listen(appFor(fm, await ssoUser(fm, 'op-1', { email: 'op@example', groups: [] })));
   const adminApp = await listen(appFor(fm));
   const ticket = (url, purpose, headers = {}) => call(`${url}/api/v1/ws-ticket`, {
     method: 'POST',

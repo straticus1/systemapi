@@ -1,9 +1,10 @@
 // Threats: approving someone else's device login. Holding the user code is
 // NOT consent: the person who starts the flow receives it. Approval needs an
-// Authentik session whose sub is bound to the device row's member
-// (cp_sso_bindings, byte-exact; no email or username matching), the user
-// TYPES the code on that page (RFC 8628; no code in any URL), every POST
-// carries a CSRF token bound to the session, and GET never approves. Code
+// Authentik session whose sub is bound to every membership row of the device
+// row's member (cp_members.sso_sub, byte-exact; no email or username
+// matching; NULL never matches), the user TYPES the code on that page (RFC
+// 8628; no code in any URL), every POST carries a CSRF token bound to the
+// session, and GET never approves. Code
 // entry is limited per session and per IP; a session that fails too often
 // denies every pending login of its member. A Google or GitHub approval runs
 // only after those same checks; a first-use subject binding needs that
@@ -225,18 +226,27 @@ function validSsoSub(value) {
   return typeof value === 'string' && SSO_SUB_RE.test(value);
 }
 
-// SSO identity is the Authentik sub only, bound to a member by an admin
-// (cp_sso_bindings). Email, name and preferred_username never identify.
+// SSO identity is the Authentik sub only (cp_members.sso_sub, set by an
+// admin), compared byte-exact. Email, name and preferred_username never
+// identify. Returns the one member id the sub is bound to, or null when it is
+// bound to none, or (fail closed) to more than one.
 async function sessionMember(registry, sessionUser) {
   if (!sessionUser || !validSsoSub(sessionUser.id)) return null;
-  const member = await registry.memberForSub(sessionUser.id);
+  const rows = await registry.membershipsForSub(sessionUser.id);
+  const ids = new Set((rows || []).filter((row) => row && row.sso_sub === sessionUser.id).map((row) => row.user_id));
+  if (ids.size !== 1) return null;
+  const [member] = ids;
   return typeof member === 'string' && member.length > 0 ? member : null;
 }
 
+// A session owns a member only when EVERY membership row of that member is
+// bound to the session's sub. A device token acts in all of the member's
+// tenants, so one tenant's admin binding a row cannot hand out the others.
 async function sessionOwnsUser(registry, sessionUser, userId) {
   if (typeof userId !== 'string' || userId.length === 0) return false;
-  const member = await sessionMember(registry, sessionUser);
-  return member !== null && member === userId;
+  if (!sessionUser || !validSsoSub(sessionUser.id)) return false;
+  const rows = await registry.membershipsForUser(userId);
+  return Array.isArray(rows) && rows.length > 0 && rows.every((row) => row && row.sso_sub === sessionUser.id);
 }
 
 function sessionLabel(sessionUser) {
@@ -323,12 +333,6 @@ function entryPage(sessionUser, member, csrf, notice) {
     + '<input type="hidden" name="csrf" value="' + escapeHtml(csrf) + '">'
     + '<label>Code <input name="user_code" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="16" required></label>'
     + '<button type="submit">Continue</button></form>' + logoutForm(csrf));
-}
-
-function mismatchPage(sessionUser, owner, csrf) {
-  return page('<p>Login denied (login_denied).</p><p>You are signed in as <strong>'
-    + escapeHtml(sessionLabel(sessionUser)) + '</strong>; this login is for <strong>'
-    + escapeHtml(owner) + '</strong>.</p>' + logoutForm(csrf));
 }
 
 async function confirmPage(registry, row, code, csrf, env) {
@@ -964,55 +968,15 @@ async function removeLink(registry, userId, provider) {
   return res.rowCount === 1;
 }
 
-// Binds an Authentik sub to a member id and writes one audit-chain row per
-// tenant the member belongs to. If the audit write fails the binding is put
-// back and the call fails. Used by the admin API and scripts/sso-bind.js.
-async function bindSsoAudited(registry, { userId, sub, actor }) {
-  if (!validSsoSub(sub)) throw http(400, 'bad_sso_sub');
+// Binds (or, with sub null, unbinds) the Authentik sub of one membership row.
+// The registry writes the binding and its audit-chain row in one transaction.
+// Used by the admin API and scripts/sso-bind.js.
+async function setSsoSubAudited(registry, { tenantId, userId, sub, actor }) {
+  if (sub !== null && !validSsoSub(sub)) throw http(400, 'bad_sso_sub');
+  if (typeof tenantId !== 'string' || !USER_RE.test(tenantId)) throw http(400, 'bad_tenant');
   if (typeof userId !== 'string' || !USER_RE.test(userId)) throw http(400, 'bad_user');
   if (typeof actor !== 'string' || actor.length === 0) throw http(400, 'bad_actor');
-  const tenants = [...new Set((await registry.membershipsForUser(userId)).map((m) => m.tenant_id))];
-  if (tenants.length === 0) throw http(404, 'not_found');
-  const before = await registry.ssoBinding(userId);
-  await registry.bindSso(userId, sub, actor);
-  try {
-    for (const tenantId of tenants) {
-      await registry.appendAudit({
-        tenant_id: tenantId,
-        actor,
-        action: 'sso_bind',
-        payload: { user_id: userId, sso_sub_fp: fingerprint(sub), previous_fp: before ? fingerprint(before.sso_sub) : null }
-      });
-    }
-  } catch (err) {
-    console.error('[control] sso bind audit failed:', err.code || 'audit_failed');
-    try {
-      if (before) await registry.bindSso(userId, before.sso_sub, before.bound_by);
-      else await registry.unbindSso(userId);
-    } catch (undoErr) {
-      console.error('[control] sso bind rollback failed:', undoErr.code || 'rollback_failed');
-    }
-    throw http(503, 'audit_unavailable');
-  }
-  return { user_id: userId, bound: true };
-}
-
-async function unbindSsoAudited(registry, { userId, actor }) {
-  if (typeof userId !== 'string' || !USER_RE.test(userId)) throw http(400, 'bad_user');
-  const tenants = [...new Set((await registry.membershipsForUser(userId)).map((m) => m.tenant_id))];
-  if (tenants.length === 0) throw http(404, 'not_found');
-  const before = await registry.ssoBinding(userId);
-  if (!before) return { user_id: userId, bound: false };
-  for (const tenantId of tenants) {
-    await registry.appendAudit({
-      tenant_id: tenantId,
-      actor,
-      action: 'sso_unbind',
-      payload: { user_id: userId, previous_fp: fingerprint(before.sso_sub) }
-    });
-  }
-  await registry.unbindSso(userId);
-  return { user_id: userId, bound: false };
+  return registry.setSsoSub({ tenantId, userId, sub, actor });
 }
 
 async function memberIds(registry, tenantIds) {
@@ -1073,11 +1037,9 @@ module.exports = {
   ssoPage,
   unboundPage,
   entryPage,
-  mismatchPage,
   confirmPage,
   validSsoSub,
-  bindSsoAudited,
-  unbindSsoAudited,
+  setSsoSubAudited,
   beginExternal,
   completeExternal,
   exchangeExternal,

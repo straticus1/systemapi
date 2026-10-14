@@ -94,17 +94,6 @@ function sessionUserOf(req) {
   return user && typeof user === 'object' ? user : null;
 }
 
-// Binding a member's SSO identity changes who can act as that member in every
-// tenant, so the caller must be admin in every tenant the member belongs to.
-async function requireSsoAdmin(fleet, principal, userId) {
-  if (typeof userId !== 'string' || !USER_RE.test(userId)) throw http(400, 'bad_user');
-  const target = await fleet.registry.membershipsForUser(userId);
-  const mine = new Set(tenantIds(principal));
-  if (!target.some((m) => mine.has(m.tenant_id))) throw http(404, 'not_found');
-  const admins = new Set(adminTenantIds(principal));
-  if (!target.every((m) => admins.has(m.tenant_id))) throw http(403, 'scope_denied');
-}
-
 function adminTenantIds(principal) {
   return principal.memberships
     .filter((member) => hasScope(scopesFor(principal, member.tenant_id), 'admin'))
@@ -184,11 +173,13 @@ async function authenticate(req, fleet) {
   }
   const sessionUser = req.session && req.session.user;
   if (sessionUser && sessionUser.id) {
-    // Sub-only identity: the session's Authentik sub must be bound to a
-    // member (cp_sso_bindings). Email is display data only.
+    // Sub-only identity: only membership rows whose sso_sub is exactly the
+    // session's Authentik sub count. Email is display data only; an unbound
+    // sub is refused.
     const userId = await oauth.sessionMember(fleet.registry, sessionUser);
     if (!userId) throw http(403, 'sso_unbound');
-    const memberships = await fleet.registry.membershipsForUser(userId);
+    const memberships = (await fleet.registry.membershipsForSub(sessionUser.id))
+      .filter((m) => m.user_id === userId && m.sso_sub === sessionUser.id);
     const boosted = roleFromGroups(sessionUser.groups);
     return {
       kind: 'session',
@@ -425,7 +416,7 @@ function mount(app, fleet) {
     }
     const csrf = oauth.sessionCsrf(req);
     const member = await oauth.sessionMember(fleet.registry, sessionUser);
-    if (!member) {
+    if (!member || !(await oauth.sessionOwnsUser(fleet.registry, sessionUser, member))) {
       res.status(403).type('html').send(oauth.unboundPage(sessionUser, csrf));
       return;
     }
@@ -441,7 +432,7 @@ function mount(app, fleet) {
     const sessionUser = sessionUserOf(req);
     const csrf = req.session.csrf;
     const member = await oauth.sessionMember(fleet.registry, sessionUser);
-    if (!member) {
+    if (!member || !(await oauth.sessionOwnsUser(fleet.registry, sessionUser, member))) {
       res.status(403).type('html').send(sessionUser ? oauth.unboundPage(sessionUser, csrf) : oauth.ssoPage());
       return;
     }
@@ -450,16 +441,25 @@ function mount(app, fleet) {
     const ipKey = 'ip:' + (req.ip || 'unknown');
     if (!oauth.codeEntryAllowed(fleet.codeTries, sessionKey, ipKey)) throw http(429, 'slow_down');
     const typed = bodyString(req.body, 'user_code');
+    // A wrong, expired or used code and a code for another member get the
+    // same answer and the same failure count; the page never names the
+    // other member.
     const found = await oauth.pendingByTypedCode(fleet.registry, typed);
-    if (!found || found.row.user_id !== member) {
+    if (!found || !(await oauth.sessionOwnsUser(fleet.registry, sessionUser, found.row.user_id))) {
       if (oauth.recordCodeFailure(fleet.codeTries, sessionKey, ipKey)) await oauth.denyPending(fleet.registry, member);
-      const html = found
-        ? oauth.mismatchPage(sessionUser, found.row.user_id, csrf)
-        : oauth.entryPage(sessionUser, member, csrf, 'That code was not accepted (login_denied).');
-      res.status(403).type('html').send(html);
+      res.status(403).type('html').send(oauth.entryPage(sessionUser, member, csrf, 'That code was not accepted (login_denied).'));
       return;
     }
+    // Approving (here or through Google/GitHub) needs the confirm page for
+    // this code to have been shown in this session first, so the person saw
+    // the requester's IP, client and start time.
     const rawProvider = req.body && req.body.provider;
+    const approving = (rawProvider != null && rawProvider !== '') || bodyString(req.body, 'confirm') === 'yes';
+    if (approving) {
+      const shown = req.session.deviceConfirm;
+      delete req.session.deviceConfirm;
+      if (typeof shown !== 'string' || !tokenEqual(shown, fingerprint(found.code))) throw http(403, 'login_denied');
+    }
     if (rawProvider != null && rawProvider !== '') {
       if (typeof rawProvider !== 'string') throw http(403, 'link_denied');
       const started = await oauth.beginExternal(fleet.registry, typed, rawProvider, fleet.env || {}, sessionUser);
@@ -467,11 +467,12 @@ function mount(app, fleet) {
       res.redirect(302, started.location);
       return;
     }
-    if (bodyString(req.body, 'confirm') === 'yes') {
+    if (approving) {
       await oauth.approveUserCode(fleet.registry, typed, sessionUser);
       res.type('html').send(oauth.donePage());
       return;
     }
+    req.session.deviceConfirm = fingerprint(found.code);
     res.type('html').send(await oauth.confirmPage(fleet.registry, found.row, found.code, csrf, fleet.env || {}));
   }));
 
@@ -833,20 +834,24 @@ function mount(app, fleet) {
     res.status(201).json(row);
   }));
 
-  app.put('/api/v1/members/:user/sso', wrap(async (req, res) => {
+  // Admin of the tenant only. Binds one membership row; every bind and unbind
+  // is an audit-chain row in that tenant (oauth.setSsoSubAudited).
+  const ssoBind = (unbind) => wrap(async (req, res) => {
     const principal = await authenticate(req, fleet);
-    const userId = req.params.user;
-    await requireSsoAdmin(fleet, principal, userId);
-    const sub = req.body && req.body.sso_sub;
-    res.json(await oauth.bindSsoAudited(fleet.registry, { userId, sub, actor: String(principal.userId) }));
-  }));
-
-  app.delete('/api/v1/members/:user/sso', wrap(async (req, res) => {
-    const principal = await authenticate(req, fleet);
-    const userId = req.params.user;
-    await requireSsoAdmin(fleet, principal, userId);
-    res.json(await oauth.unbindSsoAudited(fleet.registry, { userId, actor: String(principal.userId) }));
-  }));
+    const tenantId = req.params.tenant;
+    if (!tenantIds(principal).includes(tenantId)) throw http(404, 'not_found');
+    requireScope(fleet, principal, tenantId, 'admin');
+    const sub = unbind ? null : req.body && req.body.sso_sub;
+    if (!unbind && typeof sub !== 'string') throw http(400, 'bad_sso_sub');
+    res.json(await oauth.setSsoSubAudited(fleet.registry, {
+      tenantId,
+      userId: req.params.user,
+      sub,
+      actor: String(principal.userId)
+    }));
+  });
+  app.put('/api/v1/tenants/:tenant/members/:user/sso', ssoBind(false));
+  app.delete('/api/v1/tenants/:tenant/members/:user/sso', ssoBind(true));
 
   app.post('/api/v1/keys/:keyId/scopes', wrap(async (req, res) => {
     const principal = await authenticate(req, fleet);
