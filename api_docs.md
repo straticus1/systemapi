@@ -8,7 +8,24 @@ the router.
 
 - API key: `X-API-Key: <key>` or `Authorization: Bearer <key>`. A key in the
   query string is refused with `query_key_rejected`.
-- Dashboard: the OAuth session cookie set by `/oauth/login`.
+- Dashboard: the OAuth session cookie set by `/oauth/login`. `return_to` must
+  be a same-origin path; anything else returns to `/`.
+- Device login (CLI, sahconnect): `POST /oauth/device` with `username` returns
+  `device_code` and `verification_url`; poll `POST /oauth/token` with
+  `grant_type=urn:ietf:params:oauth:grant-type:device_code`. The user opens
+  `GET /oauth/device/verify?code=...` in a browser:
+  - no SSO session: the page links to `/oauth/login`, which returns to it;
+  - signed in as another member: 403 `login_denied` ("signed in as X; this
+    login is for Y");
+  - signed in as that member: a "Yes" form.
+  `POST /oauth/device/verify` needs the session cookie and the page's `csrf`
+  field (403 `csrf_denied` otherwise) and a session that owns the member
+  (403 `login_denied` otherwise). The session owns the member when its
+  Authentik `sub` equals `cp_members.user_id`, or its `email` (with
+  `email_verified` true) equals that member's `cp_members.email`. GET never
+  approves. A `provider` field (`google`, `github`) instead starts that IdP;
+  its callback must come back to the same browser session. Codes last 10
+  minutes and are single use; the bearer token lasts an hour.
 - Browser and CLI WebSockets: a single-use ticket from `POST /api/v1/ws-ticket`
   (`purpose` is `terminal:open`, `terminal:root` or `breakglass:open`). Tickets
   last 60 seconds, are bound to one host and purpose, and are audited. Each

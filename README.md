@@ -19,9 +19,13 @@ carries explicit entitlements.
   web terminal (opened with a single-use ticket), alert events. Containers and
   SSH key distribution are not wired and say so.
 - CLI in `cli/systemapi.js`; the key goes only in an `X-API-Key` header.
-- Username-first OAuth2 device login in `controlplane/oauth.js`. Google and
-  GitHub linking needs an admin whitelist row. API keys remain the machine
-  credential.
+- Username-first OAuth2 device login in `controlplane/oauth.js`. The client
+  prints a verification URL; approving it needs a browser signed in through
+  After Dark SSO (Authentik) as that same member, and the page offers the SSO
+  sign-in when there is no session. The user code alone approves nothing.
+  Google and GitHub linking needs an admin whitelist row, and binding a
+  linked account the first time also needs that SSO session. API keys remain
+  the machine credential.
 - Ansible and Terraform drivers in `drivers/`. They call REST, not SSH.
 - Grafana dashboard `grafana/dashboards/fleet.json`. `systemapi_alerts_active`
   is the process-wide count of open alerts. There are no Grafana alert rules.

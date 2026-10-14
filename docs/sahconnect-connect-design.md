@@ -125,6 +125,11 @@ was unreachable.
    - Prefer the OAuth device-login bearer token. SystemAPI already accepts
      `Bearer` (router.js), and `adssh identity device login` already obtains
      it.
+   - Approving the login takes a browser SSO step: the verification URL
+     opens a page that needs an After Dark SSO (Authentik) session for the
+     same member, plus a session-bound CSRF token. Holding the user code is
+     not consent (fixed 2026-10-14, see SECURITY_REVIEW.md). The URL format
+     is unchanged, so sahconnect needs no change.
    - `X-API-Key` stays for automation.
    - A long-lived scoped key in an env var is not the interactive default.
 6. **Policy cache.** Signed statements are cached until `expires_at`. An
@@ -176,7 +181,8 @@ Every phase updates `sah-suite.md` Wired join in the same change.
 
 1. **Interactive auth: device-login bearer token.** API keys remain for
    automation. This edits the contract: sahconnect gains device login and a
-   token file.
+   token file. The approval in the browser requires After Dark SSO as the
+   same member (2026-10-14); the user code alone approves nothing.
 2. **Shell user:** a fixed non-root `pty_user` per host, with root as a
    separate, higher scope.
 3. **Session recording through adssh: on by default.**
