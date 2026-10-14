@@ -1,16 +1,20 @@
 // Threats: a terminal that outlives its lease, one session reading or
 // writing another session's PTY, a root shell opened with an operator lease,
-// an unrecorded shell, and the agent's own credentials leaking into the
-// child. Each session is keyed by a server-generated session id and needs a
-// signed lease bound to that id and its deadline; it ends at the deadline or
-// when the last renewed lease expires, whichever is first. Action "pty" runs
-// as --pty-user with uid, gid and supplementary groups dropped; a root agent
-// with no --pty-user refuses (pty_user_unset). Action "pty_root" is a
-// separate lease action. Recording runs the session under adssh; a missing
-// adssh refuses (recording_unavailable) and never falls back to a bare shell.
-// Does NOT stop a dropped user from editing their own adssh audit log: the
-// log lives in a per-user directory that user owns. The control plane's audit
-// chain records start and end independently.
+// an unrecorded shell, a shell that reads the agent's credentials, one stuck
+// session freezing the agent, and processes a shell leaves behind. Each
+// session is keyed by a server-generated session id and needs a signed lease
+// bound to that id, its deadline and its phase (start or renew); it ends at
+// the deadline or when the last renewed lease expires, whichever is first.
+// Action "pty" runs as --pty-user with uid, gid and supplementary groups
+// dropped, and only on a root agent; a non-root agent refuses unless
+// --pty-allow-agent-user is set, because the shell would then run as the
+// agent's own user and could read its key and state. "pty_root" is a
+// separate lease action. The agent records every input and output byte in an
+// HMAC-chained file (recorder.go) unless --pty-record=false. Each session has
+// its own bounded input queue and writer goroutine; an overflow ends that
+// session only. Ending a session signals its process group and, on Linux,
+// every process in its session. Does NOT contain a process that starts a new
+// session of its own (tmux, setsid, a double fork); that needs cgroups.
 package main
 
 import (
@@ -25,7 +29,6 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/creack/pty"
@@ -35,14 +38,30 @@ import (
 const (
 	scriptMaxBytes   = 64 * 1024
 	ptyMaxSessions   = 32
+	ptyReservedSlots = 4 // kept free for breakglass and pty_root
 	ptyMaxDeadline   = 7*24*time.Hour + time.Minute
 	ptyDrainTimeout  = 2 * time.Second
+	ptyKillGrace     = 500 * time.Millisecond
 	ptyDefaultRows   = 24
 	ptyDefaultCols   = 80
-	ptyRootRecordDir = "/var/lib/systemapi-agent/pty"
+	ptyRootRecordDir = "/var/lib/systemapi/recordings"
+
+	recordingAgent     = "agent"
+	recordingUserOwned = "user_owned"
+	recordingOff       = "off"
 )
 
-var sessionIDRe = regexp.MustCompile(`^pts_[A-Za-z0-9_-]{16,64}$`)
+var (
+	sessionIDRe = regexp.MustCompile(`^pts_[A-Za-z0-9_-]{16,64}$`)
+
+	// inputQueueMax caps bytes waiting to be written to one PTY.
+	inputQueueMax = 1024 * 1024
+
+	privilegedGroupNames = map[string]bool{
+		"root": true, "wheel": true, "sudo": true, "admin": true, "adm": true,
+		"docker": true, "lxd": true, "disk": true, "shadow": true,
+	}
+)
 
 // ptyOut is the agent's write side of the control-plane socket. It must be
 // safe for concurrent use: every session writes from its own goroutines.
@@ -79,10 +98,11 @@ func (w *wsWriter) WriteClose() error {
 // ptySettings come from agent flags. Shell is not a flag; empty means the
 // user's passwd shell.
 type ptySettings struct {
-	User      string
-	Record    bool
-	RecordDir string
-	Shell     string
+	User           string
+	AllowAgentUser bool
+	Record         bool
+	RecordDir      string
+	Shell          string
 }
 
 var (
@@ -96,18 +116,22 @@ var (
 type ptySession struct {
 	id       string
 	action   string
-	payload  string
 	deadline time.Time
 	out      ptyOut
 	ptmx     *os.File
 	cmd      *exec.Cmd
+	rec      *recorder
 
-	writeMu sync.Mutex
+	inCh chan []byte
 
-	mu       sync.Mutex
-	leaseExp time.Time
-	timer    *time.Timer
-	reason   string
+	mu        sync.Mutex
+	leaseExp  time.Time
+	timer     *time.Timer
+	reason    string
+	recordErr string
+	ending    bool
+	inQueued  int
+	inClosed  bool
 }
 
 type ptyStartRequest struct {
@@ -204,18 +228,16 @@ func identityFromUser(u *user.User, drop bool) (*ptyIdentity, error) {
 		return nil, err
 	}
 	id := &ptyIdentity{name: u.Username, uid: uint32(uid), gid: uint32(gid), home: u.HomeDir, drop: drop}
-	if drop {
-		gids, err := u.GroupIds()
+	gids, err := u.GroupIds()
+	if err != nil && drop {
+		return nil, err
+	}
+	for _, g := range gids {
+		n, err := strconv.ParseUint(g, 10, 32)
 		if err != nil {
 			return nil, err
 		}
-		for _, g := range gids {
-			n, err := strconv.ParseUint(g, 10, 32)
-			if err != nil {
-				return nil, err
-			}
-			id.groups = append(id.groups, uint32(n))
-		}
+		id.groups = append(id.groups, uint32(n))
 	}
 	id.shell = passwdShell(u.Username)
 	if ptyCfg.Shell != "" {
@@ -228,6 +250,33 @@ func identityFromUser(u *user.User, drop bool) (*ptyIdentity, error) {
 		id.home = "/"
 	}
 	return id, nil
+}
+
+// privilegedGroups returns the names in names that grant root-equivalent
+// or broad host access.
+func privilegedGroups(names []string) []string {
+	out := []string{}
+	for _, n := range names {
+		if privilegedGroupNames[n] {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+func groupNames(id *ptyIdentity) []string {
+	seen := map[uint32]bool{}
+	var names []string
+	for _, g := range append([]uint32{id.gid}, id.groups...) {
+		if seen[g] {
+			continue
+		}
+		seen[g] = true
+		if grp, err := user.LookupGroupId(strconv.FormatUint(uint64(g), 10)); err == nil {
+			names = append(names, grp.Name)
+		}
+	}
+	return names
 }
 
 // resolvePTYIdentity picks the account a session runs as, or returns a
@@ -253,6 +302,10 @@ func resolvePTYIdentity(action string, cfg ptySettings, euid int) (*ptyIdentity,
 				return nil, "pty_start_failed"
 			}
 			return id, ""
+		}
+		if !cfg.AllowAgentUser {
+			log.Printf("terminal:open refused: the agent is not root and --pty-allow-agent-user is not set")
+			return nil, "pty_start_failed"
 		}
 		u, err := user.Current()
 		if err != nil {
@@ -302,57 +355,19 @@ func recordDir(cfg ptySettings, stateDir string, euid int) string {
 	if euid == 0 {
 		return ptyRootRecordDir
 	}
-	return filepath.Join(stateDir, "pty")
+	return filepath.Join(stateDir, "recordings")
 }
 
-// prepareRecording lays out <dir>/terminal.rego (agent-owned, mode 0644) and
-// <dir>/<user>/ (owned by the session user, mode 0700) for the adssh audit
-// log. The agent never writes inside the user's directory.
-func prepareRecording(dir string, id *ptyIdentity, euid int) (policy, auditLog string, err error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", "", err
+// recordingMode is "agent" when only the root agent can write the record,
+// "user_owned" when the shell runs as the agent's own user, else "off".
+func recordingMode(cfg ptySettings, euid int) string {
+	if !cfg.Record {
+		return recordingOff
 	}
-	if err := checkRealDir(dir, uint32(euid)); err != nil {
-		return "", "", err
+	if euid == 0 {
+		return recordingAgent
 	}
-	if err := os.Chmod(dir, 0o755); err != nil {
-		return "", "", err
-	}
-	tmp, err := os.CreateTemp(dir, ".terminal-*.rego")
-	if err != nil {
-		return "", "", err
-	}
-	_, werr := tmp.WriteString("package adssh.authz\n\ndefault allow = true\n")
-	cerr := tmp.Close()
-	if werr != nil || cerr != nil {
-		_ = os.Remove(tmp.Name())
-		return "", "", errors.New("policy_write_failed")
-	}
-	policy = filepath.Join(dir, "terminal.rego")
-	if err := os.Chmod(tmp.Name(), 0o644); err != nil {
-		_ = os.Remove(tmp.Name())
-		return "", "", err
-	}
-	if err := os.Rename(tmp.Name(), policy); err != nil {
-		_ = os.Remove(tmp.Name())
-		return "", "", err
-	}
-	userDir := filepath.Join(dir, id.name)
-	if err := os.Mkdir(userDir, 0o700); err != nil && !os.IsExist(err) {
-		return "", "", err
-	}
-	if id.drop {
-		if err := os.Lchown(userDir, int(id.uid), int(id.gid)); err != nil {
-			return "", "", err
-		}
-	}
-	if err := checkRealDir(userDir, id.uid); err != nil {
-		return "", "", err
-	}
-	if err := os.Chmod(userDir, 0o700); err != nil {
-		return "", "", err
-	}
-	return policy, filepath.Join(userDir, "audit.log"), nil
+	return recordingUserOwned
 }
 
 func sessionEnv(id *ptyIdentity, extra []string) []string {
@@ -381,6 +396,21 @@ func clampSize(n, fallback int) uint16 {
 	return uint16(n)
 }
 
+// slotFree reports whether a new session of this action fits. The last
+// ptyReservedSlots slots are kept for breakglass and pty_root.
+func slotFree(action string) bool {
+	ptyMu.Lock()
+	n := len(ptySessions)
+	ptyMu.Unlock()
+	if n >= ptyMaxSessions {
+		return false
+	}
+	if action == "pty" && n >= ptyMaxSessions-ptyReservedSlots {
+		return false
+	}
+	return true
+}
+
 // startPTYSession authorizes and starts one session. Every refusal is a
 // pty_status error with a contract code.
 func startPTYSession(out ptyOut, hostID, stateDir string, req ptyStartRequest, now time.Time) {
@@ -403,24 +433,31 @@ func startPTYSession(out ptyOut, hostID, stateDir string, req ptyStartRequest, n
 		ptyStatusError(out, sid, "lease_required")
 		return
 	}
-	payload := terminalPayload(sid, req.DeadlineUnix)
-	if err := authorizeCommand(hostID, req.Action, payload, req.Lease, now); err != nil {
+	if err := authorizeCommand(hostID, req.Action, terminalPayload(sid, req.DeadlineUnix, "start"), req.Lease, now); err != nil {
 		log.Printf("pty refused: %s", err.Error())
 		ptyStatusError(out, sid, "lease_required")
 		return
 	}
+	if lookupSession(sid) != nil || !slotFree(req.Action) {
+		log.Printf("pty refused: duplicate session or no free slot")
+		ptyStatusError(out, sid, "pty_start_failed")
+		return
+	}
 
-	id, code := resolvePTYIdentity(req.Action, ptyCfg, agentEUID())
+	euid := agentEUID()
+	id, code := resolvePTYIdentity(req.Action, ptyCfg, euid)
 	if code != "" {
 		ptyStatusError(out, sid, code)
 		return
 	}
+	privileged := privilegedGroups(groupNames(id))
+	if len(privileged) > 0 {
+		log.Printf("WARNING: pty user %s is in privileged groups %v", id.name, privileged)
+	}
 
-	var argv0 string
-	var env []string
-	recording := true
-	switch {
-	case req.Action == "breakglass":
+	argv0 := id.shell
+	env := sessionEnv(id, nil)
+	if req.Action == "breakglass" {
 		path, _, err := breakglassCommand()
 		if err != nil {
 			ptyStatusError(out, sid, "recording_unavailable")
@@ -432,38 +469,46 @@ func startPTYSession(out ptyOut, hostID, stateDir string, req ptyStartRequest, n
 			return
 		}
 		argv0 = path
-		env = stripChildEnv(os.Environ(), []string{
-			"TERM=xterm-256color",
+		env = sessionEnv(id, []string{
 			"ADSSH_POLICY=" + policy,
 			"ADSSH_AUDIT_LOG=" + filepath.Join(stateDir, "breakglass-audit.log"),
 		})
-	case ptyCfg.Record:
-		path, _, err := breakglassCommand()
-		if err != nil {
-			ptyStatusError(out, sid, "recording_unavailable")
-			return
-		}
-		policy, auditLog, err := prepareRecording(recordDir(ptyCfg, stateDir, agentEUID()), id, agentEUID())
-		if err != nil {
-			log.Printf("recording setup failed: %v", err)
-			ptyStatusError(out, sid, "recording_unavailable")
-			return
-		}
-		argv0 = path
-		env = sessionEnv(id, []string{"ADSSH_POLICY=" + policy, "ADSSH_AUDIT_LOG=" + auditLog})
-	default:
-		recording = false
-		argv0 = id.shell
-		env = sessionEnv(id, nil)
 	}
 
-	ptyMu.Lock()
-	_, dup := ptySessions[sid]
-	full := len(ptySessions) >= ptyMaxSessions
-	ptyMu.Unlock()
-	if dup || full {
-		ptyStatusError(out, sid, "pty_start_failed")
-		return
+	leaseExp := time.Unix(req.Lease.ExpiresUnix, 0)
+	if leaseExp.After(deadline) {
+		leaseExp = deadline
+	}
+	s := &ptySession{
+		id:       sid,
+		action:   req.Action,
+		deadline: deadline,
+		out:      out,
+		leaseExp: leaseExp,
+		inCh:     make(chan []byte, 4096),
+	}
+
+	mode := recordingMode(ptyCfg, euid)
+	if mode != recordingOff {
+		key, err := loadRecordingKey(stateDir)
+		if err != nil {
+			log.Printf("recording key unavailable: %v", err)
+			ptyStatusError(out, sid, "recording_unavailable")
+			return
+		}
+		rec, err := openRecorder(recordDir(ptyCfg, stateDir, euid), sid, key, map[string]interface{}{
+			"session_id": sid,
+			"host_id":    hostID,
+			"action":     req.Action,
+			"pty_user":   id.name,
+			"deadline":   req.DeadlineUnix,
+		}, func() { s.failRecording() })
+		if err != nil {
+			log.Printf("recording unavailable: %v", err)
+			ptyStatusError(out, sid, "recording_unavailable")
+			return
+		}
+		s.rec = rec
 	}
 
 	cmd := exec.Command(argv0)
@@ -475,32 +520,16 @@ func startPTYSession(out ptyOut, hostID, stateDir string, req ptyStartRequest, n
 	ptmx, err := startWithIdentity(cmd, id, &pty.Winsize{Rows: clampSize(req.Rows, ptyDefaultRows), Cols: clampSize(req.Cols, ptyDefaultCols)})
 	if err != nil {
 		log.Printf("Failed to start PTY: %v", err)
+		if s.rec != nil {
+			_, _ = s.rec.finish(map[string]interface{}{"reason": "start_failed"})
+		}
 		ptyStatusError(out, sid, "pty_start_failed")
 		return
 	}
+	s.cmd = cmd
+	s.ptmx = ptmx
 
-	leaseExp := time.Unix(req.Lease.ExpiresUnix, 0)
-	if leaseExp.After(deadline) {
-		leaseExp = deadline
-	}
-	s := &ptySession{
-		id:       sid,
-		action:   req.Action,
-		payload:  payload,
-		deadline: deadline,
-		out:      out,
-		ptmx:     ptmx,
-		cmd:      cmd,
-		leaseExp: leaseExp,
-	}
 	ptyMu.Lock()
-	if _, dup := ptySessions[sid]; dup {
-		ptyMu.Unlock()
-		_ = cmd.Process.Kill()
-		_ = ptmx.Close()
-		ptyStatusError(out, sid, "pty_start_failed")
-		return
-	}
 	ptySessions[sid] = s
 	ptyMu.Unlock()
 
@@ -509,11 +538,14 @@ func startPTYSession(out ptyOut, hostID, stateDir string, req ptyStartRequest, n
 	s.mu.Unlock()
 
 	_ = out.WriteJSON(ResponseMessage{Type: "pty_status", SessionID: sid, Payload: map[string]interface{}{
-		"status":     "started",
-		"session_id": sid,
-		"pty_user":   id.name,
-		"recording":  recording,
+		"status":                     "started",
+		"session_id":                 sid,
+		"pty_user":                   id.name,
+		"recording":                  mode,
+		"pty_user_privileged_groups": privileged,
 	}})
+
+	go s.inputLoop()
 
 	readerDone := make(chan struct{})
 	go func() {
@@ -522,6 +554,9 @@ func startPTYSession(out ptyOut, hostID, stateDir string, req ptyStartRequest, n
 		for {
 			n, err := ptmx.Read(buf)
 			if n > 0 {
+				if s.rec != nil && !s.rec.add("o", buf[:n]) {
+					return
+				}
 				frame := make([]byte, 0, 1+len(sid)+n)
 				frame = append(frame, byte(len(sid)))
 				frame = append(frame, sid...)
@@ -540,6 +575,8 @@ func startPTYSession(out ptyOut, hostID, stateDir string, req ptyStartRequest, n
 		if cmd.ProcessState != nil {
 			code = cmd.ProcessState.ExitCode()
 		}
+		// Nothing the session started may outlive it.
+		killTree(cmd.Process.Pid, ptyKillGrace)
 		select {
 		case <-readerDone:
 		case <-time.After(ptyDrainTimeout):
@@ -550,21 +587,85 @@ func startPTYSession(out ptyOut, hostID, stateDir string, req ptyStartRequest, n
 			s.timer.Stop()
 		}
 		reason := s.reason
+		recordErr := s.recordErr
+		s.inClosed = true
+		close(s.inCh)
 		s.mu.Unlock()
 		if reason == "" {
 			reason = "exited"
+		}
+		payload := map[string]interface{}{
+			"session_id": sid,
+			"code":       code,
+			"reason":     reason,
+		}
+		if s.rec != nil {
+			sum, err := s.rec.finish(map[string]interface{}{"reason": reason, "code": code})
+			payload["record"] = sum
+			if err != nil && recordErr == "" {
+				recordErr = "recording_failed"
+			}
+		}
+		if recordErr != "" {
+			payload["record_error"] = recordErr
 		}
 		ptyMu.Lock()
 		if ptySessions[sid] == s {
 			delete(ptySessions, sid)
 		}
 		ptyMu.Unlock()
-		_ = out.WriteJSON(ResponseMessage{Type: "pty_exit", SessionID: sid, Payload: map[string]interface{}{
-			"session_id": sid,
-			"code":       code,
-			"reason":     reason,
-		}})
+		_ = out.WriteJSON(ResponseMessage{Type: "pty_exit", SessionID: sid, Payload: payload})
 	}()
+}
+
+// inputLoop is the only writer to this session's PTY, so a shell that stops
+// reading blocks this goroutine and nothing else.
+func (s *ptySession) inputLoop() {
+	for data := range s.inCh {
+		if s.rec == nil || s.rec.add("i", data) {
+			_, _ = s.ptmx.Write(data)
+		}
+		s.mu.Lock()
+		s.inQueued -= len(data)
+		s.mu.Unlock()
+	}
+}
+
+// queueInput never blocks. Overflow ends this session only.
+func (s *ptySession) queueInput(data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	s.mu.Lock()
+	if s.inClosed || s.ending {
+		s.mu.Unlock()
+		return
+	}
+	if s.inQueued+len(data) > inputQueueMax {
+		s.mu.Unlock()
+		log.Printf("pty %s input queue full; ending session", s.id)
+		s.end("stopped")
+		return
+	}
+	select {
+	case s.inCh <- append([]byte(nil), data...):
+		s.inQueued += len(data)
+		s.mu.Unlock()
+	default:
+		s.mu.Unlock()
+		log.Printf("pty %s input queue full; ending session", s.id)
+		s.end("stopped")
+	}
+}
+
+func (s *ptySession) failRecording() {
+	s.mu.Lock()
+	if s.recordErr == "" {
+		s.recordErr = "recording_failed"
+	}
+	s.mu.Unlock()
+	log.Printf("pty %s recording failed or fell behind; ending session", s.id)
+	s.end("stopped")
 }
 
 // onTimer fires at the earlier of the lease expiry and the deadline.
@@ -587,9 +688,15 @@ func (s *ptySession) onTimer() {
 	s.end("stopped")
 }
 
-// end kills the shell once. The wait goroutine reports pty_exit.
+// end stops the session once: SIGHUP to its process group and session, then
+// SIGKILL after a short grace. The wait goroutine reports pty_exit.
 func (s *ptySession) end(reason string) {
 	s.mu.Lock()
+	if s.ending {
+		s.mu.Unlock()
+		return
+	}
+	s.ending = true
 	if s.reason == "" {
 		s.reason = reason
 	}
@@ -598,10 +705,31 @@ func (s *ptySession) end(reason string) {
 	}
 	s.mu.Unlock()
 	if s.cmd != nil && s.cmd.Process != nil {
-		_ = s.cmd.Process.Signal(syscall.SIGKILL)
+		go killTree(s.cmd.Process.Pid, ptyKillGrace)
 	}
-	if s.ptmx != nil {
-		_ = s.ptmx.Close()
+}
+
+// stopAllSessions ends every session with reason "stopped" and waits up to
+// timeout for their pty_exit to be sent. The agent calls it on every exit.
+func stopAllSessions(timeout time.Duration) {
+	ptyMu.Lock()
+	live := make([]*ptySession, 0, len(ptySessions))
+	for _, s := range ptySessions {
+		live = append(live, s)
+	}
+	ptyMu.Unlock()
+	for _, s := range live {
+		s.end("stopped")
+	}
+	end := time.Now().Add(timeout)
+	for time.Now().Before(end) {
+		ptyMu.Lock()
+		n := len(ptySessions)
+		ptyMu.Unlock()
+		if n == 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -612,7 +740,7 @@ func renewPTYSession(hostID, sessionID string, lease *Lease, now time.Time) erro
 	if s == nil {
 		return errors.New("unknown_session")
 	}
-	if err := authorizeCommand(hostID, s.action, s.payload, lease, now); err != nil {
+	if err := authorizeCommand(hostID, s.action, terminalPayload(s.id, s.deadline.Unix(), "renew"), lease, now); err != nil {
 		return err
 	}
 	exp := time.Unix(lease.ExpiresUnix, 0)
@@ -621,7 +749,7 @@ func renewPTYSession(hostID, sessionID string, lease *Lease, now time.Time) erro
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.reason != "" {
+	if s.ending {
 		return errors.New("session_ended")
 	}
 	if exp.After(s.leaseExp) {
@@ -634,13 +762,9 @@ func renewPTYSession(hostID, sessionID string, lease *Lease, now time.Time) erro
 }
 
 func handlePTYInput(sessionID string, data []byte) {
-	s := lookupSession(sessionID)
-	if s == nil || len(data) == 0 {
-		return
+	if s := lookupSession(sessionID); s != nil {
+		s.queueInput(data)
 	}
-	s.writeMu.Lock()
-	_, _ = s.ptmx.Write(data)
-	s.writeMu.Unlock()
 }
 
 // handlePTYEOF sends the terminal EOF character. In canonical mode the shell

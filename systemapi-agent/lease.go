@@ -4,8 +4,8 @@
 // Does NOT persist the nonce cache across process restarts (TTL cap is 300s).
 // Does NOT accept a control public key that changes after the first pin.
 // Terminal actions (pty, pty_root, breakglass) sign "<action>\n<session_id>\n
-// <deadline_unix>", so a renewal lease is bound to one session and cannot move
-// its deadline.
+// <deadline_unix>\n<start|renew>", so a renewal lease is bound to one session,
+// cannot move its deadline, and cannot be replayed as a start.
 package main
 
 import (
@@ -71,9 +71,10 @@ func terminalAction(action string) bool {
 	return action == "pty" || action == "pty_root" || action == "breakglass"
 }
 
-// terminalPayload is the signed payload of a terminal lease.
-func terminalPayload(sessionID string, deadlineUnix int64) string {
-	return sessionID + "\n" + strconv.FormatInt(deadlineUnix, 10)
+// terminalPayload is the signed payload of a terminal lease. phase is
+// "start" or "renew", so a renewal lease cannot start a session.
+func terminalPayload(sessionID string, deadlineUnix int64, phase string) string {
+	return sessionID + "\n" + strconv.FormatInt(deadlineUnix, 10) + "\n" + phase
 }
 
 func hashEqual(a, b string) bool {

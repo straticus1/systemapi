@@ -46,6 +46,8 @@ POST /api/v1/ws-ticket   {"host_id": "...", "purpose": "terminal:open" | "termin
   only. The shell runs as root.
 - Response: `{"ticket": "stk_...", "expires_at": "<iso8601>"}`. The ticket is
   single-use, valid 60 s, and bound to host and purpose.
+- `429 {"error": "rate_limited"}` when the host has had too many tickets in
+  the last minute (`SYSTEMAPI_TICKET_RATE_PER_HOST`, default 20).
 
 ## 3. Open the terminal
 
@@ -96,14 +98,31 @@ expires. A dead server therefore cannot leave a shell running for long.
 
 ## 5. Recording and audit
 
-- **Recording is on by default.** The agent runs the session under `adssh`, so
-  `adssh`'s HMAC audit chain records it. That is the same mechanism break-glass
-  already uses.
-- If recording is required and `adssh` is missing on the host, the session is
-  refused with `recording_unavailable`. It never runs unrecorded.
+- **Recording is on by default, and the agent does it.** The agent copies
+  every input and output byte of the session into its own append-only file,
+  one per session. Each line carries an HMAC-SHA256 chained to the line
+  before it, keyed by a key that only the agent holds (a 0600 file made with a
+  CSPRNG). On a root agent the recordings live in a root-owned 0700 directory
+  (`--pty-record-dir`, default `/var/lib/systemapi/recordings`).
+- The recording mode is one of `agent` (a root agent records a shell that runs
+  as another user, or as root), `user_owned` (the agent runs as an ordinary
+  user with `--pty-allow-agent-user`, so the shell's user can edit the
+  record), or `off` (`--pty-record=false`).
+- `adssh` is not needed for an ordinary session. Break-glass still runs
+  `adssh` and is also recorded by the agent.
+- If the record cannot be opened or written, or the recorder cannot keep up,
+  the session is refused or ended. It never runs unrecorded and never drops
+  bytes. A refusal at start is `recording_unavailable`.
+- Until phase 2 policy exists, a `terminal:root` session whose recording is
+  not `agent` is refused with `recording_unavailable`.
 - Phase 2 makes recording configurable per tenant and per user, with an admin
   lock.
 - **The server writes audit-chain records for:**
   - ticket issued: who, host and purpose;
-  - session started: session id, host, purpose, pty user, recording on or off;
-  - session ended: session id, reason, exit code and duration.
+  - session started: session id, host, purpose, pty user, recording mode, and
+    any privileged groups of the pty user;
+  - session ended: session id, reason, exit code, duration, and the agent's
+    final recording digest, record path and byte counts.
+- Audit rows hash every column (actor, host, tenant, action, payload), so
+  rewriting who did something breaks verification.
+- Client frames are unchanged by recording.

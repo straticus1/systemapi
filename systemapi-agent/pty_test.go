@@ -6,12 +6,14 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -106,18 +108,14 @@ func newPTYHarness(t *testing.T) *ptyHarness {
 		t.Fatal(err)
 	}
 	prevCfg, prevEUID := ptyCfg, agentEUID
-	ptyCfg = ptySettings{Record: false, Shell: "/bin/sh"}
+	prevIn, prevRec := inputQueueMax, recordQueueMax
+	ptyCfg = ptySettings{Record: false, Shell: "/bin/sh", AllowAgentUser: true}
+	resetRecordingKeyCache()
 	t.Cleanup(func() {
-		ptyMu.Lock()
-		live := make([]*ptySession, 0, len(ptySessions))
-		for _, s := range ptySessions {
-			live = append(live, s)
-		}
-		ptyMu.Unlock()
-		for _, s := range live {
-			s.end("stopped")
-		}
+		stopAllSessions(5 * time.Second)
 		ptyCfg, agentEUID = prevCfg, prevEUID
+		inputQueueMax, recordQueueMax = prevIn, prevRec
+		resetRecordingKeyCache()
 		clearIdentity()
 	})
 	return &ptyHarness{priv: priv, out: newFakeOut(), dir: t.TempDir()}
@@ -149,7 +147,7 @@ func signLease(t *testing.T, priv ed25519.PrivateKey, host, action, payload stri
 func (h *ptyHarness) start(t *testing.T, action string, leaseExp, deadline int64) string {
 	t.Helper()
 	sid := newSessionID(t)
-	lease := signLease(t, h.priv, ptyTestHost, action, terminalPayload(sid, deadline), leaseExp)
+	lease := signLease(t, h.priv, ptyTestHost, action, terminalPayload(sid, deadline, "start"), leaseExp)
 	startPTYSession(h.out, ptyTestHost, h.dir, ptyStartRequest{
 		SessionID: sid, Action: action, Rows: 24, Cols: 80, DeadlineUnix: deadline, Lease: lease,
 	}, time.Now())
@@ -236,7 +234,7 @@ func TestPTYRenewalExtendsSession(t *testing.T) {
 	deadline := inFuture(time.Hour)
 	sid := h.start(t, "pty", inFuture(3*time.Second), deadline)
 	time.Sleep(time.Second)
-	renew := signLease(t, h.priv, ptyTestHost, "pty", terminalPayload(sid, deadline), inFuture(5*time.Second))
+	renew := signLease(t, h.priv, ptyTestHost, "pty", terminalPayload(sid, deadline, "renew"), inFuture(5*time.Second))
 	if err := renewPTYSession(ptyTestHost, sid, renew, time.Now()); err != nil {
 		t.Fatalf("renew: %v", err)
 	}
@@ -262,7 +260,7 @@ func TestPTYRenewalRejectsBadLeases(t *testing.T) {
 	s.mu.Lock()
 	before := s.leaseExp
 	s.mu.Unlock()
-	payload := terminalPayload(sid, deadline)
+	payload := terminalPayload(sid, deadline, "renew")
 
 	_, otherPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -278,8 +276,9 @@ func TestPTYRenewalRejectsBadLeases(t *testing.T) {
 		{"expired", sid, signLease(t, h.priv, ptyTestHost, "pty", payload, inFuture(-2*time.Minute)), "expired"},
 		{"other host", sid, signLease(t, h.priv, "44444444-4444-4444-8444-444444444444", "pty", payload, inFuture(200*time.Second)), "bad_host"},
 		{"other action", sid, signLease(t, h.priv, ptyTestHost, "pty_root", payload, inFuture(200*time.Second)), "bad_action"},
-		{"other session", sid, signLease(t, h.priv, ptyTestHost, "pty", terminalPayload(newSessionID(t), deadline), inFuture(200*time.Second)), "payload_mismatch"},
-		{"moved deadline", sid, signLease(t, h.priv, ptyTestHost, "pty", terminalPayload(sid, deadline+3600), inFuture(200*time.Second)), "payload_mismatch"},
+		{"other session", sid, signLease(t, h.priv, ptyTestHost, "pty", terminalPayload(newSessionID(t), deadline, "renew"), inFuture(200*time.Second)), "payload_mismatch"},
+		{"start lease as renewal", sid, signLease(t, h.priv, ptyTestHost, "pty", terminalPayload(sid, deadline, "start"), inFuture(200*time.Second)), "payload_mismatch"},
+		{"moved deadline", sid, signLease(t, h.priv, ptyTestHost, "pty", terminalPayload(sid, deadline+3600, "renew"), inFuture(200*time.Second)), "payload_mismatch"},
 		{"unknown session", newSessionID(t), signLease(t, h.priv, ptyTestHost, "pty", payload, inFuture(200*time.Second)), "unknown_session"},
 		{"missing lease", sid, nil, "malformed"},
 	}
@@ -332,7 +331,7 @@ func TestPTYRootNeedsItsOwnLeaseAndRoot(t *testing.T) {
 	// A terminal:open lease cannot start a root shell.
 	sid := newSessionID(t)
 	deadline := inFuture(time.Hour)
-	lease := signLease(t, h.priv, ptyTestHost, "pty", terminalPayload(sid, deadline), inFuture(60*time.Second))
+	lease := signLease(t, h.priv, ptyTestHost, "pty", terminalPayload(sid, deadline, "start"), inFuture(60*time.Second))
 	startPTYSession(h.out, ptyTestHost, h.dir, ptyStartRequest{SessionID: sid, Action: "pty_root", DeadlineUnix: deadline, Lease: lease}, time.Now())
 	if e := h.startErr(t, sid); e != "lease_required" {
 		t.Fatalf("pty lease for pty_root: %q", e)
@@ -342,50 +341,6 @@ func TestPTYRootNeedsItsOwnLeaseAndRoot(t *testing.T) {
 	sid = h.start(t, "pty_root", inFuture(60*time.Second), inFuture(time.Hour))
 	if e := h.startErr(t, sid); e != "pty_start_failed" {
 		t.Fatalf("pty_root on non-root: %q", e)
-	}
-}
-
-func TestPTYRecordingUnavailableWithoutAdssh(t *testing.T) {
-	h := newPTYHarness(t)
-	ptyCfg.Record = true
-	ptyCfg.RecordDir = filepath.Join(h.dir, "rec")
-	t.Setenv("PATH", t.TempDir())
-	sid := h.start(t, "pty", inFuture(60*time.Second), inFuture(time.Hour))
-	if e := h.startErr(t, sid); e != "recording_unavailable" {
-		t.Fatalf("got %q", e)
-	}
-	if lookupSession(sid) != nil {
-		t.Fatal("ran unrecorded")
-	}
-}
-
-func TestPTYRecordingRunsUnderAdssh(t *testing.T) {
-	h := newPTYHarness(t)
-	bin := t.TempDir()
-	if err := os.WriteFile(filepath.Join(bin, "adssh"), []byte("#!/bin/sh\necho \"policy=$ADSSH_POLICY\"\nexit 7\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", bin+":/usr/bin:/bin")
-	ptyCfg.Record = true
-	ptyCfg.RecordDir = filepath.Join(h.dir, "rec")
-	sid := h.start(t, "pty", inFuture(60*time.Second), inFuture(time.Hour))
-	m := h.out.find("pty_status", sid)
-	if m == nil {
-		t.Fatal("no status")
-	}
-	p := m["payload"].(map[string]interface{})
-	if p["status"] != "started" || p["recording"] != true {
-		t.Fatalf("status %v", p)
-	}
-	if code, reason := h.exitOf(t, sid, 5*time.Second); code != 7 || reason != "exited" {
-		t.Fatalf("exit %d %s", code, reason)
-	}
-	if !strings.Contains(h.out.text(sid), "policy="+filepath.Join(ptyCfg.RecordDir, "terminal.rego")) {
-		t.Fatalf("adssh did not get the policy: %q", h.out.text(sid))
-	}
-	st, err := os.Stat(filepath.Join(ptyCfg.RecordDir, p["pty_user"].(string)))
-	if err != nil || st.Mode().Perm() != 0o700 {
-		t.Fatalf("user audit dir: %v %v", err, st)
 	}
 }
 
@@ -403,7 +358,7 @@ func TestPTYStartRejectsBadRequests(t *testing.T) {
 	}
 	// Reusing a running session id is refused.
 	live := h.start(t, "pty", inFuture(60*time.Second), deadline)
-	again := signLease(t, h.priv, ptyTestHost, "pty", terminalPayload(live, deadline), inFuture(60*time.Second))
+	again := signLease(t, h.priv, ptyTestHost, "pty", terminalPayload(live, deadline, "start"), inFuture(60*time.Second))
 	h.out.mu.Lock()
 	before := len(h.out.jsons)
 	h.out.mu.Unlock()
@@ -449,4 +404,429 @@ func TestPTYIdentityDropsToConfiguredUser(t *testing.T) {
 			t.Fatalf("missing %s in %s", want, env)
 		}
 	}
+}
+
+func writeScript(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "shell.sh")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func exitPayload(t *testing.T, h *ptyHarness, sid string, timeout time.Duration) map[string]interface{} {
+	t.Helper()
+	h.exitOf(t, sid, timeout)
+	return h.out.find("pty_exit", sid)["payload"].(map[string]interface{})
+}
+
+func startedPayload(t *testing.T, h *ptyHarness, sid string) map[string]interface{} {
+	t.Helper()
+	m := h.out.find("pty_status", sid)
+	if m == nil {
+		t.Fatalf("no status for %s", sid)
+	}
+	p := m["payload"].(map[string]interface{})
+	if p["status"] != "started" {
+		t.Fatalf("not started: %v", p)
+	}
+	return p
+}
+
+func TestPTYRenewLeaseCannotStart(t *testing.T) {
+	h := newPTYHarness(t)
+	sid := newSessionID(t)
+	deadline := inFuture(time.Hour)
+	lease := signLease(t, h.priv, ptyTestHost, "pty", terminalPayload(sid, deadline, "renew"), inFuture(60*time.Second))
+	startPTYSession(h.out, ptyTestHost, h.dir, ptyStartRequest{SessionID: sid, Action: "pty", DeadlineUnix: deadline, Lease: lease}, time.Now())
+	if e := h.startErr(t, sid); e != "lease_required" {
+		t.Fatalf("renew lease used as start: %q", e)
+	}
+}
+
+func TestPTYRefusesAgentUserWithoutFlag(t *testing.T) {
+	h := newPTYHarness(t)
+	ptyCfg.AllowAgentUser = false
+	agentEUID = func() int { return 1000 }
+	sid := h.start(t, "pty", inFuture(60*time.Second), inFuture(time.Hour))
+	if e := h.startErr(t, sid); e != "pty_start_failed" {
+		t.Fatalf("got %q", e)
+	}
+	if lookupSession(sid) != nil {
+		t.Fatal("shell started as the agent user")
+	}
+}
+
+func TestPTYRecordingModes(t *testing.T) {
+	if m := recordingMode(ptySettings{Record: true}, 0); m != "agent" {
+		t.Fatal(m)
+	}
+	if m := recordingMode(ptySettings{Record: true}, 1000); m != "user_owned" {
+		t.Fatal(m)
+	}
+	if m := recordingMode(ptySettings{Record: false}, 0); m != "off" {
+		t.Fatal(m)
+	}
+}
+
+func TestPTYAgentRecordingIsChainedAndVerifiable(t *testing.T) {
+	h := newPTYHarness(t)
+	ptyCfg.Record = true
+	ptyCfg.RecordDir = filepath.Join(h.dir, "rec")
+	t.Setenv("PATH", t.TempDir()+":/usr/bin:/bin") // no adssh: ordinary pty does not need it
+	sid := h.start(t, "pty", inFuture(60*time.Second), inFuture(time.Hour))
+	if p := startedPayload(t, h, sid); p["recording"] != "user_owned" {
+		t.Fatalf("recording %v", p["recording"])
+	}
+	handlePTYInput(sid, []byte("echo REC$((2+3))\n"))
+	waitFor(t, "output", 5*time.Second, func() bool { return strings.Contains(h.out.text(sid), "REC5") })
+	handlePTYInput(sid, []byte("exit 0\n"))
+	p := exitPayload(t, h, sid, 5*time.Second)
+	rec := p["record"].(map[string]interface{})
+	if _, bad := p["record_error"]; bad {
+		t.Fatalf("record error %v", p)
+	}
+	path := rec["path"].(string)
+	if rec["bytes_in"].(float64) < float64(len("echo REC$((2+3))\nexit 0\n")) || rec["bytes_out"].(float64) == 0 {
+		t.Fatalf("counts %v", rec)
+	}
+	key, err := loadRecordingKey(h.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := verifyRecording(path, key, sid)
+	if err != nil || digest != rec["digest"] {
+		t.Fatalf("verify: %v %s vs %v", err, digest, rec["digest"])
+	}
+	for _, f := range []struct {
+		path string
+		mode os.FileMode
+	}{{path, 0o600}, {ptyCfg.RecordDir, 0o700}, {filepath.Join(h.dir, recordingKeyFile), 0o600}} {
+		st, err := os.Stat(f.path)
+		if err != nil || st.Mode().Perm() != f.mode {
+			t.Fatalf("%s mode %v %v", f.path, st.Mode().Perm(), err)
+		}
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), base64.StdEncoding.EncodeToString([]byte("echo REC$((2+3))\n"))) {
+		t.Fatal("input not recorded")
+	}
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	tampered := filepath.Join(h.dir, "tampered.rec")
+	edited := strings.Replace(string(raw), base64.StdEncoding.EncodeToString([]byte("echo REC$((2+3))\n")), base64.StdEncoding.EncodeToString([]byte("echo XYZ$((2+3))\n")), 1)
+	if err := os.WriteFile(tampered, []byte(edited), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifyRecording(tampered, key, sid); err == nil {
+		t.Fatal("edited recording verified")
+	}
+	dropped := strings.Join(append(append([]string{}, lines[:1]...), lines[2:]...), "\n") + "\n"
+	if err := os.WriteFile(tampered, []byte(dropped), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifyRecording(tampered, key, sid); err == nil {
+		t.Fatal("recording with a deleted line verified")
+	}
+	if _, err := verifyRecording(path, []byte(strings.Repeat("k", 32)), sid); err == nil {
+		t.Fatal("wrong key verified")
+	}
+}
+
+func TestPTYRecordingKeyRefusesLooseMode(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, recordingKeyFile), []byte(strings.Repeat("ab", 32)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resetRecordingKeyCache()
+	t.Cleanup(resetRecordingKeyCache)
+	if _, err := loadRecordingKey(dir); err == nil {
+		t.Fatal("accepted a 0644 recording key")
+	}
+}
+
+func TestPTYRecordingUnavailableWhenRecordCannotOpen(t *testing.T) {
+	h := newPTYHarness(t)
+	ptyCfg.Record = true
+	target := t.TempDir()
+	link := filepath.Join(h.dir, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	notDir := filepath.Join(h.dir, "file")
+	if err := os.WriteFile(notDir, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{link, notDir} {
+		ptyCfg.RecordDir = dir
+		sid := h.start(t, "pty", inFuture(60*time.Second), inFuture(time.Hour))
+		if e := h.startErr(t, sid); e != "recording_unavailable" {
+			t.Fatalf("%s: got %q", dir, e)
+		}
+		if lookupSession(sid) != nil {
+			t.Fatal("ran unrecorded")
+		}
+	}
+}
+
+func TestPTYRecorderOverflowEndsSession(t *testing.T) {
+	h := newPTYHarness(t)
+	ptyCfg.Record = true
+	ptyCfg.RecordDir = filepath.Join(h.dir, "rec")
+	sid := h.start(t, "pty", inFuture(60*time.Second), inFuture(time.Hour))
+	startedPayload(t, h, sid)
+	recordQueueMax = 64
+	handlePTYInput(sid, []byte(strings.Repeat("x", 200)))
+	p := exitPayload(t, h, sid, 5*time.Second)
+	if p["reason"] != "stopped" || p["record_error"] != "recording_failed" {
+		t.Fatalf("exit %v", p)
+	}
+}
+
+func TestPTYBreakglassKeepsAdsshAndIsRecorded(t *testing.T) {
+	h := newPTYHarness(t)
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "adssh"), []byte("#!/bin/sh\necho \"policy=$ADSSH_POLICY key=$SYSTEMAPI_API_KEY\"\nexit 7\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+":/usr/bin:/bin")
+	t.Setenv("SYSTEMAPI_API_KEY", "leak-me")
+	ptyCfg.Record = true
+	ptyCfg.RecordDir = filepath.Join(h.dir, "rec")
+	sid := h.start(t, "breakglass", inFuture(60*time.Second), inFuture(time.Hour))
+	startedPayload(t, h, sid)
+	p := exitPayload(t, h, sid, 5*time.Second)
+	if p["code"].(float64) != 7 {
+		t.Fatalf("exit %v", p)
+	}
+	out := h.out.text(sid)
+	if !strings.Contains(out, "policy="+filepath.Join(h.dir, "breakglass.rego")) || strings.Contains(out, "leak-me") {
+		t.Fatalf("adssh env: %q", out)
+	}
+	key, err := loadRecordingKey(h.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := p["record"].(map[string]interface{})
+	if d, err := verifyRecording(rec["path"].(string), key, sid); err != nil || d != rec["digest"] {
+		t.Fatalf("verify %v", err)
+	}
+	// Without adssh, break-glass is still refused.
+	t.Setenv("PATH", t.TempDir())
+	sid = h.start(t, "breakglass", inFuture(60*time.Second), inFuture(time.Hour))
+	if e := h.startErr(t, sid); e != "recording_unavailable" {
+		t.Fatalf("got %q", e)
+	}
+}
+
+func TestPTYInputQueueNeverBlocksAndOverflowEndsOnlyThatSession(t *testing.T) {
+	inputQueueMax = 64 * 1024
+	t.Cleanup(func() { inputQueueMax = 1024 * 1024 })
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.Close(); _ = w.Close() })
+	// Nobody reads r, so the writer goroutine blocks once the pipe fills.
+	s := &ptySession{id: "pts_blockedblockedblocked", ptmx: w, inCh: make(chan []byte, 4096)}
+	go s.inputLoop()
+	chunk := make([]byte, 1024)
+	start := time.Now()
+	for i := 0; i < 400; i++ {
+		s.queueInput(chunk)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatal("queueInput blocked")
+	}
+	s.mu.Lock()
+	reason, ending := s.reason, s.ending
+	s.mu.Unlock()
+	if !ending || reason != "stopped" {
+		t.Fatalf("overflow did not end the session: %v %q", ending, reason)
+	}
+	_ = r.Close()
+	s.mu.Lock()
+	s.inClosed = true
+	close(s.inCh)
+	s.mu.Unlock()
+}
+
+func pidFromOutput(t *testing.T, h *ptyHarness, sid string) int {
+	t.Helper()
+	var pid int
+	waitFor(t, "BG pid", 5*time.Second, func() bool {
+		text := h.out.text(sid)
+		i := strings.Index(text, "BG=")
+		if i < 0 {
+			return false
+		}
+		rest := text[i+3:]
+		j := strings.IndexAny(rest, "\r\n")
+		if j < 0 {
+			return false
+		}
+		n, err := strconv.Atoi(rest[:j])
+		pid = n
+		return err == nil
+	})
+	return pid
+}
+
+func alive(pid int) bool {
+	return syscall.Kill(pid, 0) == nil
+}
+
+func TestPTYStopKillsBackgroundJobs(t *testing.T) {
+	h := newPTYHarness(t)
+	ptyCfg.Shell = writeScript(t, "nohup sleep 1000 >/dev/null 2>&1 &\necho BG=$!\nwhile :; do sleep 1; done\n")
+	sid := h.start(t, "pty", inFuture(60*time.Second), inFuture(time.Hour))
+	bg := pidFromOutput(t, h, sid)
+	if !alive(bg) {
+		t.Fatal("background job not running")
+	}
+	handlePTYStop(sid)
+	if _, reason := h.exitOf(t, sid, 5*time.Second); reason != "stopped" {
+		t.Fatal(reason)
+	}
+	waitFor(t, "background job killed", 5*time.Second, func() bool { return !alive(bg) })
+}
+
+func TestPTYShellExitKillsLeftovers(t *testing.T) {
+	h := newPTYHarness(t)
+	ptyCfg.Shell = writeScript(t, "nohup sleep 1000 >/dev/null 2>&1 &\necho BG=$!\nsleep 0.3\nexit 0\n")
+	sid := h.start(t, "pty", inFuture(60*time.Second), inFuture(time.Hour))
+	bg := pidFromOutput(t, h, sid)
+	if code, reason := h.exitOf(t, sid, 5*time.Second); code != 0 || reason != "exited" {
+		t.Fatalf("%d %s", code, reason)
+	}
+	waitFor(t, "leftover killed", 5*time.Second, func() bool { return !alive(bg) })
+}
+
+func TestStopAllSessionsEndsEverySession(t *testing.T) {
+	h := newPTYHarness(t)
+	a := h.start(t, "pty", inFuture(60*time.Second), inFuture(time.Hour))
+	b := h.start(t, "pty", inFuture(60*time.Second), inFuture(time.Hour))
+	startedPayload(t, h, a)
+	startedPayload(t, h, b)
+	stopAllSessions(5 * time.Second)
+	for _, sid := range []string{a, b} {
+		if _, reason := h.exitOf(t, sid, time.Second); reason != "stopped" {
+			t.Fatalf("%s %s", sid, reason)
+		}
+	}
+	ptyMu.Lock()
+	n := len(ptySessions)
+	ptyMu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d sessions left", n)
+	}
+}
+
+func TestPTYReservedSlotsForBreakglassAndRoot(t *testing.T) {
+	h := newPTYHarness(t)
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "adssh"), []byte("#!/bin/sh\nsleep 5\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+":/usr/bin:/bin")
+	var dummies []string
+	ptyMu.Lock()
+	for i := 0; i < ptyMaxSessions-ptyReservedSlots; i++ {
+		id := fmt.Sprintf("pts_dummy%020d", i)
+		ptySessions[id] = &ptySession{id: id}
+		dummies = append(dummies, id)
+	}
+	ptyMu.Unlock()
+	t.Cleanup(func() {
+		ptyMu.Lock()
+		for _, id := range dummies {
+			delete(ptySessions, id)
+		}
+		ptyMu.Unlock()
+	})
+	sid := h.start(t, "pty", inFuture(60*time.Second), inFuture(time.Hour))
+	if e := h.startErr(t, sid); e != "pty_start_failed" {
+		t.Fatalf("operator pty took a reserved slot: %q", e)
+	}
+	sid = h.start(t, "breakglass", inFuture(60*time.Second), inFuture(time.Hour))
+	startedPayload(t, h, sid)
+}
+
+func TestPrivilegedGroupsFlagged(t *testing.T) {
+	got := privilegedGroups([]string{"users", "docker", "staff", "sudo", "adm", "wheel"})
+	if strings.Join(got, ",") != "docker,sudo,adm,wheel" {
+		t.Fatalf("%v", got)
+	}
+	if len(privilegedGroups([]string{"users"})) != 0 {
+		t.Fatal("flagged an ordinary group")
+	}
+}
+
+func TestResolveAPIKey(t *testing.T) {
+	t.Setenv("SYSTEMAPI_API_KEY", "from-env")
+	key, warn, err := resolveAPIKey("", "")
+	if err != nil || key != "from-env" || warn != "" {
+		t.Fatalf("%q %q %v", key, warn, err)
+	}
+	if _, ok := os.LookupEnv("SYSTEMAPI_API_KEY"); ok {
+		t.Fatal("SYSTEMAPI_API_KEY left in the environment")
+	}
+	key, warn, err = resolveAPIKey("from-argv", "")
+	if err != nil || key != "from-argv" || !strings.Contains(warn, "process list") {
+		t.Fatalf("%q %q %v", key, warn, err)
+	}
+	dir := t.TempDir()
+	loose := filepath.Join(dir, "loose")
+	if err := os.WriteFile(loose, []byte("k\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := resolveAPIKey("", loose); err == nil {
+		t.Fatal("accepted a 0644 key file")
+	}
+	tight := filepath.Join(dir, "tight")
+	if err := os.WriteFile(tight, []byte("from-file\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if key, _, err := resolveAPIKey("", tight); err != nil || key != "from-file" {
+		t.Fatalf("%q %v", key, err)
+	}
+	if _, _, err := resolveAPIKey("", ""); err == nil {
+		t.Fatal("no key accepted")
+	}
+}
+
+// TestPTYSetuidDropsToPTYUser runs only as root (the Linux CI run). It
+// starts a real shell as nobody and checks uid, gid and groups.
+func TestPTYSetuidDropsToPTYUser(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root")
+	}
+	h := newPTYHarness(t)
+	nobody, err := user.Lookup("nobody")
+	if err != nil {
+		t.Skip("no nobody user")
+	}
+	ptyCfg.User = "nobody"
+	ptyCfg.Record = true
+	ptyCfg.RecordDir = filepath.Join(h.dir, "rec")
+	sid := h.start(t, "pty", inFuture(60*time.Second), inFuture(time.Hour))
+	if p := startedPayload(t, h, sid); p["pty_user"] != "nobody" || p["recording"] != "agent" {
+		t.Fatalf("%v", p)
+	}
+	handlePTYInput(sid, []byte("echo ID=$(id -u):$(id -g):$(id -G | tr ' ' ,):$HOME:$USER\n"))
+	want := "ID=" + nobody.Uid + ":" + nobody.Gid + ":"
+	waitFor(t, "id output", 5*time.Second, func() bool { return strings.Contains(h.out.text(sid), want) })
+	text := h.out.text(sid)
+	line := text[strings.Index(text, want):]
+	if strings.Contains(strings.SplitN(line, "\n", 2)[0], ":0,") || strings.Contains(strings.SplitN(line, "\n", 2)[0], ",0:") {
+		t.Fatalf("root group kept: %q", line)
+	}
+	if !strings.Contains(line, ":"+nobody.HomeDir+":nobody") {
+		t.Fatalf("HOME/USER not set: %q", line)
+	}
+	handlePTYInput(sid, []byte("exit 0\n"))
+	h.exitOf(t, sid, 5*time.Second)
 }

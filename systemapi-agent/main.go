@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -11,7 +12,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -43,25 +46,30 @@ type ResponseMessage struct {
 
 func main() {
 	serverURL := flag.String("server", "ws://localhost:3003/api/v1/systems/stream", "WebSocket stream URL")
-	apiKeyFlag := flag.String("api-key", "", "API key; prefer the SYSTEMAPI_API_KEY environment variable")
+	apiKeyFlag := flag.String("api-key", "", "API key (visible in the process list); prefer SYSTEMAPI_API_KEY or --api-key-file")
+	apiKeyFileFlag := flag.String("api-key-file", "", "file holding the API key (mode 0600)")
 	tenantFlag := flag.String("tenant", "", "tenant name (required)")
 	hostnameFlag := flag.String("hostname", "", "hostname (default: this machine)")
 	stateFlag := flag.String("state", "", "state file (default: ~/.systemapi/agent.json)")
 	ptyUserFlag := flag.String("pty-user", "", "account for terminal:open shells; required when the agent runs as root")
-	ptyRecordFlag := flag.Bool("pty-record", true, "run terminal sessions under adssh so its audit chain records them")
-	ptyRecordDirFlag := flag.String("pty-record-dir", "", "adssh policy and per-user audit logs (default: "+ptyRootRecordDir+" as root, else <state dir>/pty)")
+	ptyAllowAgentUserFlag := flag.Bool("pty-allow-agent-user", false, "let a non-root agent run terminal:open shells as its own user (the shell can read the agent's key and state; recording is user_owned)")
+	ptyRecordFlag := flag.Bool("pty-record", true, "record every terminal session in an HMAC-chained file")
+	ptyRecordDirFlag := flag.String("pty-record-dir", "", "terminal recordings (default: "+ptyRootRecordDir+" as root, else <state dir>/recordings)")
 	flag.Parse()
-	ptyCfg = ptySettings{User: *ptyUserFlag, Record: *ptyRecordFlag, RecordDir: *ptyRecordDirFlag}
+	ptyCfg = ptySettings{User: *ptyUserFlag, AllowAgentUser: *ptyAllowAgentUserFlag, Record: *ptyRecordFlag, RecordDir: *ptyRecordDirFlag}
 	if !ptyCfg.Record {
-		log.Printf("terminal recording is OFF (--pty-record=false)")
+		log.Printf("WARNING: terminal recording is OFF (--pty-record=false)")
+	}
+	if ptyCfg.AllowAgentUser {
+		log.Printf("WARNING: --pty-allow-agent-user: terminal shells run as the agent's own user and can read its API key and state")
 	}
 
-	apiKey := *apiKeyFlag
-	if apiKey == "" {
-		apiKey = os.Getenv("SYSTEMAPI_API_KEY")
+	apiKey, warn, err := resolveAPIKey(*apiKeyFlag, *apiKeyFileFlag)
+	if warn != "" {
+		log.Printf("WARNING: %s", warn)
 	}
-	if apiKey == "" {
-		fmt.Fprintln(os.Stderr, "Error: set SYSTEMAPI_API_KEY or pass --api-key")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(2)
 	}
 	if *tenantFlag == "" {
@@ -125,9 +133,11 @@ func main() {
 	defer c.Close()
 	c.SetReadLimit(256 * 1024)
 	out := &wsWriter{c: c}
+	// Every return from here ends all terminal sessions first.
+	defer stopAllSessions(3 * time.Second)
 
 	interrupt := make(chan os.Signal, 1)
-	signal.Notify(interrupt, os.Interrupt)
+	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
 
 	enrolled := make(chan error, 1)
 	var enrollOnce sync.Once
@@ -216,7 +226,8 @@ func main() {
 				return
 			}
 		case <-interrupt:
-			log.Println("interrupt received, disconnecting")
+			log.Println("signal received, stopping terminal sessions and disconnecting")
+			stopAllSessions(3 * time.Second)
 			_ = out.WriteClose()
 			select {
 			case <-done:
@@ -301,4 +312,39 @@ func writeCommandResult(out ptyOut, requestID, errText, output string) {
 		RequestID: requestID,
 		Payload:   map[string]string{"error": errText, "output": output},
 	})
+}
+
+// resolveAPIKey takes the key from --api-key-file, then SYSTEMAPI_API_KEY,
+// then --api-key, and removes SYSTEMAPI_API_KEY from the process environment
+// so no child can inherit it. A key on argv is visible in the process list,
+// so it returns a warning.
+func resolveAPIKey(flagKey, keyFile string) (string, string, error) {
+	envKey := os.Getenv("SYSTEMAPI_API_KEY")
+	if err := os.Unsetenv("SYSTEMAPI_API_KEY"); err != nil {
+		return "", "", err
+	}
+	warn := ""
+	if flagKey != "" {
+		warn = "--api-key is visible in the process list; use SYSTEMAPI_API_KEY or --api-key-file"
+	}
+	if keyFile != "" {
+		if err := checkPrivateFile(keyFile, uint32(os.Geteuid())); err != nil {
+			return "", warn, fmt.Errorf("api key file: %v", err)
+		}
+		raw, err := os.ReadFile(keyFile)
+		if err != nil {
+			return "", warn, fmt.Errorf("api key file: %v", err)
+		}
+		if key := strings.TrimSpace(string(raw)); key != "" {
+			return key, warn, nil
+		}
+		return "", warn, errors.New("api key file is empty")
+	}
+	if envKey != "" {
+		return envKey, warn, nil
+	}
+	if flagKey != "" {
+		return flagKey, warn, nil
+	}
+	return "", warn, errors.New("set SYSTEMAPI_API_KEY, --api-key-file, or --api-key")
 }

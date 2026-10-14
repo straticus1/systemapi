@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
+	"time"
 
 	"github.com/creack/pty"
 )
@@ -60,4 +61,46 @@ func checkRealDir(path string, owner uint32) error {
 		return errors.New("wrong_owner")
 	}
 	return nil
+}
+
+// checkPrivateFile refuses a symlink, a non-regular file, group or other
+// permission bits, or a file owned by someone other than owner.
+func checkPrivateFile(path string, owner uint32) error {
+	st, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !st.Mode().IsRegular() || st.Mode().Perm()&0o077 != 0 {
+		return errors.New("bad_file_mode")
+	}
+	sys, ok := st.Sys().(*syscall.Stat_t)
+	if !ok || sys.Uid != owner {
+		return errors.New("wrong_owner")
+	}
+	return nil
+}
+
+// signalTree sends sig to the process group pgid and to every process whose
+// session id is pgid (Linux only). It reports whether anything was signalled.
+func signalTree(pgid int, sig syscall.Signal) bool {
+	hit := syscall.Kill(-pgid, sig) == nil
+	for _, pid := range sessionMembers(pgid) {
+		if syscall.Kill(pid, sig) == nil {
+			hit = true
+		}
+	}
+	return hit
+}
+
+// killTree sends SIGHUP to everything the session started, waits grace, then
+// sends SIGKILL to whatever is left.
+func killTree(pid int, grace time.Duration) {
+	if pid <= 1 {
+		return
+	}
+	if !signalTree(pid, syscall.SIGHUP) {
+		return
+	}
+	time.Sleep(grace)
+	signalTree(pid, syscall.SIGKILL)
 }
