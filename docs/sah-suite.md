@@ -4,6 +4,19 @@ Status: 2026-10-12. This file is the contract for how the SAH names join. Tool c
 
 **sah** means Service Automation Hub. The hub encompasses the platform and the suite of utilities. `adssh` is the development name of the execution shell. The binary, the module `github.com/afterdarksys/adssh`, `adssh-mcp`, `~/.adssh`, and the GitHub repo `afterdarksys/adssh` stay on that name until a rename is explicit.
 
+## Domains
+
+Recorded 2026-10-13. These four names are owned. Nothing is published on them yet. A later publish step hosts the hub site. Until that publish, `systemapi.io` and `computeapi.io` remain the live product sites.
+
+| Domain | Use |
+| --- | --- |
+| `opensah.com` | Public site of the hub. |
+| `opensah.io` | Product hostname, beside `systemapi.io` and `computeapi.io`. |
+| `opensah.dev` | Docs and install. |
+| `sah.sh` | Short name for the hub and the shell. |
+
+These domains do not rename a repository, a binary, or a Go module. `adssh` stays the development name of the shell.
+
 ## Names
 
 | Name | Directory | What exists |

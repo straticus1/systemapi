@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://systemapi.io/sitemap.xml

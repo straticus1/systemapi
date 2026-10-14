@@ -8,3 +8,4 @@ systemapi-agent/systemapi-agent
 systemapi-agent/agent
 .omc/
 .planning/
+.env.production.bak-*
