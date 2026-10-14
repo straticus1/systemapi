@@ -4,7 +4,7 @@ The sections below are a historical proposal list from before the control plane.
 
 ## Current Data Available
 
-SystemAPI.io collects rich telemetry from all connected agents:
+Each connected agent reports:
 
 ### Real-time Metrics (Per Agent)
 - **CPU**: Usage %, Core count
@@ -15,14 +15,13 @@ SystemAPI.io collects rich telemetry from all connected agents:
 - **Timestamps**: Unix timestamp for every data point
 
 ### Execution & Audit Data
-- **Sysscript Executions**: Complete audit trail with SHA256 hashing
-- **Command Results**: stdout, stderr, execution time
-- **WORM Logs**: Immutable logs stored in DarkStorage.io (S3-compatible)
+- **Sysscript Executions**: hash-chained audit rows in PostgreSQL
+- **Command Results**: `result.output` and `result.error` from the agent
+- **DarkStorage**: only each result's SHA-256, and only when the DarkStorage keys are set
 
-### Alert & Incident Data
-- **Rule Evaluations**: Metric, operator, threshold, triggered value
-- **Alert History**: When, what, who
-- **Integration Events**: SMS/Voice alerts via Adstelco.io
+### Alert Data
+- **Alert Events**: z-score anomalies on CPU and memory, with host, metric, value and status
+- **Delivery**: tenant webhooks only; there is no SMS or voice integration
 
 ---
 
