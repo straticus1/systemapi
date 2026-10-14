@@ -9,8 +9,9 @@ const { safeReturnPath } = require('../controlplane/oauth');
 
 const router = express.Router();
 
-// Dynamic import for ESM module
-let Issuer, generators;
+// openid-client 6 is ESM-only and has no Issuer/generators (that was the v5
+// API, which left every login failing). Loaded lazily.
+let oidc;
 
 // Environment variables
 const AUTHENTIK_URL = process.env.AUTHENTIK_URL || 'https://auth.afterdarksys.com';
@@ -26,27 +27,26 @@ const DEV_REDIRECT_URI = process.env.DEV_REDIRECT_URI || 'http://localhost:3000/
 
 let authentikClient = null;
 
+function redirectUri() {
+  return DEV_MODE ? DEV_REDIRECT_URI : REDIRECT_URI;
+}
+
+// Unix seconds, as the v5 tokenSet.expires_at was.
+function tokenExpiry(tokenSet) {
+  const ttl = typeof tokenSet.expiresIn === 'function' ? tokenSet.expiresIn() : undefined;
+  return typeof ttl === 'number' ? Math.floor(Date.now() / 1000) + ttl : undefined;
+}
+
 /**
- * Initialize OpenID Connect client
+ * Initialize OpenID Connect client (discovery against the Authentik issuer)
  */
 async function initializeOIDCClient() {
   try {
-    // Dynamic import for ESM module
-    if (!Issuer) {
-      const oidcModule = await import('openid-client');
-      Issuer = oidcModule.Issuer;
-      generators = oidcModule.generators;
-    }
+    if (!oidc) oidc = await import('openid-client');
+    if (!CLIENT_SECRET) throw new Error('AUTHENTIK_CLIENT_SECRET is not set');
 
-    const authentikIssuer = await Issuer.discover(AUTHENTIK_ISSUER);
-    console.log('Discovered Authentik issuer:', authentikIssuer.metadata.issuer);
-
-    authentikClient = new authentikIssuer.Client({
-      client_id: CLIENT_ID,
-      client_secret: CLIENT_SECRET,
-      redirect_uris: [DEV_MODE ? DEV_REDIRECT_URI : REDIRECT_URI],
-      response_types: ['code'],
-    });
+    authentikClient = await oidc.discovery(new URL(AUTHENTIK_ISSUER), CLIENT_ID, CLIENT_SECRET);
+    console.log('Discovered Authentik issuer:', authentikClient.serverMetadata().issuer);
 
     console.log('OAuth client initialized for SystemAPI.io');
     return authentikClient;
@@ -76,10 +76,10 @@ router.get('/login', async (req, res) => {
     }
 
     // Generate PKCE challenge and state
-    const code_verifier = generators.codeVerifier();
-    const code_challenge = generators.codeChallenge(code_verifier);
-    const state = generators.state();
-    const nonce = generators.nonce();
+    const code_verifier = oidc.randomPKCECodeVerifier();
+    const code_challenge = await oidc.calculatePKCECodeChallenge(code_verifier);
+    const state = oidc.randomState();
+    const nonce = oidc.randomNonce();
 
     // Store in session for verification in callback
     req.session.oauth = {
@@ -90,7 +90,8 @@ router.get('/login', async (req, res) => {
       return_to: safeReturnPath(req.query.return_to)
     };
 
-    const authorizationUrl = authentikClient.authorizationUrl({
+    const authorizationUrl = oidc.buildAuthorizationUrl(authentikClient, {
+      redirect_uri: redirectUri(),
       scope: SCOPES,
       state,
       nonce,
@@ -98,8 +99,7 @@ router.get('/login', async (req, res) => {
       code_challenge_method: 'S256'
     });
 
-    console.log('Redirecting to Authentik login:', authorizationUrl);
-    res.redirect(authorizationUrl);
+    res.redirect(authorizationUrl.href);
   } catch (error) {
     console.error('Error initiating OAuth login:', error);
     res.status(500).json({
@@ -119,7 +119,6 @@ router.get('/callback', async (req, res) => {
       await initializeOIDCClient();
     }
 
-    const params = authentikClient.callbackParams(req);
     const { code_verifier, state, nonce, return_to } = req.session.oauth || {};
 
     if (!code_verifier || !state) {
@@ -129,17 +128,21 @@ router.get('/callback', async (req, res) => {
       });
     }
 
-    // Exchange authorization code for tokens
-    const tokenSet = await authentikClient.callback(
-      DEV_MODE ? DEV_REDIRECT_URI : REDIRECT_URI,
-      params,
-      { code_verifier, state, nonce }
-    );
+    // Exchange authorization code for tokens. The callback URL is rebuilt on
+    // the registered redirect URI (not the Host header) with this request's
+    // query; openid-client checks state, nonce, PKCE and the ID token.
+    const currentUrl = new URL(redirectUri());
+    currentUrl.search = new URL(req.originalUrl, 'http://callback.invalid').search;
+    const tokenSet = await oidc.authorizationCodeGrant(authentikClient, currentUrl, {
+      pkceCodeVerifier: code_verifier,
+      expectedState: state,
+      expectedNonce: nonce,
+      idTokenExpected: true
+    });
 
-    console.log('Token exchange successful');
-
-    // Get user info
-    const userinfo = await authentikClient.userinfo(tokenSet.access_token);
+    // Get user info, bound to the ID token subject
+    const claims = tokenSet.claims();
+    const userinfo = await oidc.fetchUserInfo(authentikClient, tokenSet.access_token, claims.sub);
 
     // New session id at login: a session id planted before login must not
     // become an authenticated one (the device approval trusts this session).
@@ -162,9 +165,8 @@ router.get('/callback', async (req, res) => {
       access_token: tokenSet.access_token,
       refresh_token: tokenSet.refresh_token,
       id_token: tokenSet.id_token,
-      expires_at: tokenSet.expires_at
+      expires_at: tokenExpiry(tokenSet)
     };
-
 
     console.log(`User logged in: ${userinfo.email} (${userinfo.sub})`);
 
@@ -200,12 +202,12 @@ router.get('/logout', async (req, res) => {
     }
 
     // Redirect to Authentik end session endpoint
-    const logoutUrl = authentikClient.endSessionUrl({
+    const logoutUrl = oidc.buildEndSessionUrl(authentikClient, {
       id_token_hint: id_token,
       post_logout_redirect_uri: DEV_MODE ? 'http://localhost:3000' : 'https://systemapi.io'
     });
 
-    res.redirect(logoutUrl);
+    res.redirect(logoutUrl.href);
   } catch (error) {
     console.error('Error during logout:', error);
     res.redirect('/');
@@ -248,19 +250,19 @@ router.post('/refresh', async (req, res) => {
       });
     }
 
-    const tokenSet = await authentikClient.refresh(refresh_token);
+    const tokenSet = await oidc.refreshTokenGrant(authentikClient, refresh_token);
 
     // Update tokens in session
     req.session.tokens = {
       access_token: tokenSet.access_token,
       refresh_token: tokenSet.refresh_token || refresh_token,
-      id_token: tokenSet.id_token,
-      expires_at: tokenSet.expires_at
+      id_token: tokenSet.id_token || req.session.tokens.id_token,
+      expires_at: tokenExpiry(tokenSet)
     };
 
     res.json({
       success: true,
-      expires_at: tokenSet.expires_at
+      expires_at: req.session.tokens.expires_at
     });
   } catch (error) {
     console.error('Error refreshing token:', error);
