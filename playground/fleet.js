@@ -12,7 +12,10 @@
  * gives a start 30 s, and renews the lease every 30 s, so a dead server lets
  * the agent end the shell when the last lease lapses. A root shell must
  * report agent recording. Does NOT persist tickets or sessions across
- * restarts or between server nodes.
+ * restarts or between server nodes. TCP-forward channel sessions live in
+ * playground/tcp.js (with their own Threats note); this file routes their
+ * upgrade path, agent frames and binary data, and ends them when the agent
+ * connection drops.
  */
 
 const WebSocket = require('ws');
@@ -29,6 +32,7 @@ const { readPlaybook } = require('../controlplane/playbooks');
 const { parseCapabilities } = require('../controlplane/channels');
 const { CreditLedger } = require('../controlplane/credit');
 const { deliverWebhooks, COOLDOWN_MS } = require('../controlplane/router');
+const { TcpChannels } = require('./tcp');
 
 const PTY_FRAME_MAX = 64 * 1024;
 const PTY_PENDING_MAX = 1024 * 1024;
@@ -140,6 +144,8 @@ class FleetManager {
         this.tickets = null;
         this.registry = null;
         this.env = process.env;
+        // TCP-forward channel sessions (playground/tcp.js).
+        this.tcp = new TcpChannels(this);
 
         const accessKey = process.env.DARKSTORAGE_ACCESS_KEY;
         const secretKey = process.env.DARKSTORAGE_SECRET_KEY;
@@ -180,6 +186,10 @@ class FleetManager {
         }
         if (parsed.pathname.startsWith('/api/v1/systems/terminal/')) {
             await this.upgradeTerminal(request, socket, head, parsed);
+            return;
+        }
+        if (parsed.pathname.startsWith('/api/v1/systems/tcp/')) {
+            this.tcp.upgrade(request, socket, head, parsed);
             return;
         }
         this.rejectUpgrade(socket, 404, 'Not Found');
@@ -274,12 +284,14 @@ class FleetManager {
             this.failTerminalSocket(ws, 'internal');
             return;
         }
-        if (!ticketRes.ok || !action) {
+        if (!ticketRes.ok) {
             this.failTerminalSocket(ws, 'ticket_invalid');
             return;
         }
+        // Consumed on first upgrade, even when host or purpose do not match
+        // (a tcp:open or file ticket presented here is spent too).
         const row = consumeTicket(this.tickets, ticketRes.ticket, hostId, purpose);
-        if (!row) {
+        if (!row || !action) {
             this.failTerminalSocket(ws, 'ticket_invalid');
             return;
         }
@@ -532,7 +544,12 @@ class FleetManager {
         if (!Buffer.isBuffer(buf) || buf.length < 1) return;
         const n = buf[0];
         if (buf.length < 1 + n) return;
-        const session = this.agentSession(ws, hostId, buf.toString('latin1', 1, 1 + n));
+        const sid = buf.toString('latin1', 1, 1 + n);
+        if (TcpChannels.owns(sid)) {
+            this.tcp.onAgentData(ws, hostId, sid, buf.subarray(1 + n));
+            return;
+        }
+        const session = this.agentSession(ws, hostId, sid);
         if (!session) return;
         const data = buf.subarray(1 + n);
         if (!session.announced) {
@@ -746,6 +763,9 @@ class FleetManager {
                 } else if (msg.type === 'pty_renew_rejected') {
                     const id = hostId;
                     if (id) inOrder(() => this.onAgentRenewRejected(ws, id, msg));
+                } else if (msg.type === 'tcp_status' || msg.type === 'tcp_eof' || msg.type === 'tcp_credit' || msg.type === 'tcp_closed') {
+                    const id = hostId;
+                    if (id) inOrder(() => this.tcp.onAgentFrame(ws, id, msg));
                 }
             } catch (err) {
                 console.error('[Fleet] message error:', err.message);
@@ -761,6 +781,7 @@ class FleetManager {
                 for (const session of [...this.stoppingSessions.values()]) {
                     if (session.agent === ws) this.finalizeTerminal(session, null);
                 }
+                this.tcp.onAgentGone(ws);
             }, 0, true);
             // A connection that a newer one for the same host already
             // replaced does not mark the host offline.

@@ -8,7 +8,7 @@
 
 const express = require('express');
 const axios = require('axios');
-const { hasScope, roleFromGroups, scopesForRole, ALL } = require('./authz');
+const { hasScope, roleFromGroups, scopesForRole, intersectScopes, ALL } = require('./authz');
 const oauth = require('./oauth');
 const { issueLease } = require('./lease');
 const { issueTicket, TTL_MS: TICKET_TTL_MS } = require('./tickets');
@@ -110,16 +110,6 @@ async function requireLinkUser(fleet, principal, userId) {
   if (!ids.includes(userId)) throw http(404, 'not_found');
 }
 
-function intersectScopes(keyScopes, role) {
-  const roleScopes = scopesForRole(role);
-  if (keyScopes.has('admin') && roleScopes.has('admin')) return new Set(ALL);
-  const left = keyScopes.has('admin') ? new Set(ALL) : keyScopes;
-  const right = roleScopes.has('admin') ? new Set(ALL) : roleScopes;
-  const out = new Set();
-  for (const scope of left) if (right.has(scope)) out.add(scope);
-  return out;
-}
-
 function scopesFor(principal, tenantId) {
   const member = principal.memberships.find((m) => m.tenant_id === tenantId);
   if (!member) return new Set();
@@ -188,6 +178,7 @@ async function authenticate(req, fleet) {
       userId,
       email: sessionUser.email,
       keyScopes: null,
+      groupRole: boosted || null,
       memberships: memberships.map((m) => ({ ...m, effective_role: boosted || m.role }))
     };
   }
@@ -363,6 +354,7 @@ async function issueAuditedTicket(fleet, principal, host, purpose, binding = nul
     purpose,
     tenantId: host.tenant_id,
     actor: principal.userId,
+    auth: { kind: principal.kind, keyId: principal.keyId || null, groupRole: principal.groupRole || null },
     target: binding && binding.target,
     root: binding && binding.root
   });

@@ -17,13 +17,16 @@ function frozenTarget(target) {
   return Object.freeze({ host: target.host, port: target.port });
 }
 
-function issueTicket(store, { hostId, purpose, tenantId, actor = null, target = null, root = null }) {
+// auth ({ kind, keyId, groupRole }) is what the upgrade needs to re-check the
+// actor's scopes (authz.ticketScopesHeld); it is never sent anywhere.
+function issueTicket(store, { hostId, purpose, tenantId, actor = null, auth = null, target = null, root = null }) {
   const ticket = `stk_${randomToken(32)}`;
   store.set(ticket, {
     hostId,
     purpose,
     tenantId,
     actor,
+    auth: auth ? Object.freeze({ kind: auth.kind, keyId: auth.keyId || null, groupRole: auth.groupRole || null }) : null,
     target: frozenTarget(target),
     root: typeof root === 'string' ? root : null,
     exp: Date.now() + TTL_MS
