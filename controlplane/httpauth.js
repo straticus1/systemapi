@@ -127,7 +127,10 @@ function corsMiddleware(env = {}) {
     credentials: true
   });
   return (req, res, next) => {
-    if (req.path === '/oauth' || req.path.startsWith('/oauth/')) {
+    // Lower-cased: Express routes are case-insensitive, so /OAUTH/user
+    // reaches the same router and must not get CORS headers either.
+    const lower = req.path.toLowerCase();
+    if (lower === '/oauth' || lower.startsWith('/oauth/')) {
       next();
       return;
     }

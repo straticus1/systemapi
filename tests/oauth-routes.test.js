@@ -18,6 +18,7 @@ const { createOAuthRouter } = require('../routes/oauth');
 const { MemoryRegistry } = require('../controlplane/registry');
 const { mount } = require('../controlplane/router');
 const { fingerprint } = require('../controlplane/token');
+const { corsMiddleware } = require('../controlplane/httpauth');
 
 const CLIENT_ID = 'systemapi-test-client';
 const CLIENT_SECRET = 'client-secret-canary-value';
@@ -213,7 +214,7 @@ async function bodyOf(res) {
   try { return JSON.parse(text); } catch { return text; }
 }
 
-async function setup() {
+async function setup(opts = {}) {
   const idp = await startIssuer();
   const fm = fleet();
   const lines = [];
@@ -223,6 +224,7 @@ async function setup() {
     error: (...a) => lines.push(a.join(' '))
   };
   const app = express();
+  if (opts.cors) app.use(corsMiddleware({ NODE_ENV: 'production', SYSTEMAPI_ALLOWED_ORIGINS: opts.cors }));
   app.use(express.json({ limit: '256kb' }));
   app.use(express.urlencoded({ extended: true, limit: '256kb' }));
   app.use(session({ secret: 'test-secret-not-production', resave: false, saveUninitialized: false }));
@@ -520,6 +522,40 @@ test('logout is POST with the session CSRF token', async () => {
     assert.equal(loc.origin + loc.pathname, t.idp.issuer + 'end-session/');
     assert.equal(typeof loc.searchParams.get('id_token_hint'), 'string');
     assert.equal((await go(t.url + '/oauth/user')).status, 401);
+  } finally {
+    t.close();
+  }
+});
+
+test('no CORS on the real /oauth router, whatever the path case', async () => {
+  const origin = 'https://app.example';
+  const t = await setup({ cors: origin });
+  try {
+    const go = browser();
+    await t.signIn(go, ADMIN);
+    for (const p of ['/oauth/user', '/OAUTH/user', '/OAuth/User', '/oAuth/user']) {
+      const res = await go(t.url + p, { headers: { origin } });
+      const body = await bodyOf(res);
+      // The real router answered (Express routing is case-insensitive) ...
+      assert.equal(res.status, 200, p);
+      assert.equal(body.user.id, ADMIN_SUB, p);
+      assert.equal(typeof body.csrf, 'string', p);
+      // ... and no other origin may read it.
+      assert.equal(res.headers.get('access-control-allow-origin'), null, p);
+      assert.equal(res.headers.get('access-control-allow-credentials'), null, p);
+    }
+    for (const p of ['/OAUTH/logout', '/Oauth/refresh']) {
+      const pre = await fetch(t.url + p, {
+        method: 'OPTIONS',
+        headers: { origin, 'access-control-request-method': 'POST' }
+      });
+      await pre.text();
+      assert.equal(pre.headers.get('access-control-allow-origin'), null, p);
+    }
+    // Control: the same origin does get CORS outside /oauth.
+    const api = await fetch(t.url + '/api/v1/fleet', { headers: { origin } });
+    await api.text();
+    assert.equal(api.headers.get('access-control-allow-origin'), origin);
   } finally {
     t.close();
   }
