@@ -54,6 +54,20 @@ On dial it sends `Authorization: Bearer <key>`, `X-SystemAPI-Tenant`,
 (OpenSSH `ssh-ed25519`). It refuses commands as `not_enrolled` until it has
 pinned the control public key, and refuses a changed key. TLS is 1.3 only.
 
+When the connection drops, the agent ends every terminal session
+(`agent_disconnected`) and redials with jittered exponential backoff from 1 s
+to 60 s. It exits non-zero only on a fatal error: the API key is rejected
+(HTTP 401/403), enrollment is refused for good (for example `not_a_member` or
+`host_steal`), or the control key changed. `systemd/systemapi-agent.service`
+is a sample unit with `Restart=on-failure`; its `KillMode=control-group` also
+ends any shell process still in the agent's cgroup when the service stops.
+
+The enrolled `--hostname` is the name `GET /api/v1/hosts/resolve` finds.
+Telemetry reports it as `host.hostname` and the OS hostname separately as
+`host.os_hostname`; the control plane never renames a host from telemetry.
+`terminal:root` on an agent that is not root, or that would not record the
+session itself, is refused with `root_unavailable`.
+
 Telemetry (every 5 seconds): host info, CPU, memory, disks, cumulative network
 byte counters, installed software, and Docker or k3s summaries when present.
 

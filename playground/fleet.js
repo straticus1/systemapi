@@ -19,7 +19,7 @@ const WebSocket = require('ws');
 const axios = require('axios');
 const crypto = require('node:crypto');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
-const { demoKeyAllowed, agentAuthFromRequest, ticketFromRequest } = require('../controlplane/httpauth');
+const { demoKeyAllowed, agentAuthFromRequest, ticketFromRequest, originAllowed } = require('../controlplane/httpauth');
 const { validateTenant, validateHostId, validateHostname, validateSSHPublicKey } = require('../controlplane/sshkey');
 const { consumeTicket } = require('../controlplane/tickets');
 const { issueLease, terminalPayload } = require('../controlplane/lease');
@@ -50,7 +50,7 @@ const PURPOSE_ACTIONS = new Map([
 ]);
 const PTY_ERRORS = new Set([
     'ticket_invalid', 'scope_denied', 'agent_offline', 'lease_required',
-    'pty_user_unset', 'recording_unavailable', 'pty_start_failed', 'internal'
+    'pty_user_unset', 'recording_unavailable', 'root_unavailable', 'pty_start_failed', 'internal'
 ]);
 const PTY_EXIT_REASONS = new Set(['exited', 'max_duration', 'stopped']);
 const B64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
@@ -216,6 +216,11 @@ class FleetManager {
     async upgradeTerminal(request, socket, head, parsed) {
         if (parsed.searchParams.has('api_key')) {
             this.rejectUpgrade(socket, 401, 'Unauthorized');
+            return;
+        }
+        if (!originAllowed(request.headers.origin, this.env || {})) {
+            console.warn('[Fleet] terminal upgrade refused: origin not allowed');
+            this.rejectUpgrade(socket, 403, 'Forbidden');
             return;
         }
         const rows = sizeParam(parsed.searchParams, 'rows', 24);
@@ -591,7 +596,7 @@ class FleetManager {
         if (session.ended) return;
         // Until phase 2 policy exists, a root shell must be agent-recorded.
         if (session.purpose === 'terminal:root' && session.recording !== 'agent') {
-            this.endTerminal(session, 'recording_unavailable', -1, { error: 'recording_unavailable', notifyAgent: true });
+            this.endTerminal(session, 'root_unavailable', -1, { error: 'root_unavailable', notifyAgent: true });
             return;
         }
         sendJSON(session.client, { type: 'pty_status', payload: { status: 'started', session_id: session.id } });
@@ -812,8 +817,9 @@ class FleetManager {
         if (!hostId || !this.registry) return hostId;
         const hostInfo = (payload && payload.host) || {};
         try {
+            // The enrolled hostname is the resolvable name; telemetry never
+            // renames a host.
             await this.registry.touchHost(hostId, {
-                hostname: hostInfo.hostname,
                 os: hostInfo.os,
                 platform: hostInfo.platform
             });

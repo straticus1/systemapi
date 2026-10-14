@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -115,7 +117,7 @@ func newPTYHarness(t *testing.T) *ptyHarness {
 	agentEUID = func() int { return 1000 }
 	resetRecordingKeyCache()
 	t.Cleanup(func() {
-		stopAllSessions(5 * time.Second)
+		stopAllSessions("stopped", 5*time.Second)
 		ptyCfg, agentEUID = prevCfg, prevEUID
 		inputQueueMax, recordQueueMax = prevIn, prevRec
 		resetRecordingKeyCache()
@@ -342,7 +344,7 @@ func TestPTYRootNeedsItsOwnLeaseAndRoot(t *testing.T) {
 	// A non-root agent refuses pty_root even with a valid lease.
 	agentEUID = func() int { return 1000 }
 	sid = h.start(t, "pty_root", inFuture(60*time.Second), inFuture(time.Hour))
-	if e := h.startErr(t, sid); e != "pty_start_failed" {
+	if e := h.startErr(t, sid); e != "root_unavailable" {
 		t.Fatalf("pty_root on non-root: %q", e)
 	}
 }
@@ -663,21 +665,17 @@ func TestPTYInputQueueNeverBlocksAndOverflowEndsOnlyThatSession(t *testing.T) {
 	s.mu.Unlock()
 }
 
+var bgPidRe = regexp.MustCompile(`BG=([0-9]+)[\r\n]`)
+
 func pidFromOutput(t *testing.T, h *ptyHarness, sid string) int {
 	t.Helper()
 	var pid int
 	waitFor(t, "BG pid", 5*time.Second, func() bool {
-		text := h.out.text(sid)
-		i := strings.Index(text, "BG=")
-		if i < 0 {
+		m := bgPidRe.FindStringSubmatch(h.out.text(sid))
+		if m == nil {
 			return false
 		}
-		rest := text[i+3:]
-		j := strings.IndexAny(rest, "\r\n")
-		if j < 0 {
-			return false
-		}
-		n, err := strconv.Atoi(rest[:j])
+		n, err := strconv.Atoi(m[1])
 		pid = n
 		return err == nil
 	})
@@ -720,7 +718,7 @@ func TestStopAllSessionsEndsEverySession(t *testing.T) {
 	b := h.start(t, "pty", inFuture(60*time.Second), inFuture(time.Hour))
 	startedPayload(t, h, a)
 	startedPayload(t, h, b)
-	stopAllSessions(5 * time.Second)
+	stopAllSessions("stopped", 5*time.Second)
 	for _, sid := range []string{a, b} {
 		if _, reason := h.exitOf(t, sid, time.Second); reason != "stopped" {
 			t.Fatalf("%s %s", sid, reason)
@@ -846,7 +844,7 @@ func TestPTYRootRefusedWithoutAgentRecording(t *testing.T) {
 	agentEUID = func() int { return 0 }
 	ptyCfg.Record = false
 	sid := h.start(t, "pty_root", inFuture(60*time.Second), inFuture(time.Hour))
-	if e := h.startErr(t, sid); e != "recording_unavailable" {
+	if e := h.startErr(t, sid); e != "root_unavailable" {
 		t.Fatalf("got %q", e)
 	}
 	if lookupSession(sid) != nil {
@@ -977,4 +975,31 @@ func TestPTYNoSignalAfterReap(t *testing.T) {
 	if s.signalUnreaped(syscall.SIGKILL) {
 		t.Fatal("signalled a reaped process group")
 	}
+}
+
+// An interactive shell puts a background job in its own process group, so a
+// group signal alone misses it. The session sweep (/proc on Linux, sysctl
+// and getsid on macOS) must catch it.
+func TestPTYStopKillsJobControlChildren(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("session sweep is Linux and macOS only")
+	}
+	h := newPTYHarness(t)
+	sid := h.start(t, "pty", inFuture(60*time.Second), inFuture(time.Hour))
+	s := lookupSession(sid)
+	if s == nil {
+		t.Fatal("not started")
+	}
+	handlePTYInput(sid, []byte("set -m; nohup sleep 1000 >/dev/null 2>&1 & echo BG=$!\n"))
+	bg := pidFromOutput(t, h, sid)
+	pgid, err := syscall.Getpgid(bg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pgid == s.cmd.Process.Pid {
+		t.Fatalf("background job shares the shell's group (%d); job control is off", pgid)
+	}
+	handlePTYStop(sid)
+	h.exitOf(t, sid, 5*time.Second)
+	waitFor(t, "job-control child killed", 5*time.Second, func() bool { return !alive(bg) })
 }

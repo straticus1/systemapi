@@ -1,0 +1,34 @@
+# Sample unit for the SystemAPI agent. Copy to /etc/systemd/system/, edit
+# the tenant, server URL and pty user, put the API key in
+# /etc/systemapi-agent/api-key (mode 0600, owned by root), then:
+#   systemctl daemon-reload && systemctl enable --now systemapi-agent
+#
+# The agent reconnects on its own (backoff 1 s to 60 s). It exits non-zero
+# only on fatal errors (rejected API key, permanent enrollment refusal,
+# changed control key); Restart=on-failure then retries slowly so a
+# misconfiguration does not spin.
+
+[Unit]
+Description=SystemAPI agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/systemapi-agent \
+  --server wss://api.systemapi.io/api/v1/systems/stream \
+  --tenant CHANGE_ME_TENANT \
+  --api-key-file /etc/systemapi-agent/api-key \
+  --state /var/lib/systemapi-agent/agent.json \
+  --pty-user CHANGE_ME_PTY_USER
+Restart=on-failure
+RestartSec=30
+# Root is required to drop terminal shells to --pty-user and to keep the
+# recording key and /var/lib/systemapi/recordings out of their reach.
+User=root
+UMask=0077
+StateDirectory=systemapi-agent
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

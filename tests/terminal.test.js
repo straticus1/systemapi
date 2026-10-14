@@ -326,7 +326,7 @@ test('start failures are pty_status errors closed with 1011', async () => {
 
     // Agent-reported refusal, and an unknown code is reported as internal.
     const agent = await connectAgent(r);
-    for (const [reported, expected] of [['pty_user_unset', 'pty_user_unset'], ['recording_unavailable', 'recording_unavailable'], ['bad_signature', 'internal']]) {
+    for (const [reported, expected] of [['pty_user_unset', 'pty_user_unset'], ['recording_unavailable', 'recording_unavailable'], ['root_unavailable', 'root_unavailable'], ['bad_signature', 'internal']]) {
       const before = agentFrames(agent, 'pty_start').length;
       const c = openClient(r);
       const start = await waitUntil('pty_start', () => agentFrames(agent, 'pty_start')[before]);
@@ -485,7 +485,7 @@ test('terminal:root is refused unless the agent records it', async () => {
       const start = await waitUntil('pty_start', () => agentFrames(agent, 'pty_start')[before]);
       sendStarted(agent, start.session_id, { recording });
       await waitUntil('refused', () => client.box.closeCode === 1011);
-      assert.equal(client.box.frames.at(-1).payload.error, 'recording_unavailable', String(recording));
+      assert.equal(client.box.frames.at(-1).payload.error, 'root_unavailable', String(recording));
       assert.equal(client.box.frames.some((f) => f.payload && f.payload.status === 'started'), false);
       await waitUntil('pty_stop', () => agentFrames(agent, 'pty_stop').find((f) => f.session_id === start.session_id));
     }
@@ -617,7 +617,7 @@ test('input sent to a root session that fails the recording check never reaches 
     await new Promise((resolve) => setTimeout(resolve, 50));
     sendStarted(agent, start.session_id, { recording: 'off' });
     await waitUntil('refused', () => client.box.closeCode === 1011);
-    assert.equal(client.box.frames.at(-1).payload.error, 'recording_unavailable');
+    assert.equal(client.box.frames.at(-1).payload.error, 'root_unavailable');
     await new Promise((resolve) => setTimeout(resolve, 50));
     assert.equal(agentFrames(agent, 'pty_input').length, 0);
   } finally {
@@ -639,5 +639,54 @@ test('held client input over its cap ends the session', async () => {
     assert.equal(agentFrames(agent, 'pty_input').length, 0);
   } finally {
     await r.close();
+  }
+});
+
+test('telemetry never renames the enrolled host', async () => {
+  const r = await rig();
+  try {
+    const agent = await connectAgent(r);
+    agent.ws.send(JSON.stringify({ type: 'telemetry', payload: { host: { hostname: 'renamed-by-os', os: 'darwin', platform: 'arm64' } } }));
+    await waitUntil('os recorded', () => r.fm.registry.hosts.get(HOST_A).os === 'darwin');
+    assert.equal(r.fm.registry.hosts.get(HOST_A).hostname, 'a.example');
+    assert.equal((await r.fm.registry.resolveHosts(['acme'], 'a.example')).length, 1);
+    assert.equal((await r.fm.registry.resolveHosts(['acme'], 'renamed-by-os')).length, 0);
+  } finally {
+    await r.close();
+  }
+});
+
+test('a terminal WebSocket from a foreign Origin is refused; no Origin and allowed origins pass', async () => {
+  const r = await rig({ NODE_ENV: 'production', SYSTEMAPI_PUBLIC_URL: 'https://app.systemapi.io/x' });
+  try {
+    const agent = await connectAgent(r);
+    const status = (origin) => new Promise((resolve) => {
+      const ticket = issueTicket(r.fm.tickets, { hostId: HOST_A, purpose: 'terminal:open', tenantId: 'acme', actor: 'user-1' });
+      const ws = r.track(new WebSocket(`${r.base}/api/v1/systems/terminal/${HOST_A}?ticket=${ticket}`, origin ? { origin } : {}));
+      ws.on('unexpected-response', (_req, res) => resolve({ code: res.statusCode, ticket }));
+      ws.on('open', () => { resolve({ code: 101, ticket }); ws.close(); });
+      ws.on('error', () => {});
+    });
+    for (const bad of ['https://evil.example', 'http://localhost:5173', 'https://systemapi.io.evil.example', 'null']) {
+      const res = await status(bad);
+      assert.equal(res.code, 403, bad);
+      assert.ok(r.fm.tickets.has(res.ticket), 'ticket not spent by a refused origin');
+    }
+    for (const good of [undefined, 'https://systemapi.io', 'https://app.systemapi.io']) {
+      assert.equal((await status(good)).code, 101, String(good));
+    }
+    await waitUntil('three starts', () => agentFrames(agent, 'pty_start').length === 3);
+  } finally {
+    await r.close();
+  }
+  const custom = await rig({ SYSTEMAPI_ALLOWED_ORIGINS: 'https://ops.example.com' });
+  try {
+    await connectAgent(custom);
+    const { originAllowed } = require('../controlplane/httpauth');
+    assert.equal(originAllowed('https://ops.example.com', custom.fm.env), true);
+    assert.equal(originAllowed('https://systemapi.io', custom.fm.env), false);
+    assert.equal(originAllowed('http://localhost:5173', { NODE_ENV: 'development' }), true);
+  } finally {
+    await custom.close();
   }
 });

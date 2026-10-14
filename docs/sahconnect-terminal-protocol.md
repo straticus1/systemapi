@@ -61,6 +61,11 @@ wss://<systemapi>/api/v1/systems/terminal/<host_id>?ticket=<ticket>&purpose=<pur
 `rows` and `cols` are optional initial sizes, each 1–1000. The defaults are
 24 and 80.
 
+The upgrade needs no credential header; the ticket authorizes it. A request
+with no `Origin` header (the CLI) is accepted. A request with an `Origin`
+header (a browser) is refused with HTTP 403 unless that origin is on the
+server's allowlist (`SYSTEMAPI_ALLOWED_ORIGINS`).
+
 ### Client → server: text frames, JSON
 
 | Frame | Meaning |
@@ -81,7 +86,7 @@ wss://<systemapi>/api/v1/systems/terminal/<host_id>?ticket=<ticket>&purpose=<pur
 |---|---|
 | `{"type":"pty_status","payload":{"status":"starting"}}` | The ticket was accepted and the agent was asked to start. |
 | `{"type":"pty_status","payload":{"status":"started","session_id":"..."}}` | The shell is running. |
-| `{"type":"pty_status","payload":{"error":"<code>"}}` | Failure. Codes: `ticket_invalid`, `scope_denied`, `agent_offline`, `lease_required`, `pty_user_unset`, `recording_unavailable`, `pty_start_failed`, `internal`. The socket is then closed with code 1011. |
+| `{"type":"pty_status","payload":{"error":"<code>"}}` | Failure. Codes: `ticket_invalid`, `scope_denied`, `agent_offline`, `lease_required`, `pty_user_unset`, `recording_unavailable`, `root_unavailable`, `pty_start_failed`, `internal`. `root_unavailable` means the host cannot run a `terminal:root` shell: the agent is not root, or it would not record the session itself. The socket is then closed with code 1011. |
 | `{"type":"pty_exit","payload":{"session_id":"...","code":N,"reason":"exited"\|"max_duration"\|"agent_disconnected"\|"stopped"}}` | The session ended. `code` is the shell's exit status, or -1 when there is none. The server then closes with code 1000. |
 
 ## 4. Session lifetime
@@ -120,8 +125,8 @@ expires. A dead server therefore cannot leave a shell running for long.
   1 GiB). A session that reaches its recording size cap (default 1 GiB) ends
   with `pty_exit` reason `stopped`; the audit row says `recording_size_limit`.
 - Until phase 2 policy exists, a `terminal:root` session whose recording is
-  not `agent` is refused with `recording_unavailable`. The agent and the
-  server both enforce this.
+  not `agent` is refused with `root_unavailable`. The agent and the server
+  both enforce this.
 - Nothing the client sends reaches the shell until `started` has been sent,
   which is after the start audit row is written.
 - Phase 2 makes recording configurable per tenant and per user, with an admin

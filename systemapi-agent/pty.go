@@ -329,7 +329,7 @@ func resolvePTYIdentity(action string, cfg ptySettings, euid int) (*ptyIdentity,
 	case "pty_root":
 		if euid != 0 {
 			log.Printf("terminal:root needs an agent running as root")
-			return nil, "pty_start_failed"
+			return nil, "root_unavailable"
 		}
 		u, err := user.LookupId("0")
 		if err != nil {
@@ -498,7 +498,7 @@ func startPTYSession(out ptyOut, hostID, stateDir string, req ptyStartRequest, n
 	// A root shell runs only with agent recording, whatever the server says.
 	if req.Action == "pty_root" && mode != recordingAgent {
 		log.Printf("terminal:root refused: recording is %s, not agent", mode)
-		ptyStatusError(out, sid, "recording_unavailable")
+		ptyStatusError(out, sid, "root_unavailable")
 		return
 	}
 	if mode != recordingOff {
@@ -768,9 +768,9 @@ func (s *ptySession) killTree(grace time.Duration) {
 	s.signalUnreaped(syscall.SIGKILL)
 }
 
-// stopAllSessions ends every session with reason "stopped" and waits up to
-// timeout for their pty_exit to be sent. The agent calls it on every exit.
-func stopAllSessions(timeout time.Duration) {
+// stopAllSessions ends every session with reason and waits up to timeout for
+// their pty_exit to be sent. The agent calls it whenever a connection ends.
+func stopAllSessions(reason string, timeout time.Duration) {
 	ptyMu.Lock()
 	live := make([]*ptySession, 0, len(ptySessions))
 	for _, s := range ptySessions {
@@ -778,7 +778,7 @@ func stopAllSessions(timeout time.Duration) {
 	}
 	ptyMu.Unlock()
 	for _, s := range live {
-		s.end("stopped")
+		s.end(reason)
 	}
 	end := time.Now().Add(timeout)
 	for time.Now().Before(end) {

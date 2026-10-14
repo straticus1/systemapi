@@ -13,7 +13,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -138,119 +137,34 @@ func main() {
 	header.Set("X-SystemAPI-Hostname", hostname)
 	header.Set("X-SystemAPI-SSH-PubKey", pubLine)
 
-	log.Printf("dialing control plane %s host_id=%s", u.Host, st.HostID)
 	dialer := *websocket.DefaultDialer
 	dialer.HandshakeTimeout = 10 * time.Second
 	dialer.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS13}
-	c, _, err := dialer.Dial(u.String(), header)
-	if err != nil {
-		log.Fatalf("dial error: %v", err)
-	}
-	defer c.Close()
-	c.SetReadLimit(256 * 1024)
-	out := &wsWriter{c: c}
-	// Every return from here ends all terminal sessions first.
-	defer stopAllSessions(3 * time.Second)
 
+	stop := make(chan struct{})
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
-
-	enrolled := make(chan error, 1)
-	var enrollOnce sync.Once
-	signalEnroll := func(err error) {
-		enrollOnce.Do(func() { enrolled <- err })
-	}
-	done := make(chan struct{})
-	stateDir := filepath.Dir(statePath)
-
 	go func() {
-		defer close(done)
-		for {
-			_, message, err := c.ReadMessage()
-			if err != nil {
-				log.Printf("read error: %v", err)
-				signalEnroll(err)
-				return
-			}
-			var peek struct {
-				Type          string `json:"type"`
-				Error         string `json:"error"`
-				HostID        string `json:"host_id"`
-				ControlPubKey string `json:"control_pubkey"`
-			}
-			if err := json.Unmarshal(message, &peek); err != nil {
-				log.Printf("rejected malformed message")
-				continue
-			}
-			switch peek.Type {
-			case "enrolled":
-				if err := acceptEnrolled(st, statePath, peek.HostID, peek.ControlPubKey); err != nil {
-					log.Printf("enroll pin failed: %v", err)
-					signalEnroll(err)
-					return
-				}
-				signalEnroll(nil)
-			case "enroll_error":
-				log.Printf("enroll rejected: %s", peek.Error)
-				signalEnroll(fmt.Errorf("enroll_error:%s", peek.Error))
-				return
-			default:
-				processIncomingMessage(out, st.HostID, stateDir, message)
-			}
-		}
+		<-interrupt
+		close(stop)
 	}()
 
-	telemetryTicker := time.NewTicker(5 * time.Second)
-	defer telemetryTicker.Stop()
-	enrollTimer := time.NewTimer(10 * time.Second)
-	defer enrollTimer.Stop()
-	enrolledOK := false
-
-	for {
-		select {
-		case err := <-enrolled:
-			if err != nil {
-				log.Fatalf("enrollment failed: %v", err)
-			}
-			enrolledOK = true
-			log.Printf("enrolled host_id=%s", st.HostID)
-		case <-enrollTimer.C:
-			if !enrolledOK {
-				log.Fatal("enrollment timed out")
-			}
-		case <-done:
-			select {
-			case err := <-enrolled:
-				if err != nil {
-					log.Fatalf("enrollment failed: %v", err)
-				}
-			default:
-			}
-			if !enrolledOK {
-				log.Fatal("connection closed before enrollment")
-			}
-			return
-		case <-telemetryTicker.C:
-			stats, err := gatherTelemetry()
-			if err != nil {
-				log.Printf("telemetry: %v", err)
-				continue
-			}
-			response := ResponseMessage{Type: "telemetry", Payload: stats}
-			if err := out.WriteJSON(response); err != nil {
-				log.Printf("write telemetry: %v", err)
-				return
-			}
-		case <-interrupt:
-			log.Println("signal received, stopping terminal sessions and disconnecting")
-			stopAllSessions(3 * time.Second)
-			_ = out.WriteClose()
-			select {
-			case <-done:
-			case <-time.After(time.Second):
-			}
-			return
-		}
+	conn := &agentConn{
+		url:            u.String(),
+		header:         header,
+		dialer:         dialer,
+		st:             st,
+		statePath:      statePath,
+		hostname:       hostname,
+		telemetryEvery: 5 * time.Second,
+		enrollTimeout:  10 * time.Second,
+		minBackoff:     time.Second,
+		maxBackoff:     60 * time.Second,
+		telemetry:      gatherTelemetry,
+	}
+	if err := conn.run(stop); err != nil {
+		log.Printf("fatal: %v", err)
+		os.Exit(1)
 	}
 }
 
