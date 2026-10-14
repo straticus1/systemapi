@@ -6,6 +6,11 @@
 // Terminal actions (pty, pty_root, breakglass) sign "<action>\n<session_id>\n
 // <deadline_unix>\n<start|renew>", so a renewal lease is bound to one session,
 // cannot move its deadline, and cannot be replayed as a start.
+// Channel actions (tcp, file, file_root) sign "<action>\n<payload>" too, with
+// the payloads of docs/sah-tcp-protocol.md §5 and docs/sah-file-protocol.md
+// §7. The agent rebuilds the payload from what it is about to dial or open,
+// so a lease for one target, root or mode never verifies for another. The
+// builders refuse newlines and control bytes so fields cannot be shifted.
 package main
 
 import (
@@ -61,7 +66,7 @@ func payloadHash(action, payload string) string {
 }
 
 func payloadFor(action, payload string) string {
-	if terminalAction(action) {
+	if terminalAction(action) || channelAction(action) {
 		return action + "\n" + payload
 	}
 	return payload
@@ -85,7 +90,66 @@ func hashEqual(a, b string) bool {
 }
 
 func knownAction(action string) bool {
-	return action == "sysscript" || terminalAction(action)
+	return action == "sysscript" || terminalAction(action) || channelAction(action)
+}
+
+// channelAction reports the SAH channel lease actions.
+func channelAction(action string) bool {
+	return action == "tcp" || action == "file" || action == "file_root"
+}
+
+var (
+	tcpSessionRe  = regexp.MustCompile(`^tcs_[A-Za-z0-9_-]{16,64}$`)
+	fileSessionRe = regexp.MustCompile(`^fls_[A-Za-z0-9_-]{16,64}$`)
+	tcpLeaseHost  = regexp.MustCompile(`^(local|[0-9A-Fa-f.:]{2,45})$`)
+)
+
+func checkLeaseCommon(sessionID string, re *regexp.Regexp, deadlineUnix int64, phase string) error {
+	if !re.MatchString(sessionID) {
+		return errors.New("bad_session_id")
+	}
+	if deadlineUnix <= 0 {
+		return errors.New("bad_deadline")
+	}
+	if phase != "start" && phase != "renew" {
+		return errors.New("bad_phase")
+	}
+	return nil
+}
+
+// tcpLeasePayload is the signed payload of a tcp lease (TCP §5):
+// "<session_id>\n<deadline_unix>\n<start|renew>\n<target.host>\n<port>".
+func tcpLeasePayload(sessionID string, deadlineUnix int64, phase, host string, port int) (string, error) {
+	if err := checkLeaseCommon(sessionID, tcpSessionRe, deadlineUnix, phase); err != nil {
+		return "", err
+	}
+	if !tcpLeaseHost.MatchString(host) {
+		return "", errors.New("bad_target")
+	}
+	if port < 1 || port > 65535 {
+		return "", errors.New("bad_target")
+	}
+	return sessionID + "\n" + strconv.FormatInt(deadlineUnix, 10) + "\n" + phase + "\n" + host + "\n" + strconv.Itoa(port), nil
+}
+
+// fileLeasePayload is the signed payload of a file or file_root lease
+// (FILE §7): "<session_id>\n<deadline_unix>\n<start|renew>\n<read|write>\n<root>".
+func fileLeasePayload(sessionID string, deadlineUnix int64, phase, mode, root string) (string, error) {
+	if err := checkLeaseCommon(sessionID, fileSessionRe, deadlineUnix, phase); err != nil {
+		return "", err
+	}
+	if mode != "read" && mode != "write" {
+		return "", errors.New("bad_mode")
+	}
+	if root == "" || len(root) > 4096 || (root != "~" && root[0] != '/') {
+		return "", errors.New("bad_root")
+	}
+	for i := 0; i < len(root); i++ {
+		if root[i] < 0x20 || root[i] == 0x7f {
+			return "", errors.New("bad_root")
+		}
+	}
+	return sessionID + "\n" + strconv.FormatInt(deadlineUnix, 10) + "\n" + phase + "\n" + mode + "\n" + root, nil
 }
 
 // verifyLease checks the signature and the time window. It does not record

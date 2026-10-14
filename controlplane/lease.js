@@ -7,13 +7,25 @@
 // where the payload is "<session_id>\n<deadline_unix>\n<start|renew>". A
 // renewal lease is bound to one session, cannot move its deadline, and cannot
 // be replayed as a start.
+// Channel actions (tcp, file, file_root) follow the same rule, "<action>\n
+// <payload>", with the payloads of docs/sah-tcp-protocol.md §5
+// ("<session_id>\n<deadline_unix>\n<start|renew>\n<target.host>\n<port>")
+// and docs/sah-file-protocol.md §7 ("<session_id>\n<deadline_unix>\n
+// <start|renew>\n<read|write>\n<root>"), so the agent dials only the signed
+// target and opens only the signed root in the signed mode. The builders
+// refuse a newline or control byte in any field, so fields cannot be shifted.
 'use strict';
 
 const crypto = require('node:crypto');
 const { randomBytes, timingSafeEqual } = crypto;
 
-const ACTIONS = new Set(['sysscript', 'pty', 'pty_root', 'breakglass']);
+const ACTIONS = new Set(['sysscript', 'pty', 'pty_root', 'breakglass', 'tcp', 'file', 'file_root']);
 const TERMINAL_ACTIONS = new Set(['pty', 'pty_root', 'breakglass']);
+const CHANNEL_ACTIONS = new Set(['tcp', 'file', 'file_root']);
+// Actions whose hash covers "<action>\n<payload>".
+const SESSION_ACTIONS = new Set([...TERMINAL_ACTIONS, ...CHANNEL_ACTIONS]);
+const TCP_SESSION_RE = /^tcs_[A-Za-z0-9_-]{16,64}$/;
+const FILE_SESSION_RE = /^fls_[A-Za-z0-9_-]{16,64}$/;
 const MAX_TTL_S = 300;
 const SKEW_S = 30;
 
@@ -22,7 +34,7 @@ function sha256Hex(buf) {
 }
 
 function payloadHash(action, payload) {
-  if (TERMINAL_ACTIONS.has(action)) return sha256Hex(Buffer.from(`${action}\n${String(payload)}`, 'utf8'));
+  if (SESSION_ACTIONS.has(action)) return sha256Hex(Buffer.from(`${action}\n${String(payload)}`, 'utf8'));
   return sha256Hex(Buffer.isBuffer(payload) ? payload : Buffer.from(String(payload), 'utf8'));
 }
 
@@ -97,9 +109,45 @@ function terminalPayload(sessionId, deadlineUnix, phase) {
   return `${sessionId}\n${deadlineUnix}\n${phase}`;
 }
 
+function badPayload() {
+  const err = new Error('bad_payload');
+  err.status = 400;
+  return err;
+}
+
+function checkCommon(sessionId, re, deadlineUnix, phase) {
+  if (typeof sessionId !== 'string' || !re.test(sessionId)) throw badPayload();
+  if (!Number.isInteger(deadlineUnix) || deadlineUnix <= 0) throw badPayload();
+  if (phase !== 'start' && phase !== 'renew') throw badPayload();
+}
+
+// TCP §5. host is "local", an IPv4 dotted quad or a canonical IPv6 literal
+// (controlplane/channels.js validateTcpTarget output).
+function tcpPayload(sessionId, deadlineUnix, phase, host, port) {
+  checkCommon(sessionId, TCP_SESSION_RE, deadlineUnix, phase);
+  if (typeof host !== 'string' || !/^(local|[0-9A-Fa-f.:]{2,45})$/.test(host)) throw badPayload();
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw badPayload();
+  return `${sessionId}\n${deadlineUnix}\n${phase}\n${host}\n${port}`;
+}
+
+// FILE §7. mode is "read" or "write"; root is "~" or an absolute path
+// (controlplane/channels.js validateFileRoot output).
+function filePayload(sessionId, deadlineUnix, phase, mode, root) {
+  checkCommon(sessionId, FILE_SESSION_RE, deadlineUnix, phase);
+  if (mode !== 'read' && mode !== 'write') throw badPayload();
+  if (typeof root !== 'string' || root.length === 0 || root.length > 4096 || /[\u0000-\u001f\u007f]/.test(root)) throw badPayload();
+  if (root !== '~' && !root.startsWith('/')) throw badPayload();
+  return `${sessionId}\n${deadlineUnix}\n${phase}\n${mode}\n${root}`;
+}
+
 module.exports = {
   TERMINAL_ACTIONS,
+  CHANNEL_ACTIONS,
+  TCP_SESSION_RE,
+  FILE_SESSION_RE,
   terminalPayload,
+  tcpPayload,
+  filePayload,
   payloadHash,
   canonicalLease,
   issueLease,

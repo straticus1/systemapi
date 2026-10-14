@@ -1,0 +1,77 @@
+{
+  "public_raw_b64": "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc=",
+  "host_id": "11111111-1111-4111-8111-111111111111",
+  "now_ms": 1700000000000,
+  "vectors": [
+    {
+      "action": "tcp",
+      "payload": "tcs_AAAAAAAAAAAAAAAA_-\n1700028800\nstart\n10.0.0.7\n3389",
+      "message": "systemapi-lease-v1\n11111111-1111-4111-8111-111111111111\ntcp\n1700000060\ncdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\na409fa59616c00de4e8096da2f983f1eeb06bb36a69c3959f6d88d9bb494d6c8\n",
+      "lease": {
+        "v": 1,
+        "host_id": "11111111-1111-4111-8111-111111111111",
+        "action": "tcp",
+        "expires_unix": 1700000060,
+        "nonce_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "payload_sha256": "a409fa59616c00de4e8096da2f983f1eeb06bb36a69c3959f6d88d9bb494d6c8",
+        "signature": "vQ73eps2nG8rwBNmqqiltIpEmSj9bH/aOcsaqO9mMr4gaModSuT33X6x+2aNi/+1hP0EwmQmvAZbhMaZ/VCKAg=="
+      }
+    },
+    {
+      "action": "tcp",
+      "payload": "tcs_AAAAAAAAAAAAAAAA_-\n1700028800\nrenew\n2001:db8::1\n22",
+      "message": "systemapi-lease-v1\n11111111-1111-4111-8111-111111111111\ntcp\n1700000060\ncdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\n0e1de555725a1938bbc18983f4cae1354e7ffe6f7ac539c7d2f0e85594c3bbeb\n",
+      "lease": {
+        "v": 1,
+        "host_id": "11111111-1111-4111-8111-111111111111",
+        "action": "tcp",
+        "expires_unix": 1700000060,
+        "nonce_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "payload_sha256": "0e1de555725a1938bbc18983f4cae1354e7ffe6f7ac539c7d2f0e85594c3bbeb",
+        "signature": "5Q+RRKfiNHr6ACNVaEGoLd5WSr0L4ornGBEy7DGxp4c9pRghqj1gDmNtxmUHtjU1Nr5HQkGaiih61dr59TWqDw=="
+      }
+    },
+    {
+      "action": "file",
+      "payload": "fls_BBBBBBBBBBBBBBBB\n1700028800\nstart\nread\n/srv/app",
+      "message": "systemapi-lease-v1\n11111111-1111-4111-8111-111111111111\nfile\n1700000060\ncdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\n98296d1bcf0dc7eb6d9afa1e7e4223f1295f987583ce0d06c4923e87bc62e0d8\n",
+      "lease": {
+        "v": 1,
+        "host_id": "11111111-1111-4111-8111-111111111111",
+        "action": "file",
+        "expires_unix": 1700000060,
+        "nonce_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "payload_sha256": "98296d1bcf0dc7eb6d9afa1e7e4223f1295f987583ce0d06c4923e87bc62e0d8",
+        "signature": "xrhHw90X8YMbF1J3rRyYYGK9+IQtnZGWINz1VoMZLFZ7xqcSd4t1uE4iwbB2aZcMP0bS/f5NpxhvsIwHDKqmDw=="
+      }
+    },
+    {
+      "action": "file",
+      "payload": "fls_BBBBBBBBBBBBBBBB\n1700028800\nstart\nwrite\n~",
+      "message": "systemapi-lease-v1\n11111111-1111-4111-8111-111111111111\nfile\n1700000060\ncdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\n146dcf65c880fb69bcdcd5e79f72954c9fed739ae4230093fa26ce0d1ba69f4f\n",
+      "lease": {
+        "v": 1,
+        "host_id": "11111111-1111-4111-8111-111111111111",
+        "action": "file",
+        "expires_unix": 1700000060,
+        "nonce_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "payload_sha256": "146dcf65c880fb69bcdcd5e79f72954c9fed739ae4230093fa26ce0d1ba69f4f",
+        "signature": "8b/xgFm78cVMtqwNi6GUYIi6kznPd8qI8XhVhnf06/DmPC0IU9ATVfc+5P43DUkgiry2isQ24XELvcUYcwzgDg=="
+      }
+    },
+    {
+      "action": "file_root",
+      "payload": "fls_CCCCCCCCCCCCCCCC\n1700028800\nstart\nwrite\n/etc",
+      "message": "systemapi-lease-v1\n11111111-1111-4111-8111-111111111111\nfile_root\n1700000060\ncdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\nf0c424019f3789a4d85156475a9728bf44386bbbc4131c8c6290b91771c8afe4\n",
+      "lease": {
+        "v": 1,
+        "host_id": "11111111-1111-4111-8111-111111111111",
+        "action": "file_root",
+        "expires_unix": 1700000060,
+        "nonce_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "payload_sha256": "f0c424019f3789a4d85156475a9728bf44386bbbc4131c8c6290b91771c8afe4",
+        "signature": "Xie3kr2wmbhRtycjRvXOY9ThaUg2fRn++bzJwzhxODrJEHcnZsJ7FHIYHQ4XRL74ZNJ7ooU1R/t3Q4fn0VaVAw=="
+      }
+    }
+  ]
+}

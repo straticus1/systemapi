@@ -338,3 +338,64 @@ test('ws-ticket budgets: tcp has its own (default 120), file:root is privileged,
     server.close();
   }
 });
+
+test('channel leases: payload builders, vectors, and negative cases', () => {
+  const crypto = require('node:crypto');
+  const lease = require('../controlplane/lease');
+  const key = privateKeyFromSeed(TEST_SEED);
+  const signer = buildSigner(key, rawPublicKey(key));
+  const pub = crypto.createPublicKey(key);
+  const other = crypto.generateKeyPairSync('ed25519');
+  const otherPub = other.publicKey;
+  const sid = 'tcs_AAAAAAAAAAAAAAAA_-';
+  const fid = 'fls_BBBBBBBBBBBBBBBB';
+
+  // Session id regexes and field checks.
+  for (const bad of ['tcs_short', 'pty_AAAAAAAAAAAAAAAA', 'tcs_' + 'a'.repeat(65), 'tcs_AAAAAAAAAAAAAAAA\n']) {
+    assert.throws(() => lease.tcpPayload(bad, 1, 'start', 'local', 22), /bad_payload/, bad);
+  }
+  assert.throws(() => lease.tcpPayload(sid, 1, 'begin', 'local', 22), /bad_payload/);
+  assert.throws(() => lease.tcpPayload(sid, 1, 'start', 'local\n9', 22), /bad_payload/);
+  assert.throws(() => lease.tcpPayload(sid, 1, 'start', 'db.internal', 22), /bad_payload/);
+  assert.throws(() => lease.tcpPayload(sid, 1, 'start', 'local', 0), /bad_payload/);
+  assert.throws(() => lease.filePayload(sid, 1, 'start', 'read', '/srv'), /bad_payload/);
+  assert.throws(() => lease.filePayload(fid, 1, 'start', 'admin', '/srv'), /bad_payload/);
+  assert.throws(() => lease.filePayload(fid, 1, 'start', 'read', '/srv\nwrite'), /bad_payload/);
+  assert.throws(() => lease.filePayload(fid, 1, 'start', 'read', 'srv'), /bad_payload/);
+
+  // Vectors shared with systemapi-agent/lease_channels_test.go.
+  const vec = require('../controlplane/testdata/channel-lease-vectors.json');
+  for (const v of vec.vectors) {
+    assert.equal(lease.payloadHash(v.action, v.payload), v.lease.payload_sha256);
+    assert.equal(signer.sign(v.message), v.lease.signature, 'ed25519 is deterministic');
+    assert.equal(lease.verifyLease(pub, v.lease, v.payload, vec.now_ms).ok, true, v.action);
+  }
+
+  const now = Date.now();
+  const deadline = Math.floor(now / 1000) + 3600;
+  const tcpStart = lease.tcpPayload(sid, deadline, 'start', '10.0.0.7', 3389);
+  const tl = lease.issueLease(signer, { hostId: HOST_A, action: 'tcp', payload: tcpStart, now });
+  assert.equal(lease.verifyLease(pub, tl, tcpStart, now).ok, true);
+  const tamper = (payload) => lease.verifyLease(pub, tl, payload, now).error;
+  // Tampered target, port, phase, deadline.
+  assert.equal(tamper(lease.tcpPayload(sid, deadline, 'start', '10.0.0.8', 3389)), 'payload_mismatch');
+  assert.equal(tamper(lease.tcpPayload(sid, deadline, 'start', '10.0.0.7', 3390)), 'payload_mismatch');
+  assert.equal(tamper(lease.tcpPayload(sid, deadline, 'renew', '10.0.0.7', 3389)), 'payload_mismatch');
+  assert.equal(tamper(lease.tcpPayload(sid, deadline + 1, 'start', '10.0.0.7', 3389)), 'payload_mismatch');
+  // Wrong action: the same payload under another action label.
+  assert.equal(lease.verifyLease(pub, { ...tl, action: 'pty' }, tcpStart, now).error, 'payload_mismatch');
+  assert.equal(lease.verifyLease(pub, { ...tl, action: 'tcp_listen' }, tcpStart, now).error, 'bad_action');
+  // Expired, wrong key, bad signature.
+  assert.equal(lease.verifyLease(pub, tl, tcpStart, now + 200_000).error, 'expired');
+  assert.equal(lease.verifyLease(otherPub, tl, tcpStart, now).error, 'bad_signature');
+
+  const fileStart = lease.filePayload(fid, deadline, 'start', 'read', '/srv/a');
+  const fl = lease.issueLease(signer, { hostId: HOST_A, action: 'file', payload: fileStart, now });
+  assert.equal(lease.verifyLease(pub, fl, fileStart, now).ok, true);
+  assert.equal(lease.verifyLease(pub, fl, lease.filePayload(fid, deadline, 'start', 'write', '/srv/a'), now).error, 'payload_mismatch');
+  assert.equal(lease.verifyLease(pub, fl, lease.filePayload(fid, deadline, 'start', 'read', '/srv/b'), now).error, 'payload_mismatch');
+  // A file lease cannot be presented as file_root (the hash binds the action).
+  assert.equal(lease.verifyLease(pub, { ...fl, action: 'file_root' }, fileStart, now).error, 'payload_mismatch');
+  assert.equal(lease.verifyLease(pub, fl, fileStart, now + 200_000).error, 'expired');
+  assert.equal(lease.verifyLease(otherPub, fl, fileStart, now).error, 'bad_signature');
+});
