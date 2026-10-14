@@ -129,7 +129,7 @@ const HostCard = ({ host, onConnect, onDiagnostic }) => {
           onDiagnostic("Netstat", script);
       } else if (action === 'SysLogs') {
           script = 'r = sys.exec.run("journalctl", "-n", "50", "--no-pager")\nprint(r["output"])';
-          onDiagnostic("Live System Logs", script);
+          onDiagnostic("System Logs (last 50 lines)", script);
       } else if (action === 'AuditSSH') {
           script = 'r = sys.exec.run("ls", "-l", "/etc/ssh")\nprint(r["output"])';
           onDiagnostic("List /etc/ssh", script);
@@ -241,7 +241,7 @@ const HostCard = ({ host, onConnect, onDiagnostic }) => {
                  <div style={{ borderTop: '1px solid var(--border-light)', margin: '6px 0' }}></div>
                  
                  <div style={{ fontSize: '0.7rem', color: 'var(--accent-red)', marginBottom: '4px', textTransform: 'uppercase', padding: '0 6px', letterSpacing: '0.5px' }}>Destructive</div>
-                 <button onClick={() => handleEmergencyAction("Kill Process")} className="btn btn-ghost" style={{ width: '100%', justifyContent: 'flex-start', color: 'var(--accent-amber)', padding: '6px', fontSize: '0.85rem' }}>Kill Rogue PID</button>
+                 <button onClick={() => handleEmergencyAction("Kill Process")} className="btn btn-ghost" style={{ width: '100%', justifyContent: 'flex-start', color: 'var(--accent-amber)', padding: '6px', fontSize: '0.85rem' }}>Kill Process</button>
                  <button onClick={() => handleEmergencyAction("Reboot")} className="btn btn-ghost" style={{ width: '100%', justifyContent: 'flex-start', color: 'var(--accent-red)', padding: '6px', fontSize: '0.85rem', marginTop: '4px' }}>Force Reboot OS</button>
              </div>
          </div>
