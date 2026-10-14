@@ -3,15 +3,15 @@
  * Provides login, callback, logout, and user info endpoints
  */
 // Threats: login CSRF and code injection (state, nonce and PKCE S256 are
-// checked by openid-client), ID tokens signed with another algorithm (only
-// RS256 is accepted), off-site redirects after login (safeReturnPath, checked
+// checked by openid-client), ID tokens naming another algorithm (the header
+// alg is pinned to RS256), off-site redirects after login (safeReturnPath, checked
 // at login and again at the callback), session fixation (the session id is
 // regenerated at login and pre-login fields are dropped), cross-site logout
 // and refresh (POST with the session CSRF token), and leaking error details,
 // emails or subjects to the browser or the log (generic codes plus a request
 // id; the log gets only the error name and code). The session stores the
-// Authentik sub; who that sub may act as is decided by cp_sso_bindings, not
-// here. Does NOT bind subs to members. options.customFetch exists so tests can
+// Authentik sub; who that sub may act as is decided by cp_members.sso_sub,
+// not here. Does NOT bind subs to members. options.customFetch exists so tests can
 // trust a local mock HTTPS issuer; TLS is never turned off.
 'use strict';
 
@@ -131,7 +131,10 @@ function createOAuthRouter(options = {}) {
 
       // The callback URL is rebuilt on the registered redirect URI (not the
       // Host header) with this request's query; openid-client checks state,
-      // nonce, PKCE, issuer, audience and the RS256 ID-token signature.
+      // nonce, PKCE, issuer, audience and expiry, and that the ID token's alg
+      // is RS256. It does NOT verify the ID token's signature: the token came
+      // straight from the token endpoint over TLS, which OIDC Core 3.1.3.7
+      // allows in place of signature validation.
       const currentUrl = new URL(redirectUri());
       currentUrl.search = new URL(req.originalUrl, 'http://callback.invalid').search;
       const tokenSet = await oidc.authorizationCodeGrant(config, currentUrl, {
@@ -151,7 +154,7 @@ function createOAuthRouter(options = {}) {
       });
 
       // id is the Authentik sub (sub_mode hashed_user_id). Email and name are
-      // display data; cp_sso_bindings decides which member the sub may act as.
+      // display data; cp_members.sso_sub decides which member the sub may act as.
       req.session.user = {
         id: claims.sub,
         email: userinfo.email,
