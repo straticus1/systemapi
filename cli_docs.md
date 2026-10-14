@@ -75,6 +75,12 @@ anything not granted is refused. The control plane clamps them first:
 
 A JSON boolean in a list field grants nothing, and `"*"` is dropped.
 
+The control plane currently forwards `allow_fs_read`, `allow_fs_write`,
+`allow_net_outbound`, `allow_config_write` and `allow_service_reload` as
+booleans (see `clampEntitlements` in `controlplane/router.js`), so a run
+started through the API or dashboard never receives those path or name lists.
+The other list fields are passed through for admins.
+
 ### Modules
 
 | Module | Functions |

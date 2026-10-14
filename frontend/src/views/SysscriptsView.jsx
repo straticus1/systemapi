@@ -17,8 +17,10 @@ const SysscriptsView = () => {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
   
-  // Boolean entitlements the control plane honours. Path-scoped ones
-  // (allow_fs_read, allow_fs_write, allow_net_outbound) are API-only for now.
+  // Boolean entitlements the control plane honours. The control plane clamps
+  // path-scoped ones (allow_fs_read, allow_fs_write, allow_net_outbound,
+  // allow_config_write, allow_service_reload) to booleans, which the agent
+  // treats as no grant, so they cannot be granted from here or the API yet.
   const [allowExec, setAllowExec] = useState(true);
   const [allowContainers, setAllowContainers] = useState(false);
   const [allowK3s, setAllowK3s] = useState(false);
@@ -111,7 +113,7 @@ const SysscriptsView = () => {
 
           <h3 style={{ fontSize: '1rem', marginBottom: '16px' }}>Security Entitlements</h3>
           <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: '16px' }}>
-            Grants for this run. Containers and k3s need the admin role. Path-scoped grants (files, outbound network) are set through the API.
+            Grants for this run. Containers and k3s need the admin role. Path-scoped grants (files, outbound network, config writes, service reloads) cannot be granted from the control plane yet.
           </p>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', marginBottom: '32px' }}>
