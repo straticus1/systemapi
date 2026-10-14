@@ -45,9 +45,14 @@ function dbSsl(env) {
 
 const app = express();
 // req.ip feeds the device-login requester display and the per-IP code-entry
-// limit, so behind a reverse proxy it must be the client, not the proxy.
-// Default trusts X-Forwarded-For only from a loopback peer (a local proxy).
-app.set('trust proxy', process.env.SYSTEMAPI_TRUST_PROXY || 'loopback');
+// limit. SYSTEMAPI_TRUST_PROXY is a hop count or a CIDR list; production
+// refuses to start without it (see controlplane/httpauth.js).
+try {
+    app.set('trust proxy', require('./controlplane/httpauth').trustProxySetting(process.env));
+} catch (err) {
+    console.error('[control] ' + err.message + '; refusing to start');
+    process.exit(1);
+}
 const PORT = process.env.PORT || 3003;
 
 // Prometheus metrics registry

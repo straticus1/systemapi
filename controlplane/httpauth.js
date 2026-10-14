@@ -4,6 +4,8 @@
 // authenticate the key itself; callers still verify the bearer against the store.
 'use strict';
 
+const net = require('node:net');
+
 function demoKeyAllowed(env) {
   return env.SYSTEMAPI_ALLOW_DEMO === '1' && env.NODE_ENV !== 'production';
 }
@@ -68,6 +70,32 @@ function originAllowed(origin, env = {}) {
   return allowedOrigins(env).has(origin);
 }
 
+// Express "trust proxy" from SYSTEMAPI_TRUST_PROXY. req.ip feeds the
+// device-login requester display and the per-IP code-entry limit, so a
+// spoofable X-Forwarded-For would let a caller pick its own IP. Accepted: a
+// hop count ("1") or a comma-separated list of CIDRs ("10.0.0.0/8,::1/128").
+// "true", bare addresses and names are refused. Unset is refused in
+// production; elsewhere it trusts loopback proxies only.
+function trustProxySetting(env = {}) {
+  const raw = env.SYSTEMAPI_TRUST_PROXY;
+  if (raw === undefined || raw.trim() === '') {
+    if (env.NODE_ENV === 'production') throw new Error('SYSTEMAPI_TRUST_PROXY is required in production');
+    return ['127.0.0.0/8', '::1/128'];
+  }
+  const value = raw.trim();
+  if (/^\d{1,2}$/.test(value)) return Number(value);
+  const list = value.split(',').map((part) => part.trim());
+  for (const cidr of list) {
+    const m = /^([^/]+)\/(\d{1,3})$/.exec(cidr);
+    const family = m ? net.isIP(m[1]) : 0;
+    const bits = m ? Number(m[2]) : -1;
+    if (!family || bits > (family === 4 ? 32 : 128)) {
+      throw new Error('SYSTEMAPI_TRUST_PROXY must be a hop count or a list of CIDRs');
+    }
+  }
+  return list;
+}
+
 // Credentialed CORS origins: the same list as allowedOrigins, but only exact
 // origins (scheme://host[:port], no path, no wildcard) and https only, except
 // http://localhost / 127.0.0.1 outside production. Anything else is dropped.
@@ -107,4 +135,4 @@ function corsMiddleware(env = {}) {
   };
 }
 
-module.exports = { demoKeyAllowed, agentAuthFromRequest, ticketFromRequest, allowedOrigins, originAllowed, corsOrigins, corsMiddleware };
+module.exports = { demoKeyAllowed, agentAuthFromRequest, ticketFromRequest, allowedOrigins, originAllowed, corsOrigins, corsMiddleware, trustProxySetting };

@@ -15,7 +15,7 @@ const { mount, clampEntitlements } = require('../controlplane/router');
 const { TEST_SEED, privateKeyFromSeed, rawPublicKey, buildSigner } = require('../controlplane/keys');
 const { issueLease, verifyLease, canonicalLease, payloadHash } = require('../controlplane/lease');
 const { tokenEqual, randomToken } = require('../controlplane/token');
-const { demoKeyAllowed, agentAuthFromRequest, ticketFromRequest, corsOrigins, corsMiddleware } = require('../controlplane/httpauth');
+const { demoKeyAllowed, agentAuthFromRequest, ticketFromRequest, corsOrigins, corsMiddleware, trustProxySetting } = require('../controlplane/httpauth');
 const { validateSSHPublicKey } = require('../controlplane/sshkey');
 const { assertWebhookURL } = require('../controlplane/webhook');
 const { cronValid, cronMatches, zscore } = require('../controlplane/stats');
@@ -1396,6 +1396,21 @@ test('cli login writes a mode 0600 token and prints only the verification URI an
     server.close();
     fs.rmSync(tokenFile, { force: true });
     fs.rmSync(mismatchFile, { force: true });
+  }
+});
+
+test('trust proxy is a hop count or CIDR list, never true, and required in production', () => {
+  assert.throws(() => trustProxySetting({ NODE_ENV: 'production' }), /required in production/);
+  assert.throws(() => trustProxySetting({ NODE_ENV: 'production', SYSTEMAPI_TRUST_PROXY: ' ' }), /required in production/);
+  assert.deepEqual(trustProxySetting({ NODE_ENV: 'test' }), ['127.0.0.0/8', '::1/128']);
+  assert.equal(trustProxySetting({ NODE_ENV: 'production', SYSTEMAPI_TRUST_PROXY: '1' }), 1);
+  assert.equal(trustProxySetting({ NODE_ENV: 'production', SYSTEMAPI_TRUST_PROXY: '0' }), 0);
+  assert.deepEqual(
+    trustProxySetting({ NODE_ENV: 'production', SYSTEMAPI_TRUST_PROXY: '10.0.0.0/8, fd00::/8' }),
+    ['10.0.0.0/8', 'fd00::/8']
+  );
+  for (const bad of ['true', 'TRUE', 'false', 'loopback', '10.0.0.1', '10.0.0.0/33', '::1/129', '1.2.3.4/8,*', '-1', '100', 'x/8']) {
+    assert.throws(() => trustProxySetting({ NODE_ENV: 'production', SYSTEMAPI_TRUST_PROXY: bad }), /hop count or a list of CIDRs/, bad);
   }
 });
 

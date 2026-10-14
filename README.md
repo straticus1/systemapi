@@ -62,9 +62,12 @@ commit an env file. `SYSTEMAPI_ALLOWED_ORIGINS` (comma-separated exact
 origins) sets the browser origins allowed to open a terminal WebSocket and to
 make credentialed CORS requests; CORS keeps only exact `https://` origins (plus
 `http://localhost` outside production) and is never served on `/oauth`.
-`SYSTEMAPI_TRUST_PROXY` (default `loopback`) is Express `trust proxy`, which
-decides the client IP shown on the device-login page and used for its rate
-limit. A sample agent unit is
+`SYSTEMAPI_TRUST_PROXY` sets Express `trust proxy`, which decides the client
+IP shown on the device-login page and used for its rate limit. It is a hop
+count (`1` for one reverse proxy) or a comma-separated CIDR list
+(`10.0.0.0/8,::1/128`); `true`, names and bare addresses are refused because
+they would trust a spoofable `X-Forwarded-For`. Production refuses to start
+without it; elsewhere it defaults to loopback proxies. A sample agent unit is
 `systemd/systemapi-agent.service`.
 Database TLS is on by default (`DB_SSL=disable` opts out, `DB_SSL_CA` adds a
 CA). The playground routes under `/playground` need `DB_PASSWORD` and Redis.
