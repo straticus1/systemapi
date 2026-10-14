@@ -3,12 +3,16 @@
 // wrong-host, and wrong-action input. Replay cache is the agent's job (the
 // server mints a fresh nonce per issue). Clock skew allowance is 30s. TTL
 // cap is 300s. Does NOT stop an agent that ignores the lease.
+// Terminal actions (pty, pty_root, breakglass) sign "<action>\n<payload>",
+// where the payload is "<session_id>\n<deadline_unix>". A renewal lease is
+// bound to one session and cannot move its deadline.
 'use strict';
 
 const crypto = require('node:crypto');
 const { randomBytes, timingSafeEqual } = crypto;
 
-const ACTIONS = new Set(['sysscript', 'pty', 'breakglass']);
+const ACTIONS = new Set(['sysscript', 'pty', 'pty_root', 'breakglass']);
+const TERMINAL_ACTIONS = new Set(['pty', 'pty_root', 'breakglass']);
 const MAX_TTL_S = 300;
 const SKEW_S = 30;
 
@@ -17,8 +21,7 @@ function sha256Hex(buf) {
 }
 
 function payloadHash(action, payload) {
-  if (action === 'pty') return sha256Hex(Buffer.from('pty'));
-  if (action === 'breakglass') return sha256Hex(Buffer.from('breakglass'));
+  if (TERMINAL_ACTIONS.has(action)) return sha256Hex(Buffer.from(`${action}\n${String(payload)}`, 'utf8'));
   return sha256Hex(Buffer.isBuffer(payload) ? payload : Buffer.from(String(payload), 'utf8'));
 }
 
@@ -87,7 +90,13 @@ function fail(error) {
   return { ok: false, error };
 }
 
+function terminalPayload(sessionId, deadlineUnix) {
+  return `${sessionId}\n${deadlineUnix}`;
+}
+
 module.exports = {
+  TERMINAL_ACTIONS,
+  terminalPayload,
   payloadHash,
   canonicalLease,
   issueLease,

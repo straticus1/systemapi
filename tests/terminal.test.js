@@ -1,0 +1,370 @@
+'use strict';
+
+// Terminal WebSocket sessions: client <-> FleetManager <-> fake agent.
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
+const http = require('node:http');
+const WebSocket = require('ws');
+
+const FleetManager = require('../playground/fleet');
+const { MemoryRegistry } = require('../controlplane/registry');
+const { TEST_SEED, privateKeyFromSeed, rawPublicKey, buildSigner } = require('../controlplane/keys');
+const { issueTicket } = require('../controlplane/tickets');
+const { verifyLease, terminalPayload } = require('../controlplane/lease');
+
+const HOST_A = '11111111-1111-4111-8111-111111111111';
+const PUBLIC_KEY = crypto.createPublicKey(privateKeyFromSeed(TEST_SEED));
+
+function signer() {
+  const key = privateKeyFromSeed(TEST_SEED);
+  return buildSigner(key, rawPublicKey(key));
+}
+
+function opensshEd25519(raw32) {
+  const name = Buffer.from('ssh-ed25519');
+  const buf = Buffer.alloc(4 + name.length + 4 + 32);
+  buf.writeUInt32BE(name.length, 0);
+  name.copy(buf, 4);
+  buf.writeUInt32BE(32, 4 + name.length);
+  raw32.copy(buf, 4 + name.length + 4);
+  return `ssh-ed25519 ${buf.toString('base64')} test@systemapi`;
+}
+
+async function waitUntil(what, fn, timeout = 3000) {
+  const end = Date.now() + timeout;
+  for (;;) {
+    const value = fn();
+    if (value) return value;
+    if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
+function collect(ws) {
+  const box = { frames: [], closeCode: null };
+  ws.on('message', (data, isBinary) => {
+    box.frames.push(isBinary ? { binary: Buffer.from(data) } : JSON.parse(data.toString()));
+  });
+  ws.on('close', (code) => { box.closeCode = code; });
+  ws.on('error', () => {});
+  return box;
+}
+
+async function rig(env = {}) {
+  const server = http.createServer();
+  const fm = new FleetManager(server, null, 'systemapi', null);
+  fm.env = { NODE_ENV: 'test', ...env };
+  fm.signer = signer();
+  fm.tickets = new Map();
+  fm.registry = new MemoryRegistry({ NODE_ENV: 'test' });
+  fm.verifyApiKey = async (key) => (key === 'agent-key' ? { key_id: 'k1', user_id: 'user-1' } : null);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const base = `ws://127.0.0.1:${server.address().port}`;
+  const sockets = [];
+  return {
+    fm,
+    base,
+    track(ws) { sockets.push(ws); return ws; },
+    async close() {
+      for (const ws of sockets) if (ws.readyState === WebSocket.OPEN) ws.terminate();
+      for (const s of fm.terminalSessions.values()) { clearInterval(s.renewTimer); clearTimeout(s.maxTimer); }
+      await new Promise((resolve) => server.close(resolve));
+    }
+  };
+}
+
+async function connectAgent(r) {
+  const ws = r.track(new WebSocket(`${r.base}/api/v1/systems/stream`, {
+    headers: {
+      authorization: 'Bearer agent-key',
+      'x-systemapi-tenant': 'acme',
+      'x-systemapi-host-id': HOST_A,
+      'x-systemapi-hostname': 'a.example',
+      'x-systemapi-ssh-pubkey': opensshEd25519(r.fm.signer.publicKeyRaw)
+    }
+  }));
+  const box = collect(ws);
+  await waitUntil('enrolled', () => box.frames.find((f) => f.type === 'enrolled'));
+  return { ws, box };
+}
+
+function openClient(r, { purpose = 'terminal:open', query = '' } = {}) {
+  const ticket = issueTicket(r.fm.tickets, { hostId: HOST_A, purpose, tenantId: 'acme', actor: 'user-1' });
+  const ws = r.track(new WebSocket(`${r.base}/api/v1/systems/terminal/${HOST_A}?ticket=${ticket}&purpose=${purpose}${query}`));
+  return { ws, box: collect(ws) };
+}
+
+function agentFrames(agent, type) {
+  return agent.box.frames.filter((f) => f.type === type);
+}
+
+function sendStarted(agent, sessionId, extra = {}) {
+  agent.ws.send(JSON.stringify({
+    type: 'pty_status',
+    session_id: sessionId,
+    payload: { status: 'started', session_id: sessionId, pty_user: 'ops', recording: true, ...extra }
+  }));
+}
+
+function output(sessionId, text) {
+  const id = Buffer.from(sessionId, 'latin1');
+  return Buffer.concat([Buffer.from([id.length]), id, Buffer.from(text)]);
+}
+
+function textOf(box) {
+  return Buffer.concat(box.frames.filter((f) => f.binary).map((f) => f.binary)).toString();
+}
+
+async function startSession(r, agent, opts) {
+  const before = agentFrames(agent, 'pty_start').length;
+  const client = openClient(r, opts);
+  const start = await waitUntil('pty_start', () => agentFrames(agent, 'pty_start')[before]);
+  sendStarted(agent, start.session_id);
+  await waitUntil('started', () => client.box.frames.find((f) => f.type === 'pty_status' && f.payload.status === 'started'));
+  return { client, start };
+}
+
+test('pty_start carries a signed, session-bound lease, sizes and a deadline', async () => {
+  const r = await rig();
+  try {
+    const agent = await connectAgent(r);
+    const client = openClient(r, { query: '&rows=40&cols=120' });
+    const start = await waitUntil('pty_start', () => agentFrames(agent, 'pty_start')[0]);
+    assert.match(start.session_id, /^pts_[A-Za-z0-9_-]{16,64}$/);
+    assert.equal(start.action, 'pty');
+    assert.equal(start.rows, 40);
+    assert.equal(start.cols, 120);
+    const now = Math.floor(Date.now() / 1000);
+    assert.ok(Math.abs(start.deadline_unix - (now + 28800)) <= 2);
+    const ok = verifyLease(PUBLIC_KEY, start.lease, terminalPayload(start.session_id, start.deadline_unix));
+    assert.equal(ok.ok, true);
+    assert.equal(start.lease.action, 'pty');
+    assert.equal(start.lease.host_id, HOST_A);
+    assert.deepEqual(client.box.frames[0], { type: 'pty_status', payload: { status: 'starting' } });
+
+    const root = openClient(r, { purpose: 'terminal:root' });
+    const rootStart = await waitUntil('root start', () => agentFrames(agent, 'pty_start')[1]);
+    assert.equal(rootStart.action, 'pty_root');
+    assert.equal(rootStart.lease.action, 'pty_root');
+    root.ws.close();
+  } finally {
+    await r.close();
+  }
+});
+
+test('two sessions on one host do not collide', async () => {
+  const r = await rig();
+  try {
+    const agent = await connectAgent(r);
+    const one = await startSession(r, agent);
+    const two = await startSession(r, agent);
+    assert.notEqual(one.start.session_id, two.start.session_id);
+
+    agent.ws.send(output(one.start.session_id, 'out-one'));
+    agent.ws.send(output(two.start.session_id, 'out-two'));
+    await waitUntil('output one', () => textOf(one.client.box) === 'out-one');
+    await waitUntil('output two', () => textOf(two.client.box) === 'out-two');
+
+    two.client.ws.send(JSON.stringify({ type: 'pty_input', data_b64: Buffer.from('ls\n').toString('base64') }));
+    one.client.ws.send(JSON.stringify({ type: 'pty_input', data: 'pwd\n' }));
+    one.client.ws.send(JSON.stringify({ type: 'pty_resize', rows: 50, cols: 132 }));
+    one.client.ws.send(JSON.stringify({ type: 'pty_resize', rows: 0, cols: 132 }));
+    one.client.ws.send(JSON.stringify({ type: 'pty_eof' }));
+    one.client.ws.send(JSON.stringify({ type: 'something_new' }));
+    await waitUntil('eof', () => agentFrames(agent, 'pty_eof').length === 1);
+    const inputs = agentFrames(agent, 'pty_input');
+    assert.deepEqual(inputs.map((f) => [f.session_id, Buffer.from(f.data_b64, 'base64').toString()]).sort(), [
+      [one.start.session_id, 'pwd\n'],
+      [two.start.session_id, 'ls\n']
+    ].sort());
+    assert.deepEqual(agentFrames(agent, 'pty_resize'), [{ type: 'pty_resize', session_id: one.start.session_id, rows: 50, cols: 132 }]);
+    assert.equal(agentFrames(agent, 'pty_eof')[0].session_id, one.start.session_id);
+
+    one.client.ws.close();
+    await waitUntil('stop one', () => agentFrames(agent, 'pty_stop').length === 1);
+    assert.equal(agentFrames(agent, 'pty_stop')[0].session_id, one.start.session_id);
+    agent.ws.send(output(two.start.session_id, '-still'));
+    await waitUntil('two still live', () => textOf(two.client.box) === 'out-two-still');
+  } finally {
+    await r.close();
+  }
+});
+
+test('a frame over 64 KiB closes the socket with 1009', async () => {
+  const r = await rig();
+  try {
+    const agent = await connectAgent(r);
+    const { client, start } = await startSession(r, agent);
+    client.ws.send(JSON.stringify({ type: 'pty_input', data_b64: 'A'.repeat(64 * 1024 + 4) }));
+    await waitUntil('1009', () => client.box.closeCode === 1009);
+    await waitUntil('pty_stop', () => agentFrames(agent, 'pty_stop').find((f) => f.session_id === start.session_id));
+    assert.equal(agentFrames(agent, 'pty_input').length, 0);
+  } finally {
+    await r.close();
+  }
+});
+
+test('exit code and reason pass through, then the server closes 1000 and audits', async () => {
+  const r = await rig();
+  try {
+    const agent = await connectAgent(r);
+    const { client, start } = await startSession(r, agent);
+    agent.ws.send(output(start.session_id, 'bye'));
+    agent.ws.send(JSON.stringify({ type: 'pty_exit', session_id: start.session_id, payload: { session_id: start.session_id, code: 3, reason: 'exited' } }));
+    await waitUntil('close', () => client.box.closeCode === 1000);
+    const exit = client.box.frames.find((f) => f.type === 'pty_exit');
+    assert.deepEqual(exit, { type: 'pty_exit', payload: { session_id: start.session_id, code: 3, reason: 'exited' } });
+    assert.equal(textOf(client.box), 'bye');
+
+    const rows = r.fm.registry.audit;
+    const began = rows.find((row) => row.action === 'terminal_start');
+    assert.deepEqual(began.payload, { session_id: start.session_id, purpose: 'terminal:open', pty_user: 'ops', recording: true });
+    assert.equal(began.host_id, HOST_A);
+    assert.equal(began.actor, 'user-1');
+    const ended = await waitUntil('end audit', () => r.fm.registry.audit.find((row) => row.action === 'terminal_end'));
+    assert.equal(ended.payload.session_id, start.session_id);
+    assert.equal(ended.payload.reason, 'exited');
+    assert.equal(ended.payload.exit_code, 3);
+    assert.equal(typeof ended.payload.duration_s, 'number');
+    assert.equal((await r.fm.registry.verifyAudit()).ok, true);
+  } finally {
+    await r.close();
+  }
+});
+
+test('the server renews the lease while the session is live', async () => {
+  const r = await rig();
+  r.fm.ptyRenewMs = 40;
+  try {
+    const agent = await connectAgent(r);
+    const { client, start } = await startSession(r, agent);
+    const renewals = await waitUntil('renewals', () => {
+      const got = agentFrames(agent, 'pty_renew');
+      return got.length >= 2 ? got : null;
+    });
+    const nonces = new Set([start.lease.nonce_hex]);
+    for (const renew of renewals) {
+      assert.equal(renew.session_id, start.session_id);
+      const ok = verifyLease(PUBLIC_KEY, renew.lease, terminalPayload(start.session_id, start.deadline_unix));
+      assert.equal(ok.ok, true);
+      assert.equal(renew.lease.action, 'pty');
+      nonces.add(renew.lease.nonce_hex);
+    }
+    assert.equal(nonces.size, renewals.length + 1);
+    client.ws.close();
+    await waitUntil('stop', () => agentFrames(agent, 'pty_stop').length === 1);
+    const count = agentFrames(agent, 'pty_renew').length;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(agentFrames(agent, 'pty_renew').length, count);
+  } finally {
+    await r.close();
+  }
+});
+
+test('the maximum duration ends the session with reason max_duration', async () => {
+  const r = await rig({ SYSTEMAPI_PTY_MAX_SECONDS: '1' });
+  try {
+    const agent = await connectAgent(r);
+    const { client, start } = await startSession(r, agent);
+    assert.ok(start.deadline_unix - Math.floor(Date.now() / 1000) <= 1);
+    await waitUntil('close', () => client.box.closeCode === 1000, 4000);
+    const exit = client.box.frames.find((f) => f.type === 'pty_exit');
+    assert.deepEqual(exit.payload, { session_id: start.session_id, code: -1, reason: 'max_duration' });
+    assert.ok(agentFrames(agent, 'pty_stop').find((f) => f.session_id === start.session_id));
+    const ended = await waitUntil('end audit', () => r.fm.registry.audit.find((row) => row.action === 'terminal_end'));
+    assert.equal(ended.payload.reason, 'max_duration');
+  } finally {
+    await r.close();
+  }
+});
+
+test('an agent disconnect ends its sessions with agent_disconnected', async () => {
+  const r = await rig();
+  try {
+    const agent = await connectAgent(r);
+    const { client, start } = await startSession(r, agent);
+    agent.ws.close();
+    await waitUntil('close', () => client.box.closeCode === 1000);
+    const exit = client.box.frames.find((f) => f.type === 'pty_exit');
+    assert.deepEqual(exit.payload, { session_id: start.session_id, code: -1, reason: 'agent_disconnected' });
+  } finally {
+    await r.close();
+  }
+});
+
+test('start failures are pty_status errors closed with 1011', async () => {
+  const r = await rig();
+  try {
+    // Ticket problems.
+    const bogus = r.track(new WebSocket(`${r.base}/api/v1/systems/terminal/${HOST_A}?ticket=stk_nope`));
+    const bogusBox = collect(bogus);
+    await waitUntil('bogus close', () => bogusBox.closeCode === 1011);
+    assert.deepEqual(bogusBox.frames, [{ type: 'pty_status', payload: { error: 'ticket_invalid' } }]);
+
+    const wrongPurpose = issueTicket(r.fm.tickets, { hostId: HOST_A, purpose: 'terminal:open', tenantId: 'acme' });
+    const wp = r.track(new WebSocket(`${r.base}/api/v1/systems/terminal/${HOST_A}?ticket=${wrongPurpose}&purpose=terminal:root`));
+    const wpBox = collect(wp);
+    await waitUntil('purpose close', () => wpBox.closeCode === 1011);
+    assert.equal(wpBox.frames[0].payload.error, 'ticket_invalid');
+
+    // Agent offline.
+    const offline = openClient(r);
+    await waitUntil('offline close', () => offline.box.closeCode === 1011);
+    assert.equal(offline.box.frames[0].payload.error, 'agent_offline');
+
+    // Bad sizes are refused before the ticket is spent.
+    const ticket = issueTicket(r.fm.tickets, { hostId: HOST_A, purpose: 'terminal:open', tenantId: 'acme' });
+    const sized = r.track(new WebSocket(`${r.base}/api/v1/systems/terminal/${HOST_A}?ticket=${ticket}&rows=1001`));
+    const sizedErr = await new Promise((resolve) => sized.on('unexpected-response', (_req, res) => resolve(res.statusCode)));
+    assert.equal(sizedErr, 400);
+    assert.ok(r.fm.tickets.has(ticket));
+
+    // Agent-reported refusal, and an unknown code is reported as internal.
+    const agent = await connectAgent(r);
+    for (const [reported, expected] of [['pty_user_unset', 'pty_user_unset'], ['recording_unavailable', 'recording_unavailable'], ['bad_signature', 'internal']]) {
+      const before = agentFrames(agent, 'pty_start').length;
+      const c = openClient(r);
+      const start = await waitUntil('pty_start', () => agentFrames(agent, 'pty_start')[before]);
+      agent.ws.send(JSON.stringify({ type: 'pty_status', session_id: start.session_id, payload: { error: reported } }));
+      await waitUntil('refusal close', () => c.box.closeCode === 1011);
+      assert.deepEqual(c.box.frames, [
+        { type: 'pty_status', payload: { status: 'starting' } },
+        { type: 'pty_status', payload: { error: expected } }
+      ]);
+    }
+  } finally {
+    await r.close();
+  }
+});
+
+test('an agent cannot write into a session it does not own', async () => {
+  const r = await rig();
+  try {
+    const agent = await connectAgent(r);
+    const { client, start } = await startSession(r, agent);
+    const fake = { readyState: WebSocket.OPEN, send() {} };
+    r.fm.onAgentOutput(fake, HOST_A, output(start.session_id, 'injected'));
+    r.fm.onAgentPtyExit(fake, HOST_A, { session_id: start.session_id, payload: { code: 0, reason: 'exited' } });
+    r.fm.onAgentOutput(agent.ws, '22222222-2222-4222-8222-222222222222', output(start.session_id, 'injected'));
+    agent.ws.send(output(start.session_id, 'real'));
+    await waitUntil('real output', () => textOf(client.box) === 'real');
+    assert.equal(client.box.frames.some((f) => f.type === 'pty_exit'), false);
+  } finally {
+    await r.close();
+  }
+});
+
+test('large agent output reaches the client in frames of at most 64 KiB', async () => {
+  const r = await rig();
+  try {
+    const agent = await connectAgent(r);
+    const { client, start } = await startSession(r, agent);
+    agent.ws.send(output(start.session_id, 'x'.repeat(200 * 1024)));
+    await waitUntil('all output', () => textOf(client.box).length === 200 * 1024);
+    for (const f of client.box.frames.filter((frame) => frame.binary)) assert.ok(f.binary.length <= 64 * 1024);
+  } finally {
+    await r.close();
+  }
+});

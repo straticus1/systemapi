@@ -3,6 +3,12 @@
  * Agents dial out. The control plane never opens an inbound SSH port.
  * Threats: query-string API keys, unsigned exec, and a demo key in production.
  * A missing lease is a refusal. This file does not store the API key.
+ * Terminal sessions: one server-generated session id per socket; agent
+ * output is routed only to the session that the same agent connection owns;
+ * client frames over 64 KiB close with 1009; the server enforces
+ * SYSTEMAPI_PTY_MAX_SECONDS and renews the lease every 30 s, so a dead server
+ * lets the agent end the shell when the last lease lapses. Does NOT persist
+ * tickets or sessions across restarts or between server nodes.
  */
 
 const WebSocket = require('ws');
@@ -12,11 +18,57 @@ const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 const { demoKeyAllowed, agentAuthFromRequest, ticketFromRequest } = require('../controlplane/httpauth');
 const { validateTenant, validateHostId, validateHostname, validateSSHPublicKey } = require('../controlplane/sshkey');
 const { consumeTicket } = require('../controlplane/tickets');
-const { issueLease } = require('../controlplane/lease');
+const { issueLease, terminalPayload } = require('../controlplane/lease');
 const { fingerprint, randomToken } = require('../controlplane/token');
 const { zscore } = require('../controlplane/stats');
 const { readPlaybook } = require('../controlplane/playbooks');
 const { deliverWebhooks, COOLDOWN_MS } = require('../controlplane/router');
+
+const PTY_FRAME_MAX = 64 * 1024;
+const PTY_PENDING_MAX = 1024 * 1024;
+const PTY_RENEW_MS = 30_000;
+const PTY_LEASE_TTL_S = 60;
+const PTY_MAX_SECONDS_DEFAULT = 28800;
+const PTY_MAX_SECONDS_CAP = 7 * 86400;
+const PURPOSE_ACTIONS = new Map([
+    ['terminal:open', 'pty'],
+    ['terminal:root', 'pty_root'],
+    ['breakglass:open', 'breakglass']
+]);
+const PTY_ERRORS = new Set([
+    'ticket_invalid', 'scope_denied', 'agent_offline', 'lease_required',
+    'pty_user_unset', 'recording_unavailable', 'pty_start_failed', 'internal'
+]);
+const PTY_EXIT_REASONS = new Set(['exited', 'max_duration', 'stopped']);
+const B64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+function ptyMaxSeconds(env) {
+    const raw = env && env.SYSTEMAPI_PTY_MAX_SECONDS;
+    if (raw === undefined || raw === null || raw === '') return PTY_MAX_SECONDS_DEFAULT;
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 1 || n > PTY_MAX_SECONDS_CAP) {
+        console.error('[Fleet] SYSTEMAPI_PTY_MAX_SECONDS is invalid; using the default');
+        return PTY_MAX_SECONDS_DEFAULT;
+    }
+    return n;
+}
+
+// Returns the size, the fallback when absent, or null when invalid.
+function sizeParam(params, name, fallback) {
+    if (!params.has(name)) return fallback;
+    const raw = params.get(name);
+    if (!/^[0-9]{1,4}$/.test(raw)) return null;
+    const n = Number(raw);
+    return n >= 1 && n <= 1000 ? n : null;
+}
+
+function validSize(n) {
+    return Number.isInteger(n) && n >= 1 && n <= 1000;
+}
+
+function sendJSON(ws, obj) {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
 
 class FleetManager {
     constructor(server, db, apiSite = 'systemapi', prometheusMetrics = null) {
@@ -25,7 +77,9 @@ class FleetManager {
         this.apiSite = apiSite;
         this.metrics = prometheusMetrics;
         this.connectedAgents = new Map();
-        this.terminalSubscribers = new Map();
+        this.terminalSessions = new Map();
+        this.terminalWss = new WebSocket.Server({ noServer: true, maxPayload: PTY_FRAME_MAX });
+        this.ptyRenewMs = PTY_RENEW_MS;
         this.hostTenants = new Map();
         this.alertCooldown = new Map();
         this.pendingExecutions = new Map();
@@ -114,38 +168,291 @@ class FleetManager {
     }
 
     async upgradeTerminal(request, socket, head, parsed) {
-        const hostId = decodeURIComponent(parsed.pathname.split('/').pop() || '');
-        const ticketRes = ticketFromRequest(parsed);
-        if (!ticketRes.ok) {
-            this.rejectUpgrade(socket, ticketRes.status, 'Unauthorized');
-            return;
-        }
-        if (!this.tickets || !this.signer) {
-            this.rejectUpgrade(socket, 503, 'Unavailable');
-            return;
-        }
-        const purpose = parsed.searchParams.get('purpose') || 'terminal:open';
-        if (purpose !== 'terminal:open' && purpose !== 'breakglass:open') {
+        if (parsed.searchParams.has('api_key')) {
             this.rejectUpgrade(socket, 401, 'Unauthorized');
+            return;
+        }
+        const rows = sizeParam(parsed.searchParams, 'rows', 24);
+        const cols = sizeParam(parsed.searchParams, 'cols', 80);
+        if (rows === null || cols === null) {
+            this.rejectUpgrade(socket, 400, 'Bad Request');
+            return;
+        }
+        let hostId;
+        try {
+            hostId = decodeURIComponent(parsed.pathname.split('/').pop() || '');
+        } catch {
+            this.rejectUpgrade(socket, 400, 'Bad Request');
+            return;
+        }
+        this.terminalWss.handleUpgrade(request, socket, head, (ws) => {
+            try {
+                this.openTerminal(ws, parsed, hostId, rows, cols);
+            } catch (err) {
+                console.error('[Fleet] terminal open failed:', err.message);
+                this.failTerminalSocket(ws, 'internal');
+            }
+        });
+    }
+
+    failTerminalSocket(ws, code) {
+        sendJSON(ws, { type: 'pty_status', payload: { error: code } });
+        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close(1011);
+    }
+
+    openTerminal(ws, parsed, hostId, rows, cols) {
+        ws.on('error', (err) => console.error('[Fleet] terminal socket error:', err.message));
+        const ticketRes = ticketFromRequest(parsed);
+        const purpose = parsed.searchParams.get('purpose') || 'terminal:open';
+        const action = PURPOSE_ACTIONS.get(purpose);
+        if (!this.tickets) {
+            this.failTerminalSocket(ws, 'internal');
+            return;
+        }
+        if (!ticketRes.ok || !action) {
+            this.failTerminalSocket(ws, 'ticket_invalid');
             return;
         }
         const row = consumeTicket(this.tickets, ticketRes.ticket, hostId, purpose);
         if (!row) {
-            this.rejectUpgrade(socket, 401, 'Unauthorized');
+            this.failTerminalSocket(ws, 'ticket_invalid');
             return;
         }
-        const action = purpose === 'breakglass:open' ? 'breakglass' : 'pty';
+        if (!this.signer) {
+            this.failTerminalSocket(ws, 'lease_required');
+            return;
+        }
+        const agentWs = this.connectedAgents.get(hostId);
+        if (!agentWs || agentWs.readyState !== WebSocket.OPEN) {
+            this.failTerminalSocket(ws, 'agent_offline');
+            return;
+        }
+        const sessionId = `pts_${randomToken(16)}`;
+        const maxSeconds = ptyMaxSeconds(this.env);
+        const startedMs = Date.now();
+        const deadlineUnix = Math.floor(startedMs / 1000) + maxSeconds;
+        const payload = terminalPayload(sessionId, deadlineUnix);
         let lease;
         try {
-            lease = issueLease(this.signer, { hostId, action, payload: action, ttl: 60 });
+            lease = issueLease(this.signer, { hostId, action, payload, ttl: PTY_LEASE_TTL_S });
         } catch (err) {
-            this.rejectUpgrade(socket, err.status || 503, 'Unavailable');
+            this.failTerminalSocket(ws, 'lease_required');
             return;
         }
-        const dashboardWss = new WebSocket.Server({ noServer: true });
-        dashboardWss.handleUpgrade(request, socket, head, (ws) => {
-            this.attachTerminalClient(hostId, ws, lease, action);
+        const session = {
+            id: sessionId,
+            hostId,
+            tenantId: row.tenantId,
+            actor: row.actor || null,
+            purpose,
+            action,
+            payload,
+            deadlineUnix,
+            startedMs,
+            client: ws,
+            agent: agentWs,
+            started: false,
+            ended: false,
+            announced: false,
+            pending: [],
+            pendingBytes: 0,
+            ptyUser: null,
+            recording: null,
+            renewTimer: null,
+            maxTimer: null
+        };
+        this.terminalSessions.set(sessionId, session);
+        ws.on('message', (buf, isBinary) => this.onTerminalClientMessage(session, buf, isBinary));
+        ws.on('close', () => this.endTerminal(session, 'client_closed', -1, { notifyAgent: true }));
+        sendJSON(ws, { type: 'pty_status', payload: { status: 'starting' } });
+        sendJSON(agentWs, {
+            type: 'pty_start',
+            session_id: sessionId,
+            request_id: sessionId,
+            action,
+            rows,
+            cols,
+            deadline_unix: deadlineUnix,
+            lease
         });
+        session.renewTimer = setInterval(() => this.renewTerminal(session), this.ptyRenewMs);
+        if (typeof session.renewTimer.unref === 'function') session.renewTimer.unref();
+        session.maxTimer = setTimeout(() => {
+            this.endTerminal(session, 'max_duration', -1, { notifyAgent: true, notifyClient: true });
+        }, maxSeconds * 1000);
+        if (typeof session.maxTimer.unref === 'function') session.maxTimer.unref();
+    }
+
+    renewTerminal(session) {
+        if (session.ended || !this.signer) return;
+        try {
+            const lease = issueLease(this.signer, {
+                hostId: session.hostId,
+                action: session.action,
+                payload: session.payload,
+                ttl: PTY_LEASE_TTL_S
+            });
+            sendJSON(session.agent, { type: 'pty_renew', session_id: session.id, lease });
+        } catch (err) {
+            console.error('[Fleet] lease renewal failed:', err.message);
+        }
+    }
+
+    onTerminalClientMessage(session, buf, isBinary) {
+        if (session.ended || isBinary) return;
+        const text = buf.toString();
+        let cmd;
+        try {
+            cmd = JSON.parse(text);
+        } catch {
+            // Legacy browser clients sent raw text as input.
+            sendJSON(session.agent, {
+                type: 'pty_input',
+                session_id: session.id,
+                data_b64: Buffer.from(text, 'utf8').toString('base64')
+            });
+            return;
+        }
+        const type = cmd && typeof cmd === 'object' ? cmd.type : undefined;
+        if (type === 'pty_input') {
+            let b64 = null;
+            if (typeof cmd.data_b64 === 'string') {
+                if (B64_RE.test(cmd.data_b64)) b64 = cmd.data_b64;
+            } else if (typeof cmd.data === 'string') {
+                b64 = Buffer.from(cmd.data, 'utf8').toString('base64');
+            }
+            if (b64 === null) {
+                console.warn(`[Fleet] terminal ${session.id}: malformed pty_input ignored`);
+                return;
+            }
+            sendJSON(session.agent, { type: 'pty_input', session_id: session.id, data_b64: b64 });
+        } else if (type === 'pty_resize') {
+            if (!validSize(cmd.rows) || !validSize(cmd.cols)) {
+                console.warn(`[Fleet] terminal ${session.id}: bad pty_resize ignored`);
+                return;
+            }
+            sendJSON(session.agent, { type: 'pty_resize', session_id: session.id, rows: cmd.rows, cols: cmd.cols });
+        } else if (type === 'pty_eof') {
+            sendJSON(session.agent, { type: 'pty_eof', session_id: session.id });
+        } else {
+            const label = typeof type === 'string' ? type.replace(/[^A-Za-z0-9_:-]/g, '').slice(0, 32) : typeof type;
+            console.warn(`[Fleet] terminal ${session.id}: unknown frame type ${label} ignored`);
+        }
+    }
+
+    // Ends a session once. opts.error sends a pty_status error and closes 1011;
+    // opts.notifyClient sends pty_exit and closes 1000.
+    endTerminal(session, reason, code, opts = {}) {
+        if (session.ended) return;
+        session.ended = true;
+        clearInterval(session.renewTimer);
+        clearTimeout(session.maxTimer);
+        this.terminalSessions.delete(session.id);
+        if (opts.notifyAgent) sendJSON(session.agent, { type: 'pty_stop', session_id: session.id });
+        if (opts.error) {
+            this.failTerminalSocket(session.client, opts.error);
+        } else if (opts.notifyClient && session.client.readyState === WebSocket.OPEN) {
+            sendJSON(session.client, { type: 'pty_exit', payload: { session_id: session.id, code, reason } });
+            session.client.close(1000);
+        }
+        this.auditTerminal(session, 'terminal_end', {
+            session_id: session.id,
+            purpose: session.purpose,
+            reason,
+            exit_code: code,
+            started: session.started,
+            duration_s: Math.round((Date.now() - session.startedMs) / 1000)
+        }).catch((err) => console.error('[Fleet] terminal end audit failed:', err.message));
+    }
+
+    async auditTerminal(session, action, payload) {
+        if (!this.registry) throw new Error('registry_unavailable');
+        return this.registry.appendAudit({
+            tenant_id: session.tenantId,
+            host_id: session.hostId,
+            actor: session.actor,
+            action,
+            payload
+        });
+    }
+
+    // Returns the session only when this agent connection owns it.
+    agentSession(ws, hostId, sessionId) {
+        if (typeof sessionId !== 'string') return null;
+        const session = this.terminalSessions.get(sessionId);
+        if (!session || session.ended || session.agent !== ws || session.hostId !== hostId) return null;
+        return session;
+    }
+
+    onAgentOutput(ws, hostId, buf) {
+        if (!Buffer.isBuffer(buf) || buf.length < 1) return;
+        const n = buf[0];
+        if (buf.length < 1 + n) return;
+        const session = this.agentSession(ws, hostId, buf.toString('latin1', 1, 1 + n));
+        if (!session) return;
+        const data = buf.subarray(1 + n);
+        if (!session.announced) {
+            // Output can arrive while the start audit row is being written.
+            // Hold it so the client sees "started" first.
+            session.pendingBytes += data.length;
+            if (session.pendingBytes > PTY_PENDING_MAX) {
+                this.endTerminal(session, 'internal', -1, { error: 'internal', notifyAgent: true });
+                return;
+            }
+            session.pending.push(Buffer.from(data));
+            return;
+        }
+        this.sendOutput(session, data);
+    }
+
+    // Output goes out in slices of at most 64 KiB; clients cap frames at 1 MiB.
+    sendOutput(session, data) {
+        for (let off = 0; off < data.length; off += PTY_FRAME_MAX) {
+            if (session.client.readyState !== WebSocket.OPEN) return;
+            session.client.send(data.subarray(off, off + PTY_FRAME_MAX));
+        }
+    }
+
+    async onAgentPtyStatus(ws, hostId, msg) {
+        const session = this.agentSession(ws, hostId, msg.session_id);
+        if (!session) return;
+        const payload = msg.payload && typeof msg.payload === 'object' ? msg.payload : {};
+        if (payload.error) {
+            const code = PTY_ERRORS.has(payload.error) ? payload.error : 'internal';
+            this.endTerminal(session, code, -1, { error: code });
+            return;
+        }
+        if (payload.status !== 'started' || session.started) return;
+        session.started = true;
+        session.ptyUser = typeof payload.pty_user === 'string' ? payload.pty_user.slice(0, 64) : null;
+        session.recording = payload.recording === true;
+        try {
+            await this.auditTerminal(session, 'terminal_start', {
+                session_id: session.id,
+                purpose: session.purpose,
+                pty_user: session.ptyUser,
+                recording: session.recording
+            });
+        } catch (err) {
+            console.error('[Fleet] terminal start audit failed:', err.message);
+            this.endTerminal(session, 'internal', -1, { error: 'internal', notifyAgent: true });
+            return;
+        }
+        if (session.ended) return;
+        sendJSON(session.client, { type: 'pty_status', payload: { status: 'started', session_id: session.id } });
+        session.announced = true;
+        for (const chunk of session.pending) this.sendOutput(session, chunk);
+        session.pending = [];
+        session.pendingBytes = 0;
+    }
+
+    onAgentPtyExit(ws, hostId, msg) {
+        const session = this.agentSession(ws, hostId, msg.session_id);
+        if (!session) return;
+        const payload = msg.payload && typeof msg.payload === 'object' ? msg.payload : {};
+        const code = Number.isInteger(payload.code) ? payload.code : -1;
+        const reason = PTY_EXIT_REASONS.has(payload.reason) ? payload.reason : 'exited';
+        this.endTerminal(session, reason, code, { notifyClient: true });
     }
 
     async verifyApiKey(secretProvided) {
@@ -192,14 +499,20 @@ class FleetManager {
         const userId = keyData.user_id;
         const keyId = keyData.key_id;
         let hostId = null;
+        // Terminal frames are handled in arrival order, even while a start
+        // audit row is being written.
+        let ptyChain = Promise.resolve();
+        const inOrder = (fn) => {
+            ptyChain = ptyChain.then(fn).catch((err) => console.error('[Fleet] terminal frame error:', err.message));
+        };
         console.log(`[Fleet] Agent connected key fingerprint sha256:${fingerprint(keyId)}`);
 
         ws.on('message', async (messageBuffer, isBinary) => {
             try {
                 if (isBinary) {
-                    if (hostId && this.terminalSubscribers.has(hostId)) {
-                        const dashboardWs = this.terminalSubscribers.get(hostId);
-                        if (dashboardWs.readyState === WebSocket.OPEN) dashboardWs.send(messageBuffer);
+                    if (hostId) {
+                        const id = hostId;
+                        inOrder(() => this.onAgentOutput(ws, id, messageBuffer));
                     }
                     return;
                 }
@@ -216,10 +529,15 @@ class FleetManager {
                         this.pendingExecutions.delete(msg.request_id);
                     }
                 } else if (msg.type === 'pty_status') {
-                    if (hostId && this.terminalSubscribers.has(hostId)) {
-                        const dashboardWs = this.terminalSubscribers.get(hostId);
-                        if (dashboardWs.readyState === WebSocket.OPEN) dashboardWs.send(JSON.stringify(msg));
-                    }
+                    const id = hostId;
+                    if (id) inOrder(() => this.onAgentPtyStatus(ws, id, msg));
+                } else if (msg.type === 'pty_exit') {
+                    const id = hostId;
+                    if (id) inOrder(() => this.onAgentPtyExit(ws, id, msg));
+                } else if (msg.type === 'pty_renew_rejected') {
+                    const raw = msg.payload && msg.payload.error;
+                    const err = typeof raw === 'string' ? raw.replace(/[^a-z_]/g, '').slice(0, 64) : 'unknown';
+                    console.warn(`[Fleet] agent rejected a lease renewal: ${err}`);
                 }
             } catch (err) {
                 console.error('[Fleet] message error:', err.message);
@@ -228,13 +546,12 @@ class FleetManager {
 
         ws.on('close', async () => {
             if (!hostId) return;
-            this.connectedAgents.delete(hostId);
-            if (this.terminalSubscribers.has(hostId)) {
-                const dashboardWs = this.terminalSubscribers.get(hostId);
-                if (dashboardWs.readyState === WebSocket.OPEN) {
-                    dashboardWs.send(JSON.stringify({ type: 'pty_status', payload: { status: 'disconnected' } }));
+            if (this.connectedAgents.get(hostId) === ws) this.connectedAgents.delete(hostId);
+            inOrder(() => {
+                for (const session of [...this.terminalSessions.values()]) {
+                    if (session.agent === ws) this.endTerminal(session, 'agent_disconnected', -1, { notifyClient: true });
                 }
-            }
+            });
             if (this.registry) {
                 try { await this.registry.setHostStatus(hostId, 'offline'); } catch (err) {
                     console.error('[Fleet] status update failed:', err.message);
@@ -566,43 +883,6 @@ class FleetManager {
                 request_id: requestId,
                 lease
             }));
-        });
-    }
-
-    attachTerminalClient(hostId, dashboardWs, lease, action) {
-        if (!lease || typeof lease.signature !== 'string') {
-            dashboardWs.send(JSON.stringify({ type: 'pty_status', payload: { error: 'lease_required' } }));
-            dashboardWs.close();
-            return;
-        }
-        this.terminalSubscribers.set(hostId, dashboardWs);
-        const agentWs = this.connectedAgents.get(hostId);
-        if (agentWs && agentWs.readyState === WebSocket.OPEN) {
-            agentWs.send(JSON.stringify({
-                type: 'pty_start',
-                request_id: randomToken(16),
-                action: action || 'pty',
-                lease
-            }));
-        } else {
-            dashboardWs.send(JSON.stringify({ type: 'pty_status', payload: { error: 'Agent offline' } }));
-        }
-        dashboardWs.on('close', () => {
-            this.terminalSubscribers.delete(hostId);
-            if (agentWs && agentWs.readyState === WebSocket.OPEN) {
-                agentWs.send(JSON.stringify({ type: 'pty_stop' }));
-            }
-        });
-        dashboardWs.on('message', (msgBuffer, isBinary) => {
-            if (!agentWs || agentWs.readyState !== WebSocket.OPEN || isBinary) return;
-            try {
-                const cmd = JSON.parse(msgBuffer.toString());
-                if (cmd && (cmd.type === 'pty_input' || cmd.type === 'pty_resize')) {
-                    agentWs.send(JSON.stringify(cmd));
-                }
-            } catch {
-                agentWs.send(JSON.stringify({ type: 'pty_input', data: msgBuffer.toString() }));
-            }
         });
     }
 }
