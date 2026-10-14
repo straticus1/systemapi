@@ -58,12 +58,19 @@ func main() {
 	ptyRecordFlag := flag.Bool("pty-record", true, "record every terminal session in an HMAC-chained file")
 	ptyRecordDirFlag := flag.String("pty-record-dir", "", "terminal recordings (default: "+ptyRootRecordDir+" as root, else <state dir>/recordings)")
 	ptyRecordMaxFlag := flag.Int64("pty-record-max-bytes", recordMaxBytesDefault, "end a terminal session once it has recorded this many bytes")
+	tcpAllowFlag := flag.String("tcp-allow", "", "TCP-forward targets this agent may dial, e.g. local:5432,10.0.0.0/24:3389,10.0.0.0/24:8000-8099 (default: none)")
 	ptyRecordMinFreeFlag := flag.Uint64("pty-record-min-free", recordMinFreeDefault, "refuse a terminal session when the recording filesystem has less free space (bytes)")
 	flag.Parse()
 	if *ptyRecordMaxFlag <= 0 || *ptyRecordMinFreeFlag == 0 {
 		fmt.Fprintln(os.Stderr, "Error: --pty-record-max-bytes and --pty-record-min-free must be positive")
 		os.Exit(2)
 	}
+	rules, err := parseTCPAllow(*tcpAllowFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(2)
+	}
+	tcpAllowRules = rules
 	ptyCfg = ptySettings{
 		User:           *ptyUserFlag,
 		AllowAgentUser: *ptyAllowAgentUserFlag,

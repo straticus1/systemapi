@@ -7,12 +7,14 @@ import (
 
 func TestCapabilitiesAdvertiseOnlyWhatIsReal(t *testing.T) {
 	got := capabilitiesHeaderValue()
-	want := "pty"
+	// tcp registers from tcp.go; file is advertised only once its handler
+	// registers (stage 3).
+	want := "pty,tcp"
 	if runtime.GOOS == "windows" {
-		want = ""
+		want = "tcp"
 	}
 	if got != want {
-		t.Fatalf("capabilities %q, want %q (tcp/file are advertised only once their handlers register)", got, want)
+		t.Fatalf("capabilities %q, want %q", got, want)
 	}
 	registerCapability("zz_test_off", func() bool { return false })
 	registerCapability("aa_test_on", func() bool { return true })

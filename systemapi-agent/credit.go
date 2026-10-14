@@ -40,6 +40,7 @@ type creditStream struct {
 
 	sendCredit int64  // bytes the agent may still send to the server
 	pending    []byte // queued for sending, at most creditMaxTurn
+	inflight   int    // frames taken from pending but not yet written
 	closed     bool
 
 	inWindow          int64 // bytes the server sent that the agent has not credited back
@@ -153,6 +154,28 @@ func (m *creditMux) Write(id string, p []byte) error {
 	return nil
 }
 
+// Flush blocks until every byte queued for the stream so far has been
+// written to the socket, so a control frame sent next (tcp_eof, tcp_closed)
+// cannot overtake the stream's data. It returns an error when the stream or
+// the mux closes first.
+func (m *creditMux) Flush(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for {
+		if m.stopped {
+			return errMuxStopped
+		}
+		s, ok := m.streams[id]
+		if !ok || s.closed {
+			return errStreamClosed
+		}
+		if len(s.pending) == 0 && s.inflight == 0 {
+			return nil
+		}
+		m.cond.Wait()
+	}
+}
+
 // Grant applies a "<kind>_credit" frame from the server. A non-positive
 // amount or credit past the window is a violation.
 func (m *creditMux) Grant(id string, n int64) error {
@@ -253,11 +276,14 @@ func (m *creditMux) run() {
 		frame = append(frame, s.pending[:take]...)
 		s.pending = append(s.pending[:0], s.pending[take:]...)
 		s.sendCredit -= int64(take)
+		s.inflight++
 		m.cond.Broadcast()
 		m.mu.Unlock()
 		// The socket lock is taken per frame, so PTY frames interleave.
 		_ = m.out.WriteBinary(frame)
 		m.mu.Lock()
+		s.inflight--
+		m.cond.Broadcast()
 	}
 }
 

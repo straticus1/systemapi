@@ -4,7 +4,9 @@
 // with jittered exponential backoff (1 s doubling to 60 s), ends every
 // terminal session when a connection drops, and exits non-zero only on a
 // fatal error: a rejected API key (HTTP 401/403), a permanent enrollment
-// refusal, or a changed control public key.
+// refusal, or a changed control public key. Channel streams (tcp.go) are
+// per connection and end with it; a control plane that overruns a stream's
+// credit window gets its connection dropped.
 package main
 
 import (
@@ -113,6 +115,9 @@ func (a *agentConn) runOnce(stop <-chan struct{}) (bool, error) {
 	defer c.Close()
 	c.SetReadLimit(256 * 1024)
 	out := &wsWriter{c: c}
+	// Channel streams (TCP forward) live and die with this connection.
+	ch := newChannelConn(out, a.st.HostID)
+	defer ch.close("agent_disconnected")
 
 	enrolled := make(chan error, 1)
 	var enrollOnce sync.Once
@@ -125,10 +130,19 @@ func (a *agentConn) runOnce(stop <-chan struct{}) (bool, error) {
 	go func() {
 		defer close(done)
 		for {
-			_, message, err := c.ReadMessage()
+			mt, message, err := c.ReadMessage()
 			if err != nil {
 				signalEnroll(err)
 				return
+			}
+			if mt == websocket.BinaryMessage {
+				// Channel data. A server past a stream's credit window is a
+				// fatal violation: drop the connection.
+				if err := ch.data(message); err != nil {
+					log.Printf("channel credit violation (%v); dropping the connection", err)
+					_ = c.Close()
+				}
+				continue
 			}
 			var peek struct {
 				Type          string `json:"type"`
@@ -157,7 +171,15 @@ func (a *agentConn) runOnce(stop <-chan struct{}) (bool, error) {
 				signalEnroll(err)
 				return
 			default:
-				processIncomingMessage(out, a.st.HostID, stateDir, message)
+				handled, err := ch.handle(peek.Type, message)
+				if err != nil {
+					log.Printf("channel credit violation (%v); dropping the connection", err)
+					_ = c.Close()
+					continue
+				}
+				if !handled {
+					processIncomingMessage(out, a.st.HostID, stateDir, message)
+				}
 			}
 		}
 	}()
@@ -204,6 +226,7 @@ func (a *agentConn) runOnce(stop <-chan struct{}) (bool, error) {
 		case <-stop:
 			log.Println("signal received, stopping terminal sessions and disconnecting")
 			stopAllSessions("stopped", 3*time.Second)
+			ch.close("stopped")
 			_ = out.WriteClose()
 			select {
 			case <-done:
