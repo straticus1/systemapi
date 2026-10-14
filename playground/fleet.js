@@ -26,6 +26,8 @@ const { issueLease, terminalPayload } = require('../controlplane/lease');
 const { fingerprint, randomToken } = require('../controlplane/token');
 const { zscore } = require('../controlplane/stats');
 const { readPlaybook } = require('../controlplane/playbooks');
+const { parseCapabilities } = require('../controlplane/channels');
+const { CreditLedger } = require('../controlplane/credit');
 const { deliverWebhooks, COOLDOWN_MS } = require('../controlplane/router');
 
 const PTY_FRAME_MAX = 64 * 1024;
@@ -116,6 +118,11 @@ class FleetManager {
         this.apiSite = apiSite;
         this.metrics = prometheusMetrics;
         this.connectedAgents = new Map();
+        // Per live agent socket: the capabilities it advertised on dial
+        // (X-SystemAPI-Capabilities) and the credit state of its channel
+        // streams. Keyed by socket, so a reconnect starts fresh.
+        this.agentCaps = new WeakMap();
+        this.agentLedgers = new WeakMap();
         this.terminalSessions = new Map();
         this.terminalWss = new WebSocket.Server({ noServer: true, maxPayload: PTY_FRAME_MAX });
         this.stoppingSessions = new Map();
@@ -208,6 +215,7 @@ class FleetManager {
         }
         request.systemapiEnroll = enroll;
         request.systemapiKey = keyData;
+        request.systemapiCapabilities = parseCapabilities(request.headers['x-systemapi-capabilities']);
         this.wss.handleUpgrade(request, socket, head, (ws) => {
             this.wss.emit('connection', ws, request, keyData);
         });
@@ -800,6 +808,7 @@ class FleetManager {
             });
             hostId = host.host_id;
             this.hostTenants.set(hostId, host.tenant_id);
+            this.agentCaps.set(ws, request.systemapiCapabilities || new Set());
             this.connectedAgents.set(hostId, ws);
             ws.send(JSON.stringify({
                 type: 'enrolled',
@@ -811,6 +820,34 @@ class FleetManager {
             ws.send(JSON.stringify({ type: 'enroll_error', error: err.code || 'enroll_failed' }));
             ws.close();
         }
+    }
+
+    // True when the live agent for hostId advertised capability on dial.
+    // Channel handlers answer agent_unsupported when this is false (an old
+    // agent advertises nothing).
+    agentSupports(hostId, capability) {
+        const ws = this.connectedAgents.get(hostId);
+        if (!ws) return false;
+        const caps = this.agentCaps.get(ws);
+        return !!caps && caps.has(capability);
+    }
+
+    // The credit ledger of one agent socket (controlplane/credit.js). An
+    // agent that overruns a stream's window, or returns more credit than it
+    // could owe, is disconnected (TCP §6, FILE §6).
+    agentCreditLedger(ws) {
+        let ledger = this.agentLedgers.get(ws);
+        if (!ledger) {
+            ledger = new CreditLedger({
+                onViolation: (sessionId, reason) => {
+                    console.error(`[Fleet] agent credit violation (${reason}); disconnecting the agent`);
+                    this.noteSecurity('agent_credit_violation', null, { reason }).catch(() => {});
+                    ws.terminate();
+                }
+            });
+            this.agentLedgers.set(ws, ledger);
+        }
+        return ledger;
     }
 
     async handleTelemetry(keyId, userId, ws, payload, hostId) {

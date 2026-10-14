@@ -136,6 +136,9 @@ func main() {
 	header.Set("X-SystemAPI-Host-ID", st.HostID)
 	header.Set("X-SystemAPI-Hostname", hostname)
 	header.Set("X-SystemAPI-SSH-PubKey", pubLine)
+	if caps := capabilitiesHeaderValue(); caps != "" {
+		header.Set(capabilitiesHeader, caps)
+	}
 
 	dialer := *websocket.DefaultDialer
 	dialer.HandshakeTimeout = 10 * time.Second

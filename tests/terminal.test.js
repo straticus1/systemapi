@@ -77,14 +77,15 @@ async function rig(env = {}) {
   };
 }
 
-async function connectAgent(r) {
+async function connectAgent(r, extraHeaders = {}) {
   const ws = r.track(new WebSocket(`${r.base}/api/v1/systems/stream`, {
     headers: {
       authorization: 'Bearer agent-key',
       'x-systemapi-tenant': 'acme',
       'x-systemapi-host-id': HOST_A,
       'x-systemapi-hostname': 'a.example',
-      'x-systemapi-ssh-pubkey': opensshEd25519(r.fm.signer.publicKeyRaw)
+      'x-systemapi-ssh-pubkey': opensshEd25519(r.fm.signer.publicKeyRaw),
+      ...extraHeaders
     }
   }));
   const box = collect(ws);
@@ -688,5 +689,42 @@ test('a terminal WebSocket from a foreign Origin is refused; no Origin and allow
     assert.equal(originAllowed('http://localhost:5173', { NODE_ENV: 'development' }), true);
   } finally {
     await custom.close();
+  }
+});
+
+test('agent capabilities are recorded per live connection; an old agent advertises nothing', async () => {
+  const r = await rig();
+  try {
+    const old = await connectAgent(r);
+    assert.equal(r.fm.agentSupports(HOST_A, 'pty'), false);
+    assert.equal(r.fm.agentSupports(HOST_A, 'tcp'), false);
+    old.ws.close();
+    await waitUntil('old agent gone', () => !r.fm.connectedAgents.has(HOST_A));
+    const fresh = await connectAgent(r, { 'x-systemapi-capabilities': 'pty,tcp' });
+    assert.equal(r.fm.agentSupports(HOST_A, 'pty'), true);
+    assert.equal(r.fm.agentSupports(HOST_A, 'tcp'), true);
+    assert.equal(r.fm.agentSupports(HOST_A, 'file'), false);
+    assert.equal(r.fm.agentSupports('33333333-3333-4333-8333-333333333333', 'pty'), false);
+    fresh.ws.close();
+    await waitUntil('agent gone', () => !r.fm.connectedAgents.has(HOST_A));
+    assert.equal(r.fm.agentSupports(HOST_A, 'pty'), false);
+  } finally {
+    await r.close();
+  }
+});
+
+test('an agent that overruns its channel credit is disconnected', async () => {
+  const r = await rig();
+  try {
+    await connectAgent(r, { 'x-systemapi-capabilities': 'pty,tcp' });
+    const ws = r.fm.connectedAgents.get(HOST_A);
+    const ledger = r.fm.agentCreditLedger(ws);
+    assert.equal(r.fm.agentCreditLedger(ws), ledger, 'one ledger per socket');
+    ledger.open('tcs_aaaaaaaaaaaaaaaa', { window: 1024 });
+    assert.equal(ledger.receive('tcs_aaaaaaaaaaaaaaaa', 1024), true);
+    assert.equal(ledger.receive('tcs_aaaaaaaaaaaaaaaa', 1), false);
+    await waitUntil('agent disconnected', () => !r.fm.connectedAgents.has(HOST_A));
+  } finally {
+    await r.close();
   }
 });
