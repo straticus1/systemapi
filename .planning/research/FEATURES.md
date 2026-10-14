@@ -204,7 +204,7 @@ Not yet stubbed. New `sys.process` module.
 |---------|-------------------|------------|
 | Scriptable process remediation | "If any process is using >90% CPU for >5 minutes, send SIGTERM, wait 10s, then SIGKILL" - fully expressible in Starlark | Low once primitives exist |
 | Process list as convergence input | Convergence script can assert "exactly one nginx worker should be running" and enforce it | Medium |
-| Correlated with security scanning | List processes, then `sys.security.scan_memory(pid)` on unknown PIDs | Low - both modules present |
+| Correlated with security scanning | List processes, then `sys.security.scan_memory(pid)` on unknown PIDs | Low once `scan_memory` exists (it currently fails as not implemented) |
 
 ### Anti-Features
 
@@ -438,7 +438,7 @@ This is a cross-cutting concern, not a separate module. Every feature above must
 
 ## Feature 11: Real-Time System Event Streaming (inotify, kqueue, ETW)
 
-Stub exists: `sys.events.listen` in `sys_advanced.go` logs and returns true.
+`sys.events.listen` in `sys_advanced.go` is reserved and fails with a not-implemented error.
 
 ### Table Stakes
 
@@ -476,7 +476,7 @@ Stub exists: `sys.events.listen` in `sys_advanced.go` logs and returns true.
 
 ## Feature 12: sys.alerts Real Push (complete the stub)
 
-Currently `sys.alerts.push` logs to the agent's stdout. It must actually push back through the WebSocket to the FleetManager.
+Currently `sys.alerts.push` logs to the agent's stdout and returns False (not delivered). It must actually push back through the WebSocket to the FleetManager.
 
 ### Table Stakes
 
