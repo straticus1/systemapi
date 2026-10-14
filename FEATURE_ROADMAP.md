@@ -1,10 +1,10 @@
 # SystemAPI.io - Feature Roadmap & Enhancement Proposals
 
-The sections below are a historical proposal list from before the control plane. They are not product status. In particular, DarkStorage is not the audit of record, and nothing in this file is a completed integration. The wired surface is described in `FEATURES_COMPLETE.md`.
+The sections below are a historical proposal list from before the control plane. They are not product status. In particular, DarkStorage is not the audit of record, and nothing in this file is a completed integration. The wired surface is described in `README.md`.
 
 ## Current Data Available
 
-SystemAPI.io collects rich telemetry from all connected agents:
+Each connected agent reports:
 
 ### Real-time Metrics (Per Agent)
 - **CPU**: Usage %, Core count
@@ -15,18 +15,17 @@ SystemAPI.io collects rich telemetry from all connected agents:
 - **Timestamps**: Unix timestamp for every data point
 
 ### Execution & Audit Data
-- **Sysscript Executions**: Complete audit trail with SHA256 hashing
-- **Command Results**: stdout, stderr, execution time
-- **WORM Logs**: Immutable logs stored in DarkStorage.io (S3-compatible)
+- **Sysscript Executions**: hash-chained audit rows in PostgreSQL
+- **Command Results**: `result.output` and `result.error` from the agent
+- **DarkStorage**: only each result's SHA-256, and only when the DarkStorage keys are set
 
-### Alert & Incident Data
-- **Rule Evaluations**: Metric, operator, threshold, triggered value
-- **Alert History**: When, what, who
-- **Integration Events**: SMS/Voice alerts via Adstelco.io
+### Alert Data
+- **Alert Events**: z-score anomalies on CPU and memory, with host, metric, value and status
+- **Delivery**: tenant webhooks only; there is no SMS or voice integration
 
 ---
 
-## 🎯 Priority 1: Metrics Visualization & Analytics
+## Priority 1: Metrics Visualization & Analytics
 
 ### 1.1 Grafana Integration
 **Goal**: Provide professional-grade dashboards for fleet monitoring
@@ -83,7 +82,7 @@ CREATE INDEX idx_telemetry_metric ON telemetry_timeseries (metric_name, timestam
 **Implementation**:
 - Store telemetry in TimescaleDB (PostgreSQL extension for time-series)
 - Configurable retention policies (7d, 30d, 90d, 1y)
-- Data aggregation for older metrics (hourly → daily → monthly)
+- Data aggregation for older metrics (hourly -> daily -> monthly)
 - Compression and partitioning for efficiency
 
 **New Endpoints**:
@@ -111,7 +110,7 @@ GET /api/v1/metrics/export?format=csv|json&from=<timestamp>&to=<timestamp>
 
 ---
 
-## 🎯 Priority 2: Advanced Alerting & Automation
+## Priority 2: Advanced Alerting & Automation
 
 ### 2.1 Machine Learning Anomaly Detection
 **Goal**: Automatically detect unusual patterns without manual threshold configuration
@@ -211,7 +210,7 @@ def cleanup_disk():
 
 ---
 
-## 🎯 Priority 3: Cost Optimization & Insights
+## Priority 3: Cost Optimization & Insights
 
 ### 3.1 Resource Efficiency Dashboard
 **Goal**: Identify underutilized hosts and optimization opportunities
@@ -259,7 +258,7 @@ Response: {
 
 ---
 
-## 🎯 Priority 4: Security & Compliance
+## Priority 4: Security & Compliance
 
 ### 4.1 Execution Audit Dashboard
 **Goal**: Full visibility into who ran what, when
@@ -319,7 +318,7 @@ CREATE TABLE security_events (
 
 ---
 
-## 🎯 Priority 5: Integrations & API Enhancements
+## Priority 5: Integrations & API Enhancements
 
 ### 5.1 Webhook Notifications
 **Goal**: Send alerts to external systems
@@ -396,7 +395,7 @@ POST /api/v1/api-keys
 
 ---
 
-## 🎯 Priority 6: User Experience Improvements
+## Priority 6: User Experience Improvements
 
 ### 6.1 Smart Search
 **Goal**: Find hosts, scripts, alerts quickly
@@ -432,7 +431,7 @@ POST /api/v1/api-keys
 
 ---
 
-## 🎯 Priority 7: Performance & Scalability
+## Priority 7: Performance & Scalability
 
 ### 7.1 Metrics Aggregation
 **Goal**: Handle 10,000+ hosts efficiently

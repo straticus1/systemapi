@@ -6,8 +6,8 @@ Date: 2026-10-12. This is a reading of the control plane, the agent, the CLI, an
 
 From `/Users/ryan/development/systemapi.io`:
 
-- `node --test tests/drivers.test.js` — 10 passed.
-- `node --test tests/controlplane.test.js` — 16 passed.
+- `node --test tests/drivers.test.js` - 10 passed.
+- `node --test tests/controlplane.test.js` - 16 passed.
 
 The agent `go test ./...` was green in the previous session and was not re-run here. The dashboard was not opened in a browser. Vite's production build was the earlier frontend check. No live agent dialed this control plane.
 
@@ -52,6 +52,8 @@ JWT audience, when set, is the OIDC audience or the Keycloak client id. A token 
 The agent can emit telemetry before it has pinned the control public key. The server drops telemetry until `hostId` is set, which happens after `registry.enroll` returns. Commands the server sends before the pin are refused by the agent as `not_enrolled`.
 
 PTY input, resize, and stop are not covered by a new lease after `pty_start`. A second `pty_start` replaces the session. The timer is the lease expiry.
+
+Sessions use express-session's default in-memory store. They are lost on restart and are not shared between replicas. `server.js`.
 
 `modules/` no longer contains the unwired quantum, blockchain, machine-learning, and integration files. Do not put them back.
 

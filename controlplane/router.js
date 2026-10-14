@@ -766,9 +766,7 @@ async function lookupKeyOwner(fleet, keyId) {
 module.exports = {
   mount,
   authenticate,
-  runScript,
   deliverWebhooks,
-  scopesFor,
   clampEntitlements,
   COOLDOWN_MS
 };

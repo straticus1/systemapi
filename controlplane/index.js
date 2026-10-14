@@ -6,7 +6,6 @@ const { loadSigner } = require('./keys');
 const { createRegistry } = require('./registry');
 const { mount, deliverWebhooks } = require('./router');
 const { issueLease } = require('./lease');
-const { readPlaybook } = require('./playbooks');
 
 function attach(app, fleet, env = process.env, logger = console) {
   fleet.env = env;
@@ -82,15 +81,9 @@ async function refreshGauges(fleet) {
   }
 }
 
-function dispatchPlaybookScript(id) {
-  return readPlaybook(id);
-}
-
 module.exports = {
   attach,
   boot,
-  tickSchedules,
   refreshGauges,
-  dispatchPlaybookScript,
   deliverWebhooks
 };

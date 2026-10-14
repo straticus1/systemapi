@@ -72,12 +72,9 @@ function buildSigner(privateKey, raw) {
 }
 
 module.exports = {
-  PKCS8_PREFIX,
   TEST_SEED,
   privateKeyFromSeed,
   rawPublicKey,
-  fingerprintOf,
-  signMessage,
   loadSigner,
   buildSigner
 };

@@ -1,166 +1,129 @@
-# SystemAPI.io API Reference
+# SystemAPI REST and WebSocket reference
 
-SystemAPI.io provides a robust REST API for Fleet Management and a bi-directional WebSocket API for Real-time Telemetry, Alerting, and Zero-Trust Terminal access.
+Routes are mounted by `controlplane/router.js` and `server.js`. This file lists
+what is mounted; `tests/catalog.test.js` checks the area index routes against
+the router.
 
 ## Authentication
 
-All endpoints require a Master API Key passed either in the header or as a query parameter.
+- API key: `X-API-Key: <key>` or `Authorization: Bearer <key>`. A key in the
+  query string is refused with `query_key_rejected`.
+- Dashboard: the OAuth session cookie set by `/oauth/login`.
+- Browser WebSockets: a single-use ticket from `POST /api/v1/ws-ticket`
+  (`purpose` is `terminal:open` or `breakglass:open`). Tickets last 60 seconds.
+- Agents: `Authorization: Bearer <key>` on the WebSocket upgrade, plus the
+  enrollment headers described in `cli_docs.md`.
 
-**Header:**
-```http
-X-API-Key: ak_live_yourkey
-```
+Every route checks a scope (`hosts:read`, `metrics:read`, `exec:run`,
+`alerts:write`, `audit:read`, `admin`, ...). An API key with no scope rows has
+no scopes.
 
-**Query Parameter (WebSockets):**
-```
-ws://api.systemapi.io/api/v1/systems/stream?api_key=ak_live_yourkey
-```
+## Hosts
 
----
+| Method | Path | Notes |
+| --- | --- | --- |
+| GET | `/api/v1/fleet` | Hosts in your tenants. `?q=` filters by hostname. |
+| GET | `/api/v1/fleet/export` | Same list; `?format=csv` for CSV. |
+| GET | `/api/v1/fleet/efficiency` | Average CPU and memory per host over the last 100 samples. |
+| GET | `/api/v1/fleet/:hostId/software` | Installed software reported by the agent. |
+| GET | `/api/v1/fleet/:hostId/cves` | CVEs for that software. Empty unless `DARKAPI_KEY` is set. |
+| GET/POST | `/api/v1/fleet/:hostId/comments` | Host notes. |
 
-## REST Endpoints
+A host in the list looks like:
 
-### 1. Retrieve Fleet Overview
-
-Fetches a list of all hosts registered to the authenticated API Key, enriched with real-time connection status.
-
-**Endpoint:** `GET /api/v1/fleet`
-
-**Response:**
 ```json
 {
-  "hosts": [
-    {
-      "host_id": "c5bf94a5-1a0f-4165-b1ae-e47bcbe239c6",
-      "hostname": "ubuntu-db-01",
-      "os": "linux",
-      "platform": "ubuntu",
-      "status": "online",
-      "last_seen_at": "2026-03-13T11:25:16Z",
-      "live_stats": {
-        "cpu": { "usage_percent": 14.5 },
-        "memory": { "used_percent": 62.1 }
-      }
-    }
-  ]
+  "host_id": "c5bf94a5-...",
+  "tenant_id": "acme",
+  "hostname": "db-01",
+  "os": "linux",
+  "platform": "ubuntu",
+  "status": "online",
+  "last_seen_at": "2026-10-12T11:25:16Z",
+  "tags": [],
+  "cpu_percent": 14.5,
+  "sparkline": [12.1, 13.0, 14.5]
 }
 ```
 
-### 2. Execute Sysscript Playbook
+`cpu_percent` is the latest `cpu.usage_percent` sample and is `null` when there
+is none. Memory, disk and network figures are stored as telemetry but are not
+part of this object.
 
-Pushes a Starlark-based Sysscript payload out to a specific agent for immediate execution.
+## Metrics and alerts
 
-**Endpoint:** `POST /api/v1/fleet/:hostId/execute`
+| Method | Path | Notes |
+| --- | --- | --- |
+| GET | `/api/v1/fleet/:hostId/metrics` | `?metric=cpu.usage_percent` (or `memory.used_percent`, `disk.used_percent`), `?bucket=minute`, `?from=`, `?to=`. |
+| GET | `/api/v1/fleet/:hostId/forecast` | Linear forecast over the last 60 samples. |
+| GET | `/api/v1/fleet/:hostId/anomalies` | Z-score over the last 60 samples. |
+| GET | `/api/v1/alerts` | Alert events. `?status=open|ack|resolved`. |
+| POST | `/api/v1/alerts/:id/ack` | |
+| POST | `/api/v1/alerts/:id/resolve` | |
 
-**Request Body:**
+Alert events are raised by the control plane's z-score check on CPU and memory
+telemetry and posted to the tenant's webhooks. There is no API for alert rules.
+
+## Execution
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| POST | `/api/v1/fleet/:hostId/execute` | Run a Sysscript on one host. |
+| POST | `/api/v1/fleet/execute` | `host_ids` (1 to 50) plus `script`. |
+| POST | `/api/v1/fleet/:hostId/breakglass` | Break-glass session (needs `adssh` on the host). |
+| GET | `/api/v1/playbooks` | Playbooks in `controlplane/playbooks/`. |
+| POST | `/api/v1/playbooks/:id/run` | |
+| GET/POST | `/api/v1/schedules` | Cron schedules. `DELETE /api/v1/schedules/:id`. |
+
+Request:
+
 ```json
 {
-  "script": "sys.exec.run('rm -rf /tmp/cache')",
-  "entitlements": {
-    "allow_exec": true,
-    "allow_network": false,
-    "allow_fs": true
-  }
+  "script": "r = sys.exec.run(\"uname\", \"-a\")\nprint(r[\"output\"])",
+  "entitlements": { "allow_exec": true }
 }
 ```
 
-**Response:**
+Response:
+
 ```json
 {
   "success": true,
-  "message": "Script dispatched to node",
-  "request_id": "1647891234567"
+  "request_id": "9f1c...",
+  "result": { "error": "", "output": "Linux db-01 6.8.0 ...\n" },
+  "executed_by": "ops@example.com"
 }
 ```
 
----
+`success` means the agent answered. A script that failed on the host comes
+back with `success: true` and a non-empty `result.error`; check that field.
 
-## WebSocket API (Agent Stream)
+Entitlements are clamped by the caller's scopes before they reach the agent:
+`allow_exec` needs `exec:run`; every other entitlement needs `admin`. The
+names the agent understands are listed in `cli_docs.md`.
 
-The Go Agent maintains a persistent WebSocket connection to stream telemetry and receive commands.
+## Audit, compliance, tenants
 
-**Endpoint:** `ws://api.systemapi.io/api/v1/systems/stream`
+| Method | Path |
+| --- | --- |
+| GET | `/api/v1/audit`, `/api/v1/audit/verify`, `/api/v1/audit/export` |
+| GET | `/api/v1/security-events` |
+| GET | `/api/v1/compliance/export` |
+| GET/POST | `/api/v1/webhooks`; `DELETE /api/v1/webhooks/:id` |
+| POST | `/api/v1/tenants/:tenant/members` |
+| POST | `/api/v1/keys/:keyId/scopes` |
+| GET/POST/DELETE | `/api/v1/oauth/links` |
 
-### Agent -> Server Messages
+## Threat intelligence
 
-#### 1. Telemetry Payload
-Fired every 5-10 seconds by the agent.
+`GET /api/v1/threat-intel/ip/:ip`, `/domain/:domain`, `/otx/:indicator`,
+`/crowdsec/:ip`, `/safebrowsing`, and `POST /api/v1/threat-intel/check`. These
+proxy cached data from DNSScience (`DNSSCIENCE_API_URL`) and DarkAPI.
 
-```json
-{
-  "type": "telemetry",
-  "payload": {
-    "host": { "hostname": "mac-pro-01", "os": "darwin" },
-    "cpu": { "usage_percent": 4.2 },
-    "memory": { "used_percent": 45.1 },
-    "network": { "rx_bytes": 1048576, "tx_bytes": 2048 },
-    "disk": { "free_space": 45000000000 }
-  }
-}
-```
+## WebSockets
 
-#### 2. Command Result
-Fired when a Sysscript finishes execution.
-
-```json
-{
-  "type": "command_result",
-  "payload": {
-    "stdout": "total 0\n",
-    "stderr": "",
-    "error": null
-  }
-}
-```
-
-### Server -> Agent Messages
-
-#### 1. Execute Sysscript
-Requests the agent to evaluate the Starlark script inside the sandbox.
-
-```json
-{
-  "type": "sysscript",
-  "script": "sys.containers.restart('nginx')",
-  "entitlements": { "allow_exec": true },
-  "request_id": "1647891234567"
-}
-```
-
-#### 2. Terminate Process
-Specific action from the Dashboard quick-actions.
-
-```json
-{
-  "type": "kill",
-  "pid": 1048
-}
-```
-
----
-
-## WebSocket API (Zero-Trust Terminal)
-
-SystemAPI.io allows Dashboard users to pop a reverse-TTY shell into any active host using a secondary WebSocket tunnel that routes through the master API.
-
-**Dashboard Endpoint:** `ws://api.systemapi.io/api/v1/systems/terminal/:hostId?api_key=ak_live...`
-
-Once connected, binary payloads and JSON sizing commands are passed transparently into the Go Agent's `creack/pty` multiplexer.
-
-### Dashboard -> Server -> Agent
-```json
-{
-  "type": "pty_input",
-  "data": "ls -la\n"
-}
-```
-Or for resizing the virtual terminal:
-```json
-{
-  "type": "pty_resize",
-  "data": { "cols": 120, "rows": 40 }
-}
-```
-
-### Agent -> Server -> Dashboard
-The agent streams the raw `stdout/stderr` binary buffer back through the WebSocket, which is fed directly into `xterm.js`.
+- Agent stream: `/api/v1/systems/stream`. The agent sends `telemetry` every
+  5 seconds and `command_result` (`{"error": "...", "output": "..."}`) for each
+  script. The server sends `sysscript`, `pty_start`, `pty_input`, `pty_resize`
+  and `pty_stop`, each carrying a signed lease.
+- Terminal: `/api/v1/systems/terminal/:hostId?ticket=<ticket>`.

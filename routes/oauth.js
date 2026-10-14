@@ -38,7 +38,7 @@ async function initializeOIDCClient() {
     }
 
     const authentikIssuer = await Issuer.discover(AUTHENTIK_ISSUER);
-    console.log('✓ Discovered Authentik issuer:', authentikIssuer.metadata.issuer);
+    console.log('Discovered Authentik issuer:', authentikIssuer.metadata.issuer);
 
     authentikClient = new authentikIssuer.Client({
       client_id: CLIENT_ID,
@@ -47,10 +47,10 @@ async function initializeOIDCClient() {
       response_types: ['code'],
     });
 
-    console.log('✓ OAuth client initialized for SystemAPI.io');
+    console.log('OAuth client initialized for SystemAPI.io');
     return authentikClient;
   } catch (error) {
-    console.error('⚠ Failed to initialize OIDC client:', error.message);
+    console.error('Failed to initialize OIDC client:', error.message);
     throw error;
   }
 }
@@ -60,7 +60,7 @@ async function initializeOIDCClient() {
   try {
     await initializeOIDCClient();
   } catch (err) {
-    console.error('⚠ OIDC initialization failed (will retry on first request):', err.message);
+    console.error('OIDC initialization failed (will retry on first request):', err.message);
   }
 })();
 
@@ -134,7 +134,7 @@ router.get('/callback', async (req, res) => {
       { code_verifier, state, nonce }
     );
 
-    console.log('✓ Token exchange successful');
+    console.log('Token exchange successful');
 
     // Get user info
     const userinfo = await authentikClient.userinfo(tokenSet.access_token);
@@ -158,7 +158,7 @@ router.get('/callback', async (req, res) => {
     // Clear OAuth temporary data
     delete req.session.oauth;
 
-    console.log(`✓ User logged in: ${userinfo.email} (${userinfo.sub})`);
+    console.log(`User logged in: ${userinfo.email} (${userinfo.sub})`);
 
     // Redirect to return URL or dashboard
     res.redirect(return_to || '/');

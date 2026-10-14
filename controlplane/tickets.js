@@ -23,4 +23,4 @@ function consumeTicket(store, token, hostId, purpose, now = Date.now()) {
   return row;
 }
 
-module.exports = { TTL_MS, issueTicket, consumeTicket };
+module.exports = { issueTicket, consumeTicket };

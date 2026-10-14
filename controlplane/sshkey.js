@@ -52,7 +52,6 @@ function validateSSHPublicKey(line) {
 }
 
 module.exports = {
-  TENANT_RE,
   validateTenant,
   validateHostId,
   validateHostname,

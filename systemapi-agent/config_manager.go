@@ -20,7 +20,7 @@ type ConfigManager struct{}
 // AtomicWrite safely replaces path with content:
 //  1. Write content to path + ".systemapi.tmp"
 //  2. If original exists: copy to path + ".bak." + unix-timestamp
-//  3. os.Rename(tmp, path) — atomic on same filesystem
+//  3. os.Rename(tmp, path) - atomic on same filesystem
 //  4. On rename failure: remove tmp, return error (backup preserved)
 func (cm *ConfigManager) AtomicWrite(path, content string) error {
 	tmp := path + ".systemapi.tmp"

@@ -41,4 +41,4 @@ function verifyRows(rows) {
   return { ok: true, head: prev };
 }
 
-module.exports = { GENESIS, stable, canonicalJSON, chainHash, verifyRows };
+module.exports = { GENESIS, canonicalJSON, chainHash, verifyRows };

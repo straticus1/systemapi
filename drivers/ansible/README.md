@@ -6,8 +6,8 @@ Pipes, redirects, and `&&` are refused because the API does not run a shell. Sem
 
 Set these in the environment before running Ansible:
 
-- `SYSTEMAPI_URL` — API base URL. A single trailing slash is stripped.
-- `SYSTEMAPI_API_KEY` — sent only as the `X-API-Key` header, never as a query parameter or an inventory variable.
+- `SYSTEMAPI_URL` - API base URL. A single trailing slash is stripped.
+- `SYSTEMAPI_API_KEY` - sent only as the `X-API-Key` header, never as a query parameter or an inventory variable.
 
 `SYSTEMAPI_TENANT` is optional and is not printed. Do not put the API key in `ansible.cfg`, group vars, or argv.
 

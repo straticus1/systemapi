@@ -159,9 +159,9 @@ if (process.env.DB_PASSWORD && process.env.DB_PASSWORD !== '') {
         });
 
         redisClient.connect().then(() => {
-            console.log('✓ Redis connected for playground');
+            console.log('Redis connected for playground');
         }).catch(err => {
-            console.error('⚠ Redis connection failed:', err.message);
+            console.error('Redis connection failed:', err.message);
         });
 
         // Playground configuration
@@ -179,12 +179,12 @@ if (process.env.DB_PASSWORD && process.env.DB_PASSWORD !== '') {
         const playgroundRouter = createPlaygroundRouter(playgroundConfig);
         app.use('/playground', playgroundRouter);
 
-        console.log('✓ API Playground initialized at /playground');
+        console.log('API Playground initialized at /playground');
     } catch (err) {
-        console.error('⚠ Playground initialization failed:', err.message);
+        console.error('Playground initialization failed:', err.message);
     }
 } else {
-    console.log('⚠ Playground not configured (DB_PASSWORD not set) - playground endpoints disabled');
+    console.warn('Playground not configured (DB_PASSWORD not set) - playground endpoints disabled');
 }
 
 
@@ -260,45 +260,8 @@ app.get('/', (req, res) => {
     });
 });
 
-// Systems API
-app.get('/api/v1/systems', (req, res) => {
-    res.json({
-        message: 'Systems API',
-        endpoints: [
-            'GET /api/v1/systems - List systems',
-            'GET /api/v1/systems/:id - Get system details',
-            'POST /api/v1/systems - Create system',
-            'PUT /api/v1/systems/:id - Update system',
-            'DELETE /api/v1/systems/:id - Delete system'
-        ]
-    });
-});
-
-// Monitoring API
-app.get('/api/v1/monitoring', (req, res) => {
-    res.json({
-        message: 'Monitoring API',
-        endpoints: [
-            'GET /api/v1/monitoring/metrics - Get metrics',
-            'GET /api/v1/monitoring/alerts - List alerts',
-            'POST /api/v1/monitoring/alerts - Create alert',
-            'GET /api/v1/monitoring/dashboards - List dashboards'
-        ]
-    });
-});
-
-// Automation API
-app.get('/api/v1/automation', (req, res) => {
-    res.json({
-        message: 'Automation API',
-        endpoints: [
-            'GET /api/v1/automation/workflows - List workflows',
-            'POST /api/v1/automation/workflows - Create workflow',
-            'POST /api/v1/automation/execute - Execute automation',
-            'GET /api/v1/automation/jobs - List jobs'
-        ]
-    });
-});
+// Area index routes for systems, monitoring and automation
+require('./routes/catalog').mountCatalog(app);
 
 // =============================================================================
 // THREAT INTELLIGENCE API - Pulls from DNSScience/DarkAPI cached data
@@ -439,7 +402,7 @@ if (process.env.DB_PASSWORD && process.env.DB_PASSWORD !== '') {
     });
 } else {
     // Local fallback for development & verification
-    console.warn('⚠ Using local postgres DB settings (DB_PASSWORD not set).');
+    console.warn('Using local postgres DB settings (DB_PASSWORD not set).');
     dbPool = new Pool({
         connectionString: process.env.DATABASE_URL || 'postgres://localhost/postgres'
     });

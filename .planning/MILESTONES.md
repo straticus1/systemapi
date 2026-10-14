@@ -1,8 +1,8 @@
 # Milestones
 
-## v1.0 — Foundation (Shipped)
+## v1.0 - Foundation (Shipped)
 
-**Shipped:** 2026-04-28 (baseline — existing codebase)
+**Shipped:** 2026-04-28 (baseline - existing codebase)
 
 **What shipped:**
 - Go WebSocket agent with Starlark execution engine

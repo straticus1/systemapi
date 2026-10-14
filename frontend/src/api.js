@@ -33,6 +33,10 @@ export const FleetAPI = {
     const res = await api.post(`/api/v1/fleet/${hostId}/execute`, { script, entitlements });
     return res.data;
   },
+  getAlerts: async () => {
+    const res = await api.get('/api/v1/alerts');
+    return res.data;
+  },
   openTicket: async (hostId, purpose) => {
     const res = await api.post('/api/v1/ws-ticket', { host_id: hostId, purpose });
     return res.data;

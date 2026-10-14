@@ -305,7 +305,7 @@ func (kc *K3sClient) Apply(yamlStr string) error {
 
 	switch {
 	case resp.StatusCode == http.StatusConflict:
-		// 409: resource exists — PATCH with strategic merge
+		// 409: resource exists - PATCH with strategic merge
 		patchResp, err := kc.doPatch(fullURL, jsonBytes)
 		if err != nil {
 			return fmt.Errorf("k3s apply PATCH: %w", err)

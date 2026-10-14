@@ -1,151 +1,114 @@
-# SystemAPI.io Agent Configuration & Sysscript Documentation
+# Agent, CLI and Sysscript reference
 
-The `systemapi-agent` is a natively compiled, zero-dependency Go binary built to run across Linux, macOS, and Windows. It provides Deep System Telemetry, Cloud-Agnostic Container Orchestration, real-time Alert Engine bindings, and a Zero-Trust remote Web PTY.
+## Agent (`systemapi-agent/`)
 
----
-
-## Agent Installation & CLI Usage
-
-### Basic Execution
-The agent requires only your Master API Key to authenticate with the dashboard.
+The agent dials the control plane over a WebSocket and never listens on a port.
 
 ```bash
-./systemapi-agent --api-key ak_live_1234.demo
+cd systemapi-agent
+go build -o systemapi-agent .
+SYSTEMAPI_API_KEY=<key> ./systemapi-agent \
+  --tenant acme \
+  --server wss://api.systemapi.io/api/v1/systems/stream
 ```
 
-### Advanced Flags
-You can customize the endpoint URL and logging verbosity.
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--server` | `ws://localhost:3003/api/v1/systems/stream` | Control-plane stream URL. A URL containing `api_key` is refused. |
+| `--api-key` | `$SYSTEMAPI_API_KEY` | Prefer the environment variable. |
+| `--tenant` | (required) | Tenant the host enrolls into. |
+| `--hostname` | this machine | Reported hostname. |
+| `--state` | `~/.systemapi/agent.json` | Host id, SSH key and pinned control key. |
 
-```bash
-./systemapi-agent \
-  --api-key ak_live_1234.demo \
-  --server wss://api.systemapi.io/api/v1/systems/stream \
-  --verbose true \
-  --tags "production,db-cluster,us-east"
+On dial it sends `Authorization: Bearer <key>`, `X-SystemAPI-Tenant`,
+`X-SystemAPI-Host-ID`, `X-SystemAPI-Hostname` and `X-SystemAPI-SSH-PubKey`
+(OpenSSH `ssh-ed25519`). It refuses commands as `not_enrolled` until it has
+pinned the control public key, and refuses a changed key. TLS is 1.3 only.
+
+Telemetry (every 5 seconds): host info, CPU, memory, disks, cumulative network
+byte counters, installed software, and Docker or k3s summaries when present.
+
+There is no install script; run the binary under your own service manager.
+
+## CLI (`cli/systemapi.js`)
+
+```
+SYSTEMAPI_URL=https://api.systemapi.io SYSTEMAPI_API_KEY=<key> node cli/systemapi.js <command>
+
+  hosts
+  exec --host <id> --script-file <path>
+  metrics --host <id>
+  audit
+  breakglass-ticket --host <id>
+  host-json --host <id>
+  login <username>
 ```
 
-### Background Service Deployment (Systemd)
+The key is sent only as `X-API-Key`. A key in `SYSTEMAPI_URL` is refused.
 
-We provide a universal install script to immediately daemonize the agent on Linux:
+## Sysscript
 
-```bash
-curl -sSL https://install.systemapi.io | sudo bash -s -- --api-key ak_live_1234.demo --tags "web-worker"
-```
+Sysscripts are Starlark. `print()` output is returned as `result.output`; a
+runtime error is returned as `result.error`. Each run carries entitlements;
+anything not granted is refused. The control plane clamps them first:
+`allow_exec` needs the `exec:run` scope, everything else needs `admin`.
 
----
+### Entitlements
 
-## The Sysscript Engine
+| Name | Type | Grants |
+| --- | --- | --- |
+| `allow_exec` | bool | `sys.exec.run`, `sys.proc.kill` |
+| `allow_fs_read` | path list | `sys.fs.read`, `stat`, `glob`; `sys.config.backup` |
+| `allow_fs_write` | path list | `sys.fs.write`, `mkdir`, `rm`, `chmod`; `sys.config.restore` |
+| `allow_net_outbound` | host list | `sys.net.http_get` |
+| `allow_config_write` | path list | `sys.config.write`, `restore` |
+| `allow_service_reload` | name list | `sys.config.reload`, `sys.services.*` actions |
+| `allow_packages` | exact list | `sys.packages.install` |
+| `allow_containers` | bool | the `sys.containers` module |
+| `allow_images` | exact list | `sys.containers.run` |
+| `allow_k3s`, `allow_k8s` | bool | the `sys.k3s` / `sys.k8s` modules |
+| `allow_k3s_namespaces`, `allow_k8s_namespaces` | exact list | namespaces those modules may touch |
+| `allow_linux` | bool | `sys.linux`, `sys.disk`, `sys.procfs` (Linux hosts only) |
+| `allow_mount_targets` | exact list | `sys.disk.mount`, `umount` |
+| `allow_sysctl` | exact list | `sys.procfs.sysctl_get`, `sysctl_set` (some keys are always denied) |
+| `allow_net_manage` | exact list | `sys.net.set_address`, `set_route`, `link_up`, `link_down`, `set_dns` |
 
-SystemAPI.io utilizes **Sysscript**, a dialect of Starlark (Python-lite) explicitly hardened for systems administration. 
+A JSON boolean in a list field grants nothing, and `"*"` is dropped.
 
-When a Sysscript is dispatched from the Dashboard, it is evaluated by the local Go Agent within a heavily restricted, non-Turing-complete sandbox. **All capabilities are default-deny.** The sender must explicitly pass authorization Entitlements (e.g., `allow_exec: true`).
+The control plane currently forwards `allow_fs_read`, `allow_fs_write`,
+`allow_net_outbound`, `allow_config_write` and `allow_service_reload` as
+booleans (see `clampEntitlements` in `controlplane/router.js`), so a run
+started through the API or dashboard never receives those path or name lists.
+The other list fields are passed through for admins.
 
-### Global Modules
+### Modules
 
-#### 1. `sys.os` (Entitlement: `allow_fs`)
-Cross-platform OS utilities and File System interactions.
+| Module | Functions |
+| --- | --- |
+| `sys.exec` | `run(cmd, *args)` returns `{"output": ...}` |
+| `sys.fs` | `read`, `write`, `stat`, `glob`, `mkdir`, `rm`, `chmod` |
+| `sys.net` | `http_get`, `dns_lookup`, `reverse_dns`, `port_check`, `links`, `addresses`, `routes`, `set_address`, `set_route`, `link_up`, `link_down`, `set_dns` |
+| `sys.proc` | `list`, `get`, `find`, `kill` |
+| `sys.services` | `start`, `stop`, `restart`, `enable`, `disable`, `status` |
+| `sys.config` | `write`, `template`, `validate`, `reload`, `backup`, `restore` |
+| `sys.packages` | `install` |
+| `sys.json`, `sys.yaml`, `sys.ini` | `parse`, `encode` (and `encode_pretty`, `get`) |
+| `sys.containers` | `list`, `stats`, `start`, `stop`, `restart`, `inspect`, `logs`, `run`, `exec` |
+| `sys.k3s`, `sys.k8s` | `nodes`, `pods`, `apply`, `get`, `list`, `logs`, `exec`, `delete` |
+| `sys.linux` | `os_release`, `uname`, `hostname`, `uptime`, `users`, `groups` |
+| `sys.disk` | `mounts`, `usage`, `block_devices`, `mount`, `umount` |
+| `sys.procfs` | `read`, `sysctl_get`, `sysctl_set` |
+
+Not implemented:
+
+- `sys.alerts.push(severity, message)` logs on the agent and returns `False`.
+  Nothing forwards it to the control plane yet.
+- `sys.security.yara_scan`, `sys.security.scan_memory` and `sys.events.listen`
+  raise a "not implemented" error.
+
+Example:
 
 ```python
-# Read a file
-content = sys.os.read_file("/etc/passwd")
-
-# Check if a mount exists
-is_mounted = sys.os.path_exists("/mnt/data")
-
-# Get environment variables
-db_pass = sys.os.getenv("PGPASSWORD")
+r = sys.exec.run("df", "-h")
+print(r["output"])
 ```
-
-#### 2. `sys.exec` (Entitlement: `allow_exec`)
-Executing arbitrary shell commands on the host.
-
-```python
-# Execute and return stdout
-result = sys.exec.run("systemctl restart nginx")
-print(result.stdout)
-
-# Run a background task
-sys.exec.spawn("./long_running_job.sh")
-```
-
-#### 3. `sys.net` (Entitlement: `allow_network`)
-Perform local network diagnostics.
-
-```python
-# Check if a port is physically listening
-is_up = sys.net.check_port(5432)
-
-# Ping an internal dependency
-latency = sys.net.ping("10.0.0.5")
-```
-
-#### 4. `sys.containers` (Entitlement: `allow_exec`)
-**Cloud-Agnostic Orchestration.** Automatically detects the local runtime (Docker socket, Podman, Containerd) and executes Lifecycle commands without requiring OS-specific tooling.
-
-```python
-# Restart a container dynamically
-sys.containers.restart("redis-cache")
-
-# Spin up a new workload
-sys.containers.run(
-    image="nginx:latest", 
-    name="web-01", 
-    ports=["80:80"]
-)
-
-# Pull down everything
-sys.containers.stop_all()
-```
-
-#### 5. `sys.alerts` (Two-Way Automations)
-Push telemetry anomalies or incident markers *back* to the Dashboard's alerting engine to trigger generic Remediations.
-
-```python
-# Analyze local logs for a match...
-if "OOMKiller" in sys.os.read_file("/var/log/syslog"):
-    # Send a high-severity alert to SystemAPI.io, which can trigger an SMS
-    # or instantly execute a "Memory Dump" Playbook!
-    sys.alerts.push(
-        severity="critical",
-        alert_name="OOMKiller_Triggered",
-        message="Host RAM exhausted. Initiating auto-remediation."
-    )
-```
-
-#### 6. `sys.ssh` (Access Management)
-Abstract out IAM permissions by universally injecting public keys into the agent's authorized lists.
-
-```python
-# Add an engineer's public key for 1 hour (Requires allow_fs)
-sys.ssh.add_key(
-    user="root",
-    key="ssh-ed25519 AAAAC3NzaC1... deploy@hq"
-)
-```
-
-#### 7. `sys.security` & `sys.events` (State of the Art Hooking)
-Advanced eBPF/ETW modules.
-
-```python
-# Scan a suspicious file against local YARA rules before letting it execute
-matches = sys.security.yara_scan("/tmp/uploaded_binary", rules_dir="/opt/yara")
-
-if len(matches) > 0:
-    sys.alerts.push(severity="high", alert_name="YARA_Detect", message=matches[0])
-    sys.exec.run("rm -f /tmp/uploaded_binary")
-```
-
----
-
-## Security Entitlements Matrix
-
-To execute *any* of the above scripts successfully, the `POST /execute` payload must explicitly contain the required Entitlement flags:
-
-| Starlark Module | Required Entitlement | Description |
-| :--- | :--- | :--- |
-| `sys.os` | `allow_fs: true` | Grants read/write access to the host's physical disk |
-| `sys.exec` | `allow_exec: true` | Grants access to spawn generic shell processes |
-| `sys.net` | `allow_network: true` | Grants ability to open outbound TCP/UDP sockets |
-| `sys.containers` | `allow_exec: true` | Requires shell access to wrap Docker/Podman APIs |
-| `sys.ssh` | `allow_fs: true` | Requires disk access to mutate `~/.ssh/authorized_keys` |
-| `sys.security` | *built-in* | YARA scanning engine requires no specific entitlements |

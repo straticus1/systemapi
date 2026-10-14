@@ -238,7 +238,7 @@ func (engine *SysscriptEngine) buildSysModule() *starlarkstruct.Struct {
 		"chmod": starlark.NewBuiltin("chmod", engine.fsChmod),
 	}
 
-	// Advanced Modules (Stubs)
+	// Reserved modules: sys.alerts logs locally; sys.security and sys.events fail as not implemented.
 	sysAlerts := starlark.StringDict{
 		"push": starlark.NewBuiltin("push", engine.alertsPush),
 	}

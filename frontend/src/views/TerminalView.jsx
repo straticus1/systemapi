@@ -30,10 +30,10 @@ const TerminalView = () => {
     const term = new XTerm({
       cursorBlink: true,
       theme: {
-        background: '#090a0c', // matches var(--bg-darker)
-        foreground: '#f0f4f8',
-        cursor: '#00f0ff',
-        selection: 'rgba(0, 240, 255, 0.3)',
+        background: '#0e1013', // matches var(--bg-darker)
+        foreground: '#e4e7eb',
+        cursor: '#4aa8b5',
+        selection: 'rgba(74, 168, 181, 0.3)',
       },
       fontFamily: '"JetBrains Mono", monospace',
       fontSize: 14,
@@ -161,11 +161,11 @@ const TerminalView = () => {
           </button>
           <div>
             <h2 style={{ fontSize: '1.1rem', margin: 0, display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <Terminal size={18} color="var(--accent-cyan)" />
+              <Terminal size={18} color="var(--accent)" />
               {host?.hostname || hostId}
             </h2>
             <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-              {host?.os} {host?.platform} • Secure PTY Tunnel
+              {host?.os} {host?.platform} / PTY session
             </div>
           </div>
         </div>
@@ -175,7 +175,7 @@ const TerminalView = () => {
              <span style={{ fontSize: '0.85rem', color: 'var(--accent-green)', display: 'flex', alignItems: 'center', gap: '6px' }}><Activity size={14}/> Connected</span>
           )}
           {status === 'connecting' && (
-             <span style={{ fontSize: '0.85rem', color: 'var(--accent-blue)', display: 'flex', alignItems: 'center', gap: '6px' }}><Activity size={14} className="animate-spin"/> Negotiating Tunnel...</span>
+             <span style={{ fontSize: '0.85rem', color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: '6px' }}><Activity size={14} className="animate-spin"/> Negotiating Tunnel...</span>
           )}
           {(status === 'closed' || status === 'error') && (
              <span style={{ fontSize: '0.85rem', color: 'var(--accent-red)', display: 'flex', alignItems: 'center', gap: '6px' }}><AlertTriangle size={14}/> {status === 'error' && statusError ? statusError : 'Disconnected'}</span>

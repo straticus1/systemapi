@@ -16,7 +16,7 @@ import (
 // sys.json
 // =============================================================================
 
-// sys.json.parse(content) — JSON string → Starlark dict/list tree
+// sys.json.parse(content) - JSON string -> Starlark dict/list tree
 func (engine *SysscriptEngine) jsonParse(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	var content string
 	if err := starlark.UnpackArgs("parse", args, kwargs, "content", &content); err != nil {
@@ -29,7 +29,7 @@ func (engine *SysscriptEngine) jsonParse(thread *starlark.Thread, b *starlark.Bu
 	return goToStarlark(raw), nil
 }
 
-// sys.json.encode(value) — Starlark dict/list → JSON string
+// sys.json.encode(value) - Starlark dict/list -> JSON string
 func (engine *SysscriptEngine) jsonEncode(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	var value starlark.Value
 	if err := starlark.UnpackArgs("encode", args, kwargs, "value", &value); err != nil {
@@ -42,7 +42,7 @@ func (engine *SysscriptEngine) jsonEncode(thread *starlark.Thread, b *starlark.B
 	return starlark.String(string(out)), nil
 }
 
-// sys.json.encode_pretty(value) — indented JSON
+// sys.json.encode_pretty(value) - indented JSON
 func (engine *SysscriptEngine) jsonEncodePretty(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	var value starlark.Value
 	if err := starlark.UnpackArgs("encode_pretty", args, kwargs, "value", &value); err != nil {
@@ -59,7 +59,7 @@ func (engine *SysscriptEngine) jsonEncodePretty(thread *starlark.Thread, b *star
 // sys.ini  (key=value + [sections], covers postfix main.cf, most /etc configs)
 // =============================================================================
 
-// sys.ini.parse(content) — returns dict of dicts: {"": {global keys}, "section": {keys}}
+// sys.ini.parse(content) - returns dict of dicts: {"": {global keys}, "section": {keys}}
 // Lines starting with # or ; are comments. Keys without a section go into "".
 func (engine *SysscriptEngine) iniParse(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	var content string
@@ -106,7 +106,7 @@ func (engine *SysscriptEngine) iniParse(thread *starlark.Thread, b *starlark.Bui
 	return result, nil
 }
 
-// sys.ini.encode(data) — dict of dicts → INI string
+// sys.ini.encode(data) - dict of dicts -> INI string
 func (engine *SysscriptEngine) iniEncode(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	var value starlark.Value
 	if err := starlark.UnpackArgs("encode", args, kwargs, "value", &value); err != nil {
@@ -141,7 +141,7 @@ func (engine *SysscriptEngine) iniEncode(thread *starlark.Thread, b *starlark.Bu
 	return starlark.String(sb.String()), nil
 }
 
-// sys.ini.get(data, key, section="") — convenience getter with default
+// sys.ini.get(data, key, section="") - convenience getter with default
 func (engine *SysscriptEngine) iniGet(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	var data starlark.Value
 	var key, section, def string
@@ -171,7 +171,7 @@ func (engine *SysscriptEngine) iniGet(thread *starlark.Thread, b *starlark.Built
 // sys.fs extended
 // =============================================================================
 
-// sys.fs.stat(path) — returns dict {exists, size, mode, is_dir, mod_time} or None
+// sys.fs.stat(path) - returns dict {exists, size, mode, is_dir, mod_time} or None
 func (engine *SysscriptEngine) fsStat(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	var path string
 	if err := starlark.UnpackArgs("stat", args, kwargs, "path", &path); err != nil {
@@ -202,7 +202,7 @@ func (engine *SysscriptEngine) fsStat(thread *starlark.Thread, b *starlark.Built
 	return d, nil
 }
 
-// sys.fs.glob(pattern) — returns list of matching paths
+// sys.fs.glob(pattern) - returns list of matching paths
 func (engine *SysscriptEngine) fsGlob(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	var pattern string
 	if err := starlark.UnpackArgs("glob", args, kwargs, "pattern", &pattern); err != nil {
@@ -229,7 +229,7 @@ func (engine *SysscriptEngine) fsGlob(thread *starlark.Thread, b *starlark.Built
 	return starlark.NewList(results), nil
 }
 
-// sys.fs.mkdir(path, mode="0755") — create directory and parents
+// sys.fs.mkdir(path, mode="0755") - create directory and parents
 func (engine *SysscriptEngine) fsMkdir(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	var path, modeStr string
 	if err := starlark.UnpackArgs("mkdir", args, kwargs, "path", &path, "mode?", &modeStr); err != nil {
@@ -259,7 +259,7 @@ func (engine *SysscriptEngine) fsMkdir(thread *starlark.Thread, b *starlark.Buil
 	return starlark.True, nil
 }
 
-// sys.fs.rm(path, recursive=False) — remove file or directory
+// sys.fs.rm(path, recursive=False) - remove file or directory
 func (engine *SysscriptEngine) fsRm(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	var path string
 	var recursive bool
@@ -288,7 +288,7 @@ func (engine *SysscriptEngine) fsRm(thread *starlark.Thread, b *starlark.Builtin
 	return starlark.True, nil
 }
 
-// sys.fs.chmod(path, mode) — change permissions, mode is octal string e.g. "0644"
+// sys.fs.chmod(path, mode) - change permissions, mode is octal string e.g. "0644"
 func (engine *SysscriptEngine) fsChmod(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	var path, modeStr string
 	if err := starlark.UnpackArgs("chmod", args, kwargs, "path", &path, "mode", &modeStr); err != nil {
@@ -381,13 +381,13 @@ func (engine *SysscriptEngine) svcDisable(thread *starlark.Thread, b *starlark.B
 	return engine.svcAction("disable", service)
 }
 
-// sys.services.status(service) — returns {active: bool, sub_state: str, output: str}
+// sys.services.status(service) - returns {active: bool, sub_state: str, output: str}
 func (engine *SysscriptEngine) svcStatus(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	var service string
 	if err := starlark.UnpackArgs("status", args, kwargs, "service", &service); err != nil {
 		return starlark.None, err
 	}
-	// status doesn't modify — no entitlement required
+	// status doesn't modify - no entitlement required
 	out, err := exec.Command("systemctl", "is-active", service).Output()
 	state := strings.TrimSpace(string(out))
 	d := starlark.NewDict(3)

@@ -3,22 +3,12 @@ import Editor from '@monaco-editor/react';
 import { Terminal, Send, Server, CheckCircle2, XCircle } from 'lucide-react';
 import { useAppStore } from '../store';
 import { FleetAPI } from '../api';
+import { scriptOutcome } from '../format';
 
-const DEFAULT_SCRIPT = `def run():
-    # Return OS-level details using the Sysscript API
-    hostname = sys.os.hostname()
-    platform = sys.os.platform()
-    
-    # You can also run commands directly
-    # out = sys.exec.run("whoami", [])
-    
-    return {
-        "hostname": hostname,
-        "platform": platform,
-        "status": "Healthy and under your command"
-    }
-
-run()`;
+const DEFAULT_SCRIPT = `# Runs on the agent. Requires the exec entitlement.
+r = sys.exec.run("uname", "-a")
+print(r["output"])
+`;
 
 const SysscriptsView = () => {
   const { hosts } = useAppStore();
@@ -27,10 +17,13 @@ const SysscriptsView = () => {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
   
-  // Entitlements
+  // Boolean entitlements the control plane honours. The control plane clamps
+  // path-scoped ones (allow_fs_read, allow_fs_write, allow_net_outbound,
+  // allow_config_write, allow_service_reload) to booleans, which the agent
+  // treats as no grant, so they cannot be granted from here or the API yet.
   const [allowExec, setAllowExec] = useState(true);
-  const [allowFs, setAllowFs] = useState(false);
-  const [allowNet, setAllowNet] = useState(false);
+  const [allowContainers, setAllowContainers] = useState(false);
+  const [allowK3s, setAllowK3s] = useState(false);
 
   const handleExecute = async () => {
     if (!selectedHost) return;
@@ -40,14 +33,11 @@ const SysscriptsView = () => {
     try {
       const entitlements = {
         allow_exec: allowExec,
-        allow_fs: allowFs,
-        allow_network: allowNet
+        allow_containers: allowContainers,
+        allow_k3s: allowK3s
       };
-      
-      const res = await FleetAPI.executeScript(selectedHost, code, entitlements);
-      setResult({ success: true, data: res.output || res });
+      setResult(scriptOutcome(await FleetAPI.executeScript(selectedHost, code, entitlements)));
     } catch (e) {
-      console.error(e);
       setResult({ success: false, data: e.response?.data?.error || e.message });
     } finally {
       setLoading(false);
@@ -58,10 +48,10 @@ const SysscriptsView = () => {
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
       <div style={{ padding: '24px', borderBottom: '1px solid var(--border-light)' }}>
         <h1 style={{ marginBottom: '8px', display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <Terminal color="var(--accent-blue)" /> Sysscript Studio
+          <Terminal color="var(--accent)" /> Sysscript Studio
         </h1>
         <p style={{ color: 'var(--text-muted)' }}>
-          Write and deploy Starlark (Python) scripts globally. The agent engine handles the OS abstraction natively.
+          Write a Starlark script and run it on one host.
         </p>
       </div>
 
@@ -94,7 +84,7 @@ const SysscriptsView = () => {
                     {result.success ? <CheckCircle2 size={16} color="var(--accent-green)" /> : <XCircle size={16} color="var(--accent-red)" />}
                     {result.success ? 'Execution Successful' : 'Execution Failed'}
                 </div>
-                <div style={{ padding: '16px', flex: 1, overflowY: 'auto', fontFamily: 'monospace', fontSize: '0.9rem', color: result.success ? '#e5e7eb' : 'var(--accent-red)', whiteSpace: 'pre-wrap' }}>
+                <div style={{ padding: '16px', flex: 1, overflowY: 'auto', fontFamily: 'monospace', fontSize: '0.9rem', color: result.success ? 'var(--text-code)' : 'var(--accent-red)', whiteSpace: 'pre-wrap' }}>
                     {typeof result.data === 'string' ? result.data : JSON.stringify(result.data, null, 2)}
                 </div>
              </div>
@@ -123,7 +113,7 @@ const SysscriptsView = () => {
 
           <h3 style={{ fontSize: '1rem', marginBottom: '16px' }}>Security Entitlements</h3>
           <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: '16px' }}>
-            Zero-Trust Sandbox: explicitly define what this script is permitted to do on the endpoint.
+            Grants for this run. Containers and k3s need the admin role. Path-scoped grants (files, outbound network, config writes, service reloads) cannot be granted from the control plane yet.
           </p>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', marginBottom: '32px' }}>
@@ -132,12 +122,12 @@ const SysscriptsView = () => {
                 <span>Allow Exec (`sys.exec`)</span>
             </label>
             <label style={{ display: 'flex', alignItems: 'center', gap: '10px', cursor: 'pointer' }}>
-                <input type="checkbox" checked={allowFs} onChange={e => setAllowFs(e.target.checked)} />
-                <span>Allow Fileset (`sys.fs`)</span>
+                <input type="checkbox" checked={allowContainers} onChange={e => setAllowContainers(e.target.checked)} />
+                <span>Allow Containers (`sys.containers`)</span>
             </label>
             <label style={{ display: 'flex', alignItems: 'center', gap: '10px', cursor: 'pointer' }}>
-                <input type="checkbox" checked={allowNet} onChange={e => setAllowNet(e.target.checked)} />
-                <span>Allow Network (`sys.net`)</span>
+                <input type="checkbox" checked={allowK3s} onChange={e => setAllowK3s(e.target.checked)} />
+                <span>Allow k3s (`sys.k3s`)</span>
             </label>
           </div>
 
@@ -147,7 +137,7 @@ const SysscriptsView = () => {
             className="btn btn-primary" 
             style={{ width: '100%', padding: '12px' }}
           >
-            <Send size={16} /> {loading ? 'Transmitting...' : 'Deploy Script'}
+            <Send size={16} /> {loading ? 'Running...' : 'Run Script'}
           </button>
         </div>
       </div>
