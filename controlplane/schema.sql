@@ -26,8 +26,9 @@ CREATE INDEX IF NOT EXISTS cp_members_user_idx ON cp_members (user_id);
 -- binding is per membership row, so a tenant admin can only bind rows of that
 -- tenant; a device login needs every row of the member bound to the same sub.
 -- Unique per tenant here; the application also refuses one sub on two member
--- ids anywhere (bind holds an advisory lock), and the reader fails closed if
--- it ever finds two.
+-- ids anywhere and two different subs on one member id (bind holds an
+-- advisory lock; changing a member's sub means unbinding every row first),
+-- and the reader fails closed if it ever finds one sub on two member ids.
 ALTER TABLE cp_members ADD COLUMN IF NOT EXISTS sso_sub TEXT;
 CREATE UNIQUE INDEX IF NOT EXISTS cp_members_tenant_sso_sub_idx ON cp_members (tenant_id, sso_sub) WHERE sso_sub IS NOT NULL;
 CREATE INDEX IF NOT EXISTS cp_members_sso_sub_idx ON cp_members (sso_sub) WHERE sso_sub IS NOT NULL;

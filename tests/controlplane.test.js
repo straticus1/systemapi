@@ -1072,6 +1072,28 @@ test('SSO binding is admin only, audited in the chain, and one sub per member', 
       (err) => err.status === 409 && err.code === 'sso_sub_taken'
     );
 
+    // A member has one identity across tenants: another tenant cannot bind a
+    // different sub to it, the same sub is fine, and a change needs every
+    // row unbound first.
+    await fm.registry.addMember('beta', 'mail-1', 'viewer');
+    const auditAt = fm.registry.audit.length;
+    await assert.rejects(
+      () => fm.registry.setSsoSub({ tenantId: 'beta', userId: 'mail-1', sub: 'sub-mail-other', actor: 'test' }),
+      (err) => err.status === 409 && err.code === 'sso_sub_conflict'
+    );
+    assert.equal(rowOf('beta', 'mail-1').sso_sub, null);
+    assert.equal(fm.registry.audit.length, auditAt);
+    await fm.registry.setSsoSub({ tenantId: 'beta', userId: 'mail-1', sub: subMail, actor: 'test' });
+    assert.equal(rowOf('beta', 'mail-1').sso_sub, subMail);
+    await assert.rejects(
+      () => fm.registry.setSsoSub({ tenantId: 'acme', userId: 'mail-1', sub: 'sub-mail-new', actor: 'test' }),
+      (err) => err.code === 'sso_sub_conflict'
+    );
+    const viaApi = await bind(admin.url, 'acme', 'mail-1', { sso_sub: 'sub-mail-new' });
+    assert.equal(viaApi.status, 409);
+    assert.equal(viaApi.body.error, 'sso_sub_conflict');
+    await fm.registry.setSsoSub({ tenantId: 'beta', userId: 'mail-1', sub: null, actor: 'test' });
+
     // Unbinding is audited, and the sub stops working at once.
     const mailApp = await listen(appFor(fm, { id: subMail }));
     try {

@@ -16,7 +16,10 @@ the router.
   `sub_mode = hashed_user_id`. A session acts as a member only through
   membership rows whose `cp_members.sso_sub` equals that sub byte for byte;
   email, name and username never match, and a NULL `sso_sub` cannot sign in
-  (403 `sso_unbound`). One sub maps to one member id (409 `sso_sub_taken`).
+  (403 `sso_unbound`). One sub maps to one member id (409 `sso_sub_taken`),
+  and a member has one sub in every tenant: binding a different sub while
+  another row of that member is bound is 409 `sso_sub_conflict`, so changing
+  it means unbinding every row first.
   A tenant admin binds one membership row with
   `PUT /api/v1/tenants/:tenant/members/:user/sso` `{"sso_sub": "<sub>"}` and
   removes it with `DELETE` on the same path; each is an audit-chain row

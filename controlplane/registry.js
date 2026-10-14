@@ -167,6 +167,9 @@ class MemoryRegistry {
     return this.members.filter((m) => m.sso_sub === sub).map((m) => ({ ...m }));
   }
 
+  // A member's identity is the same in every tenant: binding a row to a sub
+  // that differs from another bound row of that member is refused
+  // (sso_sub_conflict); changing it means unbinding every row first.
   // Sets (or clears, with sub null) one membership row's sso_sub and appends
   // the audit row; the row is put back if the audit write fails.
   async setSsoSub({ tenantId, userId, sub, actor }) {
@@ -174,6 +177,10 @@ class MemoryRegistry {
     if (!row) throw http(404, 'not_found');
     if (sub !== null && this.members.some((m) => m.sso_sub === sub && m.user_id !== userId)) {
       throw http(409, 'sso_sub_taken');
+    }
+    if (sub !== null && this.members.some((m) => m.user_id === userId && m.tenant_id !== tenantId
+      && m.sso_sub != null && m.sso_sub !== sub)) {
+      throw http(409, 'sso_sub_conflict');
     }
     const previous = row.sso_sub || null;
     row.sso_sub = sub;
@@ -614,6 +621,12 @@ class PgRegistry {
           [sub, userId]
         );
         if (taken.rowCount > 0) throw http(409, 'sso_sub_taken');
+        const conflict = await client.query(
+          `SELECT 1 FROM cp_members
+           WHERE user_id = $1 AND tenant_id <> $2 AND sso_sub IS NOT NULL AND sso_sub <> $3 LIMIT 1`,
+          [userId, tenantId, sub]
+        );
+        if (conflict.rowCount > 0) throw http(409, 'sso_sub_conflict');
       }
       await client.query(
         'UPDATE cp_members SET sso_sub = $3 WHERE tenant_id = $1 AND user_id = $2',
