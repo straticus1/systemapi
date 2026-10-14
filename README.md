@@ -19,10 +19,13 @@ carries explicit entitlements.
   web terminal (opened with a single-use ticket), alert events. Containers and
   SSH key distribution are not wired and say so.
 - CLI in `cli/systemapi.js`; the key goes only in an `X-API-Key` header.
-- Username-first OAuth2 device login in `controlplane/oauth.js`. The client
-  prints a verification URL; approving it needs a browser signed in through
-  After Dark SSO (Authentik) as that same member, and the page offers the SSO
-  sign-in when there is no session. The user code alone approves nothing.
+- Username-first OAuth2 device login (RFC 8628) in `controlplane/oauth.js`.
+  The client prints the verification URI and a user code; the user signs in
+  through After Dark SSO (Authentik), types the code, checks the requester
+  shown, and confirms. SSO identity is the Authentik `sub` only
+  (`cp_members.sso_sub`, provider `sub_mode = hashed_user_id`), bound by a
+  tenant admin or, for the first admin, `node scripts/sso-bind.js <tenant>
+  <member> <sub>`. The user code alone approves nothing.
   Google and GitHub linking needs an admin whitelist row, and binding a
   linked account the first time also needs that SSO session. API keys remain
   the machine credential.
@@ -55,8 +58,13 @@ cd systemapi-agent && go build -o systemapi-agent . && \
 The server listens on `HOST` (default `0.0.0.0`) and `PORT`. It reads
 environment from `ENV_FILE` when set, otherwise from `.env.production` next
 to `server.js` (not the working directory); variables already set win. Never
-commit an env file. `SYSTEMAPI_ALLOWED_ORIGINS` sets the browser origins
-allowed to open a terminal WebSocket. A sample agent unit is
+commit an env file. `SYSTEMAPI_ALLOWED_ORIGINS` (comma-separated exact
+origins) sets the browser origins allowed to open a terminal WebSocket and to
+make credentialed CORS requests; CORS keeps only exact `https://` origins (plus
+`http://localhost` outside production) and is never served on `/oauth`.
+`SYSTEMAPI_TRUST_PROXY` (default `loopback`) is Express `trust proxy`, which
+decides the client IP shown on the device-login page and used for its rate
+limit. A sample agent unit is
 `systemd/systemapi-agent.service`.
 Database TLS is on by default (`DB_SSL=disable` opts out, `DB_SSL_CA` adds a
 CA). The playground routes under `/playground` need `DB_PASSWORD` and Redis.

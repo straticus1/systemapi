@@ -9,23 +9,41 @@ the router.
 - API key: `X-API-Key: <key>` or `Authorization: Bearer <key>`. A key in the
   query string is refused with `query_key_rejected`.
 - Dashboard: the OAuth session cookie set by `/oauth/login`. `return_to` must
-  be a same-origin path; anything else returns to `/`.
-- Device login (CLI, sahconnect): `POST /oauth/device` with `username` returns
-  `device_code` and `verification_url`; poll `POST /oauth/token` with
-  `grant_type=urn:ietf:params:oauth:grant-type:device_code`. The user opens
-  `GET /oauth/device/verify?code=...` in a browser:
-  - no SSO session: the page links to `/oauth/login`, which returns to it;
-  - signed in as another member: 403 `login_denied` ("signed in as X; this
-    login is for Y");
-  - signed in as that member: a "Yes" form.
-  `POST /oauth/device/verify` needs the session cookie and the page's `csrf`
-  field (403 `csrf_denied` otherwise) and a session that owns the member
-  (403 `login_denied` otherwise). The session owns the member when its
-  Authentik `sub` equals `cp_members.user_id`, or its `email` (with
-  `email_verified` true) equals that member's `cp_members.email`. GET never
-  approves. A `provider` field (`google`, `github`) instead starts that IdP;
-  its callback must come back to the same browser session. Codes last 10
-  minutes and are single use; the bearer token lasts an hour.
+  be a same-origin path; anything else (including dot segments such as
+  `/.//host` or `/%2e%2e//host`) returns to `/`. Logout is
+  `POST /oauth/logout` with the session `csrf` (from `GET /oauth/user`).
+- SSO identity is the Authentik `sub` only. The Authentik provider must use
+  `sub_mode = hashed_user_id`. A session acts as a member only through
+  membership rows whose `cp_members.sso_sub` equals that sub byte for byte;
+  email, name and username never match, and a NULL `sso_sub` cannot sign in
+  (403 `sso_unbound`). One sub maps to one member id (409 `sso_sub_taken`).
+  A tenant admin binds one membership row with
+  `PUT /api/v1/tenants/:tenant/members/:user/sso` `{"sso_sub": "<sub>"}` and
+  removes it with `DELETE` on the same path; each is an audit-chain row
+  (`sso_bind`, `sso_unbind`; the sub is stored as a fingerprint). The first
+  admin is bound on the server: `node scripts/sso-bind.js <tenant> <member>
+  <sub>` (same database and env file as `server.js`, actor
+  `bootstrap:sso-bind`).
+- Device login (CLI, sahconnect), RFC 8628: `POST /oauth/device` with
+  `username` returns exactly `{device_code, user_code, verification_uri,
+  expires_in, interval}`. `verification_uri` is `<public URL>/oauth/device/verify`
+  with no query; `user_code` is 8 letters from `BCDFGHJKLMNPQRSTVWXZ`, shown as
+  `XXXX-XXXX`. There is no `verification_uri_complete`. Poll `POST /oauth/token`
+  with `grant_type=urn:ietf:params:oauth:grant-type:device_code`. In the
+  browser, `GET /oauth/device/verify` (any query is ignored):
+  - no SSO session: a link to `/oauth/login`, which returns to it (no session
+    or token is created);
+  - a sub not bound on every membership row of a member: 403;
+  - otherwise a form where the user types the code. `POST` with `user_code`
+    and `csrf` shows a confirm page with the requester's IP, client and start
+    time; its "Yes" (`confirm=yes`) or a `provider` button (`google`,
+    `github`) approves. Approval needs that confirm page shown in the same
+    session and a sub bound on every membership row of the code's member.
+  A wrong, used, expired or another member's code gets the same 403. Five
+  wrong codes per session (20 per IP) in 15 minutes return 429 `slow_down`,
+  and a session's fifth failure denies its member's pending logins. GET never
+  approves. Codes last 10 minutes and are single use; the bearer token lasts
+  an hour.
 - Browser and CLI WebSockets: a single-use ticket from `POST /api/v1/ws-ticket`
   (`purpose` is `terminal:open`, `terminal:root` or `breakglass:open`). Tickets
   last 60 seconds, are bound to one host and purpose, and are audited. Each
@@ -138,6 +156,7 @@ names the agent understands are listed in `cli_docs.md`.
 | GET | `/api/v1/compliance/export` |
 | GET/POST | `/api/v1/webhooks`; `DELETE /api/v1/webhooks/:id` |
 | POST | `/api/v1/tenants/:tenant/members` |
+| PUT/DELETE | `/api/v1/tenants/:tenant/members/:user/sso` (admin; audited) |
 | POST | `/api/v1/keys/:keyId/scopes` |
 | GET/POST/DELETE | `/api/v1/oauth/links` |
 
