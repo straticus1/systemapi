@@ -2,9 +2,11 @@
 // and an OAuth session with no tenant listing every host. An API key with no
 // scope rows has no scopes. SYSTEMAPI_REQUIRE_SCOPES=0 is the migration
 // escape and grants operator, which includes exec:run and excludes
-// breakglass:open, terminal:root and admin. Does NOT bind a session to a
-// tenant by itself. admin implies every scope. terminal:root (a root shell)
-// is granted to admin only.
+// breakglass:open, terminal:root, file:root and admin. Does NOT bind a
+// session to a tenant by itself. admin implies every scope. terminal:root (a
+// root shell) and file:root (file operations as root) are granted to admin
+// only. tcp:open, file:read and file:write are operator scopes; the
+// file:write purpose needs both file:read and file:write (channels.js).
 'use strict';
 
 const ALL = Object.freeze([
@@ -15,13 +17,26 @@ const ALL = Object.freeze([
   'terminal:open',
   'terminal:root',
   'breakglass:open',
+  'tcp:open',
+  'file:read',
+  'file:write',
+  'file:root',
   'alerts:write',
   'audit:read',
   'admin'
 ]);
 
 const VIEWER = Object.freeze(['hosts:read', 'metrics:read', 'audit:read']);
-const OPERATOR = Object.freeze([...VIEWER, 'exec:run', 'terminal:open', 'alerts:write', 'hosts:write']);
+const OPERATOR = Object.freeze([
+  ...VIEWER,
+  'exec:run',
+  'terminal:open',
+  'tcp:open',
+  'file:read',
+  'file:write',
+  'alerts:write',
+  'hosts:write'
+]);
 
 function scopesForRole(role) {
   if (role === 'admin') return new Set(ALL);

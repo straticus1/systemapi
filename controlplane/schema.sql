@@ -50,6 +50,16 @@ CREATE TABLE IF NOT EXISTS cp_hosts (
 CREATE INDEX IF NOT EXISTS cp_hosts_tenant_idx ON cp_hosts (tenant_id);
 CREATE INDEX IF NOT EXISTS cp_hosts_tenant_hostname_idx ON cp_hosts (tenant_id, lower(hostname));
 
+-- SAH channel policies (docs/sah-tcp-protocol.md §4, docs/sah-file-protocol.md
+-- §2). NULL on the host means "use the tenant default"; NULL on the tenant
+-- means deny-all ({"allow":[]} / {"roots":[]}). A host value replaces the
+-- tenant value, it is never merged. The application validates the shape on
+-- write and treats a malformed stored value as deny-all.
+ALTER TABLE cp_hosts ADD COLUMN IF NOT EXISTS tcp_policy JSONB;
+ALTER TABLE cp_hosts ADD COLUMN IF NOT EXISTS file_policy JSONB;
+ALTER TABLE cp_tenants ADD COLUMN IF NOT EXISTS tcp_policy JSONB;
+ALTER TABLE cp_tenants ADD COLUMN IF NOT EXISTS file_policy JSONB;
+
 CREATE TABLE IF NOT EXISTS cp_telemetry (
   id BIGSERIAL PRIMARY KEY,
   host_id TEXT NOT NULL,

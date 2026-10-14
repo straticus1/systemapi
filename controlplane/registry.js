@@ -12,6 +12,7 @@ const { GENESIS, canonicalJSON, rowHash, verifyRows } = require('./chain');
 const { scopesForKeyRows } = require('./authz');
 const { escapeLike, efficiency: efficiencyOf } = require('./stats');
 const { fingerprint } = require('./token');
+const { assertPolicyShape } = require('./channels');
 
 const METRICS = new Set(['cpu.usage_percent', 'memory.used_percent', 'disk.used_percent']);
 const ROLES = new Set(['admin', 'operator', 'viewer']);
@@ -112,6 +113,9 @@ class MemoryRegistry {
     this.scopes = new Map();
         this.software = [];
     this.cves = [];
+    // Channel policies live apart from host rows so publicHost never sees them.
+    this.hostPolicies = new Map();
+    this.tenantPolicies = new Map();
   }
 
   async enroll({ tenantId, userId, keyId, hostId, hostname, os, platform, sshPubkey }) {
@@ -247,6 +251,44 @@ class MemoryRegistry {
     row.status = 'online';
     if (fields.os) row.os = fields.os;
     if (fields.platform) row.platform = fields.platform;
+  }
+
+  // SAH channel policies, raw (unparsed) values. See controlplane/channels.js
+  // effectivePolicies for the host -> tenant -> deny-all fallback.
+  async channelPolicies(hostId) {
+    const row = this.hosts.get(hostId);
+    if (!row) return null;
+    const h = this.hostPolicies.get(hostId) || {};
+    const t = this.tenantPolicies.get(row.tenant_id) || {};
+    return {
+      host_tcp_policy: h.tcp_policy ?? null,
+      host_file_policy: h.file_policy ?? null,
+      tenant_tcp_policy: t.tcp_policy ?? null,
+      tenant_file_policy: t.file_policy ?? null
+    };
+  }
+
+  // Only keys present in `fields` change; null clears a column.
+  async setHostChannelPolicy(hostId, fields) {
+    if (!this.hosts.has(hostId)) throw http(404, 'not_found');
+    const cur = { ...(this.hostPolicies.get(hostId) || {}) };
+    for (const key of ['tcp_policy', 'file_policy']) {
+      if (!(key in fields)) continue;
+      assertPolicyShape(key === 'tcp_policy' ? 'tcp' : 'file', fields[key]);
+      cur[key] = fields[key] === null ? null : JSON.parse(JSON.stringify(fields[key]));
+    }
+    this.hostPolicies.set(hostId, cur);
+  }
+
+  async setTenantChannelPolicy(tenantId, fields) {
+    if (!this.tenants.has(tenantId)) throw http(404, 'not_found');
+    const cur = { ...(this.tenantPolicies.get(tenantId) || {}) };
+    for (const key of ['tcp_policy', 'file_policy']) {
+      if (!(key in fields)) continue;
+      assertPolicyShape(key === 'tcp_policy' ? 'tcp' : 'file', fields[key]);
+      cur[key] = fields[key] === null ? null : JSON.parse(JSON.stringify(fields[key]));
+    }
+    this.tenantPolicies.set(tenantId, cur);
   }
 
   async setHostStatus(hostId, status) {
@@ -741,6 +783,41 @@ class PgRegistry {
        WHERE host_id = $1`,
       [hostId, fields.os || null, fields.platform || null]
     );
+  }
+
+  async channelPolicies(hostId) {
+    const res = await this.pool.query(
+      `SELECT h.tcp_policy AS host_tcp_policy, h.file_policy AS host_file_policy,
+              t.tcp_policy AS tenant_tcp_policy, t.file_policy AS tenant_file_policy
+       FROM cp_hosts h JOIN cp_tenants t ON t.tenant_id = h.tenant_id
+       WHERE h.host_id = $1`,
+      [hostId]
+    );
+    return res.rows[0] || null;
+  }
+
+  async setHostChannelPolicy(hostId, fields) {
+    await this.setChannelPolicy('cp_hosts', 'host_id', hostId, fields);
+  }
+
+  async setTenantChannelPolicy(tenantId, fields) {
+    await this.setChannelPolicy('cp_tenants', 'tenant_id', tenantId, fields);
+  }
+
+  // table and key are fixed identifiers from the two callers above, never
+  // caller input. Values are parameters.
+  async setChannelPolicy(table, keyColumn, id, fields) {
+    const sets = [];
+    const values = [id];
+    for (const key of ['tcp_policy', 'file_policy']) {
+      if (!(key in fields)) continue;
+      assertPolicyShape(key === 'tcp_policy' ? 'tcp' : 'file', fields[key]);
+      values.push(fields[key] === null ? null : JSON.stringify(fields[key]));
+      sets.push(`${key} = $${values.length}::jsonb`);
+    }
+    if (sets.length === 0) return;
+    const res = await this.pool.query(`UPDATE ${table} SET ${sets.join(', ')} WHERE ${keyColumn} = $1`, values);
+    if (res.rowCount === 0) throw http(404, 'not_found');
   }
 
   async setHostStatus(hostId, status) {

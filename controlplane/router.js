@@ -12,6 +12,7 @@ const { hasScope, roleFromGroups, scopesForRole, ALL } = require('./authz');
 const oauth = require('./oauth');
 const { issueLease } = require('./lease');
 const { issueTicket, TTL_MS: TICKET_TTL_MS } = require('./tickets');
+const { CHANNEL_PURPOSES, PURPOSE_SCOPES, validateBinding, policyDecision } = require('./channels');
 const { fingerprint, randomToken, tokenEqual } = require('./token');
 const { sealSecret, openSecret } = require('./seal');
 const { assertWebhookURL } = require('./webhook');
@@ -22,9 +23,10 @@ const SCRIPT_MAX = 64 * 1024;
 const COOLDOWN_MS = 5 * 60 * 1000;
 const USER_RE = /^[a-zA-Z0-9][a-zA-Z0-9._@-]{0,128}$/;
 const RESOLVE_NAME_RE = /^[A-Za-z0-9._-]{1,253}$/;
-const TICKET_PURPOSES = new Set(['terminal:open', 'terminal:root', 'breakglass:open']);
+const TICKET_PURPOSES = new Set(['terminal:open', 'terminal:root', 'breakglass:open', ...CHANNEL_PURPOSES]);
 const TICKET_RATE_DEFAULT = 20;
-const PRIVILEGED_PURPOSES = new Set(['breakglass:open', 'terminal:root']);
+const TICKET_RATE_TCP_DEFAULT = 120;
+const PRIVILEGED_PURPOSES = new Set(['breakglass:open', 'terminal:root', 'file:root']);
 const formBody = express.urlencoded({ extended: false, limit: '8kb' });
 const BOOL_ENTITLEMENTS = [
   'allow_fs_write',
@@ -300,17 +302,29 @@ async function runScript(fleet, principal, host, script, entitlements) {
   return { request_id: requestId, result };
 }
 
-// Ticket rate, per actor and host, per minute. Ordinary terminals use
-// SYSTEMAPI_TICKET_RATE_PER_HOST (default 20); breakglass:open and
-// terminal:root use their own budget, SYSTEMAPI_TICKET_RATE_PRIVILEGED
-// (default 20), so one operator cannot starve another user or an admin's
-// break-glass. In process memory, like the tickets themselves.
+// Ticket rate, per actor and host, per minute. Three separate budgets:
+// - terminal: terminal:open, file:read, file:write;
+//   SYSTEMAPI_TICKET_RATE_PER_HOST (default 20);
+// - privileged: breakglass:open, terminal:root, file:root;
+//   SYSTEMAPI_TICKET_RATE_PRIVILEGED (default 20), so one operator cannot
+//   starve another user or an admin's break-glass;
+// - tcp: tcp:open; SYSTEMAPI_TICKET_RATE_TCP (default 120), because one RDP
+//   or HTTP session opens several connections (TCP §2).
+// In process memory, like the tickets themselves.
+function ticketBudget(purpose) {
+  if (PRIVILEGED_PURPOSES.has(purpose)) return 'privileged';
+  if (purpose === 'tcp:open') return 'tcp';
+  return 'terminal';
+}
+
 function ticketAllowed(fleet, actor, hostId, purpose, now = Date.now()) {
   const env = fleet.env || {};
-  const privileged = PRIVILEGED_PURPOSES.has(purpose);
-  const raw = Number(privileged ? env.SYSTEMAPI_TICKET_RATE_PRIVILEGED : env.SYSTEMAPI_TICKET_RATE_PER_HOST);
-  const limit = Number.isInteger(raw) && raw > 0 ? raw : TICKET_RATE_DEFAULT;
-  const key = JSON.stringify([String(actor), hostId, privileged ? 'privileged' : 'terminal']);
+  const budget = ticketBudget(purpose);
+  const setting = { privileged: 'SYSTEMAPI_TICKET_RATE_PRIVILEGED', tcp: 'SYSTEMAPI_TICKET_RATE_TCP', terminal: 'SYSTEMAPI_TICKET_RATE_PER_HOST' }[budget];
+  const raw = Number(env[setting]);
+  const fallback = budget === 'tcp' ? TICKET_RATE_TCP_DEFAULT : TICKET_RATE_DEFAULT;
+  const limit = Number.isInteger(raw) && raw > 0 ? raw : fallback;
+  const key = JSON.stringify([String(actor), hostId, budget]);
   if (!fleet.ticketRate) fleet.ticketRate = new Map();
   const recent = (fleet.ticketRate.get(key) || []).filter((t) => now - t < 60_000);
   if (recent.length >= limit) {
@@ -329,21 +343,28 @@ function ticketAllowed(fleet, actor, hostId, purpose, now = Date.now()) {
 
 // The audit row is written before the ticket exists, so a failed audit write
 // issues nothing. The ticket itself is never written to the audit log.
-async function issueAuditedTicket(fleet, principal, host, purpose) {
+// binding is null, { target } (tcp:open) or { root } (file:*); it is
+// audited and stored on the ticket.
+async function issueAuditedTicket(fleet, principal, host, purpose, binding = null) {
   if (!fleet.tickets) throw http(503, 'tickets_unavailable');
   if (!ticketAllowed(fleet, principal.userId, host.host_id, purpose)) throw http(429, 'rate_limited');
+  const payload = { purpose };
+  if (binding && binding.target) payload.target = { host: binding.target.host, port: binding.target.port };
+  if (binding && binding.root) payload.root = binding.root;
   await fleet.registry.appendAudit({
     tenant_id: host.tenant_id,
     host_id: host.host_id,
     actor: principal.userId,
     action: 'ticket_issued',
-    payload: { purpose }
+    payload
   });
   const ticket = issueTicket(fleet.tickets, {
     hostId: host.host_id,
     purpose,
     tenantId: host.tenant_id,
-    actor: principal.userId
+    actor: principal.userId,
+    target: binding && binding.target,
+    root: binding && binding.root
   });
   return {
     ticket,
@@ -518,9 +539,18 @@ function mount(app, fleet) {
     const purpose = req.body && req.body.purpose;
     const hostId = req.body && req.body.host_id;
     if (typeof purpose !== 'string' || !TICKET_PURPOSES.has(purpose)) throw http(400, 'bad_purpose');
+    // Channel purposes: shape first (400), then host (404), scope (403),
+    // refused classes and server policy (403), then the rate budget (429).
+    const parsed = validateBinding(purpose, req.body);
+    if (!parsed.ok) throw http(400, parsed.error);
     const host = await requireHost(fleet, principal, hostId);
-    requireScope(fleet, principal, host.tenant_id, purpose);
-    res.json(await issueAuditedTicket(fleet, principal, host, purpose));
+    for (const scope of PURPOSE_SCOPES[purpose] || [purpose]) requireScope(fleet, principal, host.tenant_id, scope);
+    if (CHANNEL_PURPOSES.has(purpose)) {
+      if (parsed.forbidden) throw http(403, 'target_forbidden');
+      const denied = await policyDecision(fleet.registry, host.host_id, purpose, parsed.binding);
+      if (denied) throw http(denied === 'bad_target' || denied === 'bad_root' ? 400 : 403, denied);
+    }
+    res.json(await issueAuditedTicket(fleet, principal, host, purpose, parsed.binding));
   }));
 
   app.get('/api/v1/hosts/resolve', wrap(async (req, res) => {
