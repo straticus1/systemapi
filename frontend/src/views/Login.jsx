@@ -13,20 +13,19 @@ const Login = () => {
 
   // Check if user is already authenticated via session
   useEffect(() => {
-    checkSession();
-  }, []);
-
-  const checkSession = async () => {
-    try {
-      const res = await api.get('/oauth/user');
-      if (res.data.authenticated) {
-        // User is authenticated via OAuth, redirect to dashboard
-        setApiKey('oauth_session'); // Use a placeholder to indicate OAuth auth
+    const checkSession = async () => {
+      try {
+        const res = await api.get('/oauth/user');
+        if (res.data.authenticated) {
+          // User is authenticated via OAuth, redirect to dashboard
+          setApiKey('oauth_session'); // Use a placeholder to indicate OAuth auth
+        }
+      } catch {
+        // Not authenticated, show login options
       }
-    } catch {
-      // Not authenticated, show login options
-    }
-  };
+    };
+    checkSession();
+  }, [setApiKey]);
 
   const handleOAuthLogin = () => {
     // Redirect to OAuth login endpoint
