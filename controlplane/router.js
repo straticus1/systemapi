@@ -24,6 +24,7 @@ const USER_RE = /^[a-zA-Z0-9][a-zA-Z0-9._@-]{0,128}$/;
 const RESOLVE_NAME_RE = /^[A-Za-z0-9._-]{1,253}$/;
 const TICKET_PURPOSES = new Set(['terminal:open', 'terminal:root', 'breakglass:open']);
 const TICKET_RATE_DEFAULT = 20;
+const PRIVILEGED_PURPOSES = new Set(['breakglass:open', 'terminal:root']);
 const formBody = express.urlencoded({ extended: false, limit: '8kb' });
 const BOOL_ENTITLEMENTS = [
   'allow_fs_write',
@@ -284,22 +285,28 @@ async function runScript(fleet, principal, host, script, entitlements) {
   return { request_id: requestId, result };
 }
 
-// Per-host ticket rate: SYSTEMAPI_TICKET_RATE_PER_HOST tickets per minute
-// (default 20). In process memory, like the tickets themselves.
-function ticketAllowed(fleet, hostId, now = Date.now()) {
-  const raw = Number((fleet.env || {}).SYSTEMAPI_TICKET_RATE_PER_HOST);
+// Ticket rate, per actor and host, per minute. Ordinary terminals use
+// SYSTEMAPI_TICKET_RATE_PER_HOST (default 20); breakglass:open and
+// terminal:root use their own budget, SYSTEMAPI_TICKET_RATE_PRIVILEGED
+// (default 20), so one operator cannot starve another user or an admin's
+// break-glass. In process memory, like the tickets themselves.
+function ticketAllowed(fleet, actor, hostId, purpose, now = Date.now()) {
+  const env = fleet.env || {};
+  const privileged = PRIVILEGED_PURPOSES.has(purpose);
+  const raw = Number(privileged ? env.SYSTEMAPI_TICKET_RATE_PRIVILEGED : env.SYSTEMAPI_TICKET_RATE_PER_HOST);
   const limit = Number.isInteger(raw) && raw > 0 ? raw : TICKET_RATE_DEFAULT;
+  const key = JSON.stringify([String(actor), hostId, privileged ? 'privileged' : 'terminal']);
   if (!fleet.ticketRate) fleet.ticketRate = new Map();
-  const recent = (fleet.ticketRate.get(hostId) || []).filter((t) => now - t < 60_000);
+  const recent = (fleet.ticketRate.get(key) || []).filter((t) => now - t < 60_000);
   if (recent.length >= limit) {
-    fleet.ticketRate.set(hostId, recent);
+    fleet.ticketRate.set(key, recent);
     return false;
   }
   recent.push(now);
-  fleet.ticketRate.set(hostId, recent);
+  fleet.ticketRate.set(key, recent);
   if (fleet.ticketRate.size > 10_000) {
-    for (const [id, times] of fleet.ticketRate) {
-      if (!times.some((t) => now - t < 60_000)) fleet.ticketRate.delete(id);
+    for (const [k, times] of fleet.ticketRate) {
+      if (!times.some((t) => now - t < 60_000)) fleet.ticketRate.delete(k);
     }
   }
   return true;
@@ -309,7 +316,7 @@ function ticketAllowed(fleet, hostId, now = Date.now()) {
 // issues nothing. The ticket itself is never written to the audit log.
 async function issueAuditedTicket(fleet, principal, host, purpose) {
   if (!fleet.tickets) throw http(503, 'tickets_unavailable');
-  if (!ticketAllowed(fleet, host.host_id)) throw http(429, 'rate_limited');
+  if (!ticketAllowed(fleet, principal.userId, host.host_id, purpose)) throw http(429, 'rate_limited');
   await fleet.registry.appendAudit({
     tenant_id: host.tenant_id,
     host_id: host.host_id,

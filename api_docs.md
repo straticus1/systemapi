@@ -11,9 +11,11 @@ the router.
 - Dashboard: the OAuth session cookie set by `/oauth/login`.
 - Browser and CLI WebSockets: a single-use ticket from `POST /api/v1/ws-ticket`
   (`purpose` is `terminal:open`, `terminal:root` or `breakglass:open`). Tickets
-  last 60 seconds, are bound to one host and purpose, and are audited. A host
-  gets at most `SYSTEMAPI_TICKET_RATE_PER_HOST` (default 20) tickets a minute;
-  more return 429 `rate_limited`.
+  last 60 seconds, are bound to one host and purpose, and are audited. Each
+  caller gets at most `SYSTEMAPI_TICKET_RATE_PER_HOST` (default 20)
+  `terminal:open` tickets a minute per host, and a separate
+  `SYSTEMAPI_TICKET_RATE_PRIVILEGED` (default 20) budget for `terminal:root`
+  and break-glass; more return 429 `rate_limited`.
   `terminal:root` needs the admin-only scope `terminal:root`.
 - Agents: `Authorization: Bearer <key>` on the WebSocket upgrade, plus the
   enrollment headers described in `cli_docs.md`.

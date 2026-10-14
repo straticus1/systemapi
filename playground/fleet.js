@@ -30,6 +30,7 @@ const { deliverWebhooks, COOLDOWN_MS } = require('../controlplane/router');
 
 const PTY_FRAME_MAX = 64 * 1024;
 const PTY_PENDING_MAX = 1024 * 1024;
+const PTY_HELD_INPUT_MAX = 256 * 1024;
 const PTY_CLIENT_BUFFER_DEFAULT = 8 * 1024 * 1024;
 const PTY_PER_ACTOR_DEFAULT = 8;
 const PTY_START_TIMEOUT_MS = 30_000;
@@ -317,6 +318,8 @@ class FleetManager {
             finalized: false,
             pending: [],
             pendingBytes: 0,
+            heldInput: [],
+            heldInputBytes: 0,
             ptyUser: null,
             recording: 'off',
             privilegedGroups: [],
@@ -365,8 +368,25 @@ class FleetManager {
         }
     }
 
+    // Client frames wait until the shell is announced, which is after the
+    // start audit row is written and the recording check passed. Nothing
+    // reaches the agent's PTY before then.
     onTerminalClientMessage(session, buf, isBinary) {
         if (session.ended || isBinary) return;
+        if (!session.announced) {
+            session.heldInputBytes += buf.length;
+            if (session.heldInputBytes > PTY_HELD_INPUT_MAX) {
+                this.endTerminal(session, 'internal', -1, { error: 'internal', notifyAgent: true });
+                return;
+            }
+            session.heldInput.push(Buffer.from(buf));
+            return;
+        }
+        this.forwardClientFrame(session, buf);
+    }
+
+    forwardClientFrame(session, buf) {
+        if (session.ended) return;
         const text = buf.toString();
         let cmd;
         try {
@@ -421,6 +441,7 @@ class FleetManager {
         clearTimeout(session.startTimer);
         this.terminalSessions.delete(session.id);
         session.pending = [];
+        session.heldInput = [];
         if (opts.error) {
             this.failTerminalSocket(session.client, opts.error);
         } else if (opts.notifyClient && session.client.readyState === WebSocket.OPEN) {
@@ -579,6 +600,10 @@ class FleetManager {
         session.pending = [];
         session.pendingBytes = 0;
         for (const chunk of held) this.sendOutput(session, chunk);
+        const input = session.heldInput;
+        session.heldInput = [];
+        session.heldInputBytes = 0;
+        for (const frame of input) this.forwardClientFrame(session, frame);
     }
 
     onAgentPtyExit(ws, hostId, msg) {

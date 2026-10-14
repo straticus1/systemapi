@@ -1246,26 +1246,40 @@ test('the audit chain covers actor, host, tenant and action; legacy rows still v
   assert.equal((await legacy.verifyAudit()).ok, true);
 });
 
-test('ws-ticket is rate limited per host', async () => {
+test('ws-ticket is rate limited per actor and host, with a separate privileged budget', async () => {
   const fm = fleet();
-  fm.env = { NODE_ENV: 'test', SYSTEMAPI_TICKET_RATE_PER_HOST: '2' };
+  fm.env = { NODE_ENV: 'test', SYSTEMAPI_TICKET_RATE_PER_HOST: '2', SYSTEMAPI_TICKET_RATE_PRIVILEGED: '2' };
   await seed(fm);
   await fm.registry.setScopes('ak_test', ['admin']);
-  const { server, url } = await listen(appFor(fm));
-  const ticket = () => call(`${url}/api/v1/ws-ticket`, {
+  await fm.registry.addMember('acme', 'op-1', 'operator', 'op@example');
+  const opApp = await listen(appFor(fm, { id: 'op-1', email: 'op@example', groups: [] }));
+  const adminApp = await listen(appFor(fm));
+  const ticket = (url, purpose, headers = {}) => call(`${url}/api/v1/ws-ticket`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-api-key': 'good-key' },
-    body: JSON.stringify({ host_id: HOST_A, purpose: 'terminal:open' })
+    headers: { 'content-type': 'application/json', ...headers },
+    body: JSON.stringify({ host_id: HOST_A, purpose })
   });
+  const admin = { 'x-api-key': 'good-key' };
   try {
-    assert.equal((await ticket()).status, 200);
-    assert.equal((await ticket()).status, 200);
-    const limited = await ticket();
-    assert.equal(limited.status, 429);
-    assert.equal(limited.body.error, 'rate_limited');
-    assert.equal(fm.tickets.size, 2);
-    assert.equal(fm.registry.audit.filter((row) => row.action === 'ticket_issued').length, 2);
+    // An operator floods ordinary terminal tickets for the host.
+    assert.equal((await ticket(opApp.url, 'terminal:open')).status, 200);
+    assert.equal((await ticket(opApp.url, 'terminal:open')).status, 200);
+    for (let i = 0; i < 5; i++) {
+      const limited = await ticket(opApp.url, 'terminal:open');
+      assert.equal(limited.status, 429);
+      assert.equal(limited.body.error, 'rate_limited');
+    }
+    // The admin still gets break-glass, a root terminal and an ordinary one.
+    assert.equal((await ticket(adminApp.url, 'breakglass:open', admin)).status, 200);
+    assert.equal((await ticket(adminApp.url, 'terminal:root', admin)).status, 200);
+    assert.equal((await ticket(adminApp.url, 'terminal:open', admin)).status, 200);
+    // Privileged tickets have their own budget per actor.
+    assert.equal((await ticket(adminApp.url, 'breakglass:open', admin)).status, 429);
+    assert.equal((await ticket(adminApp.url, 'terminal:open', admin)).status, 200);
+    assert.equal((await ticket(adminApp.url, 'terminal:open', admin)).status, 429);
+    assert.equal(fm.registry.audit.filter((row) => row.action === 'ticket_issued').length, 6);
   } finally {
-    server.close();
+    opApp.server.close();
+    adminApp.server.close();
   }
 });

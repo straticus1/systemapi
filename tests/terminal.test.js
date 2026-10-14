@@ -574,3 +574,70 @@ test('an oversized agent frame closes the agent connection with 1009', async () 
     await r.close();
   }
 });
+
+test('client input is held until the shell is announced', async () => {
+  const r = await rig();
+  let releaseAudit;
+  const gate = new Promise((resolve) => { releaseAudit = resolve; });
+  const append = r.fm.registry.appendAudit.bind(r.fm.registry);
+  r.fm.registry.appendAudit = async (entry) => {
+    if (entry.action === 'terminal_start') await gate;
+    return append(entry);
+  };
+  try {
+    const agent = await connectAgent(r);
+    const client = openClient(r);
+    const start = await waitUntil('pty_start', () => agentFrames(agent, 'pty_start')[0]);
+    await waitUntil('open', () => client.ws.readyState === WebSocket.OPEN);
+    client.ws.send(JSON.stringify({ type: 'pty_input', data: 'early-1\n' }));
+    sendStarted(agent, start.session_id);
+    client.ws.send(JSON.stringify({ type: 'pty_input', data: 'early-2\n' }));
+    client.ws.send(JSON.stringify({ type: 'pty_eof' }));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(agentFrames(agent, 'pty_input').length, 0);
+    assert.equal(agentFrames(agent, 'pty_eof').length, 0);
+    releaseAudit();
+    await waitUntil('flushed', () => agentFrames(agent, 'pty_eof').length === 1);
+    assert.deepEqual(agentFrames(agent, 'pty_input').map((f) => Buffer.from(f.data_b64, 'base64').toString()), ['early-1\n', 'early-2\n']);
+    const started = client.box.frames.findIndex((f) => f.type === 'pty_status' && f.payload.status === 'started');
+    assert.ok(started > 0);
+  } finally {
+    await r.close();
+  }
+});
+
+test('input sent to a root session that fails the recording check never reaches the agent', async () => {
+  const r = await rig();
+  try {
+    const agent = await connectAgent(r);
+    const client = openClient(r, { purpose: 'terminal:root' });
+    const start = await waitUntil('pty_start', () => agentFrames(agent, 'pty_start')[0]);
+    await waitUntil('open', () => client.ws.readyState === WebSocket.OPEN);
+    client.ws.send(JSON.stringify({ type: 'pty_input', data: 'id\n' }));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    sendStarted(agent, start.session_id, { recording: 'off' });
+    await waitUntil('refused', () => client.box.closeCode === 1011);
+    assert.equal(client.box.frames.at(-1).payload.error, 'recording_unavailable');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(agentFrames(agent, 'pty_input').length, 0);
+  } finally {
+    await r.close();
+  }
+});
+
+test('held client input over its cap ends the session', async () => {
+  const r = await rig();
+  try {
+    const agent = await connectAgent(r);
+    const client = openClient(r);
+    await waitUntil('pty_start', () => agentFrames(agent, 'pty_start')[0]);
+    await waitUntil('open', () => client.ws.readyState === WebSocket.OPEN);
+    const chunk = JSON.stringify({ type: 'pty_input', data_b64: 'A'.repeat(60 * 1024) });
+    for (let i = 0; i < 6; i++) client.ws.send(chunk);
+    await waitUntil('ended', () => client.box.closeCode === 1011);
+    assert.equal(client.box.frames.at(-1).payload.error, 'internal');
+    assert.equal(agentFrames(agent, 'pty_input').length, 0);
+  } finally {
+    await r.close();
+  }
+});
