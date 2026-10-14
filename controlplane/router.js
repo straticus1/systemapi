@@ -11,7 +11,7 @@ const axios = require('axios');
 const { hasScope, roleFromGroups, scopesForRole, ALL } = require('./authz');
 const oauth = require('./oauth');
 const { issueLease } = require('./lease');
-const { issueTicket } = require('./tickets');
+const { issueTicket, TTL_MS: TICKET_TTL_MS } = require('./tickets');
 const { fingerprint, randomToken } = require('./token');
 const { sealSecret, openSecret } = require('./seal');
 const { assertWebhookURL } = require('./webhook');
@@ -21,6 +21,8 @@ const { listPlaybooks, readPlaybook } = require('./playbooks');
 const SCRIPT_MAX = 64 * 1024;
 const COOLDOWN_MS = 5 * 60 * 1000;
 const USER_RE = /^[a-zA-Z0-9][a-zA-Z0-9._@-]{0,128}$/;
+const RESOLVE_NAME_RE = /^[A-Za-z0-9._-]{1,253}$/;
+const TICKET_PURPOSES = new Set(['terminal:open', 'terminal:root', 'breakglass:open']);
 const formBody = express.urlencoded({ extended: false, limit: '8kb' });
 const BOOL_ENTITLEMENTS = [
   'allow_fs_write',
@@ -281,6 +283,32 @@ async function runScript(fleet, principal, host, script, entitlements) {
   return { request_id: requestId, result };
 }
 
+// The audit row is written before the ticket exists, so a failed audit write
+// issues nothing. The ticket itself is never written to the audit log.
+async function issueAuditedTicket(fleet, principal, host, purpose) {
+  if (!fleet.tickets) throw http(503, 'tickets_unavailable');
+  await fleet.registry.appendAudit({
+    tenant_id: host.tenant_id,
+    host_id: host.host_id,
+    actor: principal.userId,
+    action: 'ticket_issued',
+    payload: { purpose }
+  });
+  const ticket = issueTicket(fleet.tickets, {
+    hostId: host.host_id,
+    purpose,
+    tenantId: host.tenant_id,
+    actor: principal.userId
+  });
+  return {
+    ticket,
+    expires_at: new Date(Date.now() + TICKET_TTL_MS).toISOString(),
+    expires_in: TICKET_TTL_MS / 1000,
+    host_id: host.host_id,
+    purpose
+  };
+}
+
 async function deliverWebhooks(fleet, tenantId, body) {
   if (!fleet.registry.webhooksForTenant) return;
   let hooks = [];
@@ -384,12 +412,27 @@ function mount(app, fleet) {
     const principal = await authenticate(req, fleet);
     const purpose = req.body && req.body.purpose;
     const hostId = req.body && req.body.host_id;
-    if (purpose !== 'terminal:open' && purpose !== 'breakglass:open') throw http(400, 'bad_purpose');
+    if (typeof purpose !== 'string' || !TICKET_PURPOSES.has(purpose)) throw http(400, 'bad_purpose');
     const host = await requireHost(fleet, principal, hostId);
     requireScope(fleet, principal, host.tenant_id, purpose);
-    if (!fleet.tickets) throw http(503, 'tickets_unavailable');
-    const ticket = issueTicket(fleet.tickets, { hostId: host.host_id, purpose, tenantId: host.tenant_id });
-    res.json({ ticket, expires_in: 60, host_id: host.host_id, purpose });
+    res.json(await issueAuditedTicket(fleet, principal, host, purpose));
+  }));
+
+  app.get('/api/v1/hosts/resolve', wrap(async (req, res) => {
+    const principal = await authenticate(req, fleet);
+    const name = req.query.name;
+    if (typeof name !== 'string' || !RESOLVE_NAME_RE.test(name)) throw http(400, 'invalid_name');
+    const ids = tenantIds(principal).filter((id) => hasScope(scopesFor(principal, id), 'hosts:read'));
+    const matches = ids.length ? await fleet.registry.resolveHosts(ids, name) : [];
+    if (matches.length === 0) throw http(404, 'not_found');
+    if (matches.length > 1) {
+      res.status(409).json({ error: 'ambiguous', matches: matches.length });
+      return;
+    }
+    const host = matches[0];
+    let online = host.status === 'online';
+    if (fleet.connectedAgents) online = fleet.connectedAgents.has(host.host_id);
+    res.json({ host_id: host.host_id, hostname: host.hostname, tenant: host.tenant_id, status: online ? 'online' : 'offline' });
   }));
 
   app.get('/api/v1/fleet/export', wrap(async (req, res) => {
@@ -493,13 +536,7 @@ function mount(app, fleet) {
     const principal = await authenticate(req, fleet);
     const host = await requireHost(fleet, principal, req.params.hostId);
     requireScope(fleet, principal, host.tenant_id, 'breakglass:open');
-    if (!fleet.tickets) throw http(503, 'tickets_unavailable');
-    const ticket = issueTicket(fleet.tickets, {
-      hostId: host.host_id,
-      purpose: 'breakglass:open',
-      tenantId: host.tenant_id
-    });
-    res.json({ ticket, expires_in: 60, host_id: host.host_id, purpose: 'breakglass:open' });
+    res.json(await issueAuditedTicket(fleet, principal, host, 'breakglass:open'));
   }));
 
   app.get('/api/v1/fleet/:hostId/comments', wrap(async (req, res) => {

@@ -2,8 +2,9 @@
 // and an OAuth session with no tenant listing every host. An API key with no
 // scope rows has no scopes. SYSTEMAPI_REQUIRE_SCOPES=0 is the migration
 // escape and grants operator, which includes exec:run and excludes
-// breakglass:open and admin. Does NOT bind a session to a tenant by itself.
-// admin implies every scope.
+// breakglass:open, terminal:root and admin. Does NOT bind a session to a
+// tenant by itself. admin implies every scope. terminal:root (a root shell)
+// is granted to admin only.
 'use strict';
 
 const ALL = Object.freeze([
@@ -12,6 +13,7 @@ const ALL = Object.freeze([
   'metrics:read',
   'exec:run',
   'terminal:open',
+  'terminal:root',
   'breakglass:open',
   'alerts:write',
   'audit:read',

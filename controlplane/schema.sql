@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS cp_hosts (
 );
 
 CREATE INDEX IF NOT EXISTS cp_hosts_tenant_idx ON cp_hosts (tenant_id);
+CREATE INDEX IF NOT EXISTS cp_hosts_tenant_hostname_idx ON cp_hosts (tenant_id, lower(hostname));
 
 CREATE TABLE IF NOT EXISTS cp_telemetry (
   id BIGSERIAL PRIMARY KEY,

@@ -158,6 +158,17 @@ class MemoryRegistry {
     return this.decorate(row);
   }
 
+  // Exact host_id, else exact case-insensitive hostname, inside tenantIds.
+  async resolveHosts(tenantIds, name) {
+    const allow = new Set(tenantIds || []);
+    const byId = this.hosts.get(name);
+    if (byId && allow.has(byId.tenant_id)) return [this.decorate(byId)];
+    const needle = String(name).toLowerCase();
+    return [...this.hosts.values()]
+      .filter((h) => allow.has(h.tenant_id) && String(h.hostname).toLowerCase() === needle)
+      .map((row) => this.decorate(row));
+  }
+
   async touchHost(hostId, fields = {}) {
     const row = this.hosts.get(hostId);
     if (!row) return;
@@ -581,6 +592,24 @@ class PgRegistry {
       sparkline: series,
       cpu_percent: series.length ? series[series.length - 1] : null
     });
+  }
+
+  // Exact host_id, else exact case-insensitive hostname, inside tenantIds.
+  async resolveHosts(tenantIds, name) {
+    if (!tenantIds || tenantIds.length === 0) return [];
+    const byId = await this.pool.query(
+      `SELECT host_id, tenant_id, hostname, status FROM cp_hosts
+       WHERE host_id = $1 AND tenant_id = ANY($2::text[])`,
+      [name, tenantIds]
+    );
+    if (byId.rows.length > 0) return byId.rows;
+    const res = await this.pool.query(
+      `SELECT host_id, tenant_id, hostname, status FROM cp_hosts
+       WHERE lower(hostname) = lower($1) AND tenant_id = ANY($2::text[])
+       ORDER BY host_id LIMIT 100`,
+      [name, tenantIds]
+    );
+    return res.rows;
   }
 
   async touchHost(hostId, fields = {}) {

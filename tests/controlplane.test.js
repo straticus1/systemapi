@@ -1116,3 +1116,107 @@ test('clampEntitlements denies host lists to operators and stars to admins', () 
     assert.deepEqual(denied.allow_sysctl, []);
   }
 });
+
+test('hosts/resolve matches exactly, case-insensitively, inside the caller tenants only', async () => {
+  const fm = fleet();
+  const pub = await seed(fm);
+  const HOST_C = '33333333-3333-4333-8333-333333333333';
+  const HOST_D = '44444444-4444-4444-8444-444444444444';
+  for (const [hostId, hostname] of [[HOST_C, 'dup.example'], [HOST_D, 'DUP.example']]) {
+    await fm.registry.enroll({
+      tenantId: 'acme', userId: 'user-1', keyId: 'k1', hostId, hostname, os: 'linux', platform: 'amd64', sshPubkey: pub
+    });
+  }
+  await fm.registry.setScopes('ak_test', ['hosts:read']);
+  fm.connectedAgents = new Map([[HOST_A, {}]]);
+  const { server, url } = await listen(appFor(fm));
+  const resolve = (name) => call(`${url}/api/v1/hosts/resolve?name=${encodeURIComponent(name)}`, { headers: { 'x-api-key': 'good-key' } });
+  try {
+    const exact = await resolve('a.example');
+    assert.equal(exact.status, 200);
+    assert.deepEqual(exact.body, { host_id: HOST_A, hostname: 'a.example', tenant: 'acme', status: 'online' });
+
+    const upper = await resolve('A.EXAMPLE');
+    assert.equal(upper.status, 200);
+    assert.equal(upper.body.host_id, HOST_A);
+
+    const byId = await resolve(HOST_C);
+    assert.equal(byId.status, 200);
+    assert.equal(byId.body.host_id, HOST_C);
+    assert.equal(byId.body.status, 'offline');
+
+    const ambiguous = await resolve('dup.example');
+    assert.equal(ambiguous.status, 409);
+    assert.deepEqual(ambiguous.body, { error: 'ambiguous', matches: 2 });
+
+    for (const name of ['b.example', HOST_B, 'a.exam', 'example', 'nope.example']) {
+      const miss = await resolve(name);
+      assert.equal(miss.status, 404, name);
+      assert.deepEqual(miss.body, { error: 'not_found' });
+    }
+
+    for (const name of ['', 'a b', 'a/b', "a'--", '%', 'x'.repeat(254)]) {
+      const bad = await resolve(name);
+      assert.equal(bad.status, 400, JSON.stringify(name));
+      assert.deepEqual(bad.body, { error: 'invalid_name' });
+    }
+    const missing = await call(`${url}/api/v1/hosts/resolve`, { headers: { 'x-api-key': 'good-key' } });
+    assert.equal(missing.status, 400);
+    const unauth = await call(`${url}/api/v1/hosts/resolve?name=a.example`);
+    assert.equal(unauth.status, 401);
+
+    await fm.registry.setScopes('ak_test', ['metrics:read']);
+    const noRead = await resolve('a.example');
+    assert.equal(noRead.status, 404);
+  } finally {
+    server.close();
+  }
+});
+
+test('terminal:root is admin only and every ticket is audited', async () => {
+  assert.equal(OPERATOR.includes('terminal:root'), false);
+  assert.equal(scopesForRole('operator').has('terminal:root'), false);
+  assert.equal(scopesForRole('admin').has('terminal:root'), true);
+
+  const fm = fleet();
+  await seed(fm);
+  await fm.registry.addMember('acme', 'op-1', 'operator', 'op@example');
+  const opApp = await listen(appFor(fm, { id: 'op-1', email: 'op@example', groups: [] }));
+  const adminApp = await listen(appFor(fm));
+  await fm.registry.setScopes('ak_test', ['admin']);
+  const ticket = (url, purpose, headers = {}) => call(`${url}/api/v1/ws-ticket`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...headers },
+    body: JSON.stringify({ host_id: HOST_A, purpose })
+  });
+  try {
+    const denied = await ticket(opApp.url, 'terminal:root');
+    assert.equal(denied.status, 403);
+    assert.equal(denied.body.error, 'scope_denied');
+    assert.equal(fm.tickets.size, 0);
+
+    const open = await ticket(opApp.url, 'terminal:open');
+    assert.equal(open.status, 200);
+    assert.match(open.body.ticket, /^stk_/);
+    assert.ok(Math.abs(Date.parse(open.body.expires_at) - Date.now() - 60_000) < 5000);
+
+    const root = await ticket(adminApp.url, 'terminal:root', { 'x-api-key': 'good-key' });
+    assert.equal(root.status, 200);
+    assert.equal(fm.tickets.get(root.body.ticket).purpose, 'terminal:root');
+    assert.equal(fm.tickets.get(root.body.ticket).actor, 'user-1');
+
+    const bad = await ticket(adminApp.url, 'terminal:everything', { 'x-api-key': 'good-key' });
+    assert.equal(bad.status, 400);
+
+    const issued = fm.registry.audit.filter((row) => row.action === 'ticket_issued');
+    assert.deepEqual(issued.map((row) => [row.actor, row.host_id, row.payload.purpose]), [
+      ['op-1', HOST_A, 'terminal:open'],
+      ['user-1', HOST_A, 'terminal:root']
+    ]);
+    for (const row of issued) assert.equal(JSON.stringify(row).includes('stk_'), false);
+    assert.equal((await fm.registry.verifyAudit()).ok, true);
+  } finally {
+    opApp.server.close();
+    adminApp.server.close();
+  }
+});

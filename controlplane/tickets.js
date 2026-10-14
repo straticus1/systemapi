@@ -1,15 +1,17 @@
 // Threats: a long-lived API key in a browser WebSocket URL. Tickets are
 // single-use, 60s, and bound to a host and purpose. Consume deletes the
-// ticket even when the host or purpose does not match.
+// ticket even when the host or purpose does not match. Tickets live in this
+// process's memory: they do not survive a restart and are not shared between
+// server nodes (known residual until phase 4).
 'use strict';
 
 const { randomToken } = require('./token');
 
 const TTL_MS = 60_000;
 
-function issueTicket(store, { hostId, purpose, tenantId }) {
+function issueTicket(store, { hostId, purpose, tenantId, actor = null }) {
   const ticket = `stk_${randomToken(32)}`;
-  store.set(ticket, { hostId, purpose, tenantId, exp: Date.now() + TTL_MS });
+  store.set(ticket, { hostId, purpose, tenantId, actor, exp: Date.now() + TTL_MS });
   return ticket;
 }
 
@@ -23,4 +25,4 @@ function consumeTicket(store, token, hostId, purpose, now = Date.now()) {
   return row;
 }
 
-module.exports = { issueTicket, consumeTicket };
+module.exports = { TTL_MS, issueTicket, consumeTicket };
