@@ -4,7 +4,7 @@
 // with jittered exponential backoff (1 s doubling to 60 s), ends every
 // terminal session when a connection drops, and exits non-zero only on a
 // fatal error: a rejected API key (HTTP 401/403), a permanent enrollment
-// refusal, or a changed control public key. Channel streams (tcp.go) are
+// refusal, or a changed control public key. Channel streams (tcp.go, file.go) are
 // per connection and end with it; a control plane that overruns a stream's
 // credit window gets its connection dropped.
 package main
@@ -117,6 +117,7 @@ func (a *agentConn) runOnce(stop <-chan struct{}) (bool, error) {
 	out := &wsWriter{c: c}
 	// Channel streams (TCP forward) live and die with this connection.
 	ch := newChannelConn(out, a.st.HostID)
+	ch.stateDir = filepath.Dir(a.statePath)
 	defer ch.close("agent_disconnected")
 
 	enrolled := make(chan error, 1)

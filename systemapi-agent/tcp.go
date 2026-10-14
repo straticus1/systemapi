@@ -24,6 +24,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -63,13 +64,18 @@ type channelConn struct {
 	hostID string
 	mux    *creditMux
 
+	// stateDir holds interrupted file uploads (file_uploads.go); empty in
+	// tests that do not resume.
+	stateDir string
+
 	mu     sync.Mutex
 	tcp    map[string]*tcpStream
+	files  map[string]*fileSession
 	closed bool
 }
 
 func newChannelConn(out ptyOut, hostID string) *channelConn {
-	return &channelConn{out: out, hostID: hostID, mux: newCreditMux(out), tcp: map[string]*tcpStream{}}
+	return &channelConn{out: out, hostID: hostID, mux: newCreditMux(out), tcp: map[string]*tcpStream{}, files: map[string]*fileSession{}}
 }
 
 type tcpOpenMsg struct {
@@ -90,6 +96,9 @@ type tcpOpenMsg struct {
 // channel frame, and returns an error only for a fatal violation (the
 // caller drops the connection).
 func (c *channelConn) handle(typ string, message []byte) (bool, error) {
+	if handled, err := c.handleFile(typ, message); handled {
+		return true, err
+	}
 	switch typ {
 	case "tcp_open", "tcp_renew", "tcp_eof", "tcp_stop", "tcp_credit":
 	default:
@@ -143,6 +152,10 @@ func (c *channelConn) data(frame []byte) error {
 	if err := c.mux.Receive(sid, len(payload)); err != nil {
 		return err
 	}
+	if strings.HasPrefix(sid, "fls_") {
+		c.fileData(sid, payload)
+		return nil
+	}
 	if s := c.lookup(sid); s != nil {
 		s.queueData(payload)
 	}
@@ -164,8 +177,15 @@ func (c *channelConn) close(reason string) {
 	for _, s := range c.tcp {
 		live = append(live, s)
 	}
+	files := make([]*fileSession, 0, len(c.files))
+	for _, s := range c.files {
+		files = append(files, s)
+	}
 	c.mu.Unlock()
 	for _, s := range live {
+		s.end(reason)
+	}
+	for _, s := range files {
 		s.end(reason)
 	}
 	c.mux.Stop()

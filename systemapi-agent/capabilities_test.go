@@ -7,9 +7,12 @@ import (
 
 func TestCapabilitiesAdvertiseOnlyWhatIsReal(t *testing.T) {
 	got := capabilitiesHeaderValue()
-	// tcp registers from tcp.go; file is advertised only once its handler
-	// registers (stage 3).
+	// tcp registers from tcp.go; file only on Linux where openat2 works
+	// (file_helper_linux.go).
 	want := "pty,tcp"
+	if runtime.GOOS == "linux" && openat2Available() {
+		want = "file,pty,tcp"
+	}
 	if runtime.GOOS == "windows" {
 		want = "tcp"
 	}
