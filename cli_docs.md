@@ -19,6 +19,12 @@ SYSTEMAPI_API_KEY=<key> ./systemapi-agent \
 | `--tenant` | (required) | Tenant the host enrolls into. |
 | `--hostname` | this machine | Reported hostname. |
 | `--state` | `~/.systemapi/agent.json` | Host id, SSH key and pinned control key. |
+| `--pty-user` | (none) | Account that `terminal:open` shells run as. Required when the agent runs as root; without it those sessions are refused with `pty_user_unset`. Must not be root. |
+| `--pty-record` | `true` | Run terminal sessions under `adssh` so its audit chain records them. A missing `adssh` refuses the session with `recording_unavailable`. `false` runs the user's shell unrecorded. |
+| `--pty-record-dir` | `/var/lib/systemapi-agent/pty` as root, else `<state dir>/pty` | Holds `terminal.rego` and one `adssh` audit log directory per shell user. |
+
+`terminal:root` sessions use their own lease action (`pty_root`), run as root,
+and need an agent running as root.
 
 On dial it sends `Authorization: Bearer <key>`, `X-SystemAPI-Tenant`,
 `X-SystemAPI-Host-ID`, `X-SystemAPI-Hostname` and `X-SystemAPI-SSH-PubKey`

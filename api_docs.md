@@ -9,8 +9,10 @@ the router.
 - API key: `X-API-Key: <key>` or `Authorization: Bearer <key>`. A key in the
   query string is refused with `query_key_rejected`.
 - Dashboard: the OAuth session cookie set by `/oauth/login`.
-- Browser WebSockets: a single-use ticket from `POST /api/v1/ws-ticket`
-  (`purpose` is `terminal:open` or `breakglass:open`). Tickets last 60 seconds.
+- Browser and CLI WebSockets: a single-use ticket from `POST /api/v1/ws-ticket`
+  (`purpose` is `terminal:open`, `terminal:root` or `breakglass:open`). Tickets
+  last 60 seconds, are bound to one host and purpose, and are audited.
+  `terminal:root` needs the admin-only scope `terminal:root`.
 - Agents: `Authorization: Bearer <key>` on the WebSocket upgrade, plus the
   enrollment headers described in `cli_docs.md`.
 
@@ -23,6 +25,7 @@ no scopes.
 | Method | Path | Notes |
 | --- | --- | --- |
 | GET | `/api/v1/fleet` | Hosts in your tenants. `?q=` filters by hostname. |
+| GET | `/api/v1/hosts/resolve?name=` | Exact `host_id`, or exact case-insensitive hostname, in your tenants. 200, 404 `not_found`, 409 `ambiguous`, 400 `invalid_name`. See `docs/sahconnect-terminal-protocol.md`. |
 | GET | `/api/v1/fleet/export` | Same list; `?format=csv` for CSV. |
 | GET | `/api/v1/fleet/efficiency` | Average CPU and memory per host over the last 100 samples. |
 | GET | `/api/v1/fleet/:hostId/software` | Installed software reported by the agent. |
@@ -124,6 +127,18 @@ proxy cached data from DNSScience (`DNSSCIENCE_API_URL`) and DarkAPI.
 
 - Agent stream: `/api/v1/systems/stream`. The agent sends `telemetry` every
   5 seconds and `command_result` (`{"error": "...", "output": "..."}`) for each
-  script. The server sends `sysscript`, `pty_start`, `pty_input`, `pty_resize`
-  and `pty_stop`, each carrying a signed lease.
-- Terminal: `/api/v1/systems/terminal/:hostId?ticket=<ticket>`.
+  script. `sysscript` and `pty_start` carry a signed lease; `pty_renew`
+  carries a fresh lease for a live session about every 30 s. Terminal frames
+  between server and agent are keyed by `session_id`:
+  - server to agent: `pty_start {session_id, action, rows, cols, deadline_unix, lease}`,
+    `pty_renew {session_id, lease}`, `pty_input {session_id, data_b64}`,
+    `pty_resize {session_id, rows, cols}`, `pty_eof {session_id}`,
+    `pty_stop {session_id}`;
+  - agent to server: `pty_status {session_id, payload}`, `pty_exit {session_id,
+    payload: {code, reason}}`, `pty_renew_rejected {session_id, payload: {error}}`,
+    and binary output frames `[len(session_id)][session_id][bytes]`.
+  Terminal lease actions are `pty`, `pty_root` and `breakglass`; each signs
+  `<action>\n<session_id>\n<deadline_unix>`.
+- Terminal: `/api/v1/systems/terminal/:hostId?ticket=<ticket>&purpose=<purpose>&rows=<r>&cols=<c>`.
+  The client contract is `docs/sahconnect-terminal-protocol.md`.
+  `SYSTEMAPI_PTY_MAX_SECONDS` (default 28800) caps a session.

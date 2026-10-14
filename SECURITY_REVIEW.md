@@ -51,7 +51,11 @@ JWT audience, when set, is the OIDC audience or the Keycloak client id. A token 
 
 The agent can emit telemetry before it has pinned the control public key. The server drops telemetry until `hostId` is set, which happens after `registry.enroll` returns. Commands the server sends before the pin are refused by the agent as `not_enrolled`.
 
-PTY input, resize, and stop are not covered by a new lease after `pty_start`. A second `pty_start` replaces the session. The timer is the lease expiry.
+Terminal sessions (sahconnect phase 1, 2026-10-14). Each session has a server-generated id; the agent keeps several at once and routes input, resize, EOF and stop by that id. The start lease and every renewal lease (about every 30 s) are verified the same way and are bound to the session id and its deadline, so a renewal cannot extend another session or move the deadline. The agent ends a session when the last lease lapses or at the deadline (`SYSTEMAPI_PTY_MAX_SECONDS`, default 28800, also enforced by the server). Input, resize, EOF and stop frames are not individually leased; they reach only a session the lease already authorized. The server routes agent output only to a session owned by that agent connection. Client frames over 64 KiB close with 1009. Ticket issue, session start and session end are audit-chain rows.
+
+`terminal:open` shells run as `--pty-user` with uid, gid and supplementary groups dropped; a root agent without `--pty-user` refuses (`pty_user_unset`), and root is refused as the pty user. `terminal:root` is an admin-only scope with its own lease action. Recording is on by default through `adssh`; a missing `adssh` refuses the session. `--pty-record=false` turns recording off per agent until phase 2 moves that into policy. The adssh audit log for a dropped user lives in a directory that user owns, so that user can edit or delete their own local recording; the control-plane audit rows are independent of it. The shell exit code reported with recording on is the exit code of `adssh`.
+
+Terminal tickets live in process memory. They are lost on restart and are not shared between server nodes; run one node until phase 4 moves them to shared storage. `controlplane/tickets.js`.
 
 Sessions use express-session's default in-memory store. They are lost on restart and are not shared between replicas. `server.js`.
 
