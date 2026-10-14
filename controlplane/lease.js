@@ -4,8 +4,9 @@
 // server mints a fresh nonce per issue). Clock skew allowance is 30s. TTL
 // cap is 300s. Does NOT stop an agent that ignores the lease.
 // Terminal actions (pty, pty_root, breakglass) sign "<action>\n<payload>",
-// where the payload is "<session_id>\n<deadline_unix>". A renewal lease is
-// bound to one session and cannot move its deadline.
+// where the payload is "<session_id>\n<deadline_unix>\n<start|renew>". A
+// renewal lease is bound to one session, cannot move its deadline, and cannot
+// be replayed as a start.
 'use strict';
 
 const crypto = require('node:crypto');
@@ -90,8 +91,10 @@ function fail(error) {
   return { ok: false, error };
 }
 
-function terminalPayload(sessionId, deadlineUnix) {
-  return `${sessionId}\n${deadlineUnix}`;
+// phase is 'start' or 'renew', so a renewal lease cannot start a session.
+function terminalPayload(sessionId, deadlineUnix, phase) {
+  if (phase !== 'start' && phase !== 'renew') throw new Error('bad_phase');
+  return `${sessionId}\n${deadlineUnix}\n${phase}`;
 }
 
 module.exports = {

@@ -94,6 +94,12 @@ const executionsTotal = new promClient.Counter({
     registers: [register]
 });
 
+const terminalAuditFailures = new promClient.Counter({
+    name: 'systemapi_terminal_audit_failures_total',
+    help: 'Terminal end audit rows that could not be written after retries',
+    registers: [register]
+});
+
 // Threat intel source URLs (pull from cached data, not paid APIs)
 const DNSSCIENCE_API = process.env.DNSSCIENCE_API_URL || 'https://api.dnsscience.io';
 const DARKAPI_URL = process.env.DARKAPI_URL || 'https://api.darkapi.io';
@@ -422,6 +428,7 @@ const prometheusMetrics = {
     diskUsageGauge,
     alertsActiveGauge,
     executionsTotal,
+    terminalAuditFailures,
     hostTotalGauge,
     hostOnlineGauge,
     hostOfflineGauge

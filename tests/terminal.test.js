@@ -59,6 +59,8 @@ async function rig(env = {}) {
   fm.signer = signer();
   fm.tickets = new Map();
   fm.registry = new MemoryRegistry({ NODE_ENV: 'test' });
+  fm.ptyFinalWaitMs = 200;
+  fm.auditRetryDelaysMs = [10, 10];
   fm.verifyApiKey = async (key) => (key === 'agent-key' ? { key_id: 'k1', user_id: 'user-1' } : null);
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const base = `ws://127.0.0.1:${server.address().port}`;
@@ -104,7 +106,7 @@ function sendStarted(agent, sessionId, extra = {}) {
   agent.ws.send(JSON.stringify({
     type: 'pty_status',
     session_id: sessionId,
-    payload: { status: 'started', session_id: sessionId, pty_user: 'ops', recording: true, ...extra }
+    payload: { status: 'started', session_id: sessionId, pty_user: 'ops', recording: 'agent', ...extra }
   }));
 }
 
@@ -138,7 +140,7 @@ test('pty_start carries a signed, session-bound lease, sizes and a deadline', as
     assert.equal(start.cols, 120);
     const now = Math.floor(Date.now() / 1000);
     assert.ok(Math.abs(start.deadline_unix - (now + 28800)) <= 2);
-    const ok = verifyLease(PUBLIC_KEY, start.lease, terminalPayload(start.session_id, start.deadline_unix));
+    const ok = verifyLease(PUBLIC_KEY, start.lease, terminalPayload(start.session_id, start.deadline_unix, 'start'));
     assert.equal(ok.ok, true);
     assert.equal(start.lease.action, 'pty');
     assert.equal(start.lease.host_id, HOST_A);
@@ -220,7 +222,7 @@ test('exit code and reason pass through, then the server closes 1000 and audits'
 
     const rows = r.fm.registry.audit;
     const began = rows.find((row) => row.action === 'terminal_start');
-    assert.deepEqual(began.payload, { session_id: start.session_id, purpose: 'terminal:open', pty_user: 'ops', recording: true });
+    assert.deepEqual(began.payload, { session_id: start.session_id, purpose: 'terminal:open', pty_user: 'ops', recording: 'agent', pty_user_privileged_groups: [] });
     assert.equal(began.host_id, HOST_A);
     assert.equal(began.actor, 'user-1');
     const ended = await waitUntil('end audit', () => r.fm.registry.audit.find((row) => row.action === 'terminal_end'));
@@ -247,7 +249,8 @@ test('the server renews the lease while the session is live', async () => {
     const nonces = new Set([start.lease.nonce_hex]);
     for (const renew of renewals) {
       assert.equal(renew.session_id, start.session_id);
-      const ok = verifyLease(PUBLIC_KEY, renew.lease, terminalPayload(start.session_id, start.deadline_unix));
+      const ok = verifyLease(PUBLIC_KEY, renew.lease, terminalPayload(start.session_id, start.deadline_unix, 'renew'));
+      assert.equal(verifyLease(PUBLIC_KEY, renew.lease, terminalPayload(start.session_id, start.deadline_unix, 'start')).ok, false);
       assert.equal(ok.ok, true);
       assert.equal(renew.lease.action, 'pty');
       nonces.add(renew.lease.nonce_hex);
@@ -364,6 +367,209 @@ test('large agent output reaches the client in frames of at most 64 KiB', async 
     agent.ws.send(output(start.session_id, 'x'.repeat(200 * 1024)));
     await waitUntil('all output', () => textOf(client.box).length === 200 * 1024);
     for (const f of client.box.frames.filter((frame) => frame.binary)) assert.ok(f.binary.length <= 64 * 1024);
+  } finally {
+    await r.close();
+  }
+});
+
+function serverSide(r, sessionId) {
+  return r.fm.terminalSessions.get(sessionId);
+}
+
+test('a slow client is ended instead of buffering without bound', async () => {
+  const r = await rig({ SYSTEMAPI_PTY_CLIENT_BUFFER_MAX: String(64 * 1024) });
+  try {
+    const agent = await connectAgent(r);
+    const { client, start } = await startSession(r, agent);
+    Object.defineProperty(serverSide(r, start.session_id).client, 'bufferedAmount', { get: () => 10 * 1024 * 1024 });
+    agent.ws.send(output(start.session_id, 'more output'));
+    await waitUntil('1011', () => client.box.closeCode === 1011);
+    assert.deepEqual(client.box.frames.at(-1), { type: 'pty_status', payload: { error: 'internal' } });
+    await waitUntil('pty_stop', () => agentFrames(agent, 'pty_stop').find((f) => f.session_id === start.session_id));
+    const ended = await waitUntil('end audit', () => r.fm.registry.audit.find((row) => row.action === 'terminal_end'));
+    assert.equal(ended.payload.reason, 'client_too_slow');
+  } finally {
+    await r.close();
+  }
+});
+
+test('an agent that floods its terminal queue is disconnected', async () => {
+  const r = await rig();
+  r.fm.agentQueueMaxItems = 5;
+  const append = r.fm.registry.appendAudit.bind(r.fm.registry);
+  r.fm.registry.appendAudit = async (entry) => {
+    if (entry.action === 'terminal_start') await new Promise((resolve) => setTimeout(resolve, 300));
+    return append(entry);
+  };
+  try {
+    const agent = await connectAgent(r);
+    const client = openClient(r);
+    const start = await waitUntil('pty_start', () => agentFrames(agent, 'pty_start')[0]);
+    sendStarted(agent, start.session_id);
+    for (let i = 0; i < 20; i++) agent.ws.send(output(start.session_id, `chunk${i}`));
+    await waitUntil('agent dropped', () => agent.box.closeCode !== null);
+    await waitUntil('client ended', () => client.box.closeCode !== null);
+  } finally {
+    await r.close();
+  }
+});
+
+test('the per-actor session cap refuses another session', async () => {
+  const r = await rig({ SYSTEMAPI_PTY_MAX_PER_ACTOR: '1' });
+  try {
+    const agent = await connectAgent(r);
+    await startSession(r, agent);
+    const second = openClient(r);
+    await waitUntil('refused', () => second.box.closeCode === 1011);
+    assert.deepEqual(second.box.frames, [{ type: 'pty_status', payload: { error: 'pty_start_failed' } }]);
+    assert.equal(agentFrames(agent, 'pty_start').length, 1);
+  } finally {
+    await r.close();
+  }
+});
+
+test('a start the agent never answers times out as internal', async () => {
+  const r = await rig();
+  r.fm.ptyStartTimeoutMs = 100;
+  try {
+    const agent = await connectAgent(r);
+    const client = openClient(r);
+    const start = await waitUntil('pty_start', () => agentFrames(agent, 'pty_start')[0]);
+    await waitUntil('timeout', () => client.box.closeCode === 1011);
+    assert.equal(client.box.frames.at(-1).payload.error, 'internal');
+    await waitUntil('pty_stop', () => agentFrames(agent, 'pty_stop').find((f) => f.session_id === start.session_id));
+    const ended = await waitUntil('end audit', () => r.fm.registry.audit.find((row) => row.action === 'terminal_end'));
+    assert.equal(ended.payload.reason, 'start_timeout');
+  } finally {
+    await r.close();
+  }
+});
+
+test('a renewal rejected as unknown_session ends the session; other rejections do not', async () => {
+  const r = await rig();
+  try {
+    const agent = await connectAgent(r);
+    const one = await startSession(r, agent);
+    const two = await startSession(r, agent);
+    agent.ws.send(JSON.stringify({ type: 'pty_renew_rejected', session_id: two.start.session_id, payload: { error: 'replay' } }));
+    agent.ws.send(JSON.stringify({ type: 'pty_renew_rejected', session_id: one.start.session_id, payload: { error: 'unknown_session' } }));
+    await waitUntil('one closed', () => one.client.box.closeCode === 1000);
+    assert.deepEqual(one.client.box.frames.at(-1).payload, { session_id: one.start.session_id, code: -1, reason: 'stopped' });
+    assert.equal(two.client.box.closeCode, null);
+  } finally {
+    await r.close();
+  }
+});
+
+test('an error from an older agent that tags only request_id is still routed', async () => {
+  const r = await rig();
+  try {
+    const agent = await connectAgent(r);
+    const client = openClient(r);
+    const start = await waitUntil('pty_start', () => agentFrames(agent, 'pty_start')[0]);
+    agent.ws.send(JSON.stringify({ type: 'pty_status', request_id: start.session_id, payload: { error: 'bad_signature' } }));
+    await waitUntil('closed', () => client.box.closeCode === 1011);
+    assert.equal(client.box.frames.at(-1).payload.error, 'internal');
+  } finally {
+    await r.close();
+  }
+});
+
+test('terminal:root is refused unless the agent records it', async () => {
+  const r = await rig();
+  try {
+    const agent = await connectAgent(r);
+    for (const recording of ['user_owned', 'off', true]) {
+      const before = agentFrames(agent, 'pty_start').length;
+      const client = openClient(r, { purpose: 'terminal:root' });
+      const start = await waitUntil('pty_start', () => agentFrames(agent, 'pty_start')[before]);
+      sendStarted(agent, start.session_id, { recording });
+      await waitUntil('refused', () => client.box.closeCode === 1011);
+      assert.equal(client.box.frames.at(-1).payload.error, 'recording_unavailable', String(recording));
+      assert.equal(client.box.frames.some((f) => f.payload && f.payload.status === 'started'), false);
+      await waitUntil('pty_stop', () => agentFrames(agent, 'pty_stop').find((f) => f.session_id === start.session_id));
+    }
+    const ok = await startSession(r, agent, { purpose: 'terminal:root' });
+    assert.ok(ok.start.session_id);
+  } finally {
+    await r.close();
+  }
+});
+
+test('the end audit row carries the agent recording digest after a client close', async () => {
+  const r = await rig();
+  r.fm.ptyFinalWaitMs = 2000;
+  try {
+    const agent = await connectAgent(r);
+    const { client, start } = await startSession(r, agent);
+    client.ws.close();
+    await waitUntil('pty_stop', () => agentFrames(agent, 'pty_stop').length === 1);
+    const digest = 'ab'.repeat(32);
+    agent.ws.send(JSON.stringify({
+      type: 'pty_exit',
+      session_id: start.session_id,
+      payload: { session_id: start.session_id, code: -1, reason: 'stopped', record: { path: '/var/lib/systemapi/recordings/x.rec', digest, bytes_in: 10, bytes_out: 20 } }
+    }));
+    const ended = await waitUntil('end audit', () => r.fm.registry.audit.find((row) => row.action === 'terminal_end'));
+    assert.equal(ended.payload.reason, 'client_closed');
+    assert.equal(ended.payload.recording, 'agent');
+    assert.deepEqual(ended.payload.agent_exit.record, { path: '/var/lib/systemapi/recordings/x.rec', digest, bytes_in: 10, bytes_out: 20 });
+    assert.equal(r.fm.registry.audit.filter((row) => row.action === 'terminal_end').length, 1);
+  } finally {
+    await r.close();
+  }
+});
+
+test('a failing end audit is retried, then counted and raised', async () => {
+  const r = await rig();
+  let calls = 0;
+  let incs = 0;
+  r.fm.metrics = { terminalAuditFailures: { inc: () => { incs += 1; } } };
+  const append = r.fm.registry.appendAudit.bind(r.fm.registry);
+  r.fm.registry.appendAudit = async (entry) => {
+    if (entry.action === 'terminal_end') {
+      calls += 1;
+      throw new Error('db down');
+    }
+    return append(entry);
+  };
+  try {
+    const agent = await connectAgent(r);
+    const { start } = await startSession(r, agent);
+    agent.ws.send(JSON.stringify({ type: 'pty_exit', session_id: start.session_id, payload: { code: 0, reason: 'exited' } }));
+    await waitUntil('failure counted', () => r.fm.terminalAuditFailures === 1);
+    assert.equal(calls, 3);
+    assert.equal(incs, 1);
+    await waitUntil('security event', () => r.fm.registry.securityEvents.find((e) => e.kind === 'audit_write_failed'));
+  } finally {
+    await r.close();
+  }
+});
+
+test('a replaced agent connection closing does not mark the host offline', async () => {
+  const r = await rig();
+  try {
+    const first = await connectAgent(r);
+    const second = await connectAgent(r);
+    assert.equal(r.fm.connectedAgents.get(HOST_A) !== undefined, true);
+    first.ws.close();
+    await waitUntil('first closed', () => first.box.closeCode !== null);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(r.fm.connectedAgents.size, 1);
+    assert.equal((await r.fm.registry.getHost(['acme'], HOST_A)).status, 'online');
+    second.ws.close();
+    await waitUntil('offline', () => r.fm.connectedAgents.size === 0);
+  } finally {
+    await r.close();
+  }
+});
+
+test('an oversized agent frame closes the agent connection with 1009', async () => {
+  const r = await rig();
+  try {
+    const agent = await connectAgent(r);
+    agent.ws.send(Buffer.alloc(4 * 1024 * 1024 + 16));
+    await waitUntil('1009', () => agent.box.closeCode === 1009, 5000);
   } finally {
     await r.close();
   }

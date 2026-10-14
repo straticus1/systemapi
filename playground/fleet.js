@@ -5,10 +5,14 @@
  * A missing lease is a refusal. This file does not store the API key.
  * Terminal sessions: one server-generated session id per socket; agent
  * output is routed only to the session that the same agent connection owns;
- * client frames over 64 KiB close with 1009; the server enforces
- * SYSTEMAPI_PTY_MAX_SECONDS and renews the lease every 30 s, so a dead server
- * lets the agent end the shell when the last lease lapses. Does NOT persist
- * tickets or sessions across restarts or between server nodes.
+ * client frames over 64 KiB close with 1009; a client whose send buffer
+ * passes SYSTEMAPI_PTY_CLIENT_BUFFER_MAX (8 MiB) is ended, and an agent that
+ * floods its terminal queue is disconnected; SYSTEMAPI_PTY_MAX_PER_ACTOR (8)
+ * caps live sessions per actor; the server enforces SYSTEMAPI_PTY_MAX_SECONDS,
+ * gives a start 30 s, and renews the lease every 30 s, so a dead server lets
+ * the agent end the shell when the last lease lapses. A root shell must
+ * report agent recording. Does NOT persist tickets or sessions across
+ * restarts or between server nodes.
  */
 
 const WebSocket = require('ws');
@@ -26,6 +30,14 @@ const { deliverWebhooks, COOLDOWN_MS } = require('../controlplane/router');
 
 const PTY_FRAME_MAX = 64 * 1024;
 const PTY_PENDING_MAX = 1024 * 1024;
+const PTY_CLIENT_BUFFER_DEFAULT = 8 * 1024 * 1024;
+const PTY_PER_ACTOR_DEFAULT = 8;
+const PTY_START_TIMEOUT_MS = 30_000;
+const PTY_FINAL_WAIT_MS = 5_000;
+const AGENT_FRAME_MAX = 4 * 1024 * 1024;
+const AGENT_QUEUE_MAX_ITEMS = 4096;
+const AGENT_QUEUE_MAX_BYTES = 16 * 1024 * 1024;
+const RECORDING_MODES = new Set(['agent', 'user_owned', 'off']);
 const PTY_RENEW_MS = 30_000;
 const PTY_LEASE_TTL_S = 60;
 const PTY_MAX_SECONDS_DEFAULT = 28800;
@@ -42,15 +54,41 @@ const PTY_ERRORS = new Set([
 const PTY_EXIT_REASONS = new Set(['exited', 'max_duration', 'stopped']);
 const B64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
-function ptyMaxSeconds(env) {
-    const raw = env && env.SYSTEMAPI_PTY_MAX_SECONDS;
-    if (raw === undefined || raw === null || raw === '') return PTY_MAX_SECONDS_DEFAULT;
+// Integer setting from env, or the default when unset or invalid.
+function envInt(env, name, fallback, min, max) {
+    const raw = env && env[name];
+    if (raw === undefined || raw === null || raw === '') return fallback;
     const n = Number(raw);
-    if (!Number.isInteger(n) || n < 1 || n > PTY_MAX_SECONDS_CAP) {
-        console.error('[Fleet] SYSTEMAPI_PTY_MAX_SECONDS is invalid; using the default');
-        return PTY_MAX_SECONDS_DEFAULT;
+    if (!Number.isInteger(n) || n < min || n > max) {
+        console.error(`[Fleet] ${name} is invalid; using the default`);
+        return fallback;
     }
     return n;
+}
+
+function unref(timer) {
+    if (timer && typeof timer.unref === 'function') timer.unref();
+    return timer;
+}
+
+// Recording summary from an agent pty_exit, sanitized for the audit row.
+function agentExitSummary(payload) {
+    const out = {
+        code: Number.isInteger(payload.code) ? payload.code : -1,
+        reason: typeof payload.reason === 'string' ? payload.reason.replace(/[^a-z_]/g, '').slice(0, 32) : null,
+        record: null,
+        record_error: typeof payload.record_error === 'string' ? payload.record_error.replace(/[^a-z_]/g, '').slice(0, 64) : null
+    };
+    const rec = payload.record;
+    if (rec && typeof rec === 'object') {
+        out.record = {
+            path: typeof rec.path === 'string' ? rec.path.slice(0, 512) : null,
+            digest: typeof rec.digest === 'string' && /^[0-9a-f]{64}$/.test(rec.digest) ? rec.digest : null,
+            bytes_in: Number.isSafeInteger(rec.bytes_in) && rec.bytes_in >= 0 ? rec.bytes_in : null,
+            bytes_out: Number.isSafeInteger(rec.bytes_out) && rec.bytes_out >= 0 ? rec.bytes_out : null
+        };
+    }
+    return out;
 }
 
 // Returns the size, the fallback when absent, or null when invalid.
@@ -72,14 +110,21 @@ function sendJSON(ws, obj) {
 
 class FleetManager {
     constructor(server, db, apiSite = 'systemapi', prometheusMetrics = null) {
-        this.wss = new WebSocket.Server({ noServer: true });
+        this.wss = new WebSocket.Server({ noServer: true, maxPayload: AGENT_FRAME_MAX });
         this.db = db;
         this.apiSite = apiSite;
         this.metrics = prometheusMetrics;
         this.connectedAgents = new Map();
         this.terminalSessions = new Map();
         this.terminalWss = new WebSocket.Server({ noServer: true, maxPayload: PTY_FRAME_MAX });
+        this.stoppingSessions = new Map();
         this.ptyRenewMs = PTY_RENEW_MS;
+        this.ptyStartTimeoutMs = PTY_START_TIMEOUT_MS;
+        this.ptyFinalWaitMs = PTY_FINAL_WAIT_MS;
+        this.auditRetryDelaysMs = [200, 1000];
+        this.terminalAuditFailures = 0;
+        this.agentQueueMaxItems = AGENT_QUEUE_MAX_ITEMS;
+        this.agentQueueMaxBytes = AGENT_QUEUE_MAX_BYTES;
         this.hostTenants = new Map();
         this.alertCooldown = new Map();
         this.pendingExecutions = new Map();
@@ -200,6 +245,12 @@ class FleetManager {
         if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close(1011);
     }
 
+    liveSessionsFor(actor) {
+        let n = 0;
+        for (const s of this.terminalSessions.values()) if (s.actor === actor) n++;
+        return n;
+    }
+
     openTerminal(ws, parsed, hostId, rows, cols) {
         ws.on('error', (err) => console.error('[Fleet] terminal socket error:', err.message));
         const ticketRes = ticketFromRequest(parsed);
@@ -222,19 +273,29 @@ class FleetManager {
             this.failTerminalSocket(ws, 'lease_required');
             return;
         }
+        const actor = row.actor || null;
+        if (this.liveSessionsFor(actor) >= envInt(this.env, 'SYSTEMAPI_PTY_MAX_PER_ACTOR', PTY_PER_ACTOR_DEFAULT, 1, 1000)) {
+            console.warn('[Fleet] terminal refused: per-actor session cap reached');
+            this.failTerminalSocket(ws, 'pty_start_failed');
+            return;
+        }
         const agentWs = this.connectedAgents.get(hostId);
         if (!agentWs || agentWs.readyState !== WebSocket.OPEN) {
             this.failTerminalSocket(ws, 'agent_offline');
             return;
         }
         const sessionId = `pts_${randomToken(16)}`;
-        const maxSeconds = ptyMaxSeconds(this.env);
+        const maxSeconds = envInt(this.env, 'SYSTEMAPI_PTY_MAX_SECONDS', PTY_MAX_SECONDS_DEFAULT, 1, PTY_MAX_SECONDS_CAP);
         const startedMs = Date.now();
         const deadlineUnix = Math.floor(startedMs / 1000) + maxSeconds;
-        const payload = terminalPayload(sessionId, deadlineUnix);
         let lease;
         try {
-            lease = issueLease(this.signer, { hostId, action, payload, ttl: PTY_LEASE_TTL_S });
+            lease = issueLease(this.signer, {
+                hostId,
+                action,
+                payload: terminalPayload(sessionId, deadlineUnix, 'start'),
+                ttl: PTY_LEASE_TTL_S
+            });
         } catch (err) {
             this.failTerminalSocket(ws, 'lease_required');
             return;
@@ -243,23 +304,28 @@ class FleetManager {
             id: sessionId,
             hostId,
             tenantId: row.tenantId,
-            actor: row.actor || null,
+            actor,
             purpose,
             action,
-            payload,
             deadlineUnix,
             startedMs,
             client: ws,
             agent: agentWs,
             started: false,
-            ended: false,
             announced: false,
+            ended: false,
+            finalized: false,
             pending: [],
             pendingBytes: 0,
             ptyUser: null,
-            recording: null,
+            recording: 'off',
+            privilegedGroups: [],
             renewTimer: null,
-            maxTimer: null
+            maxTimer: null,
+            startTimer: null,
+            finalTimer: null,
+            endReason: null,
+            endCode: -1
         };
         this.terminalSessions.set(sessionId, session);
         ws.on('message', (buf, isBinary) => this.onTerminalClientMessage(session, buf, isBinary));
@@ -275,12 +341,13 @@ class FleetManager {
             deadline_unix: deadlineUnix,
             lease
         });
-        session.renewTimer = setInterval(() => this.renewTerminal(session), this.ptyRenewMs);
-        if (typeof session.renewTimer.unref === 'function') session.renewTimer.unref();
-        session.maxTimer = setTimeout(() => {
+        session.renewTimer = unref(setInterval(() => this.renewTerminal(session), this.ptyRenewMs));
+        session.maxTimer = unref(setTimeout(() => {
             this.endTerminal(session, 'max_duration', -1, { notifyAgent: true, notifyClient: true });
-        }, maxSeconds * 1000);
-        if (typeof session.maxTimer.unref === 'function') session.maxTimer.unref();
+        }, maxSeconds * 1000));
+        session.startTimer = unref(setTimeout(() => {
+            if (!session.started) this.endTerminal(session, 'start_timeout', -1, { error: 'internal', notifyAgent: true });
+        }, this.ptyStartTimeoutMs));
     }
 
     renewTerminal(session) {
@@ -289,7 +356,7 @@ class FleetManager {
             const lease = issueLease(this.signer, {
                 hostId: session.hostId,
                 action: session.action,
-                payload: session.payload,
+                payload: terminalPayload(session.id, session.deadlineUnix, 'renew'),
                 ttl: PTY_LEASE_TTL_S
             });
             sendJSON(session.agent, { type: 'pty_renew', session_id: session.id, lease });
@@ -341,28 +408,71 @@ class FleetManager {
     }
 
     // Ends a session once. opts.error sends a pty_status error and closes 1011;
-    // opts.notifyClient sends pty_exit and closes 1000.
+    // opts.notifyClient sends pty_exit and closes 1000. When the agent is told
+    // to stop, the end audit row waits briefly for the agent's pty_exit so it
+    // can carry the recording digest.
     endTerminal(session, reason, code, opts = {}) {
         if (session.ended) return;
         session.ended = true;
+        session.endReason = reason;
+        session.endCode = code;
         clearInterval(session.renewTimer);
         clearTimeout(session.maxTimer);
+        clearTimeout(session.startTimer);
         this.terminalSessions.delete(session.id);
-        if (opts.notifyAgent) sendJSON(session.agent, { type: 'pty_stop', session_id: session.id });
+        session.pending = [];
         if (opts.error) {
             this.failTerminalSocket(session.client, opts.error);
         } else if (opts.notifyClient && session.client.readyState === WebSocket.OPEN) {
             sendJSON(session.client, { type: 'pty_exit', payload: { session_id: session.id, code, reason } });
             session.client.close(1000);
         }
-        this.auditTerminal(session, 'terminal_end', {
+        if (opts.notifyAgent && session.agent.readyState === WebSocket.OPEN) {
+            sendJSON(session.agent, { type: 'pty_stop', session_id: session.id });
+            this.stoppingSessions.set(session.id, session);
+            session.finalTimer = unref(setTimeout(() => this.finalizeTerminal(session, null), this.ptyFinalWaitMs));
+            return;
+        }
+        this.finalizeTerminal(session, opts.agentExit || null);
+    }
+
+    // Writes the terminal_end row once, retrying; a final failure is counted
+    // and recorded as a security event.
+    finalizeTerminal(session, agentExit) {
+        if (session.finalized) return;
+        session.finalized = true;
+        clearTimeout(session.finalTimer);
+        this.stoppingSessions.delete(session.id);
+        const payload = {
             session_id: session.id,
             purpose: session.purpose,
-            reason,
-            exit_code: code,
+            reason: session.endReason,
+            exit_code: session.endCode,
             started: session.started,
-            duration_s: Math.round((Date.now() - session.startedMs) / 1000)
-        }).catch((err) => console.error('[Fleet] terminal end audit failed:', err.message));
+            recording: session.recording,
+            duration_s: Math.round((Date.now() - session.startedMs) / 1000),
+            agent_exit: agentExit
+        };
+        const attempt = async () => {
+            let lastErr = null;
+            for (const delay of [0, ...this.auditRetryDelaysMs]) {
+                if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+                try {
+                    await this.auditTerminal(session, 'terminal_end', payload);
+                    return;
+                } catch (err) {
+                    lastErr = err;
+                }
+            }
+            this.terminalAuditFailures += 1;
+            if (this.metrics && this.metrics.terminalAuditFailures) this.metrics.terminalAuditFailures.inc();
+            console.error('[Fleet] terminal end audit failed:', lastErr && lastErr.message);
+            await this.noteSecurity('audit_write_failed', fingerprint(String(session.actor)), {
+                session_id: session.id,
+                action: 'terminal_end'
+            });
+        };
+        attempt().catch((err) => console.error('[Fleet] terminal end audit failed:', err.message));
     }
 
     async auditTerminal(session, action, payload) {
@@ -376,7 +486,7 @@ class FleetManager {
         });
     }
 
-    // Returns the session only when this agent connection owns it.
+    // Returns the live session only when this agent connection owns it.
     agentSession(ws, hostId, sessionId) {
         if (typeof sessionId !== 'string') return null;
         const session = this.terminalSessions.get(sessionId);
@@ -406,17 +516,31 @@ class FleetManager {
     }
 
     // Output goes out in slices of at most 64 KiB; clients cap frames at 1 MiB.
+    // A client that cannot keep up (bufferedAmount over the cap) ends the
+    // session instead of growing server memory.
     sendOutput(session, data) {
+        const cap = envInt(this.env, 'SYSTEMAPI_PTY_CLIENT_BUFFER_MAX', PTY_CLIENT_BUFFER_DEFAULT, PTY_FRAME_MAX, 1 << 30);
         for (let off = 0; off < data.length; off += PTY_FRAME_MAX) {
-            if (session.client.readyState !== WebSocket.OPEN) return;
+            if (session.ended || session.client.readyState !== WebSocket.OPEN) return;
+            if (session.client.bufferedAmount > cap) {
+                console.warn(`[Fleet] terminal ${session.id}: client too slow; ending session`);
+                this.endTerminal(session, 'client_too_slow', -1, { error: 'internal', notifyAgent: true });
+                return;
+            }
             session.client.send(data.subarray(off, off + PTY_FRAME_MAX));
         }
     }
 
     async onAgentPtyStatus(ws, hostId, msg) {
-        const session = this.agentSession(ws, hostId, msg.session_id);
-        if (!session) return;
+        // Older agents tag frames with request_id only; the server sets
+        // request_id to the session id.
+        const sid = typeof msg.session_id === 'string' ? msg.session_id : msg.request_id;
+        const session = this.agentSession(ws, hostId, sid);
         const payload = msg.payload && typeof msg.payload === 'object' ? msg.payload : {};
+        if (!session) {
+            if (payload.error) console.warn('[Fleet] agent pty error without a known session');
+            return;
+        }
         if (payload.error) {
             const code = PTY_ERRORS.has(payload.error) ? payload.error : 'internal';
             this.endTerminal(session, code, -1, { error: code });
@@ -424,14 +548,19 @@ class FleetManager {
         }
         if (payload.status !== 'started' || session.started) return;
         session.started = true;
+        clearTimeout(session.startTimer);
         session.ptyUser = typeof payload.pty_user === 'string' ? payload.pty_user.slice(0, 64) : null;
-        session.recording = payload.recording === true;
+        session.recording = RECORDING_MODES.has(payload.recording) ? payload.recording : 'off';
+        session.privilegedGroups = Array.isArray(payload.pty_user_privileged_groups)
+            ? payload.pty_user_privileged_groups.filter((g) => typeof g === 'string').map((g) => g.slice(0, 32)).slice(0, 16)
+            : [];
         try {
             await this.auditTerminal(session, 'terminal_start', {
                 session_id: session.id,
                 purpose: session.purpose,
                 pty_user: session.ptyUser,
-                recording: session.recording
+                recording: session.recording,
+                pty_user_privileged_groups: session.privilegedGroups
             });
         } catch (err) {
             console.error('[Fleet] terminal start audit failed:', err.message);
@@ -439,20 +568,41 @@ class FleetManager {
             return;
         }
         if (session.ended) return;
+        // Until phase 2 policy exists, a root shell must be agent-recorded.
+        if (session.purpose === 'terminal:root' && session.recording !== 'agent') {
+            this.endTerminal(session, 'recording_unavailable', -1, { error: 'recording_unavailable', notifyAgent: true });
+            return;
+        }
         sendJSON(session.client, { type: 'pty_status', payload: { status: 'started', session_id: session.id } });
         session.announced = true;
-        for (const chunk of session.pending) this.sendOutput(session, chunk);
+        const held = session.pending;
         session.pending = [];
         session.pendingBytes = 0;
+        for (const chunk of held) this.sendOutput(session, chunk);
     }
 
     onAgentPtyExit(ws, hostId, msg) {
+        const payload = msg.payload && typeof msg.payload === 'object' ? msg.payload : {};
+        const agentExit = agentExitSummary(payload);
+        const stopping = typeof msg.session_id === 'string' ? this.stoppingSessions.get(msg.session_id) : null;
+        if (stopping && stopping.agent === ws && stopping.hostId === hostId) {
+            this.finalizeTerminal(stopping, agentExit);
+            return;
+        }
         const session = this.agentSession(ws, hostId, msg.session_id);
         if (!session) return;
-        const payload = msg.payload && typeof msg.payload === 'object' ? msg.payload : {};
         const code = Number.isInteger(payload.code) ? payload.code : -1;
         const reason = PTY_EXIT_REASONS.has(payload.reason) ? payload.reason : 'exited';
-        this.endTerminal(session, reason, code, { notifyClient: true });
+        this.endTerminal(session, reason, code, { notifyClient: true, agentExit });
+    }
+
+    onAgentRenewRejected(ws, hostId, msg) {
+        const raw = msg.payload && msg.payload.error;
+        const err = typeof raw === 'string' ? raw.replace(/[^a-z_]/g, '').slice(0, 64) : 'unknown';
+        console.warn(`[Fleet] agent rejected a lease renewal: ${err}`);
+        if (err !== 'unknown_session' && err !== 'session_ended') return;
+        const session = this.agentSession(ws, hostId, msg.session_id);
+        if (session) this.endTerminal(session, 'stopped', -1, { notifyClient: true });
     }
 
     async verifyApiKey(secretProvided) {
@@ -501,18 +651,39 @@ class FleetManager {
         let hostId = null;
         // Terminal frames are handled in arrival order, even while a start
         // audit row is being written.
+        // The queue is capped: an agent that floods it while an audit write
+        // is pending is disconnected.
         let ptyChain = Promise.resolve();
-        const inOrder = (fn) => {
-            ptyChain = ptyChain.then(fn).catch((err) => console.error('[Fleet] terminal frame error:', err.message));
+        let queued = 0;
+        let queuedBytes = 0;
+        let flooded = false;
+        const inOrder = (fn, bytes = 0, force = false) => {
+            if (!force) {
+                if (flooded) return;
+                if (queued >= this.agentQueueMaxItems || queuedBytes + bytes > this.agentQueueMaxBytes) {
+                    flooded = true;
+                    console.error('[Fleet] agent terminal queue over its cap; disconnecting the agent');
+                    ws.terminate();
+                    return;
+                }
+            }
+            queued += 1;
+            queuedBytes += bytes;
+            ptyChain = ptyChain.then(fn).catch((err) => console.error('[Fleet] terminal frame error:', err.message)).finally(() => {
+                queued -= 1;
+                queuedBytes -= bytes;
+            });
         };
         console.log(`[Fleet] Agent connected key fingerprint sha256:${fingerprint(keyId)}`);
+        // ws emits oversize frames (maxPayload, close 1009) and protocol errors here.
+        ws.on('error', (err) => console.error('[Fleet] agent socket error:', err.message));
 
         ws.on('message', async (messageBuffer, isBinary) => {
             try {
                 if (isBinary) {
                     if (hostId) {
                         const id = hostId;
-                        inOrder(() => this.onAgentOutput(ws, id, messageBuffer));
+                        inOrder(() => this.onAgentOutput(ws, id, messageBuffer), messageBuffer.length);
                     }
                     return;
                 }
@@ -535,9 +706,8 @@ class FleetManager {
                     const id = hostId;
                     if (id) inOrder(() => this.onAgentPtyExit(ws, id, msg));
                 } else if (msg.type === 'pty_renew_rejected') {
-                    const raw = msg.payload && msg.payload.error;
-                    const err = typeof raw === 'string' ? raw.replace(/[^a-z_]/g, '').slice(0, 64) : 'unknown';
-                    console.warn(`[Fleet] agent rejected a lease renewal: ${err}`);
+                    const id = hostId;
+                    if (id) inOrder(() => this.onAgentRenewRejected(ws, id, msg));
                 }
             } catch (err) {
                 console.error('[Fleet] message error:', err.message);
@@ -546,12 +716,18 @@ class FleetManager {
 
         ws.on('close', async () => {
             if (!hostId) return;
-            if (this.connectedAgents.get(hostId) === ws) this.connectedAgents.delete(hostId);
             inOrder(() => {
                 for (const session of [...this.terminalSessions.values()]) {
                     if (session.agent === ws) this.endTerminal(session, 'agent_disconnected', -1, { notifyClient: true });
                 }
-            });
+                for (const session of [...this.stoppingSessions.values()]) {
+                    if (session.agent === ws) this.finalizeTerminal(session, null);
+                }
+            }, 0, true);
+            // A connection that a newer one for the same host already
+            // replaced does not mark the host offline.
+            if (this.connectedAgents.get(hostId) !== ws) return;
+            this.connectedAgents.delete(hostId);
             if (this.registry) {
                 try { await this.registry.setHostStatus(hostId, 'offline'); } catch (err) {
                     console.error('[Fleet] status update failed:', err.message);
