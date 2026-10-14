@@ -73,6 +73,7 @@ class MemoryRegistry {
     this.securityEvents = [];
     this.securitySeq = 1;
     this.scopes = new Map();
+    this.ssoBindings = new Map();
     this.software = [];
     this.cves = [];
   }
@@ -117,10 +118,37 @@ class MemoryRegistry {
     return this.members.filter((m) => m.user_id === userId).map((m) => m.tenant_id);
   }
 
-  async membershipsForUser(userId, email) {
+  // Identity is the member id only; email is display data, never a match key.
+  async membershipsForUser(userId) {
     return this.members
-      .filter((m) => m.user_id === userId || (email && m.email && m.email === email))
+      .filter((m) => m.user_id === userId)
       .map((m) => ({ ...m }));
+  }
+
+  async memberForSub(sub) {
+    if (typeof sub !== 'string' || sub.length === 0) return null;
+    for (const [userId, row] of this.ssoBindings) {
+      if (row.sso_sub === sub) return userId;
+    }
+    return null;
+  }
+
+  async ssoBinding(userId) {
+    const row = this.ssoBindings.get(userId);
+    return row ? { ...row } : null;
+  }
+
+  async bindSso(userId, sub, boundBy) {
+    for (const [other, row] of this.ssoBindings) {
+      if (other !== userId && row.sso_sub === sub) throw http(409, 'sso_sub_taken');
+    }
+    const row = { user_id: userId, sso_sub: sub, bound_by: boundBy, bound_at: new Date().toISOString() };
+    this.ssoBindings.set(userId, row);
+    return { ...row };
+  }
+
+  async unbindSso(userId) {
+    return this.ssoBindings.delete(userId);
   }
 
   async addMember(tenantId, userId, role, email) {
@@ -513,13 +541,47 @@ class PgRegistry {
     return this.getHost([tenantId], hostId);
   }
 
-  async membershipsForUser(userId, email) {
+  // Identity is the member id only; email is display data, never a match key.
+  async membershipsForUser(userId) {
     const res = await this.pool.query(
-      `SELECT tenant_id, user_id, email, role FROM cp_members
-       WHERE user_id = $1 OR ($2::text IS NOT NULL AND email = $2)`,
-      [userId, email || null]
+      'SELECT tenant_id, user_id, email, role FROM cp_members WHERE user_id = $1',
+      [userId]
     );
     return res.rows;
+  }
+
+  async memberForSub(sub) {
+    if (typeof sub !== 'string' || sub.length === 0) return null;
+    const res = await this.pool.query('SELECT user_id FROM cp_sso_bindings WHERE sso_sub = $1', [sub]);
+    return res.rows[0] ? res.rows[0].user_id : null;
+  }
+
+  async ssoBinding(userId) {
+    const res = await this.pool.query(
+      'SELECT user_id, sso_sub, bound_by, bound_at FROM cp_sso_bindings WHERE user_id = $1',
+      [userId]
+    );
+    return res.rows[0] || null;
+  }
+
+  async bindSso(userId, sub, boundBy) {
+    try {
+      const res = await this.pool.query(
+        `INSERT INTO cp_sso_bindings (user_id, sso_sub, bound_by) VALUES ($1, $2, $3)
+         ON CONFLICT (user_id) DO UPDATE SET sso_sub = EXCLUDED.sso_sub, bound_by = EXCLUDED.bound_by, bound_at = now()
+         RETURNING user_id, sso_sub, bound_by, bound_at`,
+        [userId, sub, boundBy]
+      );
+      return res.rows[0];
+    } catch (err) {
+      if (err.code === '23505') throw http(409, 'sso_sub_taken');
+      throw err;
+    }
+  }
+
+  async unbindSso(userId) {
+    const res = await this.pool.query('DELETE FROM cp_sso_bindings WHERE user_id = $1', [userId]);
+    return res.rowCount === 1;
   }
 
   async addMember(tenantId, userId, role, email) {

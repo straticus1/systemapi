@@ -85,24 +85,24 @@ function parseForm(req, res, next) {
   });
 }
 
-// CSRF for the device verify page: a synchronizer token kept in the
-// server-side session and compared in constant time. SameSite cannot carry
-// this alone: it is configurable (SESSION_COOKIE_SAMESITE) and the SSO round
-// trips need Lax.
-function deviceCsrf(req) {
-  if (!req.session) throw http(503, 'oauth_unavailable');
-  if (typeof req.session.deviceCsrf !== 'string') req.session.deviceCsrf = randomToken(32);
-  return req.session.deviceCsrf;
-}
-
-function requireDeviceCsrf(req) {
-  const want = req.session && req.session.deviceCsrf;
-  const got = bodyString(req.body, 'csrf');
-  if (typeof want !== 'string' || !got || !tokenEqual(want, got)) throw http(403, 'csrf_denied');
-}
-
+// CSRF for the device verify page is a synchronizer token kept in the
+// server-side session (oauth.sessionCsrf) and compared in constant time.
+// SameSite cannot carry this alone: it is configurable
+// (SESSION_COOKIE_SAMESITE) and the SSO round trips need Lax.
 function sessionUserOf(req) {
-  return (req.session && req.session.user) || null;
+  const user = req.session && req.session.user;
+  return user && typeof user === 'object' ? user : null;
+}
+
+// Binding a member's SSO identity changes who can act as that member in every
+// tenant, so the caller must be admin in every tenant the member belongs to.
+async function requireSsoAdmin(fleet, principal, userId) {
+  if (typeof userId !== 'string' || !USER_RE.test(userId)) throw http(400, 'bad_user');
+  const target = await fleet.registry.membershipsForUser(userId);
+  const mine = new Set(tenantIds(principal));
+  if (!target.some((m) => mine.has(m.tenant_id))) throw http(404, 'not_found');
+  const admins = new Set(adminTenantIds(principal));
+  if (!target.every((m) => admins.has(m.tenant_id))) throw http(403, 'scope_denied');
 }
 
 function adminTenantIds(principal) {
@@ -184,11 +184,15 @@ async function authenticate(req, fleet) {
   }
   const sessionUser = req.session && req.session.user;
   if (sessionUser && sessionUser.id) {
-    const memberships = await fleet.registry.membershipsForUser(sessionUser.id, sessionUser.email);
+    // Sub-only identity: the session's Authentik sub must be bound to a
+    // member (cp_sso_bindings). Email is display data only.
+    const userId = await oauth.sessionMember(fleet.registry, sessionUser);
+    if (!userId) throw http(403, 'sso_unbound');
+    const memberships = await fleet.registry.membershipsForUser(userId);
     const boosted = roleFromGroups(sessionUser.groups);
     return {
       kind: 'session',
-      userId: sessionUser.id,
+      userId,
       email: sessionUser.email,
       keyScopes: null,
       memberships: memberships.map((m) => ({ ...m, effective_role: boosted || m.role }))
@@ -403,37 +407,72 @@ function mount(app, fleet) {
 
   app.post('/oauth/device', parseForm, wrap(async (req, res) => {
     noStore(res);
-    const out = await oauth.startDevice(fleet.registry, bodyString(req.body, 'username'), fleet.env || {});
+    const out = await oauth.startDevice(fleet.registry, bodyString(req.body, 'username'), fleet.env || {}, {
+      ip: req.ip,
+      ua: req.get('user-agent')
+    });
     res.json(out);
   }));
 
+  // RFC 8628 entry page. The query string is ignored: a code never arrives in
+  // a URL. With no SSO session nothing is stored (no session, no token).
   app.get('/oauth/device/verify', wrap(async (req, res) => {
     noStore(res);
-    const code = typeof req.query.code === 'string' ? req.query.code : '';
-    const out = await oauth.verifyPage(fleet.registry, code, fleet.env || {}, {
-      sessionUser: sessionUserOf(req),
-      csrf: deviceCsrf(req)
-    });
-    res.status(out.status).type('html').send(out.html);
+    const sessionUser = sessionUserOf(req);
+    if (!sessionUser) {
+      res.type('html').send(oauth.ssoPage());
+      return;
+    }
+    const csrf = oauth.sessionCsrf(req);
+    const member = await oauth.sessionMember(fleet.registry, sessionUser);
+    if (!member) {
+      res.status(403).type('html').send(oauth.unboundPage(sessionUser, csrf));
+      return;
+    }
+    res.type('html').send(oauth.entryPage(sessionUser, member, csrf));
   }));
 
   // Never approves on possession of the code alone: the CSRF token must match
-  // this browser session, and the plain approval needs an SSO session that
-  // owns the member (oauth.approveUserCode).
+  // this browser session, the session's sub must be bound to the member that
+  // owns the typed code, and a separate confirm step shows who asked.
   app.post('/oauth/device/verify', parseForm, wrap(async (req, res) => {
     noStore(res);
-    requireDeviceCsrf(req);
-    const code = bodyString(req.body, 'code');
+    if (!oauth.csrfValid(req, bodyString(req.body, 'csrf'))) throw http(403, 'csrf_denied');
+    const sessionUser = sessionUserOf(req);
+    const csrf = req.session.csrf;
+    const member = await oauth.sessionMember(fleet.registry, sessionUser);
+    if (!member) {
+      res.status(403).type('html').send(sessionUser ? oauth.unboundPage(sessionUser, csrf) : oauth.ssoPage());
+      return;
+    }
+    if (!fleet.codeTries) fleet.codeTries = new Map();
+    const sessionKey = 'session:' + req.sessionID;
+    const ipKey = 'ip:' + (req.ip || 'unknown');
+    if (!oauth.codeEntryAllowed(fleet.codeTries, sessionKey, ipKey)) throw http(429, 'slow_down');
+    const typed = bodyString(req.body, 'user_code');
+    const found = await oauth.pendingByTypedCode(fleet.registry, typed);
+    if (!found || found.row.user_id !== member) {
+      if (oauth.recordCodeFailure(fleet.codeTries, sessionKey, ipKey)) await oauth.denyPending(fleet.registry, member);
+      const html = found
+        ? oauth.mismatchPage(sessionUser, found.row.user_id, csrf)
+        : oauth.entryPage(sessionUser, member, csrf, 'That code was not accepted (login_denied).');
+      res.status(403).type('html').send(html);
+      return;
+    }
     const rawProvider = req.body && req.body.provider;
-    if (rawProvider == null || rawProvider === '') {
-      await oauth.approveUserCode(fleet.registry, code, sessionUserOf(req));
+    if (rawProvider != null && rawProvider !== '') {
+      if (typeof rawProvider !== 'string') throw http(403, 'link_denied');
+      const started = await oauth.beginExternal(fleet.registry, typed, rawProvider, fleet.env || {}, sessionUser);
+      req.session.deviceState = fingerprint(started.state);
+      res.redirect(302, started.location);
+      return;
+    }
+    if (bodyString(req.body, 'confirm') === 'yes') {
+      await oauth.approveUserCode(fleet.registry, typed, sessionUser);
       res.type('html').send(oauth.donePage());
       return;
     }
-    if (typeof rawProvider !== 'string') throw http(403, 'link_denied');
-    const started = await oauth.beginExternal(fleet.registry, code, rawProvider, fleet.env || {});
-    req.session.deviceState = fingerprint(started.state);
-    res.redirect(302, started.location);
+    res.type('html').send(await oauth.confirmPage(fleet.registry, found.row, found.code, csrf, fleet.env || {}));
   }));
 
   app.post('/oauth/token', parseForm, wrap(async (req, res) => {
@@ -792,6 +831,21 @@ function mount(app, fleet) {
     if (typeof userId !== 'string' || userId.length === 0 || userId.length > 200) throw http(400, 'bad_user');
     const row = await fleet.registry.addMember(tenantId, userId, role, req.body.email);
     res.status(201).json(row);
+  }));
+
+  app.put('/api/v1/members/:user/sso', wrap(async (req, res) => {
+    const principal = await authenticate(req, fleet);
+    const userId = req.params.user;
+    await requireSsoAdmin(fleet, principal, userId);
+    const sub = req.body && req.body.sso_sub;
+    res.json(await oauth.bindSsoAudited(fleet.registry, { userId, sub, actor: String(principal.userId) }));
+  }));
+
+  app.delete('/api/v1/members/:user/sso', wrap(async (req, res) => {
+    const principal = await authenticate(req, fleet);
+    const userId = req.params.user;
+    await requireSsoAdmin(fleet, principal, userId);
+    res.json(await oauth.unbindSsoAudited(fleet.registry, { userId, actor: String(principal.userId) }));
   }));
 
   app.post('/api/v1/keys/:keyId/scopes', wrap(async (req, res) => {

@@ -24,9 +24,26 @@ export const useAppStore = create((set, get) => ({
   logout: async () => {
     const { authMethod } = get();
 
-    // If OAuth session, redirect to OAuth logout
+    // OAuth session: POST /oauth/logout with the session CSRF token (a GET
+    // logout would let any page sign the user out).
     if (authMethod === 'oauth') {
-      window.location.href = '/oauth/logout';
+      let csrf = '';
+      try {
+        const res = await api.get('/oauth/user');
+        csrf = res.data.csrf || '';
+      } catch {
+        // Session already gone; the server redirects to / without one.
+      }
+      const form = document.createElement('form');
+      form.method = 'POST';
+      form.action = '/oauth/logout';
+      const field = document.createElement('input');
+      field.type = 'hidden';
+      field.name = 'csrf';
+      field.value = csrf;
+      form.appendChild(field);
+      document.body.appendChild(form);
+      form.submit();
     } else {
       // API key logout
       localStorage.removeItem('systemapi_key');

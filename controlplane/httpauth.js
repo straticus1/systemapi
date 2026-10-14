@@ -68,4 +68,43 @@ function originAllowed(origin, env = {}) {
   return allowedOrigins(env).has(origin);
 }
 
-module.exports = { demoKeyAllowed, agentAuthFromRequest, ticketFromRequest, allowedOrigins, originAllowed };
+// Credentialed CORS origins: the same list as allowedOrigins, but only exact
+// origins (scheme://host[:port], no path, no wildcard) and https only, except
+// http://localhost / 127.0.0.1 outside production. Anything else is dropped.
+function corsOrigins(env = {}) {
+  const prod = env.NODE_ENV === 'production';
+  const out = [];
+  for (const raw of allowedOrigins(env)) {
+    let url;
+    try {
+      url = new URL(raw);
+    } catch {
+      continue;
+    }
+    if (url.origin !== raw || raw.includes('*')) continue;
+    const local = url.hostname === 'localhost' || url.hostname === '127.0.0.1';
+    if (url.protocol === 'https:' || (url.protocol === 'http:' && local && !prod)) out.push(raw);
+  }
+  return out;
+}
+
+// Threats: another site reading credentialed responses. No CORS headers at
+// all on /oauth (login, callback, device verify, user and its CSRF token);
+// elsewhere only the exact origins from corsOrigins.
+function corsMiddleware(env = {}) {
+  const cors = require('cors');
+  const allow = new Set(corsOrigins(env));
+  const handler = cors({
+    origin: (origin, cb) => cb(null, typeof origin === 'string' && allow.has(origin)),
+    credentials: true
+  });
+  return (req, res, next) => {
+    if (req.path === '/oauth' || req.path.startsWith('/oauth/')) {
+      next();
+      return;
+    }
+    handler(req, res, next);
+  };
+}
+
+module.exports = { demoKeyAllowed, agentAuthFromRequest, ticketFromRequest, allowedOrigins, originAllowed, corsOrigins, corsMiddleware };

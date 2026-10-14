@@ -6,7 +6,8 @@
 // A missing URL or key exits 2 and does not echo the value.
 // login is the exception: it does not read or send the API key. It writes
 // the access token to an absolute SYSTEMAPI_TOKEN_FILE (mode 0600) and
-// prints only the verification URL, then "approved" and that path.
+// prints only the verification URI and the user code (typed in the browser
+// after After Dark SSO), then "approved" and that path.
 'use strict';
 
 const fs = require('node:fs');
@@ -231,7 +232,8 @@ async function login(argv) {
   if (started.status === 429) fail(1, 'slow_down');
   if (started.status !== 200) fail(1, started.status === 403 ? 'login_denied' : 'login_failed');
   const device = started.parsed && started.parsed.device_code;
-  const verification = started.parsed && started.parsed.verification_url;
+  const verification = started.parsed && started.parsed.verification_uri;
+  const userCode = started.parsed && started.parsed.user_code;
   const interval = started.parsed && started.parsed.interval;
   let verifyUrl;
   try {
@@ -239,10 +241,12 @@ async function login(argv) {
   } catch {
     fail(1, 'login_failed');
   }
-  const leaked = verifyUrl.searchParams.has('device_code') || verifyUrl.searchParams.has('access_token');
-  if (verifyUrl.origin !== base.origin || verifyUrl.username || verifyUrl.password || leaked) fail(1, 'login_failed');
+  if (verifyUrl.origin !== base.origin || verifyUrl.username || verifyUrl.password || verifyUrl.search || verifyUrl.hash) {
+    fail(1, 'login_failed');
+  }
+  if (typeof userCode !== 'string' || !/^[BCDFGHJKLMNPQRSTVWXZ]{4}-[BCDFGHJKLMNPQRSTVWXZ]{4}$/.test(userCode)) fail(1, 'login_failed');
   if (typeof device !== 'string' || device.length < 16) fail(1, 'login_failed');
-  await write(process.stdout, verification + '\n');
+  await write(process.stdout, verifyUrl.href + '\n' + userCode + '\n');
   const pause = typeof interval === 'number' && interval > 0 ? Math.min(interval * 1000, 10000) : 100;
   for (let attempt = 0; attempt < 60; attempt += 1) {
     await sleep(pause);

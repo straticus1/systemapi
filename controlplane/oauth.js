@@ -1,23 +1,27 @@
 // Threats: approving someone else's device login. Holding the user code is
-// NOT consent: the person who starts the flow receives it. The plain "Yes"
-// needs an Authentik dashboard session that owns the device row's member id
-// (session sub equals cp_members.user_id, or a verified session email equals
-// that member's cp_members.email; the dashboard's own mapping, compared
-// byte-exact) plus a CSRF token bound to that session. GET never approves.
-// A Google or GitHub approval needs the IdP subject already bound to that
-// member; a first-use binding also needs a session that owns the member, and
-// the IdP callback state must match the browser session that started it.
-// Also covers guessing a device or user code, open signup through Google or
-// GitHub, one IdP subject on two members, replaying a consumed grant, open
-// redirects on the SSO return path, and logging the verification URL or
-// access token. Does NOT stop a member who is talked into approving a login
-// someone else started (the page names the member and warns), a stolen access
-// token inside its hour, a 200 versus 403 member probe on /oauth/device, or a
-// caller who knows a member id holding the three pending slots until they
-// expire. Does NOT create members, store IdP access tokens, keep a PKCE
-// verifier, or replace the Authentik client in routes/oauth.js.
+// NOT consent: the person who starts the flow receives it. Approval needs an
+// Authentik session whose sub is bound to the device row's member
+// (cp_sso_bindings, byte-exact; no email or username matching), the user
+// TYPES the code on that page (RFC 8628; no code in any URL), every POST
+// carries a CSRF token bound to the session, and GET never approves. Code
+// entry is limited per session and per IP; a session that fails too often
+// denies every pending login of its member. A Google or GitHub approval runs
+// only after those same checks; a first-use subject binding needs that
+// session, and the IdP callback state must match the browser session that
+// started it. Also covers guessing a device code, open signup through Google
+// or GitHub, one IdP subject on two members, replaying a consumed grant, open
+// redirects on the SSO return path, and logging codes or tokens. Does NOT stop
+// a member who is talked into typing a code someone else started (the page
+// shows the requester's IP, user agent and start time and warns), a stolen
+// access token inside its hour, a 200 versus 403 member probe on
+// /oauth/device, a database reader brute-forcing the 8-character user-code
+// hashes (approval still needs the member's session), or a caller who knows a
+// member id holding the three pending slots until they expire. Code-entry
+// counters live in process memory (one node). Does NOT create members, store
+// IdP access tokens, or keep a PKCE verifier.
 'use strict';
 
+const { randomInt } = require('node:crypto');
 const { randomToken, tokenEqual, fingerprint } = require('./token');
 const { hostIPv4 } = require('./webhook');
 
@@ -27,6 +31,14 @@ const PENDING_CAP = 3;
 const USER_RE = /^[a-zA-Z0-9][a-zA-Z0-9._@-]{0,128}$/;
 const SUBJECT_RE = /^[A-Za-z0-9._:-]{1,255}$/;
 const DEVICE_GRANT = 'urn:ietf:params:oauth:grant-type:device_code';
+// RFC 8628 section 6.1: consonants only, no vowels or look-alikes. 20^8 is
+// about 2^34.6 per code, against at most CODE_TRIES_PER_IP tries a window.
+const USER_CODE_ALPHABET = 'BCDFGHJKLMNPQRSTVWXZ';
+const USER_CODE_RE = /^[BCDFGHJKLMNPQRSTVWXZ]{8}$/;
+const SSO_SUB_RE = /^[A-Za-z0-9._:@|-]{1,255}$/;
+const CODE_TRY_WINDOW_MS = 15 * 60 * 1000;
+const CODE_TRIES_PER_SESSION = 5;
+const CODE_TRIES_PER_IP = 20;
 const RESPONSE_CAP = 8192;
 const PROVIDERS = {
   google: {
@@ -155,9 +167,37 @@ async function memberUser(registry, username) {
   return username;
 }
 
+function newUserCode() {
+  let out = '';
+  for (let i = 0; i < 8; i += 1) out += USER_CODE_ALPHABET[randomInt(USER_CODE_ALPHABET.length)];
+  return out;
+}
+
+function displayUserCode(code) {
+  return code.slice(0, 4) + '-' + code.slice(4);
+}
+
+// Accepts what a person types: any case, with or without the dash or spaces.
+function normalizeUserCode(value) {
+  if (typeof value !== 'string' || value.length > 32) return null;
+  const code = value.toUpperCase().replace(/[\s-]/g, '');
+  return USER_CODE_RE.test(code) ? code : null;
+}
+
+function userCodeHash(code) {
+  return fingerprint('user-code:' + code);
+}
+
+function cleanRequester(requester) {
+  const r = requester || {};
+  const ip = typeof r.ip === 'string' ? r.ip.replace(/[^0-9A-Fa-f:.]/g, '').slice(0, 64) : '';
+  const ua = typeof r.ua === 'string' ? r.ua.replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 256) : '';
+  return { ip: ip || null, ua: ua || null };
+}
+
 // Only a same-origin absolute path survives; anything else becomes "/".
-// Refuses scheme-relative ("//host"), backslash and control-character tricks
-// that browsers normalise into another origin.
+// Checked before and after URL parsing, because parsing resolves dot segments
+// and percent-encoded dots ("/.//x", "/%2e%2e//x") into "//x".
 function safeReturnPath(value) {
   if (typeof value !== 'string' || value.length < 1 || value.length > 2048) return '/';
   if (value[0] !== '/' || value[1] === '/' || value[1] === '\\') return '/';
@@ -169,26 +209,150 @@ function safeReturnPath(value) {
     return '/';
   }
   if (parsed.origin !== 'http://return.invalid') return '/';
-  return parsed.pathname + parsed.search;
+  const out = parsed.pathname + parsed.search;
+  if (out[0] !== '/' || out[1] === '/' || out[1] === '\\' || /[\\\u0000-\u001f\u007f]/.test(out)) return '/';
+  let again;
+  try {
+    again = new URL(out, 'http://return.invalid');
+  } catch {
+    return '/';
+  }
+  if (again.origin !== 'http://return.invalid' || again.pathname + again.search !== out) return '/';
+  return out;
 }
 
-// The dashboard maps an Authentik session to members by sub (cp_members.user_id)
-// or by email (cp_members.email). The same mapping decides who owns a device
-// row, with two tightenings: the email only counts when Authentik marked it
-// verified, and the member id must match byte-exact (no case folding).
+function validSsoSub(value) {
+  return typeof value === 'string' && SSO_SUB_RE.test(value);
+}
+
+// SSO identity is the Authentik sub only, bound to a member by an admin
+// (cp_sso_bindings). Email, name and preferred_username never identify.
+async function sessionMember(registry, sessionUser) {
+  if (!sessionUser || !validSsoSub(sessionUser.id)) return null;
+  const member = await registry.memberForSub(sessionUser.id);
+  return typeof member === 'string' && member.length > 0 ? member : null;
+}
+
 async function sessionOwnsUser(registry, sessionUser, userId) {
-  if (!sessionUser || typeof sessionUser.id !== 'string' || sessionUser.id.length === 0) return false;
   if (typeof userId !== 'string' || userId.length === 0) return false;
-  const email = sessionUser.email_verified === true && typeof sessionUser.email === 'string' && sessionUser.email.length > 0
-    ? sessionUser.email
-    : null;
-  const rows = await registry.membershipsForUser(sessionUser.id, email);
-  return Array.isArray(rows) && rows.some((row) => row && row.user_id === userId);
+  const member = await sessionMember(registry, sessionUser);
+  return member !== null && member === userId;
 }
 
 function sessionLabel(sessionUser) {
   const name = sessionUser.email || sessionUser.name || sessionUser.id;
   return typeof name === 'string' ? name : String(sessionUser.id);
+}
+
+// One CSRF token per session, used by every state-changing form here and by
+// /oauth/logout. Created only when a signed-in page renders a form.
+function sessionCsrf(req) {
+  if (!req.session) throw http(503, 'oauth_unavailable');
+  if (typeof req.session.csrf !== 'string') req.session.csrf = randomToken(32);
+  return req.session.csrf;
+}
+
+function csrfValid(req, presented) {
+  const want = req.session && req.session.csrf;
+  return typeof want === 'string' && typeof presented === 'string' && presented.length > 0 && tokenEqual(want, presented);
+}
+
+function recentFailures(tries, key, now) {
+  const list = (tries.get(key) || []).filter((t) => now - t < CODE_TRY_WINDOW_MS);
+  if (list.length) tries.set(key, list);
+  else tries.delete(key);
+  return list;
+}
+
+function codeEntryAllowed(tries, sessionKey, ipKey, now = Date.now()) {
+  return recentFailures(tries, sessionKey, now).length < CODE_TRIES_PER_SESSION
+    && recentFailures(tries, ipKey, now).length < CODE_TRIES_PER_IP;
+}
+
+// Returns true when the session has now used up its tries.
+function recordCodeFailure(tries, sessionKey, ipKey, now = Date.now()) {
+  for (const key of [sessionKey, ipKey]) {
+    const list = recentFailures(tries, key, now);
+    list.push(now);
+    tries.set(key, list);
+  }
+  if (tries.size > 10000) {
+    for (const key of [...tries.keys()]) recentFailures(tries, key, now);
+  }
+  return recentFailures(tries, sessionKey, now).length >= CODE_TRIES_PER_SESSION;
+}
+
+async function denyPending(registry, userId, now = Date.now()) {
+  if (!registry.pool) {
+    ensure(registry);
+    for (const row of registry.oauthDevices.values()) {
+      if (row.user_id === userId && row.status === 'pending') row.status = 'denied';
+    }
+    return;
+  }
+  await registry.pool.query(
+    `UPDATE cp_oauth_devices SET status = 'denied'
+     WHERE user_id = $1 AND status = 'pending' AND expires_at > $2`,
+    [userId, new Date(now).toISOString()]
+  );
+}
+
+function logoutForm(csrf) {
+  return '<form method="post" action="/oauth/logout">'
+    + '<input type="hidden" name="csrf" value="' + escapeHtml(csrf) + '">'
+    + '<button type="submit">Sign out</button></form>';
+}
+
+function ssoPage() {
+  return page('<p>Sign in to approve a command-line login.</p>'
+    + '<p><a href="/oauth/login?return_to=%2Foauth%2Fdevice%2Fverify">Sign in with After Dark SSO</a></p>');
+}
+
+function unboundPage(sessionUser, csrf) {
+  return page('<p>Login denied (login_denied).</p><p>Your After Dark SSO account <strong>'
+    + escapeHtml(sessionLabel(sessionUser)) + '</strong> is not bound to a SystemAPI member.'
+    + ' Ask an admin to bind it.</p>' + logoutForm(csrf));
+}
+
+function entryPage(sessionUser, member, csrf, notice) {
+  return page((notice ? '<p>' + escapeHtml(notice) + '</p>' : '')
+    + '<p>Signed in as <strong>' + escapeHtml(sessionLabel(sessionUser)) + '</strong> (member <strong>'
+    + escapeHtml(member) + '</strong>).</p>'
+    + '<p>Type the code your command-line client shows.</p>'
+    + '<form method="post" action="/oauth/device/verify">'
+    + '<input type="hidden" name="csrf" value="' + escapeHtml(csrf) + '">'
+    + '<label>Code <input name="user_code" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="16" required></label>'
+    + '<button type="submit">Continue</button></form>' + logoutForm(csrf));
+}
+
+function mismatchPage(sessionUser, owner, csrf) {
+  return page('<p>Login denied (login_denied).</p><p>You are signed in as <strong>'
+    + escapeHtml(sessionLabel(sessionUser)) + '</strong>; this login is for <strong>'
+    + escapeHtml(owner) + '</strong>.</p>' + logoutForm(csrf));
+}
+
+async function confirmPage(registry, row, code, csrf, env) {
+  const display = escapeHtml(displayUserCode(code));
+  const hidden = '<input type="hidden" name="user_code" value="' + display + '">'
+    + '<input type="hidden" name="csrf" value="' + escapeHtml(csrf) + '">';
+  const started = Number.isFinite(atMs(row.created_at)) ? new Date(atMs(row.created_at)).toISOString() : 'unknown';
+  let body = '<p>A command-line client asked to sign in as <strong>' + escapeHtml(row.user_id) + '</strong>.</p>'
+    + '<ul><li>From IP: <strong>' + escapeHtml(row.requester_ip || 'unknown') + '</strong></li>'
+    + '<li>Client: <strong>' + escapeHtml(row.requester_ua || 'unknown') + '</strong></li>'
+    + '<li>Started: <strong>' + escapeHtml(started) + '</strong></li></ul>'
+    + '<p><strong>Only continue if you started this login yourself.</strong></p>'
+    + '<form method="post" action="/oauth/device/verify">' + hidden
+    + '<input type="hidden" name="confirm" value="yes">'
+    + '<button type="submit">Yes, sign in</button></form>';
+  const allowed = await linksFor(registry, row.user_id);
+  for (const name of configuredNames(env)) {
+    if (!allowed.includes(name)) continue;
+    const label = name === 'google' ? 'Google' : 'GitHub';
+    body += '<form method="post" action="/oauth/device/verify">' + hidden
+      + '<input type="hidden" name="provider" value="' + name + '">'
+      + '<button type="submit">Continue with ' + label + '</button></form>';
+  }
+  return page(body);
 }
 
 function countPendingSync(registry, userId, now) {
@@ -204,6 +368,7 @@ async function insertDevice(registry, row, now) {
   if (!registry.pool) {
     ensure(registry);
     if (countPendingSync(registry, row.user_id, now) >= PENDING_CAP) throw http(429, 'slow_down');
+    if (registry.oauthByUserCode.has(row.user_code_hash)) throw http(409, 'user_code_taken');
     const stored = {
       device_hash: row.device_hash,
       user_code_hash: row.user_code_hash,
@@ -212,7 +377,10 @@ async function insertDevice(registry, row, now) {
       expires_at: row.expires_at,
       poll_after: row.poll_after,
       provider: null,
-      state_hash: null
+      state_hash: null,
+      requester_ip: row.requester_ip,
+      requester_ua: row.requester_ua,
+      created_at: new Date(now).toISOString()
     };
     registry.oauthDevices.set(stored.device_hash, stored);
     registry.oauthByUserCode.set(stored.user_code_hash, stored);
@@ -231,11 +399,16 @@ async function insertDevice(registry, row, now) {
       await client.query('ROLLBACK');
       throw http(429, 'slow_down');
     }
+    const taken = await client.query('SELECT 1 FROM cp_oauth_devices WHERE user_code_hash = $1', [row.user_code_hash]);
+    if (taken.rowCount > 0) {
+      await client.query('ROLLBACK');
+      throw http(409, 'user_code_taken');
+    }
     await client.query(
       `INSERT INTO cp_oauth_devices
-        (device_hash, user_code_hash, user_id, status, expires_at, poll_after)
-       VALUES ($1, $2, $3, 'pending', $4, $5)`,
-      [row.device_hash, row.user_code_hash, row.user_id, row.expires_at, row.poll_after]
+        (device_hash, user_code_hash, user_id, status, expires_at, poll_after, requester_ip, requester_ua)
+       VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7)`,
+      [row.device_hash, row.user_code_hash, row.user_id, row.expires_at, row.poll_after, row.requester_ip, row.requester_ua]
     );
     await client.query('COMMIT');
   } catch (err) {
@@ -250,25 +423,39 @@ async function insertDevice(registry, row, now) {
   }
 }
 
-async function startDevice(registry, username, env, now = Date.now()) {
+// RFC 8628 response. The user code is never put in a URL: the person types
+// it on the verification page after signing in.
+async function startDevice(registry, username, env, requester = {}, now = Date.now()) {
   const base = publicBase(env);
   const user = await memberUser(registry, username);
   if (!user) throw http(403, 'login_denied');
+  const who = cleanRequester(requester);
   const deviceCode = randomToken(32);
-  const userCode = randomToken(32);
-  await insertDevice(registry, {
-    device_hash: fingerprint(deviceCode),
-    user_code_hash: fingerprint(userCode),
-    user_id: user,
-    expires_at: new Date(now + DEVICE_TTL_MS).toISOString(),
-    poll_after: new Date(now).toISOString()
-  }, now);
-  return {
-    device_code: deviceCode,
-    verification_url: base + '/oauth/device/verify?code=' + encodeURIComponent(userCode),
-    expires_in: 600,
-    interval: pollSeconds(env)
-  };
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const userCode = newUserCode();
+    try {
+      await insertDevice(registry, {
+        device_hash: fingerprint(deviceCode),
+        user_code_hash: userCodeHash(userCode),
+        user_id: user,
+        expires_at: new Date(now + DEVICE_TTL_MS).toISOString(),
+        poll_after: new Date(now).toISOString(),
+        requester_ip: who.ip,
+        requester_ua: who.ua
+      }, now);
+    } catch (err) {
+      if (err.code === 'user_code_taken') continue;
+      throw err;
+    }
+    return {
+      device_code: deviceCode,
+      user_code: displayUserCode(userCode),
+      verification_uri: base + '/oauth/device/verify',
+      expires_in: 600,
+      interval: pollSeconds(env)
+    };
+  }
+  throw http(503, 'oauth_unavailable');
 }
 
 async function deviceByHash(registry, hash) {
@@ -285,18 +472,29 @@ async function deviceByHash(registry, hash) {
 }
 
 async function deviceByUserCode(registry, code) {
-  if (!validCode(code)) return null;
-  const hash = fingerprint(code);
+  if (typeof code !== 'string' || !USER_CODE_RE.test(code)) return null;
+  const hash = userCodeHash(code);
   if (!registry.pool) {
     ensure(registry);
     return registry.oauthByUserCode.get(hash) || null;
   }
   const res = await registry.pool.query(
-    `SELECT device_hash, user_id, status, expires_at, poll_after, provider, state_hash
+    `SELECT device_hash, user_id, status, expires_at, poll_after, provider, state_hash,
+            requester_ip, requester_ua, created_at
      FROM cp_oauth_devices WHERE user_code_hash = $1`,
     [hash]
   );
   return res.rows[0] || null;
+}
+
+// The pending, unexpired row for a typed code, or null. Says nothing about
+// who owns it; callers compare row.user_id with the session's member.
+async function pendingByTypedCode(registry, typed, now = Date.now()) {
+  const code = normalizeUserCode(typed);
+  if (!code) return null;
+  const row = await deviceByUserCode(registry, code);
+  if (!row || row.status !== 'pending' || atMs(row.expires_at) <= now) return null;
+  return { row, code };
 }
 
 async function deviceByState(registry, state) {
@@ -330,47 +528,6 @@ async function linksFor(registry, userId) {
   return res.rows.map((row) => row.provider).filter((name) => PROVIDERS[name]);
 }
 
-// Returns { status, html }. ctx.sessionUser is the Authentik dashboard session
-// user (or null); ctx.csrf is the session-bound token every form carries.
-async function verifyPage(registry, code, env, ctx = {}, now = Date.now()) {
-  const row = await deviceByUserCode(registry, typeof code === 'string' ? code : '');
-  if (!row || row.status !== 'pending' || atMs(row.expires_at) <= now) return { status: 200, html: denialPage() };
-  const sessionUser = ctx.sessionUser || null;
-  const safeUser = escapeHtml(row.user_id);
-  const safeCode = escapeHtml(code);
-  const safeCsrf = escapeHtml(typeof ctx.csrf === 'string' ? ctx.csrf : '');
-  const hidden = '<input type="hidden" name="code" value="' + safeCode + '">'
-    + '<input type="hidden" name="csrf" value="' + safeCsrf + '">';
-  let body = '<p>A command-line client is asking to sign in as <strong>' + safeUser + '</strong>.</p>'
-    + '<p>Only continue if you started this login yourself.</p>';
-  if (sessionUser && typeof sessionUser.id === 'string' && sessionUser.id) {
-    if (!(await sessionOwnsUser(registry, sessionUser, row.user_id))) {
-      return {
-        status: 403,
-        html: page('<p>Login denied (login_denied).</p><p>You are signed in as <strong>'
-          + escapeHtml(sessionLabel(sessionUser)) + '</strong>; this login is for <strong>'
-          + safeUser + '</strong>.</p><p><a href="/oauth/logout">Sign out</a> and sign in as '
-          + safeUser + ' to approve it.</p>')
-      };
-    }
-    body += '<form method="post" action="/oauth/device/verify">' + hidden
-      + '<button type="submit">Yes</button></form>';
-  } else {
-    const back = '/oauth/device/verify?code=' + encodeURIComponent(code);
-    body += '<p><a href="/oauth/login?return_to=' + escapeHtml(encodeURIComponent(back))
-      + '">Sign in with After Dark SSO</a></p>';
-  }
-  const allowed = await linksFor(registry, row.user_id);
-  for (const name of configuredNames(env)) {
-    if (!allowed.includes(name)) continue;
-    const label = name === 'google' ? 'Google' : 'GitHub';
-    body += '<form method="post" action="/oauth/device/verify">' + hidden
-      + '<input type="hidden" name="provider" value="' + name + '">'
-      + '<button type="submit">Continue with ' + label + '</button></form>';
-  }
-  return { status: 200, html: page(body) };
-}
-
 async function markApproved(registry, deviceHash, now) {
   if (!registry.pool) {
     ensure(registry);
@@ -387,12 +544,12 @@ async function markApproved(registry, deviceHash, now) {
   return res.rowCount === 1;
 }
 
-// Fails closed: no session, or a session that does not own the member, is
-// login_denied. The caller checks the CSRF token first.
-async function approveUserCode(registry, code, sessionUser, now = Date.now()) {
-  const row = await deviceByUserCode(registry, code);
-  if (!row || row.status !== 'pending' || atMs(row.expires_at) <= now) throw http(403, 'login_denied');
-  if (!(await sessionOwnsUser(registry, sessionUser, row.user_id))) throw http(403, 'login_denied');
+// Fails closed: no session, an unbound sub, or a session whose member does
+// not own the row is login_denied. The caller checks CSRF and rate limits.
+async function approveUserCode(registry, typed, sessionUser, now = Date.now()) {
+  const found = await pendingByTypedCode(registry, typed, now);
+  if (!found || !(await sessionOwnsUser(registry, sessionUser, found.row.user_id))) throw http(403, 'login_denied');
+  const row = found.row;
   const ok = await markApproved(registry, row.device_hash, now);
   if (!ok) throw http(403, 'login_denied');
 }
@@ -410,11 +567,12 @@ function authorizeUrl(cfg, redirectUri, state) {
   return out;
 }
 
-async function beginExternal(registry, code, provider, env, now = Date.now()) {
+async function beginExternal(registry, typed, provider, env, sessionUser, now = Date.now()) {
   const cfg = configuredProvider(env, provider);
   if (!cfg) throw http(403, 'link_denied');
-  const row = await deviceByUserCode(registry, code);
-  if (!row || row.status !== 'pending' || atMs(row.expires_at) <= now) throw http(403, 'login_denied');
+  const found = await pendingByTypedCode(registry, typed, now);
+  if (!found || !(await sessionOwnsUser(registry, sessionUser, found.row.user_id))) throw http(403, 'login_denied');
+  const row = found.row;
   const allowed = await linksFor(registry, row.user_id);
   if (!allowed.includes(provider)) throw http(403, 'link_denied');
   const base = publicBase(env);
@@ -806,6 +964,57 @@ async function removeLink(registry, userId, provider) {
   return res.rowCount === 1;
 }
 
+// Binds an Authentik sub to a member id and writes one audit-chain row per
+// tenant the member belongs to. If the audit write fails the binding is put
+// back and the call fails. Used by the admin API and scripts/sso-bind.js.
+async function bindSsoAudited(registry, { userId, sub, actor }) {
+  if (!validSsoSub(sub)) throw http(400, 'bad_sso_sub');
+  if (typeof userId !== 'string' || !USER_RE.test(userId)) throw http(400, 'bad_user');
+  if (typeof actor !== 'string' || actor.length === 0) throw http(400, 'bad_actor');
+  const tenants = [...new Set((await registry.membershipsForUser(userId)).map((m) => m.tenant_id))];
+  if (tenants.length === 0) throw http(404, 'not_found');
+  const before = await registry.ssoBinding(userId);
+  await registry.bindSso(userId, sub, actor);
+  try {
+    for (const tenantId of tenants) {
+      await registry.appendAudit({
+        tenant_id: tenantId,
+        actor,
+        action: 'sso_bind',
+        payload: { user_id: userId, sso_sub_fp: fingerprint(sub), previous_fp: before ? fingerprint(before.sso_sub) : null }
+      });
+    }
+  } catch (err) {
+    console.error('[control] sso bind audit failed:', err.code || 'audit_failed');
+    try {
+      if (before) await registry.bindSso(userId, before.sso_sub, before.bound_by);
+      else await registry.unbindSso(userId);
+    } catch (undoErr) {
+      console.error('[control] sso bind rollback failed:', undoErr.code || 'rollback_failed');
+    }
+    throw http(503, 'audit_unavailable');
+  }
+  return { user_id: userId, bound: true };
+}
+
+async function unbindSsoAudited(registry, { userId, actor }) {
+  if (typeof userId !== 'string' || !USER_RE.test(userId)) throw http(400, 'bad_user');
+  const tenants = [...new Set((await registry.membershipsForUser(userId)).map((m) => m.tenant_id))];
+  if (tenants.length === 0) throw http(404, 'not_found');
+  const before = await registry.ssoBinding(userId);
+  if (!before) return { user_id: userId, bound: false };
+  for (const tenantId of tenants) {
+    await registry.appendAudit({
+      tenant_id: tenantId,
+      actor,
+      action: 'sso_unbind',
+      payload: { user_id: userId, previous_fp: fingerprint(before.sso_sub) }
+    });
+  }
+  await registry.unbindSso(userId);
+  return { user_id: userId, bound: false };
+}
+
 async function memberIds(registry, tenantIds) {
   if (!tenantIds || tenantIds.length === 0) return [];
   if (!registry.pool) {
@@ -852,8 +1061,23 @@ async function listLinks(registry, userIds) {
 module.exports = {
   DEVICE_GRANT,
   startDevice,
-  verifyPage,
   approveUserCode,
+  pendingByTypedCode,
+  normalizeUserCode,
+  sessionMember,
+  sessionCsrf,
+  csrfValid,
+  codeEntryAllowed,
+  recordCodeFailure,
+  denyPending,
+  ssoPage,
+  unboundPage,
+  entryPage,
+  mismatchPage,
+  confirmPage,
+  validSsoSub,
+  bindSsoAudited,
+  unbindSsoAudited,
   beginExternal,
   completeExternal,
   exchangeExternal,

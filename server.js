@@ -5,7 +5,6 @@
 
 const fs = require('fs');
 const express = require('express');
-const cors = require('cors');
 const helmet = require('helmet');
 const compression = require('compression');
 const morgan = require('morgan');
@@ -45,6 +44,10 @@ function dbSsl(env) {
 }
 
 const app = express();
+// req.ip feeds the device-login requester display and the per-IP code-entry
+// limit, so behind a reverse proxy it must be the client, not the proxy.
+// Default trusts X-Forwarded-For only from a loopback peer (a local proxy).
+app.set('trust proxy', process.env.SYSTEMAPI_TRUST_PROXY || 'loopback');
 const PORT = process.env.PORT || 3003;
 
 // Prometheus metrics registry
@@ -121,17 +124,10 @@ app.use(helmet({
 app.use(compression());
 morgan.token('urlpath', (req) => req.path || '-');
 app.use(morgan(':remote-addr - :remote-user [:date[clf]] ":method :urlpath HTTP/:http-version" :status :res[content-length] ":referrer" ":user-agent"'));
-app.use(cors({
-    origin: [
-        /\.afterdarksys\.com$/,
-        /\.systemapi\.io$/,
-        /\.auth\.afterdarksys\.com$/,
-        'http://localhost:3000',
-        'http://localhost:5173', // Vite dev server
-        'https://systemapi.io'
-    ],
-    credentials: true
-}));
+// Credentialed CORS only for the exact origins in SYSTEMAPI_ALLOWED_ORIGINS
+// (default https://systemapi.io plus the public URL; local dev servers outside
+// production), and none at all on /oauth. See controlplane/httpauth.js.
+app.use(require('./controlplane/httpauth').corsMiddleware(process.env));
 app.use(express.json({ limit: '256kb' }));
 app.use(express.urlencoded({ extended: true, limit: '256kb' }));
 
@@ -206,8 +202,8 @@ if (process.env.DB_PASSWORD && process.env.DB_PASSWORD !== '') {
 
 
 // OAuth routes
-const oauthRouter = require('./routes/oauth');
-app.use('/oauth', oauthRouter);
+const { createOAuthRouter } = require('./routes/oauth');
+app.use('/oauth', createOAuthRouter({ env: process.env }));
 
 // Prometheus metrics endpoint
 app.get('/metrics', async (req, res) => {
