@@ -1220,3 +1220,52 @@ test('terminal:root is admin only and every ticket is audited', async () => {
     adminApp.server.close();
   }
 });
+
+test('the audit chain covers actor, host, tenant and action; legacy rows still verify', async () => {
+  const { GENESIS, chainHash } = require('../controlplane/chain');
+  const reg = new MemoryRegistry({ NODE_ENV: 'test' });
+  await reg.appendAudit({ tenant_id: 'acme', host_id: HOST_A, actor: 'user-1', action: 'terminal_start', payload: { session_id: 's1' } });
+  await reg.appendAudit({ tenant_id: 'acme', host_id: HOST_A, actor: 'user-1', action: 'terminal_end', payload: { session_id: 's1' } });
+  assert.equal((await reg.verifyAudit()).ok, true);
+  for (const [column, value] of [['actor', 'someone-else'], ['host_id', HOST_B], ['tenant_id', 'beta'], ['action', 'ticket_issued']]) {
+    const original = reg.audit[0][column];
+    reg.audit[0][column] = value;
+    const broken = await reg.verifyAudit();
+    assert.equal(broken.ok, false, column);
+    assert.equal(broken.broken_at, 1, column);
+    reg.audit[0][column] = original;
+  }
+  assert.equal((await reg.verifyAudit()).ok, true);
+
+  // A row written before every column was hashed (payload only) still verifies.
+  const legacy = new MemoryRegistry({ NODE_ENV: 'test' });
+  const payload = { n: 1 };
+  legacy.audit.push({ seq: 1, prev_hash: GENESIS, row_hash: chainHash(GENESIS, payload), tenant_id: 'acme', host_id: null, actor: 'old', action: 'sysscript', payload });
+  legacy.auditSeq = 2;
+  await legacy.appendAudit({ tenant_id: 'acme', actor: 'new', action: 'sysscript', payload: { n: 2 } });
+  assert.equal((await legacy.verifyAudit()).ok, true);
+});
+
+test('ws-ticket is rate limited per host', async () => {
+  const fm = fleet();
+  fm.env = { NODE_ENV: 'test', SYSTEMAPI_TICKET_RATE_PER_HOST: '2' };
+  await seed(fm);
+  await fm.registry.setScopes('ak_test', ['admin']);
+  const { server, url } = await listen(appFor(fm));
+  const ticket = () => call(`${url}/api/v1/ws-ticket`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-api-key': 'good-key' },
+    body: JSON.stringify({ host_id: HOST_A, purpose: 'terminal:open' })
+  });
+  try {
+    assert.equal((await ticket()).status, 200);
+    assert.equal((await ticket()).status, 200);
+    const limited = await ticket();
+    assert.equal(limited.status, 429);
+    assert.equal(limited.body.error, 'rate_limited');
+    assert.equal(fm.tickets.size, 2);
+    assert.equal(fm.registry.audit.filter((row) => row.action === 'ticket_issued').length, 2);
+  } finally {
+    server.close();
+  }
+});

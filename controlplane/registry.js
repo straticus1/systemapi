@@ -8,7 +8,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { GENESIS, canonicalJSON, chainHash, verifyRows } = require('./chain');
+const { GENESIS, canonicalJSON, rowHash, verifyRows } = require('./chain');
 const { scopesForKeyRows } = require('./authz');
 const { escapeLike, efficiency: efficiencyOf } = require('./stats');
 const { fingerprint } = require('./token');
@@ -249,7 +249,6 @@ class MemoryRegistry {
       const row = {
         seq: this.auditSeq++,
         prev_hash: prev,
-        row_hash: chainHash(prev, payload),
         tenant_id: entry.tenant_id || null,
         host_id: entry.host_id || null,
         actor: entry.actor || null,
@@ -257,6 +256,7 @@ class MemoryRegistry {
         payload,
         created_at: new Date().toISOString()
       };
+      row.row_hash = rowHash(prev, row);
       this.audit.push(row);
       return row;
     });
@@ -692,12 +692,19 @@ class PgRegistry {
       const prevRes = await client.query('SELECT row_hash FROM cp_audit ORDER BY seq DESC LIMIT 1 FOR UPDATE');
       const prev = prevRes.rows[0] ? prevRes.rows[0].row_hash : GENESIS;
       const payload = JSON.parse(canonicalJSON(entry.payload || {}));
-      const rowHash = chainHash(prev, payload);
+      const cols = {
+        tenant_id: entry.tenant_id || null,
+        host_id: entry.host_id || null,
+        actor: entry.actor || null,
+        action: entry.action,
+        payload
+      };
+      const hash = rowHash(prev, cols);
       const ins = await client.query(
         `INSERT INTO cp_audit (prev_hash, row_hash, tenant_id, host_id, actor, action, payload)
          VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
          RETURNING seq, prev_hash, row_hash, tenant_id, host_id, actor, action, payload, created_at`,
-        [prev, rowHash, entry.tenant_id || null, entry.host_id || null, entry.actor || null, entry.action, JSON.stringify(payload)]
+        [prev, hash, cols.tenant_id, cols.host_id, cols.actor, cols.action, JSON.stringify(payload)]
       );
       await client.query('COMMIT');
       return ins.rows[0];
@@ -710,7 +717,9 @@ class PgRegistry {
   }
 
   async verifyAudit() {
-    const res = await this.pool.query('SELECT seq, prev_hash, row_hash, payload FROM cp_audit ORDER BY seq ASC');
+    const res = await this.pool.query(
+      'SELECT seq, prev_hash, row_hash, tenant_id, host_id, actor, action, payload FROM cp_audit ORDER BY seq ASC'
+    );
     return verifyRows(res.rows.map((row) => ({ ...row, seq: Number(row.seq) })));
   }
 

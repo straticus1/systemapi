@@ -23,6 +23,7 @@ const COOLDOWN_MS = 5 * 60 * 1000;
 const USER_RE = /^[a-zA-Z0-9][a-zA-Z0-9._@-]{0,128}$/;
 const RESOLVE_NAME_RE = /^[A-Za-z0-9._-]{1,253}$/;
 const TICKET_PURPOSES = new Set(['terminal:open', 'terminal:root', 'breakglass:open']);
+const TICKET_RATE_DEFAULT = 20;
 const formBody = express.urlencoded({ extended: false, limit: '8kb' });
 const BOOL_ENTITLEMENTS = [
   'allow_fs_write',
@@ -283,10 +284,32 @@ async function runScript(fleet, principal, host, script, entitlements) {
   return { request_id: requestId, result };
 }
 
+// Per-host ticket rate: SYSTEMAPI_TICKET_RATE_PER_HOST tickets per minute
+// (default 20). In process memory, like the tickets themselves.
+function ticketAllowed(fleet, hostId, now = Date.now()) {
+  const raw = Number((fleet.env || {}).SYSTEMAPI_TICKET_RATE_PER_HOST);
+  const limit = Number.isInteger(raw) && raw > 0 ? raw : TICKET_RATE_DEFAULT;
+  if (!fleet.ticketRate) fleet.ticketRate = new Map();
+  const recent = (fleet.ticketRate.get(hostId) || []).filter((t) => now - t < 60_000);
+  if (recent.length >= limit) {
+    fleet.ticketRate.set(hostId, recent);
+    return false;
+  }
+  recent.push(now);
+  fleet.ticketRate.set(hostId, recent);
+  if (fleet.ticketRate.size > 10_000) {
+    for (const [id, times] of fleet.ticketRate) {
+      if (!times.some((t) => now - t < 60_000)) fleet.ticketRate.delete(id);
+    }
+  }
+  return true;
+}
+
 // The audit row is written before the ticket exists, so a failed audit write
 // issues nothing. The ticket itself is never written to the audit log.
 async function issueAuditedTicket(fleet, principal, host, purpose) {
   if (!fleet.tickets) throw http(503, 'tickets_unavailable');
+  if (!ticketAllowed(fleet, host.host_id)) throw http(429, 'rate_limited');
   await fleet.registry.appendAudit({
     tenant_id: host.tenant_id,
     host_id: host.host_id,
