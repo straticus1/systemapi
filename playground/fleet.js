@@ -12,8 +12,9 @@
  * gives a start 30 s, and renews the lease every 30 s, so a dead server lets
  * the agent end the shell when the last lease lapses. A root shell must
  * report agent recording. Does NOT persist tickets or sessions across
- * restarts or between server nodes. TCP-forward channel sessions live in
- * playground/tcp.js (with their own Threats note); this file routes their
+ * restarts or between server nodes. TCP-forward and file channel sessions
+ * live in playground/tcp.js and playground/file.js (with their own Threats
+ * notes); this file routes their
  * upgrade path, agent frames and binary data, and ends them when the agent
  * connection drops.
  */
@@ -33,6 +34,7 @@ const { parseCapabilities } = require('../controlplane/channels');
 const { CreditLedger } = require('../controlplane/credit');
 const { deliverWebhooks, COOLDOWN_MS } = require('../controlplane/router');
 const { TcpChannels } = require('./tcp');
+const { FileChannels } = require('./file');
 
 const PTY_FRAME_MAX = 64 * 1024;
 const PTY_PENDING_MAX = 1024 * 1024;
@@ -146,6 +148,8 @@ class FleetManager {
         this.env = process.env;
         // TCP-forward channel sessions (playground/tcp.js).
         this.tcp = new TcpChannels(this);
+        // File channel sessions (playground/file.js).
+        this.file = new FileChannels(this);
 
         const accessKey = process.env.DARKSTORAGE_ACCESS_KEY;
         const secretKey = process.env.DARKSTORAGE_SECRET_KEY;
@@ -190,6 +194,10 @@ class FleetManager {
         }
         if (parsed.pathname.startsWith('/api/v1/systems/tcp/')) {
             this.tcp.upgrade(request, socket, head, parsed);
+            return;
+        }
+        if (parsed.pathname.startsWith('/api/v1/systems/file/')) {
+            this.file.upgrade(request, socket, head, parsed);
             return;
         }
         this.rejectUpgrade(socket, 404, 'Not Found');
@@ -549,6 +557,10 @@ class FleetManager {
             this.tcp.onAgentData(ws, hostId, sid, buf.subarray(1 + n));
             return;
         }
+        if (FileChannels.owns(sid)) {
+            this.file.onAgentData(ws, hostId, sid, buf.subarray(1 + n));
+            return;
+        }
         const session = this.agentSession(ws, hostId, sid);
         if (!session) return;
         const data = buf.subarray(1 + n);
@@ -766,6 +778,10 @@ class FleetManager {
                 } else if (msg.type === 'tcp_status' || msg.type === 'tcp_eof' || msg.type === 'tcp_credit' || msg.type === 'tcp_closed') {
                     const id = hostId;
                     if (id) inOrder(() => this.tcp.onAgentFrame(ws, id, msg));
+                } else if (msg.type === 'file_status' || msg.type === 'file_result' || msg.type === 'file_write_ack' || msg.type === 'file_credit' || msg.type === 'file_closed') {
+                    const id = hostId;
+                    const raw = messageBuffer;
+                    if (id) inOrder(() => this.file.onAgentFrame(ws, id, msg, raw));
                 }
             } catch (err) {
                 console.error('[Fleet] message error:', err.message);
@@ -782,6 +798,7 @@ class FleetManager {
                     if (session.agent === ws) this.finalizeTerminal(session, null);
                 }
                 this.tcp.onAgentGone(ws);
+                this.file.onAgentGone(ws);
             }, 0, true);
             // A connection that a newer one for the same host already
             // replaced does not mark the host offline.

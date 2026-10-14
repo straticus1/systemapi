@@ -124,10 +124,13 @@ async function appendAuditRetrying(registry, entry, delaysMs, onFail, noteSecuri
 // client (tcp_eof and tcp_close ordering). Bytes go out only while
 // client.bufferedAmount < maxBuffered; credit for them goes back to the
 // agent (onCredit(n), batched by the CreditStream) only while it is under
-// that line too. Held bytes are bounded by the stream's window.
+// that line too. Held bytes are bounded by the stream's window. frameMax
+// is the largest binary frame sent (64 KiB; the file channel sends each
+// read_chunk as one frame of up to chunk_max).
 class ClientSink {
-    constructor({ client, stream, onCredit, maxBuffered = CLIENT_BUFFER_MAX, pollMs = PUMP_POLL_MS }) {
+    constructor({ client, stream, onCredit, maxBuffered = CLIENT_BUFFER_MAX, pollMs = PUMP_POLL_MS, frameMax = CHANNEL_FRAME_MAX }) {
         this.client = client;
+        this.frameMax = frameMax;
         this.stream = stream;
         this.onCredit = onCredit;
         this.maxBuffered = maxBuffered;
@@ -176,7 +179,7 @@ class ClientSink {
                 if (this.stopped) return;
                 continue;
             }
-            const take = Math.min(item.length, CHANNEL_FRAME_MAX);
+            const take = Math.min(item.length, this.frameMax);
             ws.send(item.subarray(0, take));
             this.queuedBytes -= take;
             this.uncredited += take;
