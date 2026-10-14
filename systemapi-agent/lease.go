@@ -3,6 +3,9 @@
 // rejects tampered, expired, wrong-host, wrong-action, and replayed input.
 // Does NOT persist the nonce cache across process restarts (TTL cap is 300s).
 // Does NOT accept a control public key that changes after the first pin.
+// Terminal actions (pty, pty_root, breakglass) sign "<action>\n<session_id>\n
+// <deadline_unix>", so a renewal lease is bound to one session and cannot move
+// its deadline.
 package main
 
 import (
@@ -58,14 +61,19 @@ func payloadHash(action, payload string) string {
 }
 
 func payloadFor(action, payload string) string {
-	switch action {
-	case "pty":
-		return "pty"
-	case "breakglass":
-		return "breakglass"
-	default:
-		return payload
+	if terminalAction(action) {
+		return action + "\n" + payload
 	}
+	return payload
+}
+
+func terminalAction(action string) bool {
+	return action == "pty" || action == "pty_root" || action == "breakglass"
+}
+
+// terminalPayload is the signed payload of a terminal lease.
+func terminalPayload(sessionID string, deadlineUnix int64) string {
+	return sessionID + "\n" + strconv.FormatInt(deadlineUnix, 10)
 }
 
 func hashEqual(a, b string) bool {
@@ -76,7 +84,7 @@ func hashEqual(a, b string) bool {
 }
 
 func knownAction(action string) bool {
-	return action == "sysscript" || action == "pty" || action == "breakglass"
+	return action == "sysscript" || terminalAction(action)
 }
 
 // verifyLease checks the signature and the time window. It does not record

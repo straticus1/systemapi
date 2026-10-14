@@ -24,6 +24,9 @@ type CommandMessage struct {
 	Entitlements *Entitlements `json:"entitlements"`
 	RequestID    string        `json:"request_id"`
 	Data         string        `json:"data,omitempty"`
+	DataB64      string        `json:"data_b64,omitempty"`
+	SessionID    string        `json:"session_id,omitempty"`
+	DeadlineUnix int64         `json:"deadline_unix,omitempty"`
 	Rows         int           `json:"rows,omitempty"`
 	Cols         int           `json:"cols,omitempty"`
 	Action       string        `json:"action,omitempty"`
@@ -35,6 +38,7 @@ type ResponseMessage struct {
 	Type      string      `json:"type"`
 	Payload   interface{} `json:"payload"`
 	RequestID string      `json:"request_id,omitempty"`
+	SessionID string      `json:"session_id,omitempty"`
 }
 
 func main() {
@@ -43,7 +47,14 @@ func main() {
 	tenantFlag := flag.String("tenant", "", "tenant name (required)")
 	hostnameFlag := flag.String("hostname", "", "hostname (default: this machine)")
 	stateFlag := flag.String("state", "", "state file (default: ~/.systemapi/agent.json)")
+	ptyUserFlag := flag.String("pty-user", "", "account for terminal:open shells; required when the agent runs as root")
+	ptyRecordFlag := flag.Bool("pty-record", true, "run terminal sessions under adssh so its audit chain records them")
+	ptyRecordDirFlag := flag.String("pty-record-dir", "", "adssh policy and per-user audit logs (default: "+ptyRootRecordDir+" as root, else <state dir>/pty)")
 	flag.Parse()
+	ptyCfg = ptySettings{User: *ptyUserFlag, Record: *ptyRecordFlag, RecordDir: *ptyRecordDirFlag}
+	if !ptyCfg.Record {
+		log.Printf("terminal recording is OFF (--pty-record=false)")
+	}
 
 	apiKey := *apiKeyFlag
 	if apiKey == "" {
@@ -113,6 +124,7 @@ func main() {
 	}
 	defer c.Close()
 	c.SetReadLimit(256 * 1024)
+	out := &wsWriter{c: c}
 
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, os.Interrupt)
@@ -157,7 +169,7 @@ func main() {
 				signalEnroll(fmt.Errorf("enroll_error:%s", peek.Error))
 				return
 			default:
-				processIncomingMessage(c, st.HostID, stateDir, message)
+				processIncomingMessage(out, st.HostID, stateDir, message)
 			}
 		}
 	}()
@@ -199,13 +211,13 @@ func main() {
 				continue
 			}
 			response := ResponseMessage{Type: "telemetry", Payload: stats}
-			if err := c.WriteJSON(response); err != nil {
+			if err := out.WriteJSON(response); err != nil {
 				log.Printf("write telemetry: %v", err)
 				return
 			}
 		case <-interrupt:
 			log.Println("interrupt received, disconnecting")
-			_ = c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+			_ = out.WriteClose()
 			select {
 			case <-done:
 			case <-time.After(time.Second):
@@ -215,7 +227,7 @@ func main() {
 	}
 }
 
-func processIncomingMessage(c *websocket.Conn, hostID, stateDir string, message []byte) {
+func processIncomingMessage(out ptyOut, hostID, stateDir string, message []byte) {
 	var cmd CommandMessage
 	if err := json.Unmarshal(message, &cmd); err != nil {
 		log.Printf("rejected command: %v", err)
@@ -225,12 +237,12 @@ func processIncomingMessage(c *websocket.Conn, hostID, stateDir string, message 
 	switch cmd.Type {
 	case "sysscript":
 		if len(cmd.Script) > scriptMaxBytes {
-			writeCommandResult(c, cmd.RequestID, "script_too_large", "")
+			writeCommandResult(out, cmd.RequestID, "script_too_large", "")
 			return
 		}
 		if err := authorizeCommand(hostID, "sysscript", cmd.Script, cmd.Lease, time.Now()); err != nil {
 			log.Printf("sysscript refused: %s", err.Error())
-			writeCommandResult(c, cmd.RequestID, err.Error(), "")
+			writeCommandResult(out, cmd.RequestID, err.Error(), "")
 			return
 		}
 		log.Printf("sysscript %s", cmd.RequestID)
@@ -240,43 +252,51 @@ func processIncomingMessage(c *websocket.Conn, hostID, stateDir string, message 
 		if err != nil {
 			errText = err.Error()
 		}
-		writeCommandResult(c, cmd.RequestID, errText, output)
+		writeCommandResult(out, cmd.RequestID, errText, output)
 
 	case "pty_start":
-		action := cmd.Action
-		if action == "" {
-			action = "pty"
-		}
-		if err := authorizeCommand(hostID, action, action, cmd.Lease, time.Now()); err != nil {
-			log.Printf("pty refused: %s", err.Error())
-			_ = c.WriteJSON(ResponseMessage{
-				Type:      "pty_status",
-				RequestID: cmd.RequestID,
+		log.Printf("pty_start %s action=%s", cmd.SessionID, cmd.Action)
+		startPTYSession(out, hostID, stateDir, ptyStartRequest{
+			SessionID:    cmd.SessionID,
+			Action:       cmd.Action,
+			Rows:         cmd.Rows,
+			Cols:         cmd.Cols,
+			DeadlineUnix: cmd.DeadlineUnix,
+			Lease:        cmd.Lease,
+		}, time.Now())
+
+	case "pty_renew":
+		if err := renewPTYSession(hostID, cmd.SessionID, cmd.Lease, time.Now()); err != nil {
+			log.Printf("pty_renew refused: %s", err.Error())
+			_ = out.WriteJSON(ResponseMessage{
+				Type:      "pty_renew_rejected",
+				SessionID: cmd.SessionID,
 				Payload:   map[string]string{"error": err.Error()},
 			})
-			return
 		}
-		expires := int64(0)
-		if cmd.Lease != nil {
-			expires = cmd.Lease.ExpiresUnix
-		}
-		log.Printf("pty_start %s action=%s", cmd.RequestID, action)
-		HandlePTYStart(c, cmd.RequestID, action, expires, stateDir)
 
 	case "pty_input":
-		HandlePTYInput([]byte(cmd.Data))
+		data, err := decodePTYInput(cmd.DataB64, cmd.Data)
+		if err != nil {
+			log.Printf("pty_input rejected: bad base64")
+			return
+		}
+		handlePTYInput(cmd.SessionID, data)
+
+	case "pty_eof":
+		handlePTYEOF(cmd.SessionID)
 
 	case "pty_resize":
-		HandlePTYResize(uint16(cmd.Rows), uint16(cmd.Cols))
+		handlePTYResize(cmd.SessionID, cmd.Rows, cmd.Cols)
 
 	case "pty_stop":
-		log.Printf("pty_stop")
-		HandlePTYStop()
+		log.Printf("pty_stop %s", cmd.SessionID)
+		handlePTYStop(cmd.SessionID)
 	}
 }
 
-func writeCommandResult(c *websocket.Conn, requestID, errText, output string) {
-	_ = c.WriteJSON(ResponseMessage{
+func writeCommandResult(out ptyOut, requestID, errText, output string) {
+	_ = out.WriteJSON(ResponseMessage{
 		Type:      "command_result",
 		RequestID: requestID,
 		Payload:   map[string]string{"error": errText, "output": output},
