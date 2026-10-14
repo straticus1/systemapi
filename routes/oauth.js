@@ -11,8 +11,8 @@
 // emails or subjects to the browser or the log (generic codes plus a request
 // id; the log gets only the error name and code). The session stores the
 // Authentik sub; who that sub may act as is decided by cp_sso_bindings, not
-// here. Does NOT bind subs to members. allowInsecureRequests exists for tests
-// against a local mock issuer and is refused in production.
+// here. Does NOT bind subs to members. options.customFetch exists so tests can
+// trust a local mock HTTPS issuer; TLS is never turned off.
 'use strict';
 
 const express = require('express');
@@ -43,8 +43,7 @@ function createOAuthRouter(options = {}) {
   const DEV_MODE = env.DEV_MODE === 'true';
   const DEV_REDIRECT_URI = env.DEV_REDIRECT_URI || 'http://localhost:3000/oauth/callback';
   const POST_LOGOUT = DEV_MODE ? 'http://localhost:3000' : 'https://systemapi.io';
-  const insecure = options.allowInsecureRequests === true;
-  if (insecure && env.NODE_ENV === 'production') throw new Error('allowInsecureRequests is refused in production');
+  const customFetch = typeof options.customFetch === 'function' ? options.customFetch : null;
 
   const router = express.Router();
   // openid-client 6 is ESM-only; loaded lazily on the first request.
@@ -61,7 +60,7 @@ function createOAuthRouter(options = {}) {
       err.code = 'client_secret_missing';
       throw err;
     }
-    const discoveryOptions = insecure ? { execute: [oidc.allowInsecureRequests] } : undefined;
+    const discoveryOptions = customFetch ? { [oidc.customFetch]: customFetch } : undefined;
     authentikClient = await oidc.discovery(
       new URL(AUTHENTIK_ISSUER),
       CLIENT_ID,
