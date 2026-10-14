@@ -11,7 +11,9 @@ the router.
 - Dashboard: the OAuth session cookie set by `/oauth/login`.
 - Browser and CLI WebSockets: a single-use ticket from `POST /api/v1/ws-ticket`
   (`purpose` is `terminal:open`, `terminal:root` or `breakglass:open`). Tickets
-  last 60 seconds, are bound to one host and purpose, and are audited.
+  last 60 seconds, are bound to one host and purpose, and are audited. A host
+  gets at most `SYSTEMAPI_TICKET_RATE_PER_HOST` (default 20) tickets a minute;
+  more return 429 `rate_limited`.
   `terminal:root` needs the admin-only scope `terminal:root`.
 - Agents: `Authorization: Bearer <key>` on the WebSocket upgrade, plus the
   enrollment headers described in `cli_docs.md`.
@@ -138,7 +140,14 @@ proxy cached data from DNSScience (`DNSSCIENCE_API_URL`) and DarkAPI.
     payload: {code, reason}}`, `pty_renew_rejected {session_id, payload: {error}}`,
     and binary output frames `[len(session_id)][session_id][bytes]`.
   Terminal lease actions are `pty`, `pty_root` and `breakglass`; each signs
-  `<action>\n<session_id>\n<deadline_unix>`.
+  `<action>\n<session_id>\n<deadline_unix>\n<start|renew>`. The agent's
+  `pty_status` "started" payload carries `recording` (`agent`, `user_owned` or
+  `off`) and `pty_user_privileged_groups`; its `pty_exit` payload carries
+  `record {path, digest, bytes_in, bytes_out}` and, on failure,
+  `record_error`.
 - Terminal: `/api/v1/systems/terminal/:hostId?ticket=<ticket>&purpose=<purpose>&rows=<r>&cols=<c>`.
   The client contract is `docs/sahconnect-terminal-protocol.md`.
-  `SYSTEMAPI_PTY_MAX_SECONDS` (default 28800) caps a session.
+  `SYSTEMAPI_PTY_MAX_SECONDS` (default 28800) caps a session,
+  `SYSTEMAPI_PTY_MAX_PER_ACTOR` (default 8) caps live sessions per user, and
+  `SYSTEMAPI_PTY_CLIENT_BUFFER_MAX` (default 8 MiB) ends a session whose client
+  cannot keep up.

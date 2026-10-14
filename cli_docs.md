@@ -19,12 +19,18 @@ SYSTEMAPI_API_KEY=<key> ./systemapi-agent \
 | `--tenant` | (required) | Tenant the host enrolls into. |
 | `--hostname` | this machine | Reported hostname. |
 | `--state` | `~/.systemapi/agent.json` | Host id, SSH key and pinned control key. |
-| `--pty-user` | (none) | Account that `terminal:open` shells run as. Required when the agent runs as root; without it those sessions are refused with `pty_user_unset`. Must not be root. |
-| `--pty-record` | `true` | Run terminal sessions under `adssh` so its audit chain records them. A missing `adssh` refuses the session with `recording_unavailable`. `false` runs the user's shell unrecorded. |
-| `--pty-record-dir` | `/var/lib/systemapi-agent/pty` as root, else `<state dir>/pty` | Holds `terminal.rego` and one `adssh` audit log directory per shell user. |
+| `--api-key-file` | (none) | File holding the API key, mode 0600. Preferred, with `SYSTEMAPI_API_KEY`; the agent removes `SYSTEMAPI_API_KEY` from its environment after reading it. `--api-key` works but is visible in the process list and logs a warning. |
+| `--pty-user` | (none) | Account that `terminal:open` shells run as, with uid, gid and supplementary groups dropped. Required when the agent runs as root (else `pty_user_unset`). Must not be root. Membership in `docker`, `sudo`, `wheel`, `adm` and similar groups is logged and reported. |
+| `--pty-allow-agent-user` | `false` | Let a non-root agent run `terminal:open` shells as its own user. Without it a non-root agent refuses them. Risk: that shell can read the agent's API key, state and recording key, and ptrace the agent. Recordings are then `user_owned`. |
+| `--pty-record` | `true` | Record every input and output byte of each terminal session in an HMAC-chained file. `false` turns recording off (mode `off`). |
+| `--pty-record-dir` | `/var/lib/systemapi/recordings` as root, else `<state dir>/recordings` | One `<session_id>.rec` file per session, directory mode 0700. The HMAC key is `recording.key` (0600) in the state directory. |
 
 `terminal:root` sessions use their own lease action (`pty_root`), run as root,
-and need an agent running as root.
+and need an agent running as root. The agent keeps 4 of its 32 session slots
+for `terminal:root` and break-glass. Ending a session (stop, lease expiry,
+deadline, or the shell exiting) sends SIGHUP and then SIGKILL to its process
+group and, on Linux, to every process in its session. On SIGINT, SIGTERM or a
+lost connection the agent ends every session first.
 
 On dial it sends `Authorization: Bearer <key>`, `X-SystemAPI-Tenant`,
 `X-SystemAPI-Host-ID`, `X-SystemAPI-Hostname` and `X-SystemAPI-SSH-PubKey`
