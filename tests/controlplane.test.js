@@ -15,7 +15,7 @@ const { mount, clampEntitlements } = require('../controlplane/router');
 const { TEST_SEED, privateKeyFromSeed, rawPublicKey, buildSigner } = require('../controlplane/keys');
 const { issueLease, verifyLease, canonicalLease, payloadHash } = require('../controlplane/lease');
 const { tokenEqual, randomToken } = require('../controlplane/token');
-const { demoKeyAllowed, agentAuthFromRequest, ticketFromRequest } = require('../controlplane/httpauth');
+const { demoKeyAllowed, agentAuthFromRequest, ticketFromRequest, corsOrigins, corsMiddleware } = require('../controlplane/httpauth');
 const { validateSSHPublicKey } = require('../controlplane/sshkey');
 const { assertWebhookURL } = require('../controlplane/webhook');
 const { cronValid, cronMatches, zscore } = require('../controlplane/stats');
@@ -1396,6 +1396,40 @@ test('cli login writes a mode 0600 token and prints only the verification URI an
     server.close();
     fs.rmSync(tokenFile, { force: true });
     fs.rmSync(mismatchFile, { force: true });
+  }
+});
+
+test('CORS: exact https origins only, and none at all on /oauth', async () => {
+  assert.deepEqual(corsOrigins({ NODE_ENV: 'production' }), ['https://systemapi.io']);
+  assert.deepEqual(corsOrigins({
+    NODE_ENV: 'production',
+    SYSTEMAPI_ALLOWED_ORIGINS: 'https://app.example, http://app.example,https://*.example,https://app.example/x,https://APP.example,http://localhost:5173,*,null'
+  }), ['https://app.example']);
+  assert.deepEqual(corsOrigins({ NODE_ENV: 'test', SYSTEMAPI_ALLOWED_ORIGINS: 'http://localhost:5173,http://dev.example' }), ['http://localhost:5173']);
+
+  const app = express();
+  app.use(corsMiddleware({ NODE_ENV: 'production', SYSTEMAPI_ALLOWED_ORIGINS: 'https://app.example' }));
+  app.get('/oauth/user', (_req, res) => res.json({ csrf: 'secret' }));
+  app.get('/api/v1/fleet', (_req, res) => res.json({ hosts: [] }));
+  const { server, url } = await listen(app);
+  try {
+    const ok = await fetch(url + '/api/v1/fleet', { headers: { origin: 'https://app.example' } });
+    assert.equal(ok.headers.get('access-control-allow-origin'), 'https://app.example');
+    assert.equal(ok.headers.get('access-control-allow-credentials'), 'true');
+    for (const origin of ['https://evil.example', 'https://sub.app.example', 'http://app.example', 'null']) {
+      const res = await fetch(url + '/api/v1/fleet', { headers: { origin } });
+      assert.equal(res.headers.get('access-control-allow-origin'), null, origin);
+    }
+    for (const method of ['GET', 'OPTIONS']) {
+      const res = await fetch(url + '/oauth/user', {
+        method,
+        headers: { origin: 'https://app.example', 'access-control-request-method': 'POST' }
+      });
+      assert.equal(res.headers.get('access-control-allow-origin'), null, method);
+      assert.equal(res.headers.get('access-control-allow-credentials'), null, method);
+    }
+  } finally {
+    server.close();
   }
 });
 
