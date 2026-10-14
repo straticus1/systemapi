@@ -162,7 +162,7 @@ func unclaimUpload(id string) {
 func findUpload(stateDir, actor, root, path string, size int64, sha string, now time.Time) *uploadRecord {
 	key := actorKey(actor)
 	for _, rec := range loadUploads(stateDir) {
-		if rec.ActorKey != key || rec.Root != root || rec.Path != path || rec.Size != size || rec.SHA256 != sha {
+		if !hashEqual(rec.ActorKey, key) || rec.Root != root || rec.Path != path || rec.Size != size || !hashEqual(rec.SHA256, sha) {
 			continue
 		}
 		if now.Sub(time.Unix(rec.CreatedUnix, 0)) >= uploadTTL {

@@ -25,6 +25,7 @@ package main
 import (
 	"bufio"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -760,7 +761,7 @@ func (h *fileHelper) writeCommit() fileResp {
 		h.release()
 		return helperFail("io_error")
 	}
-	if sum != w.sha {
+	if subtle.ConstantTimeCompare([]byte(sum), []byte(w.sha)) != 1 {
 		h.discard()
 		return helperFail("sha256_mismatch")
 	}
