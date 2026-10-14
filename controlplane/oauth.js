@@ -1,13 +1,21 @@
-// Threats: guessing a device or user code, approving by GET (prefetch, link
-// scanners), open signup through Google or GitHub, linking an IdP subject
-// that is not on the whitelist, replaying a consumed grant, open redirects,
-// and logging the verification URL or access token. A 200 versus 403 tells a
-// caller whether the username is already a member. A stolen user code inside
-// its 10-minute TTL is consent. A stolen access token inside its hour is a
-// session. Does NOT create members, store IdP access tokens, keep a PKCE
-// verifier, or replace the Authentik client in routes/oauth.js. Does NOT stop
-// a caller who already knows a member id from holding the three pending slots
-// until they expire.
+// Threats: approving someone else's device login. Holding the user code is
+// NOT consent: the person who starts the flow receives it. The plain "Yes"
+// needs an Authentik dashboard session that owns the device row's member id
+// (session sub equals cp_members.user_id, or a verified session email equals
+// that member's cp_members.email; the dashboard's own mapping, compared
+// byte-exact) plus a CSRF token bound to that session. GET never approves.
+// A Google or GitHub approval needs the IdP subject already bound to that
+// member; a first-use binding also needs a session that owns the member, and
+// the IdP callback state must match the browser session that started it.
+// Also covers guessing a device or user code, open signup through Google or
+// GitHub, one IdP subject on two members, replaying a consumed grant, open
+// redirects on the SSO return path, and logging the verification URL or
+// access token. Does NOT stop a member who is talked into approving a login
+// someone else started (the page names the member and warns), a stolen access
+// token inside its hour, a 200 versus 403 member probe on /oauth/device, or a
+// caller who knows a member id holding the three pending slots until they
+// expire. Does NOT create members, store IdP access tokens, keep a PKCE
+// verifier, or replace the Authentik client in routes/oauth.js.
 'use strict';
 
 const { randomToken, tokenEqual, fingerprint } = require('./token');
@@ -145,6 +153,42 @@ async function memberUser(registry, username) {
   const rows = await registry.membershipsForUser(username);
   if (!rows || rows.length === 0) return null;
   return username;
+}
+
+// Only a same-origin absolute path survives; anything else becomes "/".
+// Refuses scheme-relative ("//host"), backslash and control-character tricks
+// that browsers normalise into another origin.
+function safeReturnPath(value) {
+  if (typeof value !== 'string' || value.length < 1 || value.length > 2048) return '/';
+  if (value[0] !== '/' || value[1] === '/' || value[1] === '\\') return '/';
+  if (/[\\\u0000-\u001f\u007f]/.test(value)) return '/';
+  let parsed;
+  try {
+    parsed = new URL(value, 'http://return.invalid');
+  } catch {
+    return '/';
+  }
+  if (parsed.origin !== 'http://return.invalid') return '/';
+  return parsed.pathname + parsed.search;
+}
+
+// The dashboard maps an Authentik session to members by sub (cp_members.user_id)
+// or by email (cp_members.email). The same mapping decides who owns a device
+// row, with two tightenings: the email only counts when Authentik marked it
+// verified, and the member id must match byte-exact (no case folding).
+async function sessionOwnsUser(registry, sessionUser, userId) {
+  if (!sessionUser || typeof sessionUser.id !== 'string' || sessionUser.id.length === 0) return false;
+  if (typeof userId !== 'string' || userId.length === 0) return false;
+  const email = sessionUser.email_verified === true && typeof sessionUser.email === 'string' && sessionUser.email.length > 0
+    ? sessionUser.email
+    : null;
+  const rows = await registry.membershipsForUser(sessionUser.id, email);
+  return Array.isArray(rows) && rows.some((row) => row && row.user_id === userId);
+}
+
+function sessionLabel(sessionUser) {
+  const name = sessionUser.email || sessionUser.name || sessionUser.id;
+  return typeof name === 'string' ? name : String(sessionUser.id);
 }
 
 function countPendingSync(registry, userId, now) {
@@ -286,28 +330,45 @@ async function linksFor(registry, userId) {
   return res.rows.map((row) => row.provider).filter((name) => PROVIDERS[name]);
 }
 
-async function verifyPage(registry, code, env, now = Date.now()) {
+// Returns { status, html }. ctx.sessionUser is the Authentik dashboard session
+// user (or null); ctx.csrf is the session-bound token every form carries.
+async function verifyPage(registry, code, env, ctx = {}, now = Date.now()) {
   const row = await deviceByUserCode(registry, typeof code === 'string' ? code : '');
-  if (!row || row.status !== 'pending' || atMs(row.expires_at) <= now) return denialPage();
-  const names = [];
-  const allowed = await linksFor(registry, row.user_id);
-  for (const name of configuredNames(env)) {
-    if (allowed.includes(name)) names.push(name);
-  }
+  if (!row || row.status !== 'pending' || atMs(row.expires_at) <= now) return { status: 200, html: denialPage() };
+  const sessionUser = ctx.sessionUser || null;
   const safeUser = escapeHtml(row.user_id);
   const safeCode = escapeHtml(code);
-  let body = '<p>Sign in as <strong>' + safeUser + '</strong></p>'
-    + '<form method="post" action="/oauth/device/verify">'
-    + '<input type="hidden" name="code" value="' + safeCode + '">'
-    + '<button type="submit">Yes</button></form>';
-  for (const name of names) {
+  const safeCsrf = escapeHtml(typeof ctx.csrf === 'string' ? ctx.csrf : '');
+  const hidden = '<input type="hidden" name="code" value="' + safeCode + '">'
+    + '<input type="hidden" name="csrf" value="' + safeCsrf + '">';
+  let body = '<p>A command-line client is asking to sign in as <strong>' + safeUser + '</strong>.</p>'
+    + '<p>Only continue if you started this login yourself.</p>';
+  if (sessionUser && typeof sessionUser.id === 'string' && sessionUser.id) {
+    if (!(await sessionOwnsUser(registry, sessionUser, row.user_id))) {
+      return {
+        status: 403,
+        html: page('<p>Login denied (login_denied).</p><p>You are signed in as <strong>'
+          + escapeHtml(sessionLabel(sessionUser)) + '</strong>; this login is for <strong>'
+          + safeUser + '</strong>.</p><p><a href="/oauth/logout">Sign out</a> and sign in as '
+          + safeUser + ' to approve it.</p>')
+      };
+    }
+    body += '<form method="post" action="/oauth/device/verify">' + hidden
+      + '<button type="submit">Yes</button></form>';
+  } else {
+    const back = '/oauth/device/verify?code=' + encodeURIComponent(code);
+    body += '<p><a href="/oauth/login?return_to=' + escapeHtml(encodeURIComponent(back))
+      + '">Sign in with After Dark SSO</a></p>';
+  }
+  const allowed = await linksFor(registry, row.user_id);
+  for (const name of configuredNames(env)) {
+    if (!allowed.includes(name)) continue;
     const label = name === 'google' ? 'Google' : 'GitHub';
-    body += '<form method="post" action="/oauth/device/verify">'
-      + '<input type="hidden" name="code" value="' + safeCode + '">'
+    body += '<form method="post" action="/oauth/device/verify">' + hidden
       + '<input type="hidden" name="provider" value="' + name + '">'
       + '<button type="submit">Continue with ' + label + '</button></form>';
   }
-  return page(body);
+  return { status: 200, html: page(body) };
 }
 
 async function markApproved(registry, deviceHash, now) {
@@ -326,9 +387,12 @@ async function markApproved(registry, deviceHash, now) {
   return res.rowCount === 1;
 }
 
-async function approveUserCode(registry, code, now = Date.now()) {
+// Fails closed: no session, or a session that does not own the member, is
+// login_denied. The caller checks the CSRF token first.
+async function approveUserCode(registry, code, sessionUser, now = Date.now()) {
   const row = await deviceByUserCode(registry, code);
   if (!row || row.status !== 'pending' || atMs(row.expires_at) <= now) throw http(403, 'login_denied');
+  if (!(await sessionOwnsUser(registry, sessionUser, row.user_id))) throw http(403, 'login_denied');
   const ok = await markApproved(registry, row.device_hash, now);
   if (!ok) throw http(403, 'login_denied');
 }
@@ -372,7 +436,9 @@ async function beginExternal(registry, code, provider, env, now = Date.now()) {
     );
     if (res.rowCount !== 1) throw http(403, 'login_denied');
   }
-  return authorizeUrl(cfg, base + '/oauth/' + provider + '/callback', state);
+  // The caller binds state to the browser session; the callback refuses a
+  // state that session did not start.
+  return { location: authorizeUrl(cfg, base + '/oauth/' + provider + '/callback', state), state };
 }
 
 function subjectTakenSync(registry, provider, subject, exceptUser) {
@@ -395,6 +461,8 @@ function finishMemory(registry, input, now) {
   if (!link) throw http(403, 'link_denied');
   if (typeof link.subject === 'string' && link.subject.length > 0) {
     if (!tokenEqual(link.subject, input.subject)) throw http(403, 'link_denied');
+  } else if (input.ownedUser !== row.user_id) {
+    throw http(403, 'link_denied');
   } else if (subjectTakenSync(registry, input.provider, input.subject, row.user_id)) {
     throw http(403, 'link_denied');
   } else {
@@ -439,6 +507,9 @@ async function finishPg(registry, input, now) {
         await client.query('ROLLBACK');
         throw http(403, 'link_denied');
       }
+    } else if (input.ownedUser !== row.user_id) {
+      await client.query('ROLLBACK');
+      throw http(403, 'link_denied');
     } else {
       const others = await client.query(
         `SELECT subject FROM cp_oauth_links
@@ -479,6 +550,9 @@ async function finishPg(registry, input, now) {
   }
 }
 
+// A link with no subject yet is bound on first use only when the browser
+// session (input.sessionUser) owns the member; otherwise whoever held the
+// user code could bind their own IdP account to someone else's member id.
 async function completeExternal(registry, input, now = Date.now()) {
   const provider = input && input.provider;
   const subject = input && input.subject;
@@ -486,8 +560,11 @@ async function completeExternal(registry, input, now = Date.now()) {
   if (!PROVIDERS[provider] || typeof subject !== 'string' || !SUBJECT_RE.test(subject) || !validCode(state)) {
     throw http(403, 'link_denied');
   }
-  if (!registry.pool) return finishMemory(registry, { provider, subject, state }, now);
-  return finishPg(registry, { provider, subject, state }, now);
+  const pending = await deviceByState(registry, state);
+  let ownedUser = null;
+  if (pending && await sessionOwnsUser(registry, input.sessionUser, pending.user_id)) ownedUser = pending.user_id;
+  if (!registry.pool) return finishMemory(registry, { provider, subject, state, ownedUser }, now);
+  return finishPg(registry, { provider, subject, state, ownedUser }, now);
 }
 
 async function readCap(res) {
@@ -596,7 +673,7 @@ async function exchangeExternal(fleet, input, now = Date.now()) {
   }
   const subject = externalSubject(provider, info);
   if (!subject) throw http(403, 'link_denied');
-  return completeExternal(fleet.registry, { state: input.state, provider, subject }, now);
+  return completeExternal(fleet.registry, { state: input.state, provider, subject, sessionUser: input.sessionUser }, now);
 }
 
 async function touchPoll(registry, deviceHash, when) {
@@ -787,5 +864,7 @@ module.exports = {
   memberIds,
   listLinks,
   denialPage,
-  donePage
+  donePage,
+  safeReturnPath,
+  sessionOwnsUser
 };

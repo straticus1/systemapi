@@ -12,7 +12,7 @@ const { hasScope, roleFromGroups, scopesForRole, ALL } = require('./authz');
 const oauth = require('./oauth');
 const { issueLease } = require('./lease');
 const { issueTicket, TTL_MS: TICKET_TTL_MS } = require('./tickets');
-const { fingerprint, randomToken } = require('./token');
+const { fingerprint, randomToken, tokenEqual } = require('./token');
 const { sealSecret, openSecret } = require('./seal');
 const { assertWebhookURL } = require('./webhook');
 const { bucketName, linearForecast, toCSV, cronValid, zscore } = require('./stats');
@@ -83,6 +83,26 @@ function parseForm(req, res, next) {
     noStore(res);
     res.status(400).json({ error: 'login_denied' });
   });
+}
+
+// CSRF for the device verify page: a synchronizer token kept in the
+// server-side session and compared in constant time. SameSite cannot carry
+// this alone: it is configurable (SESSION_COOKIE_SAMESITE) and the SSO round
+// trips need Lax.
+function deviceCsrf(req) {
+  if (!req.session) throw http(503, 'oauth_unavailable');
+  if (typeof req.session.deviceCsrf !== 'string') req.session.deviceCsrf = randomToken(32);
+  return req.session.deviceCsrf;
+}
+
+function requireDeviceCsrf(req) {
+  const want = req.session && req.session.deviceCsrf;
+  const got = bodyString(req.body, 'csrf');
+  if (typeof want !== 'string' || !got || !tokenEqual(want, got)) throw http(403, 'csrf_denied');
+}
+
+function sessionUserOf(req) {
+  return (req.session && req.session.user) || null;
 }
 
 function adminTenantIds(principal) {
@@ -390,21 +410,30 @@ function mount(app, fleet) {
   app.get('/oauth/device/verify', wrap(async (req, res) => {
     noStore(res);
     const code = typeof req.query.code === 'string' ? req.query.code : '';
-    res.type('html').send(await oauth.verifyPage(fleet.registry, code, fleet.env || {}));
+    const out = await oauth.verifyPage(fleet.registry, code, fleet.env || {}, {
+      sessionUser: sessionUserOf(req),
+      csrf: deviceCsrf(req)
+    });
+    res.status(out.status).type('html').send(out.html);
   }));
 
+  // Never approves on possession of the code alone: the CSRF token must match
+  // this browser session, and the plain approval needs an SSO session that
+  // owns the member (oauth.approveUserCode).
   app.post('/oauth/device/verify', parseForm, wrap(async (req, res) => {
     noStore(res);
+    requireDeviceCsrf(req);
     const code = bodyString(req.body, 'code');
     const rawProvider = req.body && req.body.provider;
     if (rawProvider == null || rawProvider === '') {
-      await oauth.approveUserCode(fleet.registry, code);
+      await oauth.approveUserCode(fleet.registry, code, sessionUserOf(req));
       res.type('html').send(oauth.donePage());
       return;
     }
     if (typeof rawProvider !== 'string') throw http(403, 'link_denied');
-    const location = await oauth.beginExternal(fleet.registry, code, rawProvider, fleet.env || {});
-    res.redirect(302, location);
+    const started = await oauth.beginExternal(fleet.registry, code, rawProvider, fleet.env || {});
+    req.session.deviceState = fingerprint(started.state);
+    res.redirect(302, started.location);
   }));
 
   app.post('/oauth/token', parseForm, wrap(async (req, res) => {
@@ -426,8 +455,14 @@ function mount(app, fleet) {
     }
     const code = typeof req.query.code === 'string' ? req.query.code : '';
     const state = typeof req.query.state === 'string' ? req.query.state : '';
+    const bound = req.session && req.session.deviceState;
+    if (req.session) delete req.session.deviceState;
+    if (typeof bound !== 'string' || !state || !tokenEqual(bound, fingerprint(state))) {
+      res.status(403).type('html').send(oauth.denialPage());
+      return;
+    }
     try {
-      await oauth.exchangeExternal(fleet, { code, state, provider });
+      await oauth.exchangeExternal(fleet, { code, state, provider, sessionUser: sessionUserOf(req) });
     } catch (err) {
       if (err.status === 403) {
         res.type('html').send(oauth.denialPage());

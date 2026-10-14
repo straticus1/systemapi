@@ -5,6 +5,7 @@
 
 const express = require('express');
 const crypto = require('crypto');
+const { safeReturnPath } = require('../controlplane/oauth');
 
 const router = express.Router();
 
@@ -85,7 +86,8 @@ router.get('/login', async (req, res) => {
       code_verifier,
       state,
       nonce,
-      return_to: req.query.return_to || '/'
+      // Same-origin path only; the device verify page returns here.
+      return_to: safeReturnPath(req.query.return_to)
     };
 
     const authorizationUrl = authentikClient.authorizationUrl({
@@ -139,10 +141,18 @@ router.get('/callback', async (req, res) => {
     // Get user info
     const userinfo = await authentikClient.userinfo(tokenSet.access_token);
 
-    // Store user data and tokens in session
+    // New session id at login: a session id planted before login must not
+    // become an authenticated one (the device approval trusts this session).
+    await new Promise((resolve, reject) => {
+      req.session.regenerate((err) => (err ? reject(err) : resolve()));
+    });
+
+    // Store user data and tokens in session. email_verified gates the
+    // email-to-member mapping used by the device approval.
     req.session.user = {
       id: userinfo.sub,
       email: userinfo.email,
+      email_verified: userinfo.email_verified === true,
       name: userinfo.name || userinfo.preferred_username,
       groups: userinfo.groups || [],
       picture: userinfo.picture
@@ -155,13 +165,11 @@ router.get('/callback', async (req, res) => {
       expires_at: tokenSet.expires_at
     };
 
-    // Clear OAuth temporary data
-    delete req.session.oauth;
 
     console.log(`User logged in: ${userinfo.email} (${userinfo.sub})`);
 
     // Redirect to return URL or dashboard
-    res.redirect(return_to || '/');
+    res.redirect(safeReturnPath(return_to));
   } catch (error) {
     console.error('Error in OAuth callback:', error);
     res.status(500).json({
