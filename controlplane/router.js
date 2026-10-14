@@ -614,6 +614,8 @@ function mount(app, fleet) {
 
   app.get('/api/v1/audit/verify', wrap(async (req, res) => {
     const principal = await authenticate(req, fleet);
+    // A caller in no tenant has no audit:read anywhere.
+    if (tenantIds(principal).length === 0) throw http(403, 'scope_denied');
     for (const id of tenantIds(principal)) requireScope(fleet, principal, id, 'audit:read');
     res.json(await fleet.registry.verifyAudit());
   }));

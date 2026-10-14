@@ -48,6 +48,12 @@ cd systemapi-agent && go build -o systemapi-agent . && \
 ```
 
 `SESSION_SECRET` must be set in production or the server refuses to start.
+The server listens on `HOST` (default `0.0.0.0`) and `PORT`. It reads
+environment from `ENV_FILE` when set, otherwise from `.env.production` next
+to `server.js` (not the working directory); variables already set win. Never
+commit an env file. `SYSTEMAPI_ALLOWED_ORIGINS` sets the browser origins
+allowed to open a terminal WebSocket. A sample agent unit is
+`systemd/systemapi-agent.service`.
 Database TLS is on by default (`DB_SSL=disable` opts out, `DB_SSL_CA` adds a
 CA). The playground routes under `/playground` need `DB_PASSWORD` and Redis.
 

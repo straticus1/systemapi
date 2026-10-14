@@ -1,5 +1,6 @@
 // Threats: demo credentials accepted in production, and long-lived API keys
-// placed in WebSocket query strings (logs, proxies, Referer). Does NOT
+// placed in WebSocket query strings (logs, proxies, Referer), and a
+// cross-site page opening a terminal WebSocket (Origin allowlist). Does NOT
 // authenticate the key itself; callers still verify the bearer against the store.
 'use strict';
 
@@ -35,4 +36,36 @@ function ticketFromRequest(url) {
   return { ok: true, ticket };
 }
 
-module.exports = { demoKeyAllowed, agentAuthFromRequest, ticketFromRequest };
+// Browser origins that may open a terminal WebSocket. SYSTEMAPI_ALLOWED_ORIGINS
+// (comma-separated exact origins) replaces the default, which is
+// https://systemapi.io, the SYSTEMAPI_PUBLIC_URL origin, and the local dev
+// servers outside production.
+function allowedOrigins(env = {}) {
+  if (typeof env.SYSTEMAPI_ALLOWED_ORIGINS === 'string' && env.SYSTEMAPI_ALLOWED_ORIGINS.trim() !== '') {
+    return new Set(env.SYSTEMAPI_ALLOWED_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean));
+  }
+  const out = new Set(['https://systemapi.io']);
+  if (env.SYSTEMAPI_PUBLIC_URL) {
+    try {
+      out.add(new URL(env.SYSTEMAPI_PUBLIC_URL).origin);
+    } catch {
+      // An invalid public URL adds nothing.
+    }
+  }
+  if (env.NODE_ENV !== 'production') {
+    out.add('http://localhost:5173');
+    out.add('http://localhost:3000');
+  }
+  return out;
+}
+
+// A missing Origin (the CLI, agents) is allowed: the ticket is the
+// credential. A present Origin must match the allowlist exactly, so a page
+// on another site cannot ride a leaked ticket.
+function originAllowed(origin, env = {}) {
+  if (origin === undefined) return true;
+  if (typeof origin !== 'string') return false;
+  return allowedOrigins(env).has(origin);
+}
+
+module.exports = { demoKeyAllowed, agentAuthFromRequest, ticketFromRequest, allowedOrigins, originAllowed };

@@ -11,7 +11,11 @@ const compression = require('compression');
 const morgan = require('morgan');
 const session = require('express-session');
 const promClient = require('prom-client');
-require('dotenv').config({ path: '.env.production' });
+// Environment file: ENV_FILE when set, else .env.production next to this
+// file (not the working directory). Variables already set are not
+// overridden. The file itself is never committed.
+const path = require('path');
+require('dotenv').config({ path: process.env.ENV_FILE || path.join(__dirname, '.env.production') });
 
 // Threats: a production process that signs session cookies with a published
 // default, and a database TLS dial that skips certificate checks. Does NOT
@@ -415,8 +419,11 @@ if (process.env.DB_PASSWORD && process.env.DB_PASSWORD !== '') {
 }
 
 // Start server
-const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`SystemAPI.io listening on port ${PORT}`);
+// HOST defaults to 0.0.0.0 (all interfaces); set HOST=127.0.0.1 behind a
+// local reverse proxy.
+const HOST = process.env.HOST || '0.0.0.0';
+const server = app.listen(PORT, HOST, () => {
+    console.log(`SystemAPI.io listening on ${HOST}:${PORT}`);
     console.log(`Health check: http://localhost:${PORT}/health`);
 });
 

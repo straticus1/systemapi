@@ -20,6 +20,9 @@ the router.
 - Agents: `Authorization: Bearer <key>` on the WebSocket upgrade, plus the
   enrollment headers described in `cli_docs.md`.
 
+`GET /api/v1/audit/verify` returns 403 `scope_denied` to a caller who belongs
+to no tenant.
+
 Every route checks a scope (`hosts:read`, `metrics:read`, `exec:run`,
 `alerts:write`, `audit:read`, `admin`, ...). An API key with no scope rows has
 no scopes.
@@ -148,6 +151,10 @@ proxy cached data from DNSScience (`DNSSCIENCE_API_URL`) and DarkAPI.
   `record {path, digest, bytes_in, bytes_out}` and, on failure,
   `record_error`.
 - Terminal: `/api/v1/systems/terminal/:hostId?ticket=<ticket>&purpose=<purpose>&rows=<r>&cols=<c>`.
+  A request carrying an `Origin` header must match `SYSTEMAPI_ALLOWED_ORIGINS`
+  (comma-separated exact origins; default `https://systemapi.io`, the
+  `SYSTEMAPI_PUBLIC_URL` origin, and the local Vite and dev servers outside
+  production) or it gets HTTP 403. No `Origin` (the CLI) is accepted.
   The client contract is `docs/sahconnect-terminal-protocol.md`.
   `SYSTEMAPI_PTY_MAX_SECONDS` (default 28800) caps a session,
   `SYSTEMAPI_PTY_MAX_PER_ACTOR` (default 8) caps live sessions per user, and

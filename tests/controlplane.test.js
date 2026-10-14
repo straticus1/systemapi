@@ -1283,3 +1283,21 @@ test('ws-ticket is rate limited per actor and host, with a separate privileged b
     adminApp.server.close();
   }
 });
+
+test('audit verify is refused for a caller in no tenant', async () => {
+  const fm = fleet();
+  await fm.registry.appendAudit({ tenant_id: 'acme', action: 'sysscript', payload: { n: 1 } });
+  await fm.registry.setScopes('ak_test', ['admin']);
+  const { server, url } = await listen(appFor(fm));
+  try {
+    const res = await call(`${url}/api/v1/audit/verify`, { headers: { 'x-api-key': 'good-key' } });
+    assert.equal(res.status, 403);
+    assert.equal(res.body.error, 'scope_denied');
+    await seed(fm);
+    const member = await call(`${url}/api/v1/audit/verify`, { headers: { 'x-api-key': 'good-key' } });
+    assert.equal(member.status, 200);
+    assert.equal(member.body.ok, true);
+  } finally {
+    server.close();
+  }
+});
