@@ -395,7 +395,8 @@ func runVerifyRecording(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("verify-recording", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	digest := fs.String("digest", "", "expected final digest (hex), e.g. from the terminal_end audit row")
-	keyPath := fs.String("key", "", "recording key (default: ~/.systemapi/"+recordingKeyFile+")")
+	keyPath := fs.String("key", "", "recording key (default: beside --state, else ~/.systemapi/"+recordingKeyFile+")")
+	statePath := fs.String("state", "", "the agent's --state file; the key is "+recordingKeyFile+" in the same directory")
 	var file string
 	rest := args
 	for {
@@ -406,15 +407,22 @@ func runVerifyRecording(args []string, stdout, stderr io.Writer) int {
 			break
 		}
 		if file != "" {
-			fmt.Fprintln(stderr, "usage: systemapi-agent verify-recording <file> [--digest HEX] [--key PATH]")
+			fmt.Fprintln(stderr, "usage: systemapi-agent verify-recording <file> [--digest HEX] [--key PATH | --state PATH]")
 			return 2
 		}
 		file = fs.Arg(0)
 		rest = fs.Args()[1:]
 	}
 	if file == "" {
-		fmt.Fprintln(stderr, "usage: systemapi-agent verify-recording <file> [--digest HEX] [--key PATH]")
+		fmt.Fprintln(stderr, "usage: systemapi-agent verify-recording <file> [--digest HEX] [--key PATH | --state PATH]")
 		return 2
+	}
+	if *keyPath != "" && *statePath != "" {
+		fmt.Fprintln(stderr, "usage: pass --key or --state, not both")
+		return 2
+	}
+	if *keyPath == "" && *statePath != "" {
+		*keyPath = filepath.Join(filepath.Dir(*statePath), recordingKeyFile)
 	}
 	if *keyPath == "" {
 		home, err := os.UserHomeDir()

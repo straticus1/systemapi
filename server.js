@@ -15,6 +15,12 @@ const promClient = require('prom-client');
 // file (not the working directory). Variables already set are not
 // overridden. The file itself is never committed.
 const path = require('path');
+// An ENV_FILE that is set but empty is a mistake, not a request for the
+// production file: refuse it instead of silently loading .env.production.
+if (process.env.ENV_FILE !== undefined && process.env.ENV_FILE.trim() === '') {
+    console.error('ENV_FILE is set but empty; unset it or name a file');
+    process.exit(1);
+}
 require('dotenv').config({ path: process.env.ENV_FILE || path.join(__dirname, '.env.production') });
 
 // Threats: a production process that signs session cookies with a published

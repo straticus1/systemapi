@@ -913,6 +913,13 @@ func TestVerifyRecordingCommand(t *testing.T) {
 	if code, out := run(path, "--digest", strings.Repeat("0", 64), "--key", keyPath); code != 1 || !strings.Contains(out, "digest mismatch") {
 		t.Fatalf("wrong digest: %d %s", code, out)
 	}
+	// --state finds the key beside the agent's state file, as the agent keeps it.
+	if code, out := run(path, "--digest", digest, "--state", filepath.Join(h.dir, "agent.json")); code != 0 {
+		t.Fatalf("--state: %d %s", code, out)
+	}
+	if code, out := run(path, "--key", keyPath, "--state", filepath.Join(h.dir, "agent.json")); code != 2 {
+		t.Fatalf("--key with --state must be refused: %d %s", code, out)
+	}
 
 	raw, err := os.ReadFile(path)
 	if err != nil {
