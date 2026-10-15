@@ -739,6 +739,25 @@ func TestFileLinuxRootSlotsReserved(t *testing.T) {
 	}
 }
 
+// A session onto "/" or onto a root holding the state directory is refused
+// before any helper runs.
+func TestFileLinuxRootRefusesHostRootAndStateDir(t *testing.T) {
+	needOpenat2(t)
+	h := newFileHarness(t)
+	if got := h.errorOf(t, h.open(t, "/", fileOpenOpts{})); got != "root_denied" {
+		t.Fatalf("root /: %q", got)
+	}
+	root := t.TempDir()
+	h.ch.stateDir = filepath.Join(root, "state")
+	if got := h.errorOf(t, h.open(t, root, fileOpenOpts{mode: "read"})); got != "root_denied" {
+		t.Fatalf("root holding the state dir: %q", got)
+	}
+	if err := os.Mkdir(filepath.Join(root, "app"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	h.ready(t, h.open(t, filepath.Join(root, "app"), fileOpenOpts{}))
+}
+
 func TestFileLinuxIdleAndDeadline(t *testing.T) {
 	needOpenat2(t)
 	h := newFileHarness(t)

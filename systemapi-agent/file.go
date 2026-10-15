@@ -29,6 +29,8 @@ import (
 	"io"
 	"log"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -509,9 +511,52 @@ func (s *fileSession) run() {
 	}
 }
 
+// checkSessionRoot refuses, for any session but file_root, a root that
+// would widen it to the whole host or reach the agent's own secrets: "/"
+// (also "~" for an account whose home is unset or "/"), or a root that
+// contains the agent's state directory (its identity seed, upload records
+// and recordings). The state directory is compared as given and with its
+// symlinks resolved; the root itself can hold no symlink (§5.3).
+func checkSessionRoot(action, root, home, stateDir string) string {
+	if action == "file_root" {
+		return ""
+	}
+	eff := root
+	if root == "~" {
+		eff = home
+	}
+	if eff == "" {
+		return "root_denied"
+	}
+	eff = filepath.Clean(eff)
+	if eff == "/" {
+		return "root_denied"
+	}
+	if stateDir == "" {
+		return ""
+	}
+	dirs := []string{filepath.Clean(stateDir)}
+	if abs, err := filepath.Abs(stateDir); err == nil {
+		dirs = append(dirs, abs)
+		if real, err := filepath.EvalSymlinks(abs); err == nil {
+			dirs = append(dirs, real)
+		}
+	}
+	for _, d := range dirs {
+		if d == eff || strings.HasPrefix(d, eff+"/") {
+			return "root_denied"
+		}
+	}
+	return ""
+}
+
 func (s *fileSession) start() (string, int64, string) {
 	id, code := resolveFileIdentity(s.action, ptyCfg, agentEUID())
 	if code != "" {
+		return "", 0, code
+	}
+	if code := checkSessionRoot(s.action, s.root, id.home, s.c.stateDir); code != "" {
+		log.Printf("file %s refused: the root is / or holds the agent state directory", s.id)
 		return "", 0, code
 	}
 	cmd, err := startFileHelperProc(id)

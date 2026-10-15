@@ -194,6 +194,53 @@ func TestFileIdentityRules(t *testing.T) {
 	}
 }
 
+// A non-root session never gets "/" (or a "~" that is "/" or unset) or a
+// root holding the agent's state directory; file_root may.
+func TestFileSessionRootRefusesHostRootAndStateDir(t *testing.T) {
+	base := t.TempDir()
+	state := filepath.Join(base, "srv", ".systemapi")
+	if err := os.MkdirAll(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(filepath.Join(base, "srv"), link); err != nil {
+		t.Fatal(err)
+	}
+	real, err := filepath.EvalSymlinks(filepath.Join(base, "srv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ root, home, state string }{
+		{"/", "/home/u", ""},
+		{"~", "/", ""},
+		{"~", "", ""},
+		{"~", "//", ""},
+		{filepath.Join(base, "srv"), "/home/u", state},
+		{state, "/home/u", state},
+		{"~", filepath.Join(base, "srv"), state},
+		{base, "/home/u", state},
+		// The state dir is reached through a symlink: its real path still counts.
+		{real, "/home/u", filepath.Join(link, ".systemapi")},
+	} {
+		if got := checkSessionRoot("file", c.root, c.home, c.state); got != "root_denied" {
+			t.Errorf("root %q home %q state %q: %q", c.root, c.home, c.state, got)
+		}
+		if got := checkSessionRoot("file_root", c.root, c.home, c.state); got != "" {
+			t.Errorf("file_root %q: %q", c.root, got)
+		}
+	}
+	for _, c := range []struct{ root, home, state string }{
+		{filepath.Join(base, "srv", "app"), "/home/u", state},
+		{filepath.Join(base, "srv2"), "/home/u", state},
+		{"~", "/home/u", state},
+		{"/srv/a", "/home/u", ""},
+	} {
+		if got := checkSessionRoot("file", c.root, c.home, c.state); got != "" {
+			t.Errorf("root %q: %q", c.root, got)
+		}
+	}
+}
+
 type fileHarness struct {
 	priv ed25519.PrivateKey
 	out  *fakeOut
