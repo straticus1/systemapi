@@ -1,37 +1,110 @@
 /**
  * Authentication for API Playground (Express.js)
  * Supports both Authentik/JWT tokens and API keys
+ *
+ * Threats (JWT path): a token signed by another issuer or for another
+ * audience, an expired or not-yet-valid token, a tampered signature,
+ * alg=none or an HS* token "signed" with the public key, a header-chosen
+ * algorithm outside the allowlist (RS256, ES256, EdDSA), an unknown kid, and
+ * a token accepted while discovery or the JWKS is unreachable. Issuer
+ * metadata comes from openid-client 6 discovery (AUTHENTIK_ISSUER, else the
+ * Keycloak realm URL; the discovered issuer must equal it) and the signature
+ * from jose against the issuer's jwks_uri. Every failure returns null (no
+ * user). Audience is OIDC_AUDIENCE, else the configured client id; with
+ * neither every token is refused. Does NOT mint tokens, decide what a user
+ * may do, or log tokens (only error codes).
  */
 
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
-const jwt = require('jsonwebtoken');
-const { Issuer } = require('openid-client');
+
+const JWT_ALGORITHMS = ['RS256', 'ES256', 'EdDSA'];
+const JWT_MAX_LENGTH = 8192;
+const DISCOVERY_TIMEOUT_S = 5;
+const JWKS_TIMEOUT_MS = 5000;
+// After a failed discovery, tokens are refused without a new attempt for
+// this long, so a flood of bearer tokens cannot become a flood of fetches.
+const DISCOVERY_RETRY_MS = 30000;
 
 class AuthManager {
-  constructor(keycloakURL, keycloakRealm, keycloakClientID, apiSite, dbPool) {
+  /**
+   * options.env replaces process.env for the issuer and audience;
+   * options.customFetch lets tests serve discovery and the JWKS locally.
+   */
+  constructor(keycloakURL, keycloakRealm, keycloakClientID, apiSite, dbPool, options = {}) {
     this.keycloakURL = keycloakURL;
     this.keycloakRealm = keycloakRealm;
     this.keycloakClientID = keycloakClientID;
     this.apiSite = apiSite;
     this.db = dbPool;
-    this.jwksURI = `${keycloakURL}/realms/${keycloakRealm}/protocol/openid-connect/certs`;
-    this.oidcClient = null;
-    this.initOIDC();
+    this.env = options.env || process.env;
+    this.customFetch = typeof options.customFetch === 'function' ? options.customFetch : null;
+    this.verifier = null;
+    this.verifierPending = null;
+    this.discoveryFailedAt = 0;
+  }
+
+  issuerURL() {
+    return this.env.AUTHENTIK_ISSUER || `${this.keycloakURL}/realms/${this.keycloakRealm}`;
+  }
+
+  audience() {
+    return this.env.OIDC_AUDIENCE || this.keycloakClientID || null;
   }
 
   /**
-   * Initialize OIDC client for proper JWT verification
+   * Discovery and the remote JWKS, created on first use and kept. A failed
+   * discovery is not cached; it is retried after DISCOVERY_RETRY_MS.
    */
-  async initOIDC() {
-    try {
-      const authentikIssuer = process.env.AUTHENTIK_ISSUER || `${this.keycloakURL}/realms/${this.keycloakRealm}`;
-      const issuer = await Issuer.discover(authentikIssuer);
-      this.oidcClient = issuer;
-      console.log('OIDC client initialized for JWT verification');
-    } catch (error) {
-      console.warn('OIDC discovery failed; JWT verification rejects tokens:', error.message);
+  async jwtVerifier() {
+    if (this.verifier) return this.verifier;
+    if (!this.verifierPending) {
+      if (Date.now() - this.discoveryFailedAt < DISCOVERY_RETRY_MS) {
+        throw Object.assign(new Error('discovery failed recently'), { code: 'discovery_backoff' });
+      }
+      this.verifierPending = this.discoverVerifier()
+        .then((verifier) => {
+          this.verifier = verifier;
+          return verifier;
+        }, (err) => {
+          this.discoveryFailedAt = Date.now();
+          throw err;
+        })
+        .finally(() => {
+          this.verifierPending = null;
+        });
     }
+    return this.verifierPending;
+  }
+
+  async discoverVerifier() {
+    // Both are ESM-only; loaded lazily as routes/oauth.js does.
+    const oidc = await import('openid-client');
+    const jose = await import('jose');
+    const discoveryOptions = { timeout: DISCOVERY_TIMEOUT_S };
+    if (this.customFetch) discoveryOptions[oidc.customFetch] = this.customFetch;
+    const config = await oidc.discovery(
+      new URL(this.issuerURL()),
+      this.keycloakClientID,
+      undefined,
+      undefined,
+      discoveryOptions
+    );
+    const metadata = config.serverMetadata();
+    if (typeof metadata.jwks_uri !== 'string') {
+      throw Object.assign(new Error('issuer has no jwks_uri'), { code: 'jwks_uri_missing' });
+    }
+    const jwksURL = new URL(metadata.jwks_uri);
+    if (jwksURL.protocol !== 'https:') {
+      throw Object.assign(new Error('jwks_uri is not https'), { code: 'jwks_uri_insecure' });
+    }
+    const jwksOptions = { timeoutDuration: JWKS_TIMEOUT_MS };
+    if (this.customFetch) jwksOptions[jose.customFetch] = this.customFetch;
+    return {
+      jose,
+      issuer: metadata.issuer,
+      keySet: jose.createRemoteJWKSet(jwksURL, jwksOptions)
+    };
   }
 
   /**
@@ -180,54 +253,36 @@ class AuthManager {
   }
 
   /**
-   * Verify a JWT against the discovered issuer.
-   * Threats: alg=none, a header-chosen algorithm, and a token accepted with
-   * no signature when discovery failed. Allowlist is RS256, ES256, EdDSA.
-   * Does NOT mint tokens. Audience is OIDC_AUDIENCE or the configured client id.
+   * Verify a JWT against the discovered issuer and its JWKS. See Threats at
+   * the top of this file.
    * @param {string} token - JWT token
-   * @returns {Promise<Object|null>} Decoded payload or null
+   * @returns {Promise<Object|null>} Verified payload or null
    */
   async verifyJWTToken(token) {
+    if (typeof token !== 'string' || token.length === 0 || token.length > JWT_MAX_LENGTH) return null;
+    const audience = this.audience();
+    if (!audience) {
+      console.warn('JWT rejected: no audience configured');
+      return null;
+    }
+    let verifier;
     try {
-      const decoded = jwt.decode(token, { complete: true });
-      if (!decoded || !decoded.header || !decoded.payload) return null;
-
-      const allowed = ['RS256', 'ES256', 'EdDSA'];
-      if (!allowed.includes(decoded.header.alg)) {
-        console.warn('JWT algorithm rejected');
-        return null;
-      }
-      if (!this.oidcClient) {
-        console.warn('JWT rejected: OIDC client unavailable');
-        return null;
-      }
-
-      const expectedIssuers = [
-        `${this.keycloakURL}/realms/${this.keycloakRealm}`,
-        process.env.AUTHENTIK_ISSUER
-      ].filter(Boolean);
-      if (!expectedIssuers.includes(decoded.payload.iss)) {
-        console.warn('JWT issuer rejected');
-        return null;
-      }
-
-      const keystore = await this.oidcClient.keystore(true);
-      const key = keystore.get({ kid: decoded.header.kid, alg: decoded.header.alg });
-      if (!key) {
-        console.warn('No matching key found in JWKS');
-        return null;
-      }
-
-      const audience = process.env.OIDC_AUDIENCE || this.keycloakClientID;
-      const options = {
-        algorithms: allowed,
-        issuer: expectedIssuers,
-        clockTolerance: 30
-      };
-      if (audience) options.audience = audience;
-      return jwt.verify(token, key.toPEM(), options);
+      verifier = await this.jwtVerifier();
     } catch (error) {
-      console.warn('JWT verification failed:', error.message);
+      console.warn('JWT rejected: OIDC discovery unavailable:', error.code || error.name);
+      return null;
+    }
+    try {
+      const { payload } = await verifier.jose.jwtVerify(token, verifier.keySet, {
+        issuer: verifier.issuer,
+        audience,
+        algorithms: JWT_ALGORITHMS,
+        clockTolerance: 30,
+        requiredClaims: ['exp']
+      });
+      return payload;
+    } catch (error) {
+      console.warn('JWT verification failed:', error.code || error.name);
       return null;
     }
   }
