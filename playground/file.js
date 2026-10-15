@@ -26,8 +26,9 @@
  * changes without an audit trail (file_session_start is written before ready; an
  * intent row is written before every write_commit, mkdir and remove is
  * forwarded and a failure refuses the op with internal; result rows,
- * write_open and write_abort rows, coalesced file_read rows and
- * file_session_end follow, retried). Ticket values and file content are
+ * write_open and write_abort rows, file_read rows coalesced per path and
+ * flushed every 60 s, past 1 GiB of one path and at the end, and
+ * file_session_end with the failed-read count follow, retried). Ticket values and file content are
  * never logged or audited.
  * Does NOT inspect content (FILE §9), does NOT defend against what the
  * pty_user may legitimately read inside the root or hard links (§5.6), and
@@ -57,6 +58,11 @@ const FILE_LEASE_TTL_S = 60;
 const FILE_RENEW_MS = 30_000;
 const FILE_START_TIMEOUT_MS = 30_000;
 const FILE_FINAL_WAIT_MS = 5_000;
+// Coalesced file_read rows are written at least this often, and as soon as
+// one path's unwritten bytes reach READ_FLUSH_BYTES, so a long session's
+// reads are on record before it ends.
+const READ_FLUSH_MS = 60_000;
+const READ_FLUSH_BYTES = 1024 ** 3;
 const FILE_MAX_SECONDS_DEFAULT = 28800;
 const FILE_SECONDS_CAP = 7 * 86400;
 const FILE_IDLE_SECONDS_DEFAULT = 900;
@@ -242,6 +248,8 @@ class FileChannels {
         this.renewMs = FILE_RENEW_MS;
         this.startTimeoutMs = FILE_START_TIMEOUT_MS;
         this.finalWaitMs = FILE_FINAL_WAIT_MS;
+        this.readFlushMs = READ_FLUSH_MS;
+        this.readFlushBytes = READ_FLUSH_BYTES;
         this.pollMs = 20;
         this.clientBufferMax = CLIENT_BUFFER_MAX;
         this.auditFailures = 0;
@@ -407,7 +415,10 @@ class FileChannels {
             discardRids: new Map(), // closed write rid -> chunks still accepted and dropped
             expectBinary: null, // { length, forward }
             read: null, // { rid, path, offset, received, held: [], heldLen }
-            reads: new Map(),
+            reads: new Map(), // path -> { bytes, ranges, sha256 } since the last flush
+            readFlush: Promise.resolve(),
+            readFlushTimer: null,
+            failedReads: 0,
             ops: 0,
             statCount: 0,
             listCount: 0,
@@ -891,6 +902,7 @@ class FileChannels {
         });
         this.touch(s);
         this.scheduleIdle(s);
+        s.readFlushTimer = unref(setInterval(() => { this.flushReads(s); }, this.readFlushMs));
         s.sink.open();
     }
 
@@ -949,6 +961,7 @@ class FileChannels {
             case 'read': {
                 const r = s.read;
                 s.read = null;
+                if (error) s.failedReads += 1;
                 if (error && r.heldLen > 0) {
                     // Bytes of a failed read are never sent; their credit
                     // still goes back so the window does not shrink.
@@ -969,10 +982,12 @@ class FileChannels {
                     const row = this.readRow(s, r.path);
                     row.bytes += r.received;
                     row.ranges += 1;
+                    if (row.bytes >= this.readFlushBytes) this.flushReads(s);
                 }
                 break;
             }
             case 'hash':
+                if (error) s.failedReads += 1;
                 if (!error && typeof fields.sha256 === 'string' && SHA256_RE.test(fields.sha256)) this.readRow(s, inf.req.path).sha256 = fields.sha256;
                 break;
             case 'write_open': {
@@ -1062,6 +1077,7 @@ class FileChannels {
         clearTimeout(s.maxTimer);
         clearTimeout(s.startTimer);
         clearTimeout(s.idleTimer);
+        clearInterval(s.readFlushTimer);
         this.sessions.delete(s.id);
         s.sink.stop();
         s.source.stop();
@@ -1090,14 +1106,30 @@ class FileChannels {
         this.finalize(s, null);
     }
 
-    // Writes the coalesced file_read rows, then file_session_end, once.
+    // Writes the file_read rows coalesced since the last flush, one per path,
+    // and resets them, so each byte is in exactly one row. Rows are written
+    // in order, after any earlier flush; failures are retried and recorded
+    // as for every other result row.
+    flushReads(s) {
+        if (!s.ready || s.reads.size === 0) return s.readFlush;
+        const rows = [...s.reads.entries()];
+        s.reads = new Map();
+        s.readFlush = s.readFlush.then(async () => {
+            for (const [path, row] of rows) {
+                await this.auditRetrying(s, 'file_read', { session_id: s.id, path, bytes: row.bytes, ranges: row.ranges, sha256: row.sha256 });
+            }
+        });
+        return s.readFlush;
+    }
+
+    // Writes the remaining file_read rows, then file_session_end, once.
     finalize(s, agentCounts) {
         if (s.finalized) return;
         s.finalized = true;
         clearTimeout(s.finalTimer);
+        clearInterval(s.readFlushTimer);
         this.stopping.delete(s.id);
         s.agentCounts = agentCounts;
-        const rows = [...s.reads.entries()];
         const end = {
             session_id: s.id,
             reason: s.endReason,
@@ -1106,6 +1138,7 @@ class FileChannels {
             bytes_written: s.bytesWritten,
             stat_count: s.statCount,
             list_count: s.listCount,
+            failed_reads: s.failedReads,
             duration_s: Math.round((Date.now() - s.startedMs) / 1000)
         };
         (async () => {
@@ -1113,9 +1146,7 @@ class FileChannels {
                 // No session_start row was written: nothing to close.
                 return;
             }
-            for (const [path, row] of rows) {
-                await this.auditRetrying(s, 'file_read', { session_id: s.id, path, bytes: row.bytes, ranges: row.ranges, sha256: row.sha256 });
-            }
+            await this.flushReads(s);
             await this.auditRetrying(s, 'file_session_end', end);
         })().catch((err) => console.error('[Fleet] file end audit failed:', err.message));
     }

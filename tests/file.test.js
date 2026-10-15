@@ -617,6 +617,70 @@ test('read: read_chunk pairs of at most chunk_max, then file_result; one coalesc
   }
 });
 
+test('read audit: file_read rows are flushed while the session runs, each byte counted once; failed reads are counted', async () => {
+  const r = await rig();
+  r.fm.file.readFlushMs = 100;
+  try {
+    const agent = await connectAgent(r);
+    const s = await ready(r, agent);
+    const doRead = async (rid, path, bytes, error = null) => {
+      sendJSON(s.client.ws, { type: 'file_request', request_id: rid, op: 'read', path, offset: 0, length: 1024 });
+      await waitUntil('read fwd', () => agentReqs(agent, s.sid).find((q) => q.request_id === rid));
+      if (bytes) agent.ws.send(data(s.sid, Buffer.alloc(bytes, 7)));
+      if (error) agentResult(agent, s.sid, rid, 'read', {}, error);
+      else agentResult(agent, s.sid, rid, 'read', { bytes, eof: true, size: bytes, mtime_ns: 1 });
+      return waitResult(s.client.box, rid);
+    };
+    const rowsFor = (path) => auditRows(r, 'file_read').filter((x) => x.payload.path === path).map((x) => [x.payload.bytes, x.payload.ranges]);
+    await doRead('a1', 'f', 10);
+    await doRead('a2', 'f', 20);
+    // On record before the session ends.
+    await waitUntil('first flush', () => rowsFor('f').length === 1);
+    assert.deepEqual(rowsFor('f'), [[30, 2]]);
+    assert.equal(auditRows(r, 'file_session_end').length, 0);
+    await doRead('a3', 'f', 5);
+    await waitUntil('second flush', () => rowsFor('f').length === 2);
+    assert.deepEqual(rowsFor('f'), [[30, 2], [5, 1]]);
+    // Failed reads and hashes are counted, never as bytes.
+    assert.equal((await doRead('a4', 'secret', 0, 'permission_denied')).error, 'permission_denied');
+    sendJSON(s.client.ws, { type: 'file_request', request_id: 'h1', op: 'hash', path: 'secret' });
+    await waitUntil('hash fwd', () => agentReqs(agent, s.sid).find((q) => q.request_id === 'h1'));
+    agentResult(agent, s.sid, 'h1', 'hash', {}, 'permission_denied');
+    await waitResult(s.client.box, 'h1');
+    // Nothing new since the last flush: ending writes no further row for f.
+    s.client.ws.close();
+    const end = await waitUntil('end', () => auditRows(r, 'file_session_end')[0]);
+    assert.equal(end.payload.failed_reads, 2);
+    assert.equal(end.payload.bytes_read, 35);
+    assert.deepEqual(rowsFor('f'), [[30, 2], [5, 1]]);
+    assert.deepEqual(rowsFor('secret'), []);
+    // Every file_read row precedes the session end.
+    const actions = r.fm.registry.audit.map((x) => x.action);
+    assert.ok(actions.lastIndexOf('file_read') < actions.indexOf('file_session_end'));
+  } finally {
+    await r.close();
+  }
+});
+
+test('read audit: one path past the byte threshold is flushed at once', async () => {
+  const r = await rig();
+  r.fm.file.readFlushBytes = 100;
+  try {
+    const agent = await connectAgent(r);
+    const s = await ready(r, agent);
+    sendJSON(s.client.ws, { type: 'file_request', request_id: 'b1', op: 'read', path: 'big', offset: 0, length: 1024 });
+    await waitUntil('read fwd', () => agentReqs(agent, s.sid).find((q) => q.request_id === 'b1'));
+    agent.ws.send(data(s.sid, Buffer.alloc(150, 7)));
+    agentResult(agent, s.sid, 'b1', 'read', { bytes: 150, eof: true, size: 150, mtime_ns: 1 });
+    await waitResult(s.client.box, 'b1');
+    const row = await waitUntil('threshold flush', () => auditRows(r, 'file_read')[0]);
+    assert.deepEqual(row.payload, { session_id: s.sid, path: 'big', bytes: 150, ranges: 1, sha256: null });
+    assert.equal(auditRows(r, 'file_session_end').length, 0);
+  } finally {
+    await r.close();
+  }
+});
+
 // Opens a write and returns its request id.
 async function openWrite(r, agent, s, { rid = 'w1', size = 3 * MiB, offset = 0, path = 'up/f.bin' } = {}) {
   sendJSON(s.client.ws, { type: 'file_request', request_id: rid, op: 'write_open', path, size, sha256: SHA, overwrite: false });
