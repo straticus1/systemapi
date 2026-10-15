@@ -178,6 +178,16 @@ test('fails closed when discovery names a non-https jwks_uri', async () => {
   assert.equal(await manager(setup).verifyJWTToken(sign(claims())), null);
 });
 
+test('fails closed when discovery names a jwks_uri off the issuer origin', async () => {
+  for (const jwks_uri of ['https://evil.test/jwks/', 'https://issuer.test:8443/application/o/systemapi/jwks/']) {
+    const setup = issuerFetch({ metadata: { jwks_uri } });
+    const auth = manager(setup);
+    assert.equal(await auth.verifyJWTToken(sign(claims())), null);
+    assert.equal(setup.calls.jwks, 0);
+    await assert.rejects(auth.discoverVerifier(), (err) => err.code === 'jwks_uri_origin');
+  }
+});
+
 test('refuses every token when no audience is configured', async () => {
   const setup = issuerFetch();
   const auth = new AuthManager('https://unused.test', 'unused', '', 'systemapi', null, {

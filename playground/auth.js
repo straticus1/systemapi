@@ -11,7 +11,8 @@
  * Keycloak realm URL; the discovered issuer must equal it) and the signature
  * from jose against the issuer's jwks_uri. Every failure returns null (no
  * user). Audience is OIDC_AUDIENCE, else the configured client id; with
- * neither every token is refused. Does NOT mint tokens, decide what a user
+ * neither every token is refused. The jwks_uri must be https and on the
+ * issuer's origin. Does NOT mint tokens, decide what a user
  * may do, or log tokens (only error codes).
  */
 
@@ -97,6 +98,9 @@ class AuthManager {
     const jwksURL = new URL(metadata.jwks_uri);
     if (jwksURL.protocol !== 'https:') {
       throw Object.assign(new Error('jwks_uri is not https'), { code: 'jwks_uri_insecure' });
+    }
+    if (jwksURL.origin !== new URL(metadata.issuer).origin) {
+      throw Object.assign(new Error('jwks_uri is not on the issuer origin'), { code: 'jwks_uri_origin' });
     }
     const jwksOptions = { timeoutDuration: JWKS_TIMEOUT_MS };
     if (this.customFetch) jwksOptions[jose.customFetch] = this.customFetch;
