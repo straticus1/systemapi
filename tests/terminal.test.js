@@ -547,6 +547,30 @@ test('a failing end audit is retried, then counted and raised', async () => {
   }
 });
 
+test('a refused upgrade gets a complete minimal HTTP response, then the socket ends', async () => {
+  const net = require('node:net');
+  const r = await rig();
+  const port = Number(new URL(r.base).port);
+  const raw = (path, extra = '') => new Promise((resolve, reject) => {
+    const chunks = [];
+    const sock = net.connect(port, '127.0.0.1', () => {
+      sock.write(`GET ${path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n`
+        + `Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n${extra}\r\n`);
+    });
+    sock.on('data', (c) => chunks.push(c));
+    sock.on('end', () => resolve(Buffer.concat(chunks).toString('latin1')));
+    sock.on('error', reject);
+    setTimeout(() => reject(new Error('socket not ended')), 2000).unref();
+  });
+  try {
+    assert.equal(await raw('/api/v1/systems/nope'), 'HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+    assert.equal(await raw('/api/v1/systems/stream', 'Authorization: Bearer wrong\r\n'), 'HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+    assert.equal(await raw(`/api/v1/systems/tcp/${HOST_A}?api_key=x`), 'HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+  } finally {
+    await r.close();
+  }
+});
+
 test('an expired API key cannot open the agent stream', async () => {
   const bcrypt = require('bcryptjs');
   const r = await rig();

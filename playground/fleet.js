@@ -52,6 +52,7 @@ const { CreditLedger } = require('../controlplane/credit');
 const { deliverWebhooks, COOLDOWN_MS } = require('../controlplane/router');
 const { TcpChannels } = require('./tcp');
 const { FileChannels } = require('./file');
+const { rejectUpgrade } = require('./channel');
 
 const PTY_FRAME_MAX = 64 * 1024;
 const PTY_PENDING_MAX = 1024 * 1024;
@@ -193,10 +194,7 @@ class FleetManager {
         server.on('upgrade', (request, socket, head) => {
             this.handleUpgrade(request, socket, head).catch((err) => {
                 console.error('[Fleet] upgrade failed:', err.message);
-                if (!socket.destroyed) {
-                    socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
-                    socket.destroy();
-                }
+                this.rejectUpgrade(socket, 500, 'Internal Server Error');
             });
         });
 
@@ -204,8 +202,7 @@ class FleetManager {
     }
 
     rejectUpgrade(socket, status, reason) {
-        socket.write(`HTTP/1.1 ${status} ${reason}\r\n\r\n`);
-        socket.destroy();
+        rejectUpgrade(socket, status, reason);
     }
 
     async handleUpgrade(request, socket, head) {

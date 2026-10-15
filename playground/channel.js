@@ -51,9 +51,13 @@ function sendJSON(ws, obj) {
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
 }
 
+// A refused upgrade gets a complete minimal response (a bare status line
+// becomes a 502 at cloudflared), then a graceful end; the socket is destroyed
+// once the response has flushed, or after 1 s.
 function rejectUpgrade(socket, status, reason) {
-    socket.write(`HTTP/1.1 ${status} ${reason}\r\n\r\n`);
-    socket.destroy();
+    if (socket.destroyed) return;
+    socket.end(`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`, () => socket.destroy());
+    unref(setTimeout(() => socket.destroy(), 1000));
 }
 
 // PTY §3 upgrade rules for a channel path ".../<host_id>": api_key in the
