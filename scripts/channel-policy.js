@@ -17,7 +17,8 @@
 // {allow:[]}, file_policy {roots:[]}), which a tenant default does not
 // override; `inherit` sets both to null (back to the tenant default, else
 // deny). Every set, clear and inherit appends an audit-chain row (actor
-// "cli:channel-policy", the old and new policies) in the same transaction as
+// "cli:channel-policy", the operator's required --reason, the old and new
+// policies) in the same transaction as
 // the write, on one client with the host row locked (SELECT ... FOR UPDATE):
 // both land or neither does. Does NOT check who runs
 // it: whoever can read the env file can already write the database. Does NOT
@@ -27,10 +28,10 @@
 // so even `show` runs the boot-time DDL, as every script here does.
 //
 // Usage: node scripts/channel-policy.js show  --tenant <t> --host <hostname|host_id>
-//        node scripts/channel-policy.js set   --tenant <t> --host <hostname|host_id>
+//        node scripts/channel-policy.js set   --tenant <t> --host <hostname|host_id> --reason <text>
 //               [--tcp-local <port>]... [--file-read <dir>]... [--file-write <dir>]...
-//        node scripts/channel-policy.js clear --tenant <t> --host <hostname|host_id>
-//        node scripts/channel-policy.js inherit --tenant <t> --host <hostname|host_id>
+//        node scripts/channel-policy.js clear --tenant <t> --host <hostname|host_id> --reason <text>
+//        node scripts/channel-policy.js inherit --tenant <t> --host <hostname|host_id> --reason <text>
 // Database and env file: as scripts/sso-bind.js (ENV_FILE, else
 // .env.production beside server.js).
 'use strict';
@@ -45,7 +46,8 @@ const HOST_RE = /^[A-Za-z0-9._-]{1,253}$/;
 const SYSTEM_ROOTS = ['/proc', '/sys', '/dev', '/boot', '/etc', '/root', '/var/lib/systemapi-agent',
   '/etc/systemapi-agent', '/var/lib/postgresql', '/etc/sahcore'];
 const USAGE = 'usage: node scripts/channel-policy.js show|set|clear|inherit --tenant <t> --host <hostname|host_id> '
-  + '[--tcp-local <port>]... [--file-read <dir>]... [--file-write <dir>]...';
+  + '[--reason <text>, required except for show] [--tcp-local <port>]... [--file-read <dir>]... [--file-write <dir>]...';
+const REASON_MAX = 256;
 const COMMANDS = new Set(['show', 'set', 'clear', 'inherit']);
 // What each writing command stores in the two host columns and its audit
 // action. clear is an explicit deny; inherit (null) defers to the tenant.
@@ -53,7 +55,7 @@ const WRITES = {
   clear: { action: 'channel_policy_clear', policy: () => ({ tcp_policy: { allow: [] }, file_policy: { roots: [] } }) },
   inherit: { action: 'channel_policy_inherit', policy: () => ({ tcp_policy: null, file_policy: null }) }
 };
-const ONCE_FLAGS = new Set(['--tenant', '--host']);
+const ONCE_FLAGS = new Set(['--tenant', '--host', '--reason']);
 const LIST_FLAGS = new Set(['--tcp-local', '--file-read', '--file-write']);
 
 function fail(code, message = code) {
@@ -110,8 +112,16 @@ function parseArgs(argv) {
     throw usage('bad --tenant: lowercase letters, digits and "-", at most 63');
   }
   if (!HOST_RE.test(once['--host'])) throw usage('bad --host: a hostname or host id');
+  const reason = once['--reason'];
+  if (command === 'show') {
+    if (reason !== undefined) throw usage('--reason is only for set, clear and inherit');
+  } else if (typeof reason !== 'string' || reason.trim() === '' || reason.length > REASON_MAX
+    || /[\u0000-\u001f\u007f]/.test(reason)) {
+    throw usage(`${command} needs --reason "<why>": 1-${REASON_MAX} characters, no control bytes`);
+  }
 
   const out = { command, tenantId: once['--tenant'], host: once['--host'] };
+  if (command !== 'show') out.reason = reason.trim();
   if (command !== 'set') return out;
 
   const ports = [...new Set(lists['--tcp-local'].map(parsePort))].sort((a, b) => a - b);
@@ -178,7 +188,8 @@ async function run(argv, { registry }) {
       tcpPolicy: next.tcp_policy,
       filePolicy: next.file_policy,
       actor: ACTOR,
-      action
+      action,
+      reason: args.reason
     });
   } catch (err) {
     if (err.code === 'not_found' || err.code === 'bad_policy') throw err;
