@@ -599,6 +599,30 @@ func TestFileLinuxResume(t *testing.T) {
 	noTemps(t, filepath.Join(root, "sub"))
 }
 
+// A FIFO planted at a resumable upload's temp name never blocks the helper:
+// it is not resumed and a fresh upload starts.
+func TestFileLinuxResumeRefusesAFIFOTemp(t *testing.T) {
+	needOpenat2(t)
+	h := newFileHarness(t)
+	root, _ := fixture(t)
+	data := []byte("0123456789")
+	id := "upl_ffffffffffffffffffff"
+	rec := uploadRecord{UploadID: id, ActorKey: actorKey("user-1"), Root: root, Path: "sub/r.bin", Size: int64(len(data)),
+		SHA256: hexSum(data), CreatedUnix: time.Now().Unix()}
+	if err := saveUpload(h.ch.stateDir, rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(filepath.Join(root, "sub", tempName(id)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sid := h.open(t, root, fileOpenOpts{})
+	h.ready(t, sid)
+	open := h.do(t, sid, map[string]interface{}{"op": "write_open", "path": "sub/r.bin", "size": len(data), "sha256": hexSum(data), "overwrite": false, "resume": true})
+	if errOf(open) != "" || open["upload_id"] == id || open["offset"] != float64(0) {
+		t.Fatalf("resume onto a FIFO: %v", open)
+	}
+}
+
 func TestFileLinuxListMkdirRemove(t *testing.T) {
 	needOpenat2(t)
 	h := newFileHarness(t)

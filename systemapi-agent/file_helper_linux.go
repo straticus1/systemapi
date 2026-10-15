@@ -643,16 +643,24 @@ func (h *fileHelper) writeOpen(req fileReq) fileResp {
 }
 
 // resumeTemp reopens an interrupted upload's temp file: a regular file with
-// one link, owned by this identity. The durable offset is its length after
-// fsync; prefix_sha256 lets the client check those bytes (§6).
+// one link, owned by this identity. It is lstat'ed first and opened only when
+// regular, with O_NONBLOCK, then fstat'ed and compared by inode, as
+// openRegular does, so a FIFO or device planted at the temp name never
+// blocks or is written. The durable offset is its length after fsync;
+// prefix_sha256 lets the client check those bytes (§6).
 func (h *fileHelper) resumeTemp(w *helperWrite, id string) (string, bool) {
 	tmp := tempName(id)
-	fd, err := unix.Openat(w.dirFD, tmp, unix.O_WRONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	var pre unix.Stat_t
+	if err := unix.Fstatat(w.dirFD, tmp, &pre, unix.AT_SYMLINK_NOFOLLOW); err != nil || pre.Mode&unix.S_IFMT != unix.S_IFREG {
+		return "", false
+	}
+	fd, err := unix.Openat(w.dirFD, tmp, unix.O_WRONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return "", false
 	}
 	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil || st.Mode&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 || int(st.Uid) != os.Geteuid() {
+	if err := unix.Fstat(fd, &st); err != nil || st.Mode&unix.S_IFMT != unix.S_IFREG || st.Dev != pre.Dev || st.Ino != pre.Ino ||
+		st.Nlink != 1 || int(st.Uid) != os.Geteuid() {
 		_ = unix.Close(fd)
 		return "", false
 	}
