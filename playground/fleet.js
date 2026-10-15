@@ -700,7 +700,8 @@ class FleetManager {
             const keyId = parts[0];
             const res = await this.db.query(
                 `SELECT key_id, user_id, key_hash FROM playground_api_keys
-                 WHERE key_id = $1 AND api_site = $2 AND is_active = true AND is_locked = false`,
+                 WHERE key_id = $1 AND api_site = $2 AND is_active = true AND is_locked = false
+                   AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)`,
                 [keyId, this.apiSite]
             );
             if (res.rows.length === 0) return null;

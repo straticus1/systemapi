@@ -547,6 +547,50 @@ test('a failing end audit is retried, then counted and raised', async () => {
   }
 });
 
+test('an expired API key cannot open the agent stream', async () => {
+  const bcrypt = require('bcryptjs');
+  const r = await rig();
+  try {
+    const keys = [
+      { key_id: 'ak_live_expired', secret: 'ak_live_expired.s1', expires_at: new Date(Date.now() - 60_000) },
+      { key_id: 'ak_live_current', secret: 'ak_live_current.s2', expires_at: new Date(Date.now() + 3_600_000) }
+    ];
+    for (const k of keys) k.key_hash = await bcrypt.hash(k.secret, 4);
+    // Answers the key lookup as PostgreSQL would, honouring only the
+    // conditions the query actually states.
+    r.fm.db = {
+      async query(sql, params) {
+        if (!sql.includes('FROM playground_api_keys')) return { rows: [], rowCount: 0 };
+        const checksExpiry = /expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP/.test(sql);
+        const rows = keys
+          .filter((k) => k.key_id === params[0] && (!checksExpiry || k.expires_at > new Date()))
+          .map((k) => ({ key_id: k.key_id, user_id: 'user-1', key_hash: k.key_hash }));
+        return { rows, rowCount: rows.length };
+      }
+    };
+    r.fm.verifyApiKey = FleetManager.prototype.verifyApiKey.bind(r.fm);
+    const dial = (secret) => new Promise((resolve) => {
+      const ws = r.track(new WebSocket(`${r.base}/api/v1/systems/stream`, {
+        headers: {
+          authorization: `Bearer ${secret}`,
+          'x-systemapi-tenant': 'acme',
+          'x-systemapi-host-id': HOST_A,
+          'x-systemapi-hostname': 'a.example',
+          'x-systemapi-ssh-pubkey': opensshEd25519(r.fm.signer.publicKeyRaw)
+        }
+      }));
+      ws.on('unexpected-response', (_req, res) => { resolve(res.statusCode); ws.terminate(); });
+      ws.on('message', (data) => { if (JSON.parse(data.toString()).type === 'enrolled') resolve('enrolled'); });
+      ws.on('error', () => {});
+    });
+    assert.equal(await dial('ak_live_expired.s1'), 403);
+    assert.equal(r.fm.connectedAgents.has(HOST_A), false);
+    assert.equal(await dial('ak_live_current.s2'), 'enrolled');
+  } finally {
+    await r.close();
+  }
+});
+
 test('an agent dialing with the same key and host id but another SSH key is refused', async () => {
   const r = await rig();
   try {

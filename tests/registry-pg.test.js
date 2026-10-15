@@ -1,8 +1,8 @@
 'use strict';
 
-// PgRegistry against a real PostgreSQL: the enroll upsert. A fresh database
-// per run with the schema applied by createRegistry. Needs
-// SYSTEMAPI_TEST_DATABASE_URL (a role that may CREATE DATABASE); it fails,
+// PgRegistry against a real PostgreSQL: the enroll upsert, and the fleet's
+// agent-key lookup. A fresh database per run with the schema applied by
+// createRegistry. Needs SYSTEMAPI_TEST_DATABASE_URL (a role that may CREATE DATABASE); it fails,
 // not skips, without it. Not part of npm test.
 //
 //   SYSTEMAPI_TEST_DATABASE_URL=postgres://postgres@127.0.0.1:5432/postgres \
@@ -12,8 +12,10 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 const { Pool } = require('pg');
+const bcrypt = require('bcryptjs');
 
 const { createRegistry, PgRegistry } = require('../controlplane/registry');
+const FleetManager = require('../playground/fleet');
 
 const BASE = process.env.SYSTEMAPI_TEST_DATABASE_URL;
 const DB = `registry_${crypto.randomBytes(6).toString('hex')}`;
@@ -75,4 +77,19 @@ test('a re-enroll with the same key and host id but another SSH key is refused a
   const again = await registry.enroll({ ...base, hostname: 'a.example', sshPubkey: opensshEd25519(3, 'renamed@host') });
   assert.equal(again.ssh_pubkey, pub);
   assert.equal(again.status, 'online');
+});
+
+test('fleet.verifyApiKey refuses an expired key and accepts an unexpired one', async () => {
+  const fleet = { db: pool, apiSite: 'systemapi', env: { NODE_ENV: 'production' } };
+  const add = async (keyId, secret, expiresIn) => pool.query(
+    `INSERT INTO playground_api_keys (key_id, key_hash, user_id, name, api_site, expires_at)
+     VALUES ($1, $2, 'user-1', 'agent', 'systemapi', CURRENT_TIMESTAMP + $3::interval)`,
+    [keyId, await bcrypt.hash(secret, 4), expiresIn]
+  );
+  await add('ak_live_pgexpired', 'ak_live_pgexpired.s1', '-1 minute');
+  await add('ak_live_pgcurrent', 'ak_live_pgcurrent.s2', '1 hour');
+  await add('ak_live_pgnoexpiry', 'ak_live_pgnoexpiry.s3', null);
+  assert.equal(await FleetManager.prototype.verifyApiKey.call(fleet, 'ak_live_pgexpired.s1'), null);
+  assert.equal((await FleetManager.prototype.verifyApiKey.call(fleet, 'ak_live_pgcurrent.s2')).key_id, 'ak_live_pgcurrent');
+  assert.equal((await FleetManager.prototype.verifyApiKey.call(fleet, 'ak_live_pgnoexpiry.s3')).key_id, 'ak_live_pgnoexpiry');
 });
