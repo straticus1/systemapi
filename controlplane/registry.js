@@ -1,5 +1,9 @@
 // Threats: cross-tenant host reads, host theft by a second API key, a
-// rewritten audit row, and a security event with no tenant shown to every
+// host moved to new hands by a re-enroll with the same key but another SSH
+// public key (refused host_key_mismatch; the stored ssh_pubkey never changes
+// on re-enroll, so an intentional rotation is an admin resetting the cp_hosts
+// row on the server: UPDATE its ssh_pubkey, or DELETE it so the agent
+// enrolls afresh; there is no HTTP route for it), a rewritten audit row, and a security event with no tenant shown to every
 // audit reader. Queries are parameterized. A host id that belongs to another
 // tenant is returned as not found. Webhook HMAC secrets are sealed before
 // insert; this store does not log them. listSecurity returns only rows whose
@@ -14,6 +18,7 @@ const { escapeLike, efficiency: efficiencyOf } = require('./stats');
 const { fingerprint } = require('./token');
 const { assertPolicyShape } = require('./channels');
 const { demoKeyAllowed } = require('./httpauth');
+const { sshKeyMaterial } = require('./sshkey');
 
 const METRICS = new Set(['cpu.usage_percent', 'memory.used_percent', 'disk.used_percent']);
 const ROLES = new Set(['admin', 'operator', 'viewer']);
@@ -177,6 +182,9 @@ class MemoryRegistry {
     if (prev && (prev.tenant_id !== tenantId || prev.key_id !== keyId)) {
       throw http(403, 'host_steal');
     }
+    if (prev && sshKeyMaterial(prev.ssh_pubkey) !== sshKeyMaterial(sshPubkey)) {
+      throw http(403, 'host_key_mismatch');
+    }
     const now = new Date().toISOString();
     this.hosts.set(hostId, {
       host_id: hostId,
@@ -185,7 +193,7 @@ class MemoryRegistry {
       hostname,
       os: os || '',
       platform: platform || '',
-      ssh_pubkey: sshPubkey,
+      ssh_pubkey: prev ? prev.ssh_pubkey : sshPubkey,
       status: 'online',
       last_seen_at: now,
       tags: prev ? prev.tags : [],
@@ -647,6 +655,22 @@ class PgRegistry {
         );
         if (member.rowCount === 0) throw http(403, 'not_a_member');
       }
+      // A re-enroll keeps the stored ssh_pubkey: the row is locked, a
+      // different key is refused, and the stored line (comment included) is
+      // what the upsert compares, so the ON CONFLICT branch never rewrites it.
+      // A row that appears between the lock and the insert must carry the
+      // presented line exactly, else the upsert matches nothing.
+      const cur = await client.query(
+        'SELECT tenant_id, key_id, ssh_pubkey FROM cp_hosts WHERE host_id = $1 FOR UPDATE',
+        [hostId]
+      );
+      let pubkey = sshPubkey;
+      if (cur.rowCount > 0) {
+        const row = cur.rows[0];
+        if (row.tenant_id !== tenantId || row.key_id !== keyId) throw http(403, 'host_steal');
+        if (sshKeyMaterial(row.ssh_pubkey) !== sshKeyMaterial(sshPubkey)) throw http(403, 'host_key_mismatch');
+        pubkey = row.ssh_pubkey;
+      }
       const host = await client.query(
         `INSERT INTO cp_hosts (host_id, tenant_id, key_id, hostname, os, platform, ssh_pubkey, status, last_seen_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, 'online', now())
@@ -654,18 +678,14 @@ class PgRegistry {
            hostname = EXCLUDED.hostname,
            os = EXCLUDED.os,
            platform = EXCLUDED.platform,
-           ssh_pubkey = EXCLUDED.ssh_pubkey,
            status = 'online',
            last_seen_at = now()
          WHERE cp_hosts.tenant_id = EXCLUDED.tenant_id AND cp_hosts.key_id = EXCLUDED.key_id
+           AND cp_hosts.ssh_pubkey = EXCLUDED.ssh_pubkey
          RETURNING host_id`,
-        [hostId, tenantId, keyId, hostname, os || '', platform || '', sshPubkey]
+        [hostId, tenantId, keyId, hostname, os || '', platform || '', pubkey]
       );
-      if (host.rowCount === 0) {
-        const cur = await client.query('SELECT tenant_id, key_id FROM cp_hosts WHERE host_id = $1', [hostId]);
-        if (cur.rowCount > 0) throw http(403, 'host_steal');
-        throw http(403, 'host_rejected');
-      }
+      if (host.rowCount === 0) throw http(403, 'host_rejected');
       await client.query('COMMIT');
     } catch (err) {
       try { await client.query('ROLLBACK'); } catch { /* connection already failed */ }

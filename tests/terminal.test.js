@@ -547,6 +547,33 @@ test('a failing end audit is retried, then counted and raised', async () => {
   }
 });
 
+test('an agent dialing with the same key and host id but another SSH key is refused', async () => {
+  const r = await rig();
+  try {
+    const first = await connectAgent(r);
+    first.ws.close();
+    await waitUntil('first gone', () => !r.fm.connectedAgents.has(HOST_A));
+    const ws = r.track(new WebSocket(`${r.base}/api/v1/systems/stream`, {
+      headers: {
+        authorization: 'Bearer agent-key',
+        'x-systemapi-tenant': 'acme',
+        'x-systemapi-host-id': HOST_A,
+        'x-systemapi-hostname': 'a.example',
+        'x-systemapi-ssh-pubkey': opensshEd25519(Buffer.alloc(32, 9))
+      }
+    }));
+    const box = collect(ws);
+    const refused = await waitUntil('enroll_error', () => box.frames.find((f) => f.type === 'enroll_error'));
+    assert.equal(refused.error, 'host_key_mismatch');
+    await waitUntil('closed', () => box.closeCode !== null);
+    assert.equal(r.fm.connectedAgents.has(HOST_A), false);
+    assert.equal((await r.fm.registry.getHost(['acme'], HOST_A)).ssh_pubkey, opensshEd25519(r.fm.signer.publicKeyRaw));
+    assert.ok(r.fm.registry.securityEvents.find((e) => e.kind === 'enroll_rejected' && e.detail.error === 'host_key_mismatch'));
+  } finally {
+    await r.close();
+  }
+});
+
 test('a replaced agent connection closing does not mark the host offline', async () => {
   const r = await rig();
   try {

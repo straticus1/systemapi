@@ -51,9 +51,17 @@ function validateSSHPublicKey(line) {
   return line.trim();
 }
 
+// The key itself (type and base64 blob) without the comment, so a re-enroll
+// is matched on the key, not on the text after it.
+function sshKeyMaterial(line) {
+  if (typeof line !== 'string') return '';
+  return line.trim().split(/\s+/).slice(0, 2).join(' ');
+}
+
 module.exports = {
   validateTenant,
   validateHostId,
   validateHostname,
-  validateSSHPublicKey
+  validateSSHPublicKey,
+  sshKeyMaterial
 };

@@ -288,6 +288,24 @@ test('a member cannot create a second tenant or steal a host', async () => {
   assert.equal(await reg.getHost(['beta'], HOST_A), null);
 });
 
+test('a re-enroll with the same key and host id but another SSH key is refused and changes nothing', async () => {
+  const reg = new MemoryRegistry({});
+  const pub = opensshEd25519(Buffer.alloc(32, 3));
+  const other = opensshEd25519(Buffer.alloc(32, 4));
+  const base = { tenantId: 'acme', userId: 'user-1', keyId: 'k1', hostId: HOST_A, os: 'linux', platform: 'amd64' };
+  await reg.enroll({ ...base, hostname: 'a.example', sshPubkey: pub });
+  const before = { ...reg.hosts.get(HOST_A) };
+  await assert.rejects(
+    () => reg.enroll({ ...base, hostname: 'evil.example', sshPubkey: other }),
+    (err) => err.message === 'host_key_mismatch' && err.status === 403
+  );
+  assert.deepEqual(reg.hosts.get(HOST_A), before);
+  // The same key reconnects, a changed comment included, and the stored line stays.
+  const again = await reg.enroll({ ...base, hostname: 'a.example', sshPubkey: pub.replace('test@systemapi', 'renamed@host') });
+  assert.equal(again.ssh_pubkey, pub);
+  assert.equal(again.status, 'online');
+});
+
 test('fleet routes reject query keys, hide other tenants, and refuse viewer exec', async () => {
   const fm = fleet();
   await seed(fm);

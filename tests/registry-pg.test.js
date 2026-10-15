@@ -1,0 +1,78 @@
+'use strict';
+
+// PgRegistry against a real PostgreSQL: the enroll upsert. A fresh database
+// per run with the schema applied by createRegistry. Needs
+// SYSTEMAPI_TEST_DATABASE_URL (a role that may CREATE DATABASE); it fails,
+// not skips, without it. Not part of npm test.
+//
+//   SYSTEMAPI_TEST_DATABASE_URL=postgres://postgres@127.0.0.1:5432/postgres \
+//     node --test tests/registry-pg.test.js
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
+const { Pool } = require('pg');
+
+const { createRegistry, PgRegistry } = require('../controlplane/registry');
+
+const BASE = process.env.SYSTEMAPI_TEST_DATABASE_URL;
+const DB = `registry_${crypto.randomBytes(6).toString('hex')}`;
+const HOST_A = '11111111-1111-4111-8111-111111111111';
+let pool;
+let registry;
+
+function withDatabase(url, name) {
+  const u = new URL(url);
+  u.pathname = `/${name}`;
+  return u.toString();
+}
+
+function opensshEd25519(fill, comment = 'test@systemapi') {
+  const name = Buffer.from('ssh-ed25519');
+  const buf = Buffer.alloc(4 + name.length + 4 + 32);
+  buf.writeUInt32BE(name.length, 0);
+  name.copy(buf, 4);
+  buf.writeUInt32BE(32, 4 + name.length);
+  Buffer.alloc(32, fill).copy(buf, 4 + name.length + 4);
+  return `ssh-ed25519 ${buf.toString('base64')} ${comment}`;
+}
+
+test.before(async () => {
+  assert.ok(BASE, 'SYSTEMAPI_TEST_DATABASE_URL is required for this test');
+  const admin = new Pool({ connectionString: BASE });
+  await admin.query(`CREATE DATABASE ${DB}`);
+  await admin.end();
+  pool = new Pool({ connectionString: withDatabase(BASE, DB) });
+  registry = await createRegistry({ pool, env: { NODE_ENV: 'production' }, logger: { log() {}, warn() {}, error() {} } });
+  assert.ok(registry instanceof PgRegistry);
+});
+
+test.after(async () => {
+  if (pool) await pool.end();
+  if (!BASE) return;
+  const admin = new Pool({ connectionString: BASE });
+  await admin.query(`DROP DATABASE IF EXISTS ${DB} WITH (FORCE)`);
+  await admin.end();
+});
+
+test('a re-enroll with the same key and host id but another SSH key is refused and the row is unchanged', async () => {
+  const pub = opensshEd25519(3);
+  const base = { tenantId: 'acme', userId: 'user-1', keyId: 'k1', hostId: HOST_A, os: 'linux', platform: 'amd64' };
+  await registry.enroll({ ...base, hostname: 'a.example', sshPubkey: pub });
+  const row = async () => (await pool.query('SELECT hostname, ssh_pubkey, key_id, tenant_id FROM cp_hosts WHERE host_id = $1', [HOST_A])).rows[0];
+  const before = await row();
+  await assert.rejects(
+    () => registry.enroll({ ...base, hostname: 'evil.example', sshPubkey: opensshEd25519(4) }),
+    (err) => err.code === 'host_key_mismatch' && err.status === 403
+  );
+  assert.deepEqual(await row(), before);
+  // Another key id is still host_steal.
+  await assert.rejects(
+    () => registry.enroll({ ...base, keyId: 'k2', hostname: 'a.example', sshPubkey: pub }),
+    (err) => err.code === 'host_steal'
+  );
+  // The same key reconnects (a changed comment included); the stored line stays.
+  const again = await registry.enroll({ ...base, hostname: 'a.example', sshPubkey: opensshEd25519(3, 'renamed@host') });
+  assert.equal(again.ssh_pubkey, pub);
+  assert.equal(again.status, 'online');
+});
