@@ -7,8 +7,11 @@
 // as the service user with the production env file (like
 // scripts/bootstrap-admin.js). It is deliberately narrow: TCP entries are
 // only "local" ports (the agent dials 127.0.0.1; no CIDR, no remote address),
-// file entries are absolute directories with read, or read and write (never
-// "/", "~" or root), and the host must resolve to exactly one host of the
+// file entries are absolute directories of at least two components with
+// read, or read and write (never file:root), that are neither a system root
+// (SYSTEM_ROOTS: /proc /sys /dev /boot /etc /root, the agent's and the
+// server's own state and config, PostgreSQL's data), beneath one, nor a
+// parent of one (so /var/lib is refused too), and the host must resolve to exactly one host of the
 // named tenant. `set` replaces BOTH host columns, so nothing from an earlier
 // policy lingers; `clear` is an explicit deny on the host (tcp_policy
 // {allow:[]}, file_policy {roots:[]}), which a tenant default does not
@@ -39,6 +42,8 @@ const { validateFileRoot, effectivePolicies } = require('../controlplane/channel
 const ACTOR = 'cli:channel-policy';
 const MAX_ENTRIES = 16;
 const HOST_RE = /^[A-Za-z0-9._-]{1,253}$/;
+const SYSTEM_ROOTS = ['/proc', '/sys', '/dev', '/boot', '/etc', '/root', '/var/lib/systemapi-agent',
+  '/etc/systemapi-agent', '/var/lib/postgresql', '/etc/sahcore'];
 const USAGE = 'usage: node scripts/channel-policy.js show|set|clear|inherit --tenant <t> --host <hostname|host_id> '
   + '[--tcp-local <port>]... [--file-read <dir>]... [--file-write <dir>]...';
 const COMMANDS = new Set(['show', 'set', 'clear', 'inherit']);
@@ -72,7 +77,11 @@ function parseDir(flag, text) {
   if (text === '/' || text === '~') throw usage(`bad ${flag}: "${text}" is too wide; name one directory`);
   const checked = validateFileRoot(text, 'file:write');
   if (!checked.ok) throw usage(`bad ${flag}: an absolute directory with no "..", ".", "//", trailing "/" or control bytes`);
-  return checked.root;
+  const root = checked.root;
+  if (root.split('/').length - 1 < 2) throw usage(`bad ${flag}: "${root}" is too wide; name a directory at least two levels down`);
+  const sys = SYSTEM_ROOTS.find((s) => root === s || root.startsWith(`${s}/`) || s.startsWith(`${root}/`));
+  if (sys) throw usage(`bad ${flag}: "${root}" is, sits in or contains the system path ${sys}`);
+  return root;
 }
 
 function parseArgs(argv) {
@@ -218,4 +227,4 @@ async function main(argv = process.argv.slice(2), stdout = process.stdout) {
 
 if (require.main === module) main();
 
-module.exports = { run, main, parseArgs, ACTOR, MAX_ENTRIES };
+module.exports = { run, main, parseArgs, ACTOR, MAX_ENTRIES, SYSTEM_ROOTS };

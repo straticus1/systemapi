@@ -9,7 +9,7 @@ const assert = require('node:assert/strict');
 
 const { MemoryRegistry, PgRegistry } = require('../controlplane/registry');
 const { policyDecision } = require('../controlplane/channels');
-const { run, parseArgs, ACTOR, MAX_ENTRIES } = require('../scripts/channel-policy');
+const { run, parseArgs, ACTOR, MAX_ENTRIES, SYSTEM_ROOTS } = require('../scripts/channel-policy');
 
 const HOST_A = '11111111-1111-4111-8111-111111111111';
 const HOST_B = '22222222-2222-4222-8222-222222222222';
@@ -273,6 +273,24 @@ test('parseArgs refuses anything wider or malformed', () => {
   const dirs = [...base];
   for (let d = 0; d <= MAX_ENTRIES; d += 1) dirs.push('--file-read', `/srv/d${d}`);
   assert.throws(() => parseArgs(dirs), (err) => err.code === 'usage');
+});
+
+test('parseArgs refuses system roots, their contents, their parents and one-level directories', () => {
+  const base = ['set', '--tenant', 'afterdark', '--host', 'miniapps1'];
+  const refused = [
+    ...SYSTEM_ROOTS,
+    '/proc/1', '/sys/kernel', '/dev/shm', '/boot/efi', '/etc/ssh', '/root/.ssh',
+    '/var/lib/systemapi-agent/state', '/etc/systemapi-agent/keys', '/var/lib/postgresql/16', '/etc/sahcore/env',
+    '/var/lib', '/var', '/srv', '/home', '/opt', '/tmp'
+  ];
+  for (const dir of refused) {
+    for (const flag of ['--file-read', '--file-write']) {
+      assert.throws(() => parseArgs([...base, flag, dir]), (err) => err.code === 'usage', `${flag} ${dir}`);
+    }
+  }
+  for (const dir of ['/srv/data', '/var/tmp/sah-filetest', '/var/lib/app', '/home/ops', '/etcetera/x', '/var/lib/postgresql-backup']) {
+    assert.deepEqual(parseArgs([...base, '--file-read', dir]).filePolicy.roots, [{ path: dir, read: true, write: false }], dir);
+  }
 });
 
 test('parseArgs de-duplicates and sorts ports', () => {
