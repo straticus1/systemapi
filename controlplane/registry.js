@@ -18,6 +18,11 @@ const { demoKeyAllowed } = require('./httpauth');
 const METRICS = new Set(['cpu.usage_percent', 'memory.used_percent', 'disk.used_percent']);
 const ROLES = new Set(['admin', 'operator', 'viewer']);
 const SCHEMA_SQL = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
+// The playground tables (API keys, legacy hosts) the app reads but did not
+// create: applied at boot after the control-plane schema, keys file first
+// (the fleet file references playground_api_keys). Both are idempotent.
+const PLAYGROUND_SQL = ['playground_schema.sql', 'playground_fleet_schema.sql']
+  .map((name) => fs.readFileSync(path.join(__dirname, '..', 'playground', name), 'utf8'));
 const TELEMETRY_CAP = 5000;
 const DEMO_KEY_ID = 'ak_live_1234';
 
@@ -1213,6 +1218,7 @@ async function createRegistry({ pool, env, logger = console }) {
   if (pool) {
     try {
       await pool.query(SCHEMA_SQL);
+      for (const sql of PLAYGROUND_SQL) await pool.query(sql);
       logger.log('[control] cp schema ready');
       return new PgRegistry(pool, env);
     } catch (err) {

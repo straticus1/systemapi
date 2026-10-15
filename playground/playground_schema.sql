@@ -1,5 +1,8 @@
 -- API Playground Schema for nerdapi.io
 -- Separate tables to avoid conflicts with existing schema
+-- Idempotent: the app applies this file (then playground_fleet_schema.sql)
+-- at every boot through createRegistry, so every statement must be safe to
+-- run again: IF NOT EXISTS, CREATE OR REPLACE, DROP TRIGGER IF EXISTS.
 
 -- ============================================================================
 -- Playground API Keys (separate from main api_keys)
@@ -28,10 +31,10 @@ CREATE TABLE IF NOT EXISTS playground_api_keys (
     CONSTRAINT playground_api_keys_key_id_unique UNIQUE (key_id)
 );
 
-CREATE INDEX idx_playground_api_keys_user_id ON playground_api_keys(user_id);
-CREATE INDEX idx_playground_api_keys_key_id ON playground_api_keys(key_id);
-CREATE INDEX idx_playground_api_keys_api_site ON playground_api_keys(api_site);
-CREATE INDEX idx_playground_api_keys_active ON playground_api_keys(is_active, is_locked);
+CREATE INDEX IF NOT EXISTS idx_playground_api_keys_user_id ON playground_api_keys(user_id);
+CREATE INDEX IF NOT EXISTS idx_playground_api_keys_key_id ON playground_api_keys(key_id);
+CREATE INDEX IF NOT EXISTS idx_playground_api_keys_api_site ON playground_api_keys(api_site);
+CREATE INDEX IF NOT EXISTS idx_playground_api_keys_active ON playground_api_keys(is_active, is_locked);
 
 -- ============================================================================
 -- Playground Credits & Tiers
@@ -61,9 +64,9 @@ CREATE TABLE IF NOT EXISTS playground_credits (
     CONSTRAINT playground_credits_user_site_unique UNIQUE (user_id, api_site)
 );
 
-CREATE INDEX idx_playground_credits_user_id ON playground_credits(user_id);
-CREATE INDEX idx_playground_credits_tier ON playground_credits(tier);
-CREATE INDEX idx_playground_credits_site ON playground_credits(api_site);
+CREATE INDEX IF NOT EXISTS idx_playground_credits_user_id ON playground_credits(user_id);
+CREATE INDEX IF NOT EXISTS idx_playground_credits_tier ON playground_credits(tier);
+CREATE INDEX IF NOT EXISTS idx_playground_credits_site ON playground_credits(api_site);
 
 -- ============================================================================
 -- Playground Usage Tracking
@@ -92,11 +95,11 @@ CREATE TABLE IF NOT EXISTS playground_usage (
     CONSTRAINT playground_usage_check_method CHECK (http_method IN ('GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'))
 );
 
-CREATE INDEX idx_playground_usage_user_id ON playground_usage(user_id);
-CREATE INDEX idx_playground_usage_api_key_id ON playground_usage(api_key_id);
-CREATE INDEX idx_playground_usage_timestamp ON playground_usage(request_timestamp DESC);
-CREATE INDEX idx_playground_usage_site ON playground_usage(api_site);
-CREATE INDEX idx_playground_usage_endpoint ON playground_usage(endpoint);
+CREATE INDEX IF NOT EXISTS idx_playground_usage_user_id ON playground_usage(user_id);
+CREATE INDEX IF NOT EXISTS idx_playground_usage_api_key_id ON playground_usage(api_key_id);
+CREATE INDEX IF NOT EXISTS idx_playground_usage_timestamp ON playground_usage(request_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_playground_usage_site ON playground_usage(api_site);
+CREATE INDEX IF NOT EXISTS idx_playground_usage_endpoint ON playground_usage(endpoint);
 
 -- ============================================================================
 -- Anonymous User Rate Limiting (Redis-backed, PostgreSQL fallback)
@@ -117,8 +120,8 @@ CREATE TABLE IF NOT EXISTS anonymous_rate_limits (
     CONSTRAINT anonymous_rate_limits_ip_site_unique UNIQUE (ip_address, api_site)
 );
 
-CREATE INDEX idx_anonymous_rate_limits_ip ON anonymous_rate_limits(ip_address);
-CREATE INDEX idx_anonymous_rate_limits_site ON anonymous_rate_limits(api_site);
+CREATE INDEX IF NOT EXISTS idx_anonymous_rate_limits_ip ON anonymous_rate_limits(ip_address);
+CREATE INDEX IF NOT EXISTS idx_anonymous_rate_limits_site ON anonymous_rate_limits(api_site);
 
 -- ============================================================================
 -- Tier Configuration (Reference Table)
@@ -185,10 +188,10 @@ CREATE TABLE IF NOT EXISTS saved_requests (
     last_executed_at TIMESTAMP
 );
 
-CREATE INDEX idx_saved_requests_user_id ON saved_requests(user_id);
-CREATE INDEX idx_saved_requests_site ON saved_requests(api_site);
-CREATE INDEX idx_saved_requests_folder ON saved_requests(folder);
-CREATE INDEX idx_saved_requests_tags ON saved_requests USING GIN(tags);
+CREATE INDEX IF NOT EXISTS idx_saved_requests_user_id ON saved_requests(user_id);
+CREATE INDEX IF NOT EXISTS idx_saved_requests_site ON saved_requests(api_site);
+CREATE INDEX IF NOT EXISTS idx_saved_requests_folder ON saved_requests(folder);
+CREATE INDEX IF NOT EXISTS idx_saved_requests_tags ON saved_requests USING GIN(tags);
 
 -- ============================================================================
 -- Functions & Triggers
@@ -203,9 +206,11 @@ BEGIN
 END;
 $$ language 'plpgsql';
 
+DROP TRIGGER IF EXISTS update_playground_credits_updated_at ON playground_credits;
 CREATE TRIGGER update_playground_credits_updated_at BEFORE UPDATE ON playground_credits
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
+DROP TRIGGER IF EXISTS update_saved_requests_updated_at ON saved_requests;
 CREATE TRIGGER update_saved_requests_updated_at BEFORE UPDATE ON saved_requests
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 

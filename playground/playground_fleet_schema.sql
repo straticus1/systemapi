@@ -1,10 +1,12 @@
 -- SystemAPI.io Fleet Management & Sysscript Schema
 -- Adds support for remote agents, os-agnostic scripts, and alert rules
+-- Applied after playground_schema.sql (playground_api_keys must exist).
+-- Idempotent; applied at every boot like playground_schema.sql.
 
 -- 1. Hosts / Agents
 CREATE TABLE IF NOT EXISTS playground_hosts (
     host_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    key_id UUID REFERENCES playground_api_keys(key_id) ON DELETE CASCADE,
+    key_id VARCHAR(64) REFERENCES playground_api_keys(key_id) ON DELETE CASCADE, -- same type as playground_api_keys.key_id
     api_site VARCHAR(50) NOT NULL,
     hostname VARCHAR(255) NOT NULL,
     os VARCHAR(50),
