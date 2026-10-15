@@ -772,6 +772,27 @@ test('write framing: offset_mismatch and too_large end the write; write_window a
   }
 });
 
+test('chunks for a closed write: at most write_window are dropped, one more is a protocol_error', async () => {
+  const r = await rig();
+  try {
+    const agent = await connectAgent(r);
+    const s = await ready(r, agent);
+    const rid = await openWrite(r, agent, s, { size: 100 * MiB, rid: 'w1' });
+    chunk(s, rid, 5, Buffer.alloc(10, 1));
+    assert.equal((await waitResult(s.client.box, rid, 'write_chunk')).error, 'offset_mismatch');
+    for (let i = 0; i < 8; i += 1) chunk(s, rid, i * MiB, Buffer.alloc(MiB, 1));
+    sendJSON(s.client.ws, { type: 'file_request', request_id: 'st', op: 'stat', path: '.' });
+    await waitUntil('stat fwd', () => agentReqs(agent, s.sid).find((q) => q.request_id === 'st'));
+    agentResult(agent, s.sid, 'st', 'stat', {});
+    await waitResult(s.client.box, 'st');
+    assert.equal(agentFrames(agent, 'file_chunk').length, 0);
+    chunk(s, rid, 8 * MiB, Buffer.alloc(MiB, 1));
+    await failsWith(s.client, 'protocol_error');
+  } finally {
+    await r.close();
+  }
+});
+
 test('an agent chunk failure ends the write; the error reaches the client', async () => {
   const r = await rig();
   try {

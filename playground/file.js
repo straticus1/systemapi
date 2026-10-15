@@ -404,7 +404,7 @@ class FileChannels {
             inflight: null, // { rid, op, req }
             write: null, // { rid, uploadId, path, size, sha256, next, unacked, closing }
             lastWriteRid: null,
-            discardRids: new Set(),
+            discardRids: new Map(), // closed write rid -> chunks still accepted and dropped
             expectBinary: null, // { length, forward }
             read: null, // { rid, path, offset, received, held: [], heldLen }
             reads: new Map(),
@@ -676,8 +676,17 @@ class FileChannels {
         }
         const w = s.write;
         if (!w || w.rid !== rid || w.closing) {
-            // Chunks already in flight when their write ended are dropped.
-            if (s.discardRids.has(rid)) {
+            // Chunks already in flight when their write ended are dropped:
+            // at most write_window of them (all a client may have
+            // unacknowledged); one more is a protocol_error, so a closed
+            // write is never a way around the byte and op caps.
+            const left = s.discardRids.get(rid);
+            if (left !== undefined) {
+                if (left <= 0) {
+                    this.protocolError(s);
+                    return;
+                }
+                s.discardRids.set(rid, left - 1);
                 s.expectBinary = { length, forward: false };
                 return;
             }
@@ -710,7 +719,7 @@ class FileChannels {
         const w = s.write;
         if (!w) return;
         s.write = null;
-        s.discardRids.add(w.rid);
+        s.discardRids.set(w.rid, WRITE_WINDOW);
         this.clientResult(s, w.rid, op, error);
         this.toAgent(s, { request_id: w.rid, op: 'write_release' });
     }
@@ -920,7 +929,7 @@ class FileChannels {
         if (op === 'write_chunk' && s.write && rid === s.write.rid && !s.write.closing) {
             const w = s.write;
             s.write = null;
-            s.discardRids.add(w.rid);
+            s.discardRids.set(w.rid, WRITE_WINDOW);
             this.clientResult(s, rid, 'write_chunk', error || 'io_error');
             return;
         }
@@ -993,7 +1002,7 @@ class FileChannels {
             case 'write_abort': {
                 const w = s.write;
                 s.write = null;
-                if (w) s.discardRids.add(w.rid);
+                if (w) s.discardRids.set(w.rid, WRITE_WINDOW);
                 const payload = { session_id: s.id, op, path: w ? w.path : null, size: w ? w.size : null, upload_id: w ? w.uploadId : null, result: error || 'ok' };
                 if (op === 'write_commit') payload.sha256 = !error && typeof fields.sha256 === 'string' ? fields.sha256 : (w ? w.sha256 : null);
                 await this.auditRetrying(s, 'file_op', payload);
