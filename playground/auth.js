@@ -151,6 +151,24 @@ class AuthManager {
    * @returns {Promise<Object>} { keyId, keySecret } - secret is only returned once!
    */
   async createAPIKey(userId, name, options = {}) {
+    const client = await this.db.connect();
+    try {
+      return await this.insertAPIKey(client, userId, name, options);
+    } catch (error) {
+      console.error('Failed to create API key:', error);
+      throw new Error('Failed to create API key');
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Generate, hash and insert one API key on the caller's client, so a
+   * caller can do it inside its own transaction (scripts/bootstrap-admin.js).
+   * Only the bcrypt hash is stored.
+   * @returns {Promise<Object>} { keyId, keySecret }
+   */
+  async insertAPIKey(client, userId, name, options = {}) {
     const {
       description = null,
       expiresInDays = null,
@@ -167,25 +185,17 @@ class AuthManager {
       expiresAt.setDate(expiresAt.getDate() + expiresInDays);
     }
 
-    const client = await this.db.connect();
-    try {
-      await client.query(`
-        INSERT INTO playground_api_keys (
-          key_id, key_hash, user_id, name, api_site,
-          description, expires_at, ip_whitelist, allowed_endpoints
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-      `, [
-        keyId, keyHash, userId, name, this.apiSite,
-        description, expiresAt, ipWhitelist, allowedEndpoints
-      ]);
+    await client.query(`
+      INSERT INTO playground_api_keys (
+        key_id, key_hash, user_id, name, api_site,
+        description, expires_at, ip_whitelist, allowed_endpoints
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    `, [
+      keyId, keyHash, userId, name, this.apiSite,
+      description, expiresAt, ipWhitelist, allowedEndpoints
+    ]);
 
-      return { keyId, keySecret };
-    } catch (error) {
-      console.error('Failed to create API key:', error);
-      throw new Error('Failed to create API key');
-    } finally {
-      client.release();
-    }
+    return { keyId, keySecret };
   }
 
   /**

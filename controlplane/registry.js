@@ -98,6 +98,38 @@ function ssoAuditEntry(tenantId, userId, sub, previous, actor) {
   };
 }
 
+// The SSO bind (or unbind, sub null) of one membership row inside the
+// caller's transaction: PgRegistry.setSsoSub and bootstrapAdmin share it.
+// The advisory lock serializes binds, so the "one sub, one member id" check
+// cannot race.
+async function ssoBindInTx(client, { tenantId, userId, sub, actor }) {
+  await client.query("SELECT pg_advisory_xact_lock(hashtext('cp_members.sso_sub'))");
+  const cur = await client.query(
+    'SELECT sso_sub FROM cp_members WHERE tenant_id = $1 AND user_id = $2 FOR UPDATE',
+    [tenantId, userId]
+  );
+  if (!cur.rows[0]) throw http(404, 'not_found');
+  if (sub !== null) {
+    const taken = await client.query(
+      'SELECT 1 FROM cp_members WHERE sso_sub = $1 AND user_id <> $2 LIMIT 1',
+      [sub, userId]
+    );
+    if (taken.rowCount > 0) throw http(409, 'sso_sub_taken');
+    const conflict = await client.query(
+      `SELECT 1 FROM cp_members
+       WHERE user_id = $1 AND tenant_id <> $2 AND sso_sub IS NOT NULL AND sso_sub <> $3 LIMIT 1`,
+      [userId, tenantId, sub]
+    );
+    if (conflict.rowCount > 0) throw http(409, 'sso_sub_conflict');
+  }
+  await client.query(
+    'UPDATE cp_members SET sso_sub = $3 WHERE tenant_id = $1 AND user_id = $2',
+    [tenantId, userId, sub]
+  );
+  await auditInsert(client, ssoAuditEntry(tenantId, userId, sub, cur.rows[0].sso_sub || null, actor));
+  return { tenant_id: tenantId, user_id: userId, bound: sub !== null };
+}
+
 class MemoryRegistry {
   constructor(env = {}) {
     this.env = env;
@@ -663,41 +695,82 @@ class PgRegistry {
   }
 
   // One transaction: the binding and its audit-chain row land together or
-  // not at all. The advisory lock serializes binds, so the "one sub, one
-  // member id" check cannot race.
+  // not at all.
   async setSsoSub({ tenantId, userId, sub, actor }) {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query("SELECT pg_advisory_xact_lock(hashtext('cp_members.sso_sub'))");
-      const cur = await client.query(
-        'SELECT sso_sub FROM cp_members WHERE tenant_id = $1 AND user_id = $2 FOR UPDATE',
-        [tenantId, userId]
-      );
-      if (!cur.rows[0]) throw http(404, 'not_found');
-      if (sub !== null) {
-        const taken = await client.query(
-          'SELECT 1 FROM cp_members WHERE sso_sub = $1 AND user_id <> $2 LIMIT 1',
-          [sub, userId]
-        );
-        if (taken.rowCount > 0) throw http(409, 'sso_sub_taken');
-        const conflict = await client.query(
-          `SELECT 1 FROM cp_members
-           WHERE user_id = $1 AND tenant_id <> $2 AND sso_sub IS NOT NULL AND sso_sub <> $3 LIMIT 1`,
-          [userId, tenantId, sub]
-        );
-        if (conflict.rowCount > 0) throw http(409, 'sso_sub_conflict');
-      }
-      await client.query(
-        'UPDATE cp_members SET sso_sub = $3 WHERE tenant_id = $1 AND user_id = $2',
-        [tenantId, userId, sub]
-      );
-      await auditInsert(client, ssoAuditEntry(tenantId, userId, sub, cur.rows[0].sso_sub || null, actor));
+      const out = await ssoBindInTx(client, { tenantId, userId, sub, actor });
       await client.query('COMMIT');
-      return { tenant_id: tenantId, user_id: userId, bound: sub !== null };
+      return out;
     } catch (err) {
       try { await client.query('ROLLBACK'); } catch { /* connection already failed */ }
       if (err.code === '23505') throw http(409, 'sso_sub_taken');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  // First-admin bootstrap (scripts/bootstrap-admin.js). One transaction:
+  // the tenant (created when missing), the admin membership, the API key
+  // that mintKey(client) inserts, its admin scope row, the audit row and,
+  // with sub, the SSO binding and its audit row all land together or not at
+  // all. Refused (409 admin_exists) while any admin member or admin-scoped
+  // key exists, unless force; a forced run says so in its audit row. The
+  // advisory lock serializes two bootstraps racing on an empty database.
+  async bootstrapAdmin({ tenantId, userId, email, sub, force, actor, mintKey }) {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query("SELECT pg_advisory_xact_lock(hashtext('cp_bootstrap_admin'))");
+      const existing = await client.query(
+        `SELECT (SELECT count(*) FROM cp_members WHERE role = 'admin')::int AS members,
+                (SELECT count(*) FROM cp_api_scopes WHERE scope = 'admin')::int AS keys`
+      );
+      const { members, keys } = existing.rows[0];
+      if ((members > 0 || keys > 0) && !force) throw http(409, 'admin_exists');
+      const tenant = await client.query(
+        `INSERT INTO cp_tenants (tenant_id, display_name, owner_user_id)
+         VALUES ($1, $1, $2)
+         ON CONFLICT (tenant_id) DO NOTHING
+         RETURNING tenant_id`,
+        [tenantId, userId]
+      );
+      const prev = await client.query(
+        'SELECT role FROM cp_members WHERE tenant_id = $1 AND user_id = $2 FOR UPDATE',
+        [tenantId, userId]
+      );
+      await client.query(
+        `INSERT INTO cp_members (tenant_id, user_id, role, email)
+         VALUES ($1, $2, 'admin', $3)
+         ON CONFLICT (tenant_id, user_id) DO UPDATE SET role = 'admin', email = COALESCE(EXCLUDED.email, cp_members.email)`,
+        [tenantId, userId, email || null]
+      );
+      const { keyId, keySecret } = await mintKey(client);
+      await client.query("INSERT INTO cp_api_scopes (key_id, scope) VALUES ($1, 'admin')", [keyId]);
+      await auditInsert(client, {
+        tenant_id: tenantId,
+        actor,
+        action: 'bootstrap_admin',
+        payload: {
+          user_id: userId,
+          key_fp: fingerprint(keyId),
+          scopes: ['admin'],
+          tenant_created: tenant.rowCount > 0,
+          previous_role: prev.rows[0] ? prev.rows[0].role : null,
+          forced: force === true,
+          existing_admin_members: members,
+          existing_admin_keys: keys,
+          sso_bound: typeof sub === 'string'
+        }
+      });
+      if (typeof sub === 'string') await ssoBindInTx(client, { tenantId, userId, sub, actor });
+      await client.query('COMMIT');
+      return { tenant_id: tenantId, user_id: userId, key_id: keyId, key_secret: keySecret, sso_bound: typeof sub === 'string', forced: force === true };
+    } catch (err) {
+      try { await client.query('ROLLBACK'); } catch { /* connection already failed */ }
+      if (err.code === '23505') throw http(409, 'conflict');
       throw err;
     } finally {
       client.release();

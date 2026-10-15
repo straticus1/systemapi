@@ -1023,6 +1023,7 @@ async function listLinks(registry, userIds) {
 }
 
 module.exports = {
+  USER_RE,
   DEVICE_GRANT,
   startDevice,
   approveUserCode,

@@ -83,4 +83,4 @@ async function main() {
 
 if (require.main === module) main();
 
-module.exports = { run, ACTOR };
+module.exports = { run, poolFor, ACTOR };
