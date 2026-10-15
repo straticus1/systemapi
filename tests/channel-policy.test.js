@@ -7,7 +7,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { MemoryRegistry } = require('../controlplane/registry');
+const { MemoryRegistry, PgRegistry } = require('../controlplane/registry');
 const { policyDecision } = require('../controlplane/channels');
 const { run, parseArgs, ACTOR, MAX_ENTRIES } = require('../scripts/channel-policy');
 
@@ -152,28 +152,76 @@ test('a hostname shared by two hosts is ambiguous; the host id still works', asy
   assert.equal((await reg.channelPolicies(HOST_A)).host_tcp_policy, null);
 });
 
-test('an audit write that fails puts the previous policy back and fails', async () => {
+test('an audit write that fails leaves the previous policy and fails', async () => {
   const reg = await fixture();
   await run(SET, { registry: reg });
   reg.appendAudit = async () => { throw new Error('disk full'); };
   await assert.rejects(run(['set', '--tenant', 'afterdark', '--host', 'miniapps1', '--tcp-local', '22'], { registry: reg }),
-    (err) => err.code === 'audit_failed');
+    (err) => err.code === 'write_failed');
   const raw = await reg.channelPolicies(HOST_A);
   assert.deepEqual(raw.host_tcp_policy, { allow: [{ local: true, ports: [3003] }] });
   assert.deepEqual(raw.host_file_policy, { roots: [{ path: '/var/tmp/sah-filetest', read: true, write: true }] });
 });
 
-test('an audit failure whose restore also fails says so', async () => {
-  const reg = await fixture();
-  reg.appendAudit = async () => { throw new Error('disk full'); };
-  const setPolicy = reg.setHostChannelPolicy.bind(reg);
-  let calls = 0;
-  reg.setHostChannelPolicy = async (id, fields) => {
-    calls += 1;
-    if (calls > 1) throw new Error('db gone');
-    return setPolicy(id, fields);
+// A pg client double that records every statement and can fail one.
+function fakePool(failOn) {
+  const log = [];
+  let clients = 0;
+  const pool = {
+    log,
+    get clients() { return clients; },
+    async query() { throw new Error('the pool itself must not be queried'); },
+    async connect() {
+      clients += 1;
+      const id = clients;
+      return {
+        async query(sql, params = []) {
+          const q = sql.replace(/\s+/g, ' ').trim();
+          log.push({ client: id, q, params });
+          if (failOn && q.startsWith(failOn)) throw new Error('boom');
+          if (q.startsWith('SELECT tcp_policy, file_policy FROM cp_hosts')) {
+            return { rowCount: 1, rows: [{ tcp_policy: { allow: [{ local: true, ports: [3003] }] }, file_policy: null }] };
+          }
+          if (q.startsWith('SELECT row_hash FROM cp_audit')) return { rowCount: 0, rows: [] };
+          return { rowCount: 1, rows: [{}] };
+        },
+        release() { log.push({ client: id, q: 'RELEASE' }); }
+      };
+    }
   };
-  await assert.rejects(run(SET, { registry: reg }), (err) => err.code === 'audit_failed_restore_failed');
+  return pool;
+}
+
+test('PgRegistry writes the policy and its audit row in one transaction on one client', async () => {
+  const pool = fakePool(null);
+  const pg = new PgRegistry(pool, { NODE_ENV: 'production' });
+  await pg.setHostChannelPolicyAudited({
+    tenantId: 'afterdark', hostId: HOST_A, tcpPolicy: { allow: [] }, filePolicy: { roots: [] }, actor: ACTOR, action: 'channel_policy_clear'
+  });
+  assert.equal(pool.clients, 1);
+  const qs = pool.log.map((e) => e.q);
+  assert.equal(qs[0], 'BEGIN');
+  assert.match(qs[1], /^SELECT tcp_policy, file_policy FROM cp_hosts WHERE host_id = \$1 AND tenant_id = \$2 FOR UPDATE$/);
+  assert.deepEqual(pool.log[1].params, [HOST_A, 'afterdark']);
+  assert.match(qs[2], /^UPDATE cp_hosts SET tcp_policy = \$2::jsonb, file_policy = \$3::jsonb WHERE host_id = \$1$/);
+  assert.match(qs[3], /^SELECT row_hash FROM cp_audit .*FOR UPDATE$/);
+  assert.match(qs[4], /^INSERT INTO cp_audit/);
+  const audit = JSON.parse(pool.log[4].params[6]);
+  assert.deepEqual(audit.previous_tcp_policy, { allow: [{ local: true, ports: [3003] }] });
+  assert.deepEqual(audit.tcp_policy, { allow: [] });
+  assert.deepEqual(qs.slice(5), ['COMMIT', 'RELEASE']);
+});
+
+test('PgRegistry rolls the policy back when its audit row fails', async () => {
+  const pool = fakePool('INSERT INTO cp_audit');
+  const pg = new PgRegistry(pool, { NODE_ENV: 'production' });
+  await assert.rejects(pg.setHostChannelPolicyAudited({
+    tenantId: 'afterdark', hostId: HOST_A, tcpPolicy: { allow: [] }, filePolicy: { roots: [] }, actor: ACTOR, action: 'channel_policy_clear'
+  }), /boom/);
+  const qs = pool.log.map((e) => e.q);
+  assert.equal(pool.clients, 1);
+  assert.equal(qs.includes('COMMIT'), false);
+  assert.deepEqual(qs.slice(-2), ['ROLLBACK', 'RELEASE']);
 });
 
 test('a registry without the policy methods is refused', async () => {

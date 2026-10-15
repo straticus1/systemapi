@@ -135,6 +135,23 @@ async function ssoBindInTx(client, { tenantId, userId, sub, actor }) {
   return { tenant_id: tenantId, user_id: userId, bound: sub !== null };
 }
 
+// The audit row for a host channel policy write: the new and the previous
+// policies of both columns.
+function channelPolicyAuditEntry(tenantId, hostId, actor, action, tcpPolicy, filePolicy, prevTcp, prevFile) {
+  return {
+    tenant_id: tenantId,
+    host_id: hostId,
+    actor,
+    action,
+    payload: {
+      tcp_policy: tcpPolicy,
+      file_policy: filePolicy,
+      previous_tcp_policy: prevTcp ?? null,
+      previous_file_policy: prevFile ?? null
+    }
+  };
+}
+
 class MemoryRegistry {
   constructor(env = {}) {
     this.env = env;
@@ -326,6 +343,21 @@ class MemoryRegistry {
       cur[key] = fields[key] === null ? null : JSON.parse(JSON.stringify(fields[key]));
     }
     this.hostPolicies.set(hostId, cur);
+  }
+
+  // Both host columns and their audit row together: the row is written
+  // first and the policy changes only once it is in (see PgRegistry).
+  async setHostChannelPolicyAudited({ tenantId, hostId, tcpPolicy, filePolicy, actor, action }) {
+    const row = this.hosts.get(hostId);
+    if (!row || row.tenant_id !== tenantId) throw http(404, 'not_found');
+    assertPolicyShape('tcp', tcpPolicy);
+    assertPolicyShape('file', filePolicy);
+    const cur = this.hostPolicies.get(hostId) || {};
+    await this.appendAudit(channelPolicyAuditEntry(tenantId, hostId, actor, action, tcpPolicy, filePolicy, cur.tcp_policy, cur.file_policy));
+    this.hostPolicies.set(hostId, {
+      tcp_policy: tcpPolicy === null ? null : JSON.parse(JSON.stringify(tcpPolicy)),
+      file_policy: filePolicy === null ? null : JSON.parse(JSON.stringify(filePolicy))
+    });
   }
 
   async setTenantChannelPolicy(tenantId, fields) {
@@ -913,6 +945,35 @@ class PgRegistry {
 
   async setTenantChannelPolicy(tenantId, fields) {
     await this.setChannelPolicy('cp_tenants', 'tenant_id', tenantId, fields);
+  }
+
+  // One transaction on one client: lock the host row (it must belong to
+  // tenantId), replace both policy columns, append the audit row with the old
+  // and new policies. Any failure rolls all of it back.
+  async setHostChannelPolicyAudited({ tenantId, hostId, tcpPolicy, filePolicy, actor, action }) {
+    assertPolicyShape('tcp', tcpPolicy);
+    assertPolicyShape('file', filePolicy);
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const cur = await client.query(
+        'SELECT tcp_policy, file_policy FROM cp_hosts WHERE host_id = $1 AND tenant_id = $2 FOR UPDATE',
+        [hostId, tenantId]
+      );
+      if (cur.rowCount === 0) throw http(404, 'not_found');
+      const prev = cur.rows[0];
+      await client.query(
+        'UPDATE cp_hosts SET tcp_policy = $2::jsonb, file_policy = $3::jsonb WHERE host_id = $1',
+        [hostId, tcpPolicy === null ? null : JSON.stringify(tcpPolicy), filePolicy === null ? null : JSON.stringify(filePolicy)]
+      );
+      await auditInsert(client, channelPolicyAuditEntry(tenantId, hostId, actor, action, tcpPolicy, filePolicy, prev.tcp_policy, prev.file_policy));
+      await client.query('COMMIT');
+    } catch (err) {
+      try { await client.query('ROLLBACK'); } catch { /* connection already failed */ }
+      throw err;
+    } finally {
+      client.release();
+    }
   }
 
   // table and key are fixed identifiers from the two callers above, never

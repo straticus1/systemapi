@@ -1,7 +1,8 @@
 'use strict';
 
 // PgRegistry against a real PostgreSQL: the enroll upsert, and the fleet's
-// agent-key lookup (expiry and the optional tenant binding). A fresh database per run with the schema applied by
+// agent-key lookup (expiry and the optional tenant binding), and the
+// channel-policy CLI's single-transaction write. A fresh database per run with the schema applied by
 // createRegistry. Needs SYSTEMAPI_TEST_DATABASE_URL (a role that may CREATE DATABASE); it fails,
 // not skips, without it. Not part of npm test.
 //
@@ -16,6 +17,7 @@ const bcrypt = require('bcryptjs');
 
 const { createRegistry, PgRegistry } = require('../controlplane/registry');
 const FleetManager = require('../playground/fleet');
+const { run: policyRun } = require('../scripts/channel-policy');
 
 const BASE = process.env.SYSTEMAPI_TEST_DATABASE_URL;
 const DB = `registry_${crypto.randomBytes(6).toString('hex')}`;
@@ -103,4 +105,29 @@ test('fleet.verifyApiKey returns the key\'s tenant binding, null when unset', as
   );
   assert.equal((await FleetManager.prototype.verifyApiKey.call(fleet, 'ak_live_pgbound.s4')).tenant_id, 'acme');
   assert.equal((await FleetManager.prototype.verifyApiKey.call(fleet, 'ak_live_pgnoexpiry.s3')).tenant_id, null);
+});
+
+test('channel-policy writes the host policy and its audit row together, or neither', async () => {
+  const HOST_P = '44444444-4444-4444-8444-444444444444';
+  await registry.enroll({ tenantId: 'acme', userId: 'user-1', keyId: 'k1', hostId: HOST_P, hostname: 'p.example', os: '', platform: '', sshPubkey: opensshEd25519(5) });
+  const audits = async () => (await pool.query("SELECT count(*)::int AS n FROM cp_audit WHERE actor = 'cli:channel-policy'")).rows[0].n;
+  const cols = async () => (await pool.query('SELECT tcp_policy, file_policy FROM cp_hosts WHERE host_id = $1', [HOST_P])).rows[0];
+  const set = ['set', '--tenant', 'acme', '--host', HOST_P, '--tcp-local', '3003'];
+  await policyRun(set, { registry });
+  assert.deepEqual((await cols()).tcp_policy, { allow: [{ local: true, ports: [3003] }] });
+  assert.equal(await audits(), 1);
+  assert.equal((await registry.verifyAudit()).ok, true);
+
+  await pool.query(`CREATE FUNCTION test_refuse_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN RAISE EXCEPTION 'audit refused by test'; END $$`);
+  await pool.query('CREATE TRIGGER test_refuse_audit BEFORE INSERT ON cp_audit FOR EACH ROW EXECUTE FUNCTION test_refuse_audit()');
+  try {
+    await assert.rejects(policyRun(['clear', '--tenant', 'acme', '--host', HOST_P], { registry }),
+      (err) => err.code === 'write_failed');
+  } finally {
+    await pool.query('DROP TRIGGER test_refuse_audit ON cp_audit');
+    await pool.query('DROP FUNCTION test_refuse_audit()');
+  }
+  assert.deepEqual((await cols()).tcp_policy, { allow: [{ local: true, ports: [3003] }] }, 'the policy rolled back with its audit row');
+  assert.equal(await audits(), 1);
 });

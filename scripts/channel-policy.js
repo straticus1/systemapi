@@ -14,8 +14,9 @@
 // {allow:[]}, file_policy {roots:[]}), which a tenant default does not
 // override; `inherit` sets both to null (back to the tenant default, else
 // deny). Every set, clear and inherit appends an audit-chain row (actor
-// "cli:channel-policy", the old and new policies); if that write fails the
-// previous policy is put back and the command fails. Does NOT check who runs
+// "cli:channel-policy", the old and new policies) in the same transaction as
+// the write, on one client with the host row locked (SELECT ... FOR UPDATE):
+// both land or neither does. Does NOT check who runs
 // it: whoever can read the env file can already write the database. Does NOT
 // change what the agent itself allows: its --tcp-allow list and the file
 // helper's openat2 checks still apply on the host. Does NOT set tenant
@@ -151,38 +152,28 @@ async function summary(registry, host) {
 // PgRegistry.
 async function run(argv, { registry }) {
   const args = parseArgs(argv);
-  for (const fn of ['resolveHosts', 'getHost', 'channelPolicies', 'setHostChannelPolicy', 'appendAudit']) {
+  for (const fn of ['resolveHosts', 'getHost', 'channelPolicies', 'setHostChannelPolicyAudited']) {
     if (!registry || typeof registry[fn] !== 'function') throw fail('registry_unavailable');
   }
   const host = await resolveOne(registry, args.tenantId, args.host);
   if (args.command === 'show') return summary(registry, host);
 
-  const before = (await registry.channelPolicies(host.host_id)) || {};
-  const previous = {
-    tcp_policy: before.host_tcp_policy ?? null,
-    file_policy: before.host_file_policy ?? null
-  };
   const next = args.command === 'set'
     ? { tcp_policy: args.tcpPolicy, file_policy: args.filePolicy }
     : WRITES[args.command].policy();
   const action = args.command === 'set' ? 'channel_policy_set' : WRITES[args.command].action;
-
-  await registry.setHostChannelPolicy(host.host_id, next);
   try {
-    await registry.appendAudit({
-      tenant_id: host.tenant_id,
-      host_id: host.host_id,
+    await registry.setHostChannelPolicyAudited({
+      tenantId: host.tenant_id,
+      hostId: host.host_id,
+      tcpPolicy: next.tcp_policy,
+      filePolicy: next.file_policy,
       actor: ACTOR,
-      action,
-      payload: { ...next, previous_tcp_policy: previous.tcp_policy, previous_file_policy: previous.file_policy }
+      action
     });
-  } catch {
-    try {
-      await registry.setHostChannelPolicy(host.host_id, previous);
-    } catch {
-      throw fail('audit_failed_restore_failed', 'audit write failed AND the previous policy could not be restored; check the host policy by hand');
-    }
-    throw fail('audit_failed', 'audit write failed; the previous policy was restored');
+  } catch (err) {
+    if (err.code === 'not_found' || err.code === 'bad_policy') throw err;
+    throw fail('write_failed', 'the policy write or its audit row failed; the transaction was rolled back');
   }
   return summary(registry, host);
 }
@@ -217,7 +208,7 @@ async function main(argv = process.argv.slice(2), stdout = process.stdout) {
     });
     stdout.write(JSON.stringify(await run(argv, { registry })) + '\n');
   } catch (err) {
-    const known = ['usage', 'not_found', 'ambiguous', 'audit_failed', 'audit_failed_restore_failed', 'bad_policy'];
+    const known = ['usage', 'not_found', 'ambiguous', 'write_failed', 'bad_policy'];
     console.error(known.includes(err.code) ? `channel-policy: ${err.code}: ${err.message}` : 'channel-policy failed: ' + (err.code || err.name || 'error'));
     process.exitCode = 1;
   } finally {
