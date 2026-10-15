@@ -213,7 +213,16 @@ async function main(argv = process.argv.slice(2), stdout = process.stdout) {
   }
   require('dotenv').config({ path: process.env.ENV_FILE || path.join(__dirname, '..', '.env.production'), quiet: true });
   const { poolFor } = require('./sso-bind');
-  const pool = poolFor(process.env);
+  // poolFor reads DB_SSL_CA; an unreadable file is an error code, not a
+  // stack trace.
+  let pool;
+  try {
+    pool = poolFor(process.env);
+  } catch (err) {
+    console.error('channel-policy failed: ' + (err.code || err.name || 'error'));
+    process.exitCode = 1;
+    return;
+  }
   if (!pool) {
     console.error('no database configured (DB_PASSWORD or DATABASE_URL)');
     process.exitCode = 2;

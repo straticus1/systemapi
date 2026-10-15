@@ -318,3 +318,66 @@ test('parseArgs de-duplicates and sorts ports', () => {
   assert.deepEqual(out.tcpPolicy, { allow: [{ local: true, ports: [3003, 8080] }] });
   assert.deepEqual(out.filePolicy, { roots: [] });
 });
+
+// main() in-process: env handling and what reaches stdout and stderr. A
+// secret planted in the env must never be printed.
+const { main } = require('../scripts/channel-policy');
+const ENV_KEYS = ['ENV_FILE', 'DATABASE_URL', 'DB_PASSWORD', 'DB_HOST', 'DB_PORT', 'DB_SSL', 'DB_SSL_CA'];
+const SECRET = 'hunter2-not-a-real-password';
+
+async function runMain(argv, env) {
+  const saved = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
+  for (const k of ENV_KEYS) delete process.env[k];
+  Object.assign(process.env, env);
+  const out = [];
+  const err = [];
+  const realError = console.error;
+  console.error = (...args) => err.push(args.join(' '));
+  const prevExit = process.exitCode;
+  process.exitCode = undefined;
+  try {
+    await main(argv, { write(chunk) { out.push(String(chunk)); return true; } });
+    return { out: out.join(''), err: err.join('\n'), exitCode: process.exitCode };
+  } finally {
+    process.exitCode = prevExit;
+    console.error = realError;
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
+test('main: env and argument errors exit 2 with a short message and print no secret', async () => {
+  const empty = await runMain(SET, { ENV_FILE: '  ', DB_PASSWORD: SECRET });
+  assert.equal(empty.exitCode, 2);
+  assert.match(empty.err, /ENV_FILE is set but empty/);
+
+  const bad = await runMain(['set', '--tenant', 'afterdark', '--host', 'miniapps1', '--tcp-local', '3003'], { ENV_FILE: '/dev/null', DB_PASSWORD: SECRET });
+  assert.equal(bad.exitCode, 2);
+  assert.match(bad.err, /needs --reason/);
+
+  const nodb = await runMain(SET, { ENV_FILE: '/dev/null' });
+  assert.equal(nodb.exitCode, 2);
+  assert.match(nodb.err, /no database configured/);
+
+  for (const r of [empty, bad, nodb]) {
+    assert.equal(r.out, '');
+    assert.equal(r.err.includes(SECRET), false);
+  }
+});
+
+test('main: a database that cannot be reached or configured fails with a code, never the credentials', async () => {
+  const cases = [
+    { ENV_FILE: '/dev/null', DATABASE_URL: `postgres://ops:${SECRET}@127.0.0.1:1/systemapi` },
+    { ENV_FILE: '/dev/null', DB_PASSWORD: SECRET, DB_HOST: '127.0.0.1', DB_PORT: '1', DB_SSL: 'disable' },
+    { ENV_FILE: '/dev/null', DB_PASSWORD: SECRET, DB_HOST: '127.0.0.1', DB_PORT: '1', DB_SSL_CA: '/nonexistent/ca.pem' }
+  ];
+  for (const env of cases) {
+    const r = await runMain(SET, env);
+    assert.equal(r.exitCode, 1, JSON.stringify(r));
+    assert.match(r.err, /^channel-policy failed: [A-Za-z0-9_]+$/);
+    assert.equal(r.err.includes(SECRET), false);
+    assert.equal(r.out, '');
+  }
+});

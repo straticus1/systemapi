@@ -133,3 +133,36 @@ test('channel-policy writes the host policy and its audit row together, or neith
   assert.deepEqual((await cols()).tcp_policy, { allow: [{ local: true, ports: [3003] }] }, 'the policy rolled back with its audit row');
   assert.equal(await audits(), 1);
 });
+
+test('channel-policy main() against the database prints the summary and never the credentials', async () => {
+  const { main } = require('../scripts/channel-policy');
+  const secret = 'pg-secret-not-real';
+  const u = new URL(withDatabase(BASE, DB));
+  u.password = secret;
+  const keys = ['ENV_FILE', 'DATABASE_URL', 'DB_PASSWORD'];
+  const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  process.env.ENV_FILE = '/dev/null';
+  process.env.DATABASE_URL = u.toString();
+  delete process.env.DB_PASSWORD;
+  const out = [];
+  const err = [];
+  const realError = console.error;
+  console.error = (...args) => err.push(args.join(' '));
+  const prevExit = process.exitCode;
+  process.exitCode = undefined;
+  try {
+    await main(['show', '--tenant', 'acme', '--host', HOST_A], { write(c) { out.push(String(c)); return true; } });
+    assert.equal(process.exitCode, undefined, err.join('\n'));
+  } finally {
+    process.exitCode = prevExit;
+    console.error = realError;
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+  const summary = JSON.parse(out.join(''));
+  assert.equal(summary.host_id, HOST_A);
+  assert.equal(out.join('').includes(secret), false);
+  assert.equal(err.join('').includes(secret), false);
+});
