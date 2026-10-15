@@ -17,7 +17,7 @@ Production refuses to start when `SESSION_SECRET` is missing or still `default-s
 
 The fleet database pool uses `dbSsl`: `rejectUnauthorized: true`, `minVersion: 'TLSv1.3'`, optional `DB_SSL_CA`. `DB_SSL=disable` turns TLS off. That opt-out is explicit. `server.js`.
 
-JWT verification allowlists `RS256`, `ES256`, and `EdDSA` before verify. `none` and every other alg return null. A missing OIDC client returns null. There is no unsigned fallback. Audience is `OIDC_AUDIENCE` or the Keycloak client id when one of those is set. `playground/auth.js`.
+JWT verification uses openid-client 6 `discovery` for the issuer metadata and a jose remote JWKS for the signature. It checks the issuer (the discovered issuer must equal `AUTHENTIK_ISSUER` or the realm URL), the audience (`OIDC_AUDIENCE`, else the client id; with neither, every token is refused), `exp` (required) and `nbf` with 30 s tolerance, and an `RS256`/`ES256`/`EdDSA` allowlist, so `none` and HS* return null. If discovery or the JWKS is unreachable, every token returns null. A failed discovery is retried after 30 s, not once per token. There is no unsigned fallback. `playground/auth.js`, `tests/playground-auth.test.js`.
 
 API keys in the query string are rejected (`query_key_rejected`). Browser WebSockets use a single-use `stk_` ticket. Morgan logs `req.path`, so the query string is not in the access line. `controlplane/httpauth.js`, `server.js`.
 

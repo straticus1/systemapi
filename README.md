@@ -25,7 +25,9 @@ carries explicit entitlements.
   shown, and confirms. SSO identity is the Authentik `sub` only
   (`cp_members.sso_sub`, provider `sub_mode = hashed_user_id`), bound by a
   tenant admin or, for the first admin, `node scripts/sso-bind.js <tenant>
-  <member> <sub>`. The user code alone approves nothing.
+  <member> <sub>`. On a fresh database, `scripts/bootstrap-admin.js` mints the
+  first admin key, and can bind the sub in the same transaction
+  (`docs/bootstrap.md`). The user code alone approves nothing.
   Google and GitHub linking needs an admin whitelist row, and binding a
   linked account the first time also needs that SSO session. API keys remain
   the machine credential.

@@ -29,10 +29,13 @@ npm install
 
 ## Database Setup
 
-Apply the database schema:
+In systemapi.io the app applies `playground_schema.sql` and then
+`playground_fleet_schema.sql` at boot (`createRegistry` in
+`controlplane/registry.js`). Both files are idempotent, and the database role
+must own the tables (`docs/bootstrap.md`). To apply them by hand:
 
 ```bash
-psql -U your_user -d your_db -f playground_schema.sql
+psql -U your_user -d your_db -v ON_ERROR_STOP=1 -f playground_schema.sql -f playground_fleet_schema.sql
 ```
 
 ## Integration Example
