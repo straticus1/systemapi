@@ -242,10 +242,15 @@ The same as PTY:
     start and hourly while the agent runs.
   - **Upload cap.** One actor holds at most 16 live uploads (open or
     interrupted) under one root on one agent. A new `write_open` past that is
-    `no_space`; a resume of an existing one is not a new upload. The client
-    frees a slot by resuming and committing or aborting, or by letting an
-    upload expire. Only the agent can see the records, so only the agent
-    enforces this cap.
+    `no_space`; a resume that reopens an existing upload's temp file is not
+    a new upload. A resume whose temp file cannot be reopened (gone,
+    replaced, or not a regular file) starts a new upload: the agent first
+    removes the stale temp file and record, then applies the cap as to any
+    new upload. The check and the new record are serialized per actor and
+    root across sessions, so concurrent `write_open`s cannot overshoot it.
+    The client frees a slot by resuming and committing or aborting, or by
+    letting an upload expire. Only the agent can see the records, so only
+    the agent enforces this cap.
 - **Download.**
   1. `stat` the file.
   2. `read` it in ranges, with `if_match`, into a local temp file.

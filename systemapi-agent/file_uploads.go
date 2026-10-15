@@ -59,7 +59,16 @@ type uploadRecord struct {
 var (
 	uploadsMu     sync.Mutex
 	activeUploads = map[string]bool{}
+	// uploadCapLocks serialize a write_open's cap check and record save
+	// per actor and root (striped), so concurrent sessions cannot both pass
+	// the check and overshoot the cap.
+	uploadCapLocks [64]sync.Mutex
 )
+
+func uploadCapLock(actor, root string) *sync.Mutex {
+	sum := sha256.Sum256([]byte(actorKey(actor) + "\x00" + root))
+	return &uploadCapLocks[int(sum[0])%len(uploadCapLocks)]
+}
 
 func actorKey(actor string) string {
 	sum := sha256.Sum256([]byte("systemapi-file-actor\n" + actor))

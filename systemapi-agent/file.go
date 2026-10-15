@@ -724,6 +724,11 @@ func (s *fileSession) doWriteOpen(req fileReq) error {
 		return nil
 	}
 	claimUpload(newID)
+	if s.c.stateDir != "" {
+		mu := uploadCapLock(s.actor, s.canon)
+		mu.Lock()
+		defer mu.Unlock()
+	}
 	var prior *uploadRecord
 	if req.Resume != nil && *req.Resume && req.Size != nil && s.c.stateDir != "" {
 		prior = findUpload(s.c.stateDir, s.actor, s.canon, req.Path, *req.Size, req.SHA256, time.Now())
@@ -761,9 +766,29 @@ func (s *fileSession) doWriteOpen(req fileReq) error {
 		unclaimUpload(newID)
 	} else {
 		if prior != nil {
+			// The helper could not reopen the prior temp file (gone,
+			// replaced, or not a regular file), so this is a new upload: the
+			// stale record goes first, then the cap applies as to any other.
+			// A temp file that cannot be removed keeps its record, which
+			// then still counts.
+			if err := removeUploadTemp(prior.Root, prior.Path, prior.UploadID); err == nil {
+				deleteUpload(s.c.stateDir, prior.UploadID)
+			} else {
+				log.Printf("file %s: stale upload temp not removed: %v", s.id, err)
+			}
 			unclaimUpload(prior.UploadID)
 		}
 		used = newID
+		if prior != nil && s.c.stateDir != "" && countUploads(s.c.stateDir, s.actor, s.canon, time.Now()) >= uploadsPerActorRoot {
+			log.Printf("file %s: upload cap reached for this actor and root", s.id)
+			if _, err := s.call(fileReq{Op: "write_abort"}, nil, nil); err != nil {
+				unclaimUpload(newID)
+				return err
+			}
+			unclaimUpload(newID)
+			s.result(req.RequestID, req.Op, "no_space", nil)
+			return nil
+		}
 		if s.c.stateDir != "" && req.Size != nil {
 			rec := uploadRecord{UploadID: newID, ActorKey: actorKey(s.actor), Root: s.canon, Path: req.Path,
 				Size: *req.Size, SHA256: req.SHA256, CreatedUnix: time.Now().Unix()}

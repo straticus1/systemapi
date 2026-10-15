@@ -748,6 +748,112 @@ func TestFileLinuxResumeRefusesAFIFOTemp(t *testing.T) {
 	if errOf(open) != "" || open["upload_id"] == id || open["offset"] != float64(0) {
 		t.Fatalf("resume onto a FIFO: %v", open)
 	}
+	// The fresh upload replaces the stale one: its record and FIFO are gone.
+	if recs := loadUploads(h.ch.stateDir); len(recs) != 1 || recs[0].UploadID != open["upload_id"] {
+		t.Fatalf("records after the fallback: %+v", recs)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "sub", tempName(id))); !os.IsNotExist(err) {
+		t.Fatalf("stale FIFO temp left: %v", err)
+	}
+}
+
+// A resume whose temp file is gone falls back to a new upload; that removes
+// the stale record first and stays under the cap of 16, so resuming cannot
+// grow the records past it.
+func TestFileLinuxResumeFallbackKeepsTheCap(t *testing.T) {
+	needOpenat2(t)
+	h := newFileHarness(t)
+	root, _ := fixture(t)
+	data := []byte("0123456789")
+	var ids []string
+	for i := 0; i < uploadsPerActorRoot; i++ {
+		id := fmt.Sprintf("upl_fbk%017d", i)
+		ids = append(ids, id)
+		rec := uploadRecord{UploadID: id, ActorKey: actorKey("user-1"), Root: root, Path: fmt.Sprintf("sub/p%d", i), Size: int64(len(data)),
+			SHA256: hexSum(data), CreatedUnix: time.Now().Unix()}
+		if err := saveUpload(h.ch.stateDir, rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Each fallback runs in its own session and stays open, holding its slot.
+	for _, i := range []int{3, 7} {
+		sid := h.open(t, root, fileOpenOpts{})
+		h.ready(t, sid)
+		r := h.do(t, sid, map[string]interface{}{"op": "write_open", "path": fmt.Sprintf("sub/p%d", i), "size": len(data), "sha256": hexSum(data), "overwrite": false, "resume": true})
+		if errOf(r) != "" || r["upload_id"] == ids[i] || r["offset"] != float64(0) {
+			t.Fatalf("resume with no temp file: %v", r)
+		}
+		recs := loadUploads(h.ch.stateDir)
+		if len(recs) != uploadsPerActorRoot {
+			t.Fatalf("records after the fallback: %d, want %d", len(recs), uploadsPerActorRoot)
+		}
+		for _, rec := range recs {
+			if rec.UploadID == ids[i] {
+				t.Fatal("the stale record was kept")
+			}
+		}
+	}
+	// The cap still holds for a new upload.
+	sid := h.open(t, root, fileOpenOpts{})
+	h.ready(t, sid)
+	if r := h.do(t, sid, map[string]interface{}{"op": "write_open", "path": "sub/new.bin", "size": len(data), "sha256": hexSum(data), "overwrite": false}); errOf(r) != "no_space" {
+		t.Fatalf("17th upload after fallbacks: %v", r)
+	}
+	if n := len(loadUploads(h.ch.stateDir)); n != uploadsPerActorRoot {
+		t.Fatalf("records: %d, want %d", n, uploadsPerActorRoot)
+	}
+}
+
+// Concurrent write_opens from several sessions of one actor and root never
+// take more than the free slots under the cap.
+func TestFileLinuxConcurrentWriteOpensKeepTheCap(t *testing.T) {
+	needOpenat2(t)
+	h := newFileHarness(t)
+	root, _ := fixture(t)
+	data := []byte("0123456789")
+	const held = uploadsPerActorRoot - 4
+	for i := 0; i < held; i++ {
+		rec := uploadRecord{UploadID: fmt.Sprintf("upl_con%017d", i), ActorKey: actorKey("user-1"), Root: root, Path: fmt.Sprintf("sub/p%d", i),
+			Size: int64(len(data)), SHA256: hexSum(data), CreatedUnix: time.Now().Unix()}
+		if err := saveUpload(h.ch.stateDir, rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const n = 10
+	sids := make([]string, n)
+	for i := range sids {
+		sids[i] = h.open(t, root, fileOpenOpts{})
+		h.ready(t, sids[i])
+	}
+	for round := 0; round < 5; round++ {
+		rids := make([]string, n)
+		for i, sid := range sids {
+			rids[i] = nextRID()
+			h.sendReq(t, sid, map[string]interface{}{"op": "write_open", "request_id": rids[i], "path": fmt.Sprintf("sub/c%d-%d.bin", round, i),
+				"size": len(data), "sha256": hexSum(data), "overwrite": false})
+		}
+		var ok []int
+		for i, sid := range sids {
+			switch r := h.waitResult(t, sid, rids[i], "write_open"); errOf(r) {
+			case "":
+				ok = append(ok, i)
+			case "no_space":
+			default:
+				t.Fatalf("round %d: %v", round, r)
+			}
+		}
+		if got := len(loadUploads(h.ch.stateDir)); got > uploadsPerActorRoot {
+			t.Fatalf("round %d: %d records, cap %d", round, got, uploadsPerActorRoot)
+		}
+		if len(ok) != uploadsPerActorRoot-held {
+			t.Fatalf("round %d: %d write_opens succeeded, want %d", round, len(ok), uploadsPerActorRoot-held)
+		}
+		for _, i := range ok {
+			if a := h.do(t, sids[i], map[string]interface{}{"op": "write_abort", "request_id": rids[i]}); errOf(a) != "" {
+				t.Fatal(a)
+			}
+		}
+	}
 }
 
 func TestFileLinuxListMkdirRemove(t *testing.T) {
