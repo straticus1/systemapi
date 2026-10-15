@@ -363,11 +363,11 @@ test('a terminal ticket is single use', () => {
 });
 
 test('JWT rejects none, a header algorithm, and unsigned fallback', async () => {
-  const mgr = Object.create(AuthManager.prototype);
-  mgr.oidcClient = null;
-  mgr.keycloakURL = 'https://idp.example';
-  mgr.keycloakRealm = 'afterdark';
-  mgr.keycloakClientID = 'systemapi';
+  // Discovery unreachable (offline fetch): nothing may verify without it.
+  const mgr = new AuthManager('https://idp.example', 'afterdark', 'systemapi', 'systemapi', null, {
+    env: {},
+    customFetch: async () => { throw new TypeError('fetch failed'); }
+  });
   const b64 = (obj) => Buffer.from(JSON.stringify(obj)).toString('base64url');
   const none = `${b64({ alg: 'none', typ: 'JWT' })}.${b64({ iss: 'https://idp.example/realms/afterdark', exp: 9999999999 })}.`;
   assert.equal(await mgr.verifyJWTToken(none), null);
