@@ -19,8 +19,22 @@ function createPlaygroundRouter(config) {
     keycloakRealm,
     keycloakClientID,
     apiSite,
-    baseURL
+    baseURL,
+    // Optional (keyId, actor) => Promise: closes the key's live agent
+    // sockets (FleetManager.closeAgentsForKey) after a delete or a lock.
+    onKeyRevoked
   } = config;
+
+  async function keyRevoked(keyId, actor) {
+    if (typeof onKeyRevoked !== 'function') return;
+    try {
+      await onKeyRevoked(keyId, actor);
+    } catch (err) {
+      // The key row is already inactive; the fleet's periodic key check
+      // closes the agents if this call could not.
+      console.error('Closing a revoked key\'s agents failed:', err.message);
+    }
+  }
 
   const AuthManager = require('./auth');
   const PlaygroundRateLimiter = require('./rateLimiter');
@@ -290,6 +304,7 @@ function createPlaygroundRouter(config) {
           SET is_active = false
           WHERE key_id = $1
         `, [keyId]);
+        await keyRevoked(keyId, req.userId);
 
         return res.json({ success: true, message: 'API key deleted successfully' });
       } finally {
@@ -339,6 +354,7 @@ function createPlaygroundRouter(config) {
           SET is_locked = $1
           WHERE key_id = $2
         `, [locked, keyId]);
+        if (locked) await keyRevoked(keyId, req.userId);
 
         return res.json({
           success: true,

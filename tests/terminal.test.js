@@ -591,6 +591,62 @@ test('an expired API key cannot open the agent stream', async () => {
   }
 });
 
+test('revoking a key closes its live agent sockets with 4403 and an audit row', async () => {
+  const r = await rig();
+  try {
+    const agent = await connectAgent(r);
+    assert.equal(await r.fm.closeAgentsForKey('k-other', 'key_revoked', 'user-1'), 0);
+    assert.equal(agent.box.closeCode, null);
+    assert.equal(await r.fm.closeAgentsForKey('k1', 'key_revoked', 'user-1'), 1);
+    await waitUntil('agent closed', () => agent.box.closeCode !== null);
+    assert.equal(agent.box.closeCode, 4403);
+    await waitUntil('agent gone', () => !r.fm.connectedAgents.has(HOST_A));
+    const row = r.fm.registry.audit.find((a) => a.action === 'agent_key_revoked');
+    assert.equal(row.host_id, HOST_A);
+    assert.equal(row.tenant_id, 'acme');
+    assert.equal(row.actor, 'user-1');
+    assert.equal(row.payload.reason, 'key_revoked');
+    assert.equal(row.payload.close_code, 4403);
+    assert.equal(JSON.stringify(row).includes('k1"'), false, 'the key id is fingerprinted');
+  } finally {
+    await r.close();
+  }
+});
+
+test('a key revoked by another path closes its agent within one ping', async () => {
+  const r = await rig();
+  r.fm.agentPingMs = 50;
+  try {
+    const agent = await connectAgent(r);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.equal(agent.box.closeCode, null, 'an active key stays connected');
+    await r.fm.registry.revokeKey('k1');
+    const t0 = Date.now();
+    await waitUntil('agent closed', () => agent.box.closeCode !== null, 1000);
+    assert.ok(Date.now() - t0 < 1000);
+    assert.equal(agent.box.closeCode, 4403);
+    const row = r.fm.registry.audit.find((a) => a.action === 'agent_key_revoked');
+    assert.equal(row.actor, 'system:key_check');
+    assert.equal(row.payload.reason, 'key_inactive');
+  } finally {
+    await r.close();
+  }
+});
+
+test('a key check that errors twice in a row closes the agent', async () => {
+  const r = await rig();
+  r.fm.agentPingMs = 50;
+  try {
+    const agent = await connectAgent(r);
+    r.fm.registry.keyActive = async () => { throw new Error('db down'); };
+    await waitUntil('agent closed', () => agent.box.closeCode !== null, 1000);
+    assert.equal(agent.box.closeCode, 4403);
+    assert.equal(r.fm.registry.audit.find((a) => a.action === 'agent_key_revoked').payload.reason, 'key_check_failed');
+  } finally {
+    await r.close();
+  }
+});
+
 test('an agent dialing with the same key and host id but another SSH key is refused', async () => {
   const r = await rig();
   try {

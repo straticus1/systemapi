@@ -189,7 +189,9 @@ if (process.env.DB_PASSWORD && process.env.DB_PASSWORD !== '') {
             keycloakRealm: process.env.KEYCLOAK_REALM || 'afterdark',
             keycloakClientID: process.env.KEYCLOAK_CLIENT_ID || 'systemapi',
             apiSite: 'systemapi',
-            baseURL: process.env.API_BASE_URL || 'https://api.systemapi.io'
+            baseURL: process.env.API_BASE_URL || 'https://api.systemapi.io',
+            // fleetManager is created further down, before any request runs.
+            onKeyRevoked: (keyId, actor) => fleetManager.closeAgentsForKey(keyId, 'key_revoked', actor)
         };
 
         // Register playground routes

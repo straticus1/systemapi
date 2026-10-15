@@ -27,6 +27,11 @@
  * answering. Does NOT prove
  * the newcomer holds the SSH private key: with the real agent offline, a
  * stolen API key plus the (public) host key still enrolls.
+ * A revoked key loses its live agents: the /playground/api-keys delete and
+ * lock routes call closeAgentsForKey, and every ping (30 s) re-checks
+ * registry.keyActive for the socket's key, so a key expired, locked or
+ * deleted by any other path is caught within one ping; a check that errors
+ * twice in a row also closes. Each close is code 4403 with an audit row.
  */
 
 const WebSocket = require('ws');
@@ -62,6 +67,9 @@ const PTY_LEASE_TTL_S = 60;
 const PTY_MAX_SECONDS_DEFAULT = 28800;
 const PTY_MAX_SECONDS_CAP = 7 * 86400;
 const AGENT_PROBE_MS_DEFAULT = 5000;
+const AGENT_PING_MS = 30_000;
+const AGENT_REVOKED_CLOSE = 4403;
+const AGENT_CLOSE_GRACE_MS = 2000;
 const PURPOSE_ACTIONS = new Map([
     ['terminal:open', 'pty'],
     ['terminal:root', 'pty_root'],
@@ -140,6 +148,9 @@ class FleetManager {
         // streams. Keyed by socket, so a reconnect starts fresh.
         this.agentCaps = new WeakMap();
         this.agentLedgers = new WeakMap();
+        // The API key id each accepted agent socket enrolled with.
+        this.agentKeys = new WeakMap();
+        this.agentPingMs = AGENT_PING_MS;
         this.terminalSessions = new Map();
         this.terminalWss = new WebSocket.Server({ noServer: true, maxPayload: PTY_FRAME_MAX });
         this.stoppingSessions = new Map();
@@ -832,10 +843,27 @@ class FleetManager {
             }
         });
 
+        // Each ping also re-checks the key, once the socket is accepted.
+        let keyCheckFailures = 0;
         const interval = setInterval(() => {
-            if (ws.readyState === WebSocket.OPEN) ws.ping();
-            else clearInterval(interval);
-        }, 30000);
+            if (ws.readyState !== WebSocket.OPEN) {
+                clearInterval(interval);
+                return;
+            }
+            ws.ping();
+            if (!hostId || !this.registry || typeof this.registry.keyActive !== 'function') return;
+            const id = hostId;
+            this.registry.keyActive(keyId).then((active) => {
+                keyCheckFailures = 0;
+                if (active !== true) return this.closeRevokedAgent(id, ws, keyId, 'key_inactive', 'system:key_check');
+                return undefined;
+            }, (err) => {
+                keyCheckFailures += 1;
+                console.error('[Fleet] agent key check failed:', err.message);
+                if (keyCheckFailures >= 2) return this.closeRevokedAgent(id, ws, keyId, 'key_check_failed', 'system:key_check');
+                return undefined;
+            }).catch((err) => console.error('[Fleet] agent key close failed:', err.message));
+        }, this.agentPingMs);
 
         if (!this.signer) {
             ws.send(JSON.stringify({ type: 'enroll_error', error: 'signer_unavailable' }));
@@ -868,6 +896,7 @@ class FleetManager {
             hostId = host.host_id;
             this.hostTenants.set(hostId, host.tenant_id);
             this.agentCaps.set(ws, request.systemapiCapabilities || new Set());
+            this.agentKeys.set(ws, keyId);
             this.connectedAgents.set(hostId, ws);
             ws.send(JSON.stringify({
                 type: 'enrolled',
@@ -913,6 +942,43 @@ class FleetManager {
             return true;
         } finally {
             this.agentProbes.delete(hostId);
+        }
+    }
+
+    // Closes every live agent socket enrolled with keyId. Called by the key
+    // delete and lock routes. Returns how many were closed.
+    async closeAgentsForKey(keyId, reason, actor) {
+        let closed = 0;
+        for (const [hostId, ws] of [...this.connectedAgents]) {
+            if (this.agentKeys.get(ws) !== keyId) continue;
+            await this.closeRevokedAgent(hostId, ws, keyId, reason, actor);
+            closed += 1;
+        }
+        return closed;
+    }
+
+    // Close 4403 at once (nothing new is routed to a socket that is not
+    // OPEN), terminate if the agent has not finished the close within the
+    // grace period, then the audit row.
+    async closeRevokedAgent(hostId, ws, keyId, reason, actor) {
+        if (ws.readyState !== WebSocket.OPEN) return;
+        ws.close(AGENT_REVOKED_CLOSE, 'key_revoked');
+        unref(setTimeout(() => {
+            if (ws.readyState !== WebSocket.CLOSED) ws.terminate();
+        }, AGENT_CLOSE_GRACE_MS));
+        console.warn(`[Fleet] agent closed: key sha256:${fingerprint(keyId)} ${reason}`);
+        if (!this.registry) return;
+        try {
+            await this.registry.appendAudit({
+                tenant_id: this.hostTenants.get(hostId) || null,
+                host_id: hostId,
+                actor,
+                action: 'agent_key_revoked',
+                payload: { key_fp: fingerprint(keyId), reason, close_code: AGENT_REVOKED_CLOSE }
+            });
+        } catch (err) {
+            console.error('[Fleet] agent revoke audit failed:', err.message);
+            await this.noteSecurity('audit_write_failed', fingerprint(keyId), { action: 'agent_key_revoked' });
         }
     }
 

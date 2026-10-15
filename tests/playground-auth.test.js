@@ -308,7 +308,9 @@ test('a JWT whose sub equals a member id cannot list, lock or delete that member
 
   const app = express();
   app.use(express.json());
-  app.use('/playground', createPlaygroundRouter({ db: pool, redis: null, keycloakURL: 'https://unused.test', keycloakRealm: 'unused', keycloakClientID: 'systemapi-client', apiSite: 'systemapi', baseURL: 'http://127.0.0.1' }));
+  const revoked = [];
+  const onKeyRevoked = async (keyId, actor) => { revoked.push({ keyId, actor }); };
+  app.use('/playground', createPlaygroundRouter({ db: pool, redis: null, keycloakURL: 'https://unused.test', keycloakRealm: 'unused', keycloakClientID: 'systemapi-client', apiSite: 'systemapi', baseURL: 'http://127.0.0.1', onKeyRevoked }));
   const server = await new Promise((resolve) => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
   const base = `http://127.0.0.1:${server.address().port}/playground`;
   const headers = { authorization: `Bearer ${sign(claims({ sub: 'ryan' }))}`, 'content-type': 'application/json' };
@@ -336,10 +338,16 @@ test('a JWT whose sub equals a member id cannot list, lock or delete that member
     // The JWT user still owns and manages its own key.
     const own = await realFetch(`${base}/api-keys`, { headers });
     assert.deepEqual((await own.json()).api_keys.map((k) => k.key_id), [minted.key_id]);
+    assert.deepEqual(revoked, [], 'refused lock and delete close nothing');
+    const ownUnlock = await realFetch(`${base}/api-keys/${minted.key_id}/lock`, { method: 'PATCH', headers, body: JSON.stringify({ locked: false }) });
+    assert.equal(ownUnlock.status, 200);
+    assert.deepEqual(revoked, [], 'an unlock closes nothing');
     const ownLock = await realFetch(`${base}/api-keys/${minted.key_id}/lock`, { method: 'PATCH', headers, body: JSON.stringify({ locked: true }) });
     assert.equal(ownLock.status, 200);
+    assert.deepEqual(revoked, [{ keyId: minted.key_id, actor: 'oidc:ryan' }]);
     const ownDel = await realFetch(`${base}/api-keys/${minted.key_id}`, { method: 'DELETE', headers });
     assert.equal(ownDel.status, 200);
+    assert.deepEqual(revoked.map((r) => r.keyId), [minted.key_id, minted.key_id]);
   } finally {
     server.close();
     globalThis.fetch = realFetch;
