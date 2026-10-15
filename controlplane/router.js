@@ -223,6 +223,26 @@ function requireScope(fleet, principal, tenantId, scope) {
   }
 }
 
+// Scope before host: a principal that holds every scope in none of its
+// tenants is refused (403) before any host lookup, so a key without the scope
+// cannot tell which host ids exist. The host's own tenant is checked again
+// with requireScope once the host is found.
+function requireScopeAnywhere(fleet, principal, scopes) {
+  const held = tenantIds(principal).some((id) => {
+    const have = scopesFor(principal, id);
+    return scopes.every((scope) => hasScope(have, scope));
+  });
+  if (!held) {
+    safeSecurity(fleet, {
+      kind: 'scope_deny',
+      tenant_id: null,
+      actor_fingerprint: fingerprint(principal.userId),
+      detail: { scope: scopes.join(',') }
+    });
+    throw http(403, 'scope_denied');
+  }
+}
+
 function clampList(value) {
   if (!Array.isArray(value)) return [];
   const out = [];
@@ -531,12 +551,15 @@ function mount(app, fleet) {
     const purpose = req.body && req.body.purpose;
     const hostId = req.body && req.body.host_id;
     if (typeof purpose !== 'string' || !TICKET_PURPOSES.has(purpose)) throw http(400, 'bad_purpose');
-    // Channel purposes: shape first (400), then host (404), scope (403),
-    // refused classes and server policy (403), then the rate budget (429).
+    // Channel purposes: shape first (400), then scope in some tenant (403),
+    // host (404), scope in the host's tenant (403), refused classes and
+    // server policy (403), then the rate budget (429).
     const parsed = validateBinding(purpose, req.body);
     if (!parsed.ok) throw http(400, parsed.error);
+    const scopes = PURPOSE_SCOPES[purpose] || [purpose];
+    requireScopeAnywhere(fleet, principal, scopes);
     const host = await requireHost(fleet, principal, hostId);
-    for (const scope of PURPOSE_SCOPES[purpose] || [purpose]) requireScope(fleet, principal, host.tenant_id, scope);
+    for (const scope of scopes) requireScope(fleet, principal, host.tenant_id, scope);
     if (CHANNEL_PURPOSES.has(purpose)) {
       if (parsed.forbidden) throw http(403, 'target_forbidden');
       const denied = await policyDecision(fleet.registry, host.host_id, purpose, parsed.binding);
@@ -586,6 +609,7 @@ function mount(app, fleet) {
     const hostIds = req.body && req.body.host_ids;
     if (!Array.isArray(hostIds) || hostIds.length === 0 || hostIds.length > 50) throw http(400, 'bad_hosts');
     const script = req.body.script;
+    requireScopeAnywhere(fleet, principal, ['exec:run']);
     const results = [];
     for (const hostId of hostIds) {
       const host = await requireHost(fleet, principal, hostId);
@@ -654,6 +678,7 @@ function mount(app, fleet) {
 
   app.post('/api/v1/fleet/:hostId/execute', wrap(async (req, res) => {
     const principal = await authenticate(req, fleet);
+    requireScopeAnywhere(fleet, principal, ['exec:run']);
     const host = await requireHost(fleet, principal, req.params.hostId);
     const out = await runScript(fleet, principal, host, req.body && req.body.script, req.body && req.body.entitlements);
     res.json({ success: true, ...out, executed_by: principal.email || principal.userId });
@@ -661,6 +686,7 @@ function mount(app, fleet) {
 
   app.post('/api/v1/fleet/:hostId/breakglass', wrap(async (req, res) => {
     const principal = await authenticate(req, fleet);
+    requireScopeAnywhere(fleet, principal, ['breakglass:open']);
     const host = await requireHost(fleet, principal, req.params.hostId);
     requireScope(fleet, principal, host.tenant_id, 'breakglass:open');
     res.json(await issueAuditedTicket(fleet, principal, host, 'breakglass:open'));
@@ -838,6 +864,7 @@ function mount(app, fleet) {
 
   app.post('/api/v1/playbooks/:id/run', wrap(async (req, res) => {
     const principal = await authenticate(req, fleet);
+    requireScopeAnywhere(fleet, principal, ['exec:run']);
     const host = await requireHost(fleet, principal, req.body && req.body.host_id);
     const script = readPlaybook(req.params.id);
     const out = await runScript(fleet, principal, host, script, { allow_exec: true });

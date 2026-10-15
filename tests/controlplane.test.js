@@ -477,6 +477,41 @@ test('an unscored key is denied on the fleet routes', async () => {
   }
 });
 
+test('a key without the scope gets 403 on execute and ticket routes whether or not the host exists', async () => {
+  const fm = fleet();
+  await seed(fm);
+  const MISSING = '99999999-9999-4999-8999-999999999999';
+  const { server, url } = await listen(appFor(fm));
+  const post = (p, body) => call(`${url}${p}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-api-key': 'good-key' },
+    body: JSON.stringify(body)
+  });
+  try {
+    for (const hostId of [HOST_A, MISSING]) {
+      const answers = [
+        await post(`/api/v1/fleet/${hostId}/execute`, { script: 'print(1)\n' }),
+        await post('/api/v1/fleet/execute', { host_ids: [hostId], script: 'print(1)\n' }),
+        await post('/api/v1/ws-ticket', { purpose: 'terminal:open', host_id: hostId }),
+        await post(`/api/v1/fleet/${hostId}/breakglass`, {}),
+        await post('/api/v1/playbooks/disk-usage/run', { host_id: hostId })
+      ];
+      for (const a of answers) {
+        assert.equal(a.status, 403, `${hostId}: ${JSON.stringify(a.body)}`);
+        assert.equal(a.body.error, 'scope_denied');
+      }
+    }
+    assert.equal(fm.registry.securityEvents.some((e) => e.kind === 'idor'), false, 'no host lookup ran');
+    assert.equal(fm.lastPush, null);
+    // With the scope, a missing host is still not found.
+    await fm.registry.setScopes('ak_test', OPERATOR);
+    const missing = await post(`/api/v1/fleet/${MISSING}/execute`, { script: 'print(1)\n' });
+    assert.equal(missing.status, 404);
+  } finally {
+    server.close();
+  }
+});
+
 test('security events from another tenant or no tenant are not listed', async () => {
   const reg = new MemoryRegistry({});
   await reg.recordSecurity({ kind: 'enroll_fail', detail: { error: 'bad_key' } });
