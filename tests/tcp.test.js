@@ -661,6 +661,16 @@ test('revocation reaches a live stream: the next renewal re-checks and ends it w
     assert.equal(renewsFor(b.sid), renewedB);
     const ends = await waitUntil('ends', () => auditRows(r, 'tcp_end').length === 2 && auditRows(r, 'tcp_end'));
     assert.deepEqual(ends.map((e) => e.payload.reason), ['stopped', 'stopped']);
+    // A failed policy lookup only skips the renewal (the lease then lapses
+    // at the agent); the stream is not signed for.
+    await r.fm.registry.setHostChannelPolicy(HOST_A, { tcp_policy: POLICY });
+    const d = await connected(r, agent);
+    await waitUntil('d renewed', () => renewsFor(d.sid) >= 1);
+    r.fm.registry.channelPolicies = async () => { throw new Error('db down'); };
+    const before = renewsFor(d.sid);
+    await sleep(200);
+    assert.equal(renewsFor(d.sid), before);
+    assert.equal(closeFrame(d.client.box), undefined);
   } finally {
     await r.close();
   }
