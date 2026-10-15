@@ -776,6 +776,8 @@ test('limits: idle_timeout, max_duration, op_cap, byte_cap', async () => {
     const idle = await ready(r, agent);
     await waitUntil('idle', () => closeFrame(idle.client.box), 3000);
     assert.equal(closeFrame(idle.client.box).payload.reason, 'idle_timeout');
+    // file_close arrives before the WebSocket close event sets the code.
+    await waitUntil('idle close', () => idle.client.box.closeCode !== null);
     assert.equal(idle.client.box.closeCode, 1000);
 
     const ops = await ready(r, agent);

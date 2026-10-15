@@ -538,6 +538,7 @@ test('idle timeout fires', async () => {
     assert.equal(closeFrame(client.box), undefined);
     await waitUntil('idle close', () => closeFrame(client.box), 3000);
     assert.equal(closeFrame(client.box).payload.reason, 'idle_timeout');
+    await waitUntil('close code', () => client.box.closeCode !== null);
     assert.equal(client.box.closeCode, 1000);
     await waitUntil('tcp_stop', () => agentFrames(agent, 'tcp_stop').find((f) => f.session_id === sid));
     const end = await waitUntil('tcp_end', () => auditRows(r, 'tcp_end')[0]);
@@ -659,6 +660,7 @@ test('agent disconnect ends its streams with agent_disconnected', async () => {
     agent.ws.close();
     await waitUntil('close', () => closeFrame(client.box));
     assert.equal(closeFrame(client.box).payload.reason, 'agent_disconnected');
+    await waitUntil('close code', () => client.box.closeCode !== null);
     assert.equal(client.box.closeCode, 1000);
   } finally {
     await r.close();
