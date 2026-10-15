@@ -13,7 +13,9 @@
 // record file steering a deletion (records are size-capped, every field is
 // re-validated, and deletion resolves the root and parent like a helper and
 // unlinks only the reserved temp name), and unbounded growth (24 h expiry,
-// swept at every file session start). Does NOT encrypt records (they hold
+// swept at every file session start and hourly; at most 16 live uploads per
+// actor and root; a write that fails through the client's fault discards its
+// temp file and record instead of keeping them for resume). Does NOT encrypt records (they hold
 // paths and hashes, no content) and does NOT survive the state directory
 // being deleted (the temp files then expire only by hand).
 package main
@@ -35,7 +37,14 @@ const (
 	uploadTTL       = 24 * time.Hour
 	uploadRecordMax = 16 * 1024
 	uploadDirName   = "file-uploads"
+	// uploadsPerActorRoot caps the live uploads (interrupted or open) one
+	// actor may hold under one root; a new write_open past it gets no_space.
+	uploadsPerActorRoot = 16
 )
+
+// uploadSweepEvery is how often the running agent sweeps expired uploads, in
+// addition to every file session start.
+var uploadSweepEvery = time.Hour
 
 type uploadRecord struct {
 	UploadID    string `json:"upload_id"`
@@ -175,6 +184,46 @@ func findUpload(stateDir, actor, root, path string, size int64, sha string, now 
 		return &r
 	}
 	return nil
+}
+
+// countUploads returns how many live (unexpired) upload records this actor
+// holds under this root, claimed or not.
+func countUploads(stateDir, actor, root string, now time.Time) int {
+	key := actorKey(actor)
+	n := 0
+	for _, rec := range loadUploads(stateDir) {
+		if hashEqual(rec.ActorKey, key) && rec.Root == root && now.Sub(time.Unix(rec.CreatedUnix, 0)) < uploadTTL {
+			n++
+		}
+	}
+	return n
+}
+
+var uploadSweeperOnce sync.Once
+
+// startUploadSweeper sweeps expired uploads every uploadSweepEvery for the
+// life of the process, so temp files of an agent that sees no new file
+// session still expire. It runs once per process.
+func startUploadSweeper(stateDir string) {
+	if stateDir == "" {
+		return
+	}
+	uploadSweeperOnce.Do(func() {
+		go runUploadSweeper(stateDir, uploadSweepEvery, nil, removeUploadTemp)
+	})
+}
+
+func runUploadSweeper(stateDir string, every time.Duration, stop <-chan struct{}, remove func(root, path, id string) error) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case now := <-t.C:
+			sweepUploads(stateDir, now, remove)
+		}
+	}
 }
 
 // sweepUploads deletes every expired, unclaimed upload: its temp file

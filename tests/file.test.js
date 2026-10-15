@@ -785,7 +785,9 @@ test('write framing: offset_mismatch and too_large end the write; write_window a
     let rid = await openWrite(r, agent, s, { size: 10 * MiB, rid: 'w1' });
     chunk(s, rid, 5, Buffer.alloc(10, 1));
     assert.equal((await waitResult(s.client.box, rid, 'write_chunk')).error, 'offset_mismatch');
-    await waitUntil('release', () => agentReqs(agent, s.sid).find((q) => q.op === 'write_release'));
+    // The client's fault: the agent discards the upload, it is not kept for resume.
+    await waitUntil('discard', () => agentReqs(agent, s.sid).find((q) => q.op === 'write_discard' && q.request_id === rid));
+    assert.equal(agentReqs(agent, s.sid).some((q) => q.op === 'write_release'), false);
     // A chunk still in flight for the ended write is dropped; commit is upload_not_found under a new id.
     chunk(s, rid, 15, Buffer.alloc(10, 1));
     sendJSON(s.client.ws, { type: 'file_request', request_id: 'c2', op: 'write_commit' });
@@ -795,6 +797,7 @@ test('write framing: offset_mismatch and too_large end the write; write_window a
     rid = await openWrite(r, agent, s, { size: 4, rid: 'w2' });
     chunk(s, rid, 0, Buffer.alloc(5, 1));
     assert.equal((await waitResult(s.client.box, rid, 'write_chunk')).error, 'too_large');
+    await waitUntil('discard w2', () => agentReqs(agent, s.sid).find((q) => q.op === 'write_discard' && q.request_id === 'w2'));
 
     // Resume: the next offset is the agent's durable offset.
     rid = await openWrite(r, agent, s, { size: 3 * MiB, rid: 'w3', offset: 2 * MiB });

@@ -599,6 +599,132 @@ func TestFileLinuxResume(t *testing.T) {
 	noTemps(t, filepath.Join(root, "sub"))
 }
 
+// A write that fails through the client's fault (a chunk at the wrong
+// offset, data past the declared size, a commit before the last byte)
+// leaves no temp file and no record behind; one the host interrupts keeps
+// both for resume (TestFileLinuxResume).
+func TestFileLinuxClientFaultDiscardsUpload(t *testing.T) {
+	needOpenat2(t)
+	h := newFileHarness(t)
+	root, _ := fixture(t)
+	sid := h.open(t, root, fileOpenOpts{})
+	h.ready(t, sid)
+	data := randBytes(t, 100)
+	open := func() string {
+		rid := nextRID()
+		o := h.do(t, sid, map[string]interface{}{"op": "write_open", "request_id": rid, "path": "sub/c.bin", "size": len(data), "sha256": hexSum(data), "overwrite": false})
+		if errOf(o) != "" {
+			t.Fatal(o)
+		}
+		if len(loadUploads(h.ch.stateDir)) != 1 {
+			t.Fatal("no upload record while the write is open")
+		}
+		return rid
+	}
+	gone := func(what string) {
+		t.Helper()
+		noTemps(t, filepath.Join(root, "sub"))
+		if recs := loadUploads(h.ch.stateDir); len(recs) != 0 {
+			t.Fatalf("%s: records left %+v", what, recs)
+		}
+	}
+	rid := open()
+	h.chunk(t, sid, rid, 10, data[:10])
+	if r := h.waitResult(t, sid, rid, "write_chunk"); errOf(r) != "offset_mismatch" {
+		t.Fatal(r)
+	}
+	waitFor(t, "offset_mismatch discard", 5*time.Second, func() bool { return len(loadUploads(h.ch.stateDir)) == 0 })
+	gone("offset_mismatch")
+
+	rid = open()
+	h.chunk(t, sid, rid, 0, append(append([]byte{}, data...), 1))
+	if r := h.waitResult(t, sid, rid, "write_chunk"); errOf(r) != "too_large" {
+		t.Fatal(r)
+	}
+	waitFor(t, "too_large discard", 5*time.Second, func() bool { return len(loadUploads(h.ch.stateDir)) == 0 })
+	gone("too_large")
+
+	rid = open()
+	h.chunk(t, sid, rid, 0, data[:50])
+	h.waitAck(t, sid, rid, 50)
+	if r := h.do(t, sid, map[string]interface{}{"op": "write_commit", "request_id": rid}); errOf(r) != "offset_mismatch" {
+		t.Fatal(r)
+	}
+	gone("early commit")
+	// The session goes on and a correct upload still works.
+	if _, c := h.upload(t, sid, "sub/c.bin", data, nil); errOf(c) != "" {
+		t.Fatal(c)
+	}
+}
+
+// At most 16 live uploads per actor and root: the 17th new upload is
+// no_space; another actor or root, a resume, or an expired record do not
+// count against it.
+func TestFileLinuxUploadCapPerActorAndRoot(t *testing.T) {
+	needOpenat2(t)
+	h := newFileHarness(t)
+	root, _ := fixture(t)
+	data := []byte("0123456789")
+	var ids []string
+	for i := 0; i < uploadsPerActorRoot; i++ {
+		id := fmt.Sprintf("upl_cap%017d", i)
+		ids = append(ids, id)
+		rec := uploadRecord{UploadID: id, ActorKey: actorKey("user-1"), Root: root, Path: fmt.Sprintf("sub/p%d", i), Size: int64(len(data)),
+			SHA256: hexSum(data), CreatedUnix: time.Now().Unix()}
+		if err := saveUpload(h.ch.stateDir, rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	expired := uploadRecord{UploadID: "upl_capexpired0000000", ActorKey: actorKey("user-1"), Root: root, Path: "sub/old", Size: 1,
+		SHA256: hexSum([]byte("x")), CreatedUnix: time.Now().Add(-25 * time.Hour).Unix()}
+	if err := saveUpload(h.ch.stateDir, expired); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "sub", tempName(ids[3])), data[:4], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sid := h.open(t, root, fileOpenOpts{})
+	h.ready(t, sid)
+	newOpen := func(sid string) map[string]interface{} {
+		return h.do(t, sid, map[string]interface{}{"op": "write_open", "path": "sub/new.bin", "size": len(data), "sha256": hexSum(data), "overwrite": false})
+	}
+	if r := newOpen(sid); errOf(r) != "no_space" {
+		t.Fatalf("17th upload: %v", r)
+	}
+	if n := len(loadUploads(h.ch.stateDir)); n != uploadsPerActorRoot {
+		t.Fatalf("a refused write_open left a record: %d", n)
+	}
+	noTempsExcept(t, filepath.Join(root, "sub"), tempName(ids[3]))
+	// Resuming one of them is not a new upload.
+	r := h.do(t, sid, map[string]interface{}{"op": "write_open", "path": "sub/p3", "size": len(data), "sha256": hexSum(data), "overwrite": false, "resume": true})
+	if errOf(r) != "" || r["upload_id"] != ids[3] || r["offset"] != float64(4) {
+		t.Fatalf("resume under the cap: %v", r)
+	}
+	if a := h.do(t, sid, map[string]interface{}{"op": "write_abort", "request_id": r["request_id"]}); errOf(a) != "" {
+		t.Fatal(a)
+	}
+	// One slot is free again.
+	if r := newOpen(sid); errOf(r) != "" {
+		t.Fatalf("after an abort: %v", r)
+	}
+	// Another actor has its own cap.
+	other := h.open(t, root, fileOpenOpts{actor: "user-2"})
+	h.ready(t, other)
+	if r := newOpen(other); errOf(r) != "" {
+		t.Fatalf("another actor: %v", r)
+	}
+}
+
+func noTempsExcept(t *testing.T, dir, keep string) {
+	t.Helper()
+	ents, _ := os.ReadDir(dir)
+	for _, e := range ents {
+		if strings.HasPrefix(e.Name(), ".sahsync-") && e.Name() != keep {
+			t.Fatalf("temp file left: %s", e.Name())
+		}
+	}
+}
+
 // A FIFO planted at a resumable upload's temp name never blocks the helper:
 // it is not resumed and a fresh upload starts.
 func TestFileLinuxResumeRefusesAFIFOTemp(t *testing.T) {

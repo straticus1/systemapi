@@ -173,6 +173,53 @@ func TestUploadRecordsResumeKeyAndExpiry(t *testing.T) {
 	}
 }
 
+// Expired uploads are swept on a timer too, not only when a session starts.
+func TestUploadSweeperRunsOnATimer(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	old := testRecord("upl_eeeeeeeeeeeeeeeeeeee", now.Add(-25*time.Hour))
+	live := testRecord("upl_gggggggggggggggggggg", now.Add(-time.Hour))
+	for _, r := range []uploadRecord{old, live} {
+		if err := saveUpload(dir, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		runUploadSweeper(dir, 20*time.Millisecond, stop, func(root, path, id string) error { return nil })
+		close(done)
+	}()
+	waitFor(t, "the timer sweep", 5*time.Second, func() bool { return len(loadUploads(dir)) == 1 })
+	close(stop)
+	<-done
+	if recs := loadUploads(dir); len(recs) != 1 || recs[0].UploadID != live.UploadID {
+		t.Fatalf("records left: %+v", recs)
+	}
+}
+
+func TestCountUploadsPerActorAndRoot(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	recs := []uploadRecord{
+		testRecord("upl_aaaaaaaaaaaaaaaaaaa1", now),
+		testRecord("upl_aaaaaaaaaaaaaaaaaaa2", now),
+		testRecord("upl_aaaaaaaaaaaaaaaaaaa3", now.Add(-25*time.Hour)),
+	}
+	other := testRecord("upl_aaaaaaaaaaaaaaaaaaa4", now)
+	other.ActorKey = actorKey("user-2")
+	elsewhere := testRecord("upl_aaaaaaaaaaaaaaaaaaa5", now)
+	elsewhere.Root = "/srv/b"
+	for _, r := range append(recs, other, elsewhere) {
+		if err := saveUpload(dir, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := countUploads(dir, "user-1", "/srv/a", now); n != 2 {
+		t.Fatalf("count %d, want 2 (expired, other actor and other root excluded)", n)
+	}
+}
+
 func TestFileIdentityRules(t *testing.T) {
 	if _, code := resolveFileIdentity("file_root", ptySettings{AllowAgentUser: true}, 1000); code != "root_unavailable" {
 		t.Fatalf("file:root on a non-root agent: %q", code)

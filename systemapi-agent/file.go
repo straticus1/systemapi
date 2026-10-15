@@ -475,6 +475,7 @@ func (s *fileSession) run() {
 	defer s.exit()
 	if s.c.stateDir != "" {
 		sweepUploads(s.c.stateDir, time.Now(), removeUploadTemp)
+		startUploadSweeper(s.c.stateDir)
 	}
 	user, uid, code := s.start()
 	if code != "" {
@@ -666,8 +667,11 @@ func (s *fileSession) do(t fileTask) error {
 		return s.doChunk(t.chunk)
 	}
 	req := *t.req
-	if req.Op == "write_release" {
+	switch req.Op {
+	case "write_release":
 		return s.releaseWrite()
+	case "write_discard":
+		return s.discardWrite()
 	}
 	s.ops++
 	switch {
@@ -723,6 +727,14 @@ func (s *fileSession) doWriteOpen(req fileReq) error {
 	var prior *uploadRecord
 	if req.Resume != nil && *req.Resume && req.Size != nil && s.c.stateDir != "" {
 		prior = findUpload(s.c.stateDir, s.actor, s.canon, req.Path, *req.Size, req.SHA256, time.Now())
+	}
+	// A new upload past the per-actor, per-root cap is refused: interrupted
+	// uploads must be resumed, aborted or left to expire first.
+	if prior == nil && s.c.stateDir != "" && countUploads(s.c.stateDir, s.actor, s.canon, time.Now()) >= uploadsPerActorRoot {
+		unclaimUpload(newID)
+		log.Printf("file %s: upload cap reached for this actor and root", s.id)
+		s.result(req.RequestID, req.Op, "no_space", nil)
+		return nil
 	}
 	req.UploadID = newID
 	if prior != nil {
@@ -784,9 +796,10 @@ func (s *fileSession) doWriteEnd(req fileReq) error {
 		unclaimUpload(w.uploadID)
 		return err
 	}
-	// A committed, aborted or hash-mismatched upload is gone; any other
-	// commit failure keeps the temp file and its record for resume.
-	if resp.Error == "" || resp.Error == "sha256_mismatch" || req.Op == "write_abort" {
+	// A committed, aborted, hash-mismatched or early-committed
+	// (offset_mismatch) upload is gone; any other commit failure keeps the
+	// temp file and its record for resume.
+	if resp.Error == "" || resp.Error == "sha256_mismatch" || resp.Error == "offset_mismatch" || req.Op == "write_abort" {
 		deleteUpload(s.c.stateDir, w.uploadID)
 	}
 	unclaimUpload(w.uploadID)
@@ -808,6 +821,9 @@ func (s *fileSession) doChunk(ch *fileChunkIn) error {
 	}
 	if resp.Error != "" {
 		s.result(ch.reqID, "write_chunk", resp.Error, nil)
+		if clientWriteFault(resp.Error) {
+			return s.discardWrite()
+		}
 		return s.releaseWrite()
 	}
 	s.bytesWritten += int64(ch.length)
@@ -815,6 +831,28 @@ func (s *fileSession) doChunk(ch *fileChunkIn) error {
 		"type": "file_write_ack", "session_id": s.id, "request_id": ch.reqID, "offset": resp.Fields["offset"],
 	})
 	return nil
+}
+
+// clientWriteFault reports a chunk failure caused by what the client sent
+// (a wrong offset, data past the declared size, a malformed chunk): such an
+// upload cannot be resumed usefully, so it is discarded, not kept.
+func clientWriteFault(code string) bool {
+	return code == "offset_mismatch" || code == "too_large" || code == "bad_request"
+}
+
+// discardWrite closes the open write and deletes its temp file and record.
+func (s *fileSession) discardWrite() error {
+	w := s.write
+	if w == nil {
+		return nil
+	}
+	s.write = nil
+	_, err := s.call(fileReq{Op: "write_discard"}, nil, nil)
+	if err == nil {
+		deleteUpload(s.c.stateDir, w.uploadID)
+	}
+	unclaimUpload(w.uploadID)
+	return err
 }
 
 // releaseWrite closes the open write and keeps its temp file for resume.

@@ -723,16 +723,17 @@ class FileChannels {
         s.expectBinary = { length, forward: true, offset: cmd.offset, rid };
     }
 
-    // Ends the open write after a chunk failure: the client gets the error,
-    // the agent keeps the temp file for resume, and chunks still in flight
-    // are dropped.
+    // Ends the open write after a chunk the client got wrong
+    // (offset_mismatch, too_large): the client gets the error, the agent
+    // discards the temp file and its record (such an upload is not kept for
+    // resume), and chunks still in flight are dropped.
     failWrite(s, error, op) {
         const w = s.write;
         if (!w) return;
         s.write = null;
         s.discardRids.set(w.rid, WRITE_WINDOW);
         this.clientResult(s, w.rid, op, error);
-        this.toAgent(s, { request_id: w.rid, op: 'write_release' });
+        this.toAgent(s, { request_id: w.rid, op: 'write_discard' });
     }
 
     onClientBinary(s, buf) {

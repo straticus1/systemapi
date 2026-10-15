@@ -272,6 +272,9 @@ func (h *fileHelper) do(req fileReq, data []byte) fileResp {
 	case "write_release":
 		h.release()
 		return okResp(nil)
+	case "write_discard":
+		h.discard()
+		return okResp(nil)
 	}
 	if code := checkFilePath(req.Path); code != "" {
 		return helperFail(code)
@@ -738,15 +741,16 @@ func (h *fileHelper) writeChunk(req fileReq, data []byte) fileResp {
 }
 
 // writeCommit is §6 "Commit": offset == size, fsync, re-read and hash,
-// mode, rename, fsync of the parent. A hash mismatch deletes the temp file;
-// any other failure keeps it for resume.
+// mode, rename, fsync of the parent. A hash mismatch or a commit before the
+// last byte (offset_mismatch, the client's fault) deletes the temp file; any
+// other failure keeps it for resume.
 func (h *fileHelper) writeCommit() fileResp {
 	w := h.write
 	if w == nil {
 		return helperFail("upload_not_found")
 	}
 	if w.offset != w.size {
-		h.release()
+		h.discard()
 		return helperFail("offset_mismatch")
 	}
 	if err := unix.Fsync(w.fd); err != nil {
