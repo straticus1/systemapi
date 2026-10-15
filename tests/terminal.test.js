@@ -574,16 +574,54 @@ test('an agent dialing with the same key and host id but another SSH key is refu
   }
 });
 
-test('a replaced agent connection closing does not mark the host offline', async () => {
-  const r = await rig();
+test('a second agent connection is refused while the live one answers pings', async () => {
+  const r = await rig({ SYSTEMAPI_AGENT_PROBE_MS: '200' });
   try {
     const first = await connectAgent(r);
+    const live = r.fm.connectedAgents.get(HOST_A);
+    const ws = r.track(new WebSocket(`${r.base}/api/v1/systems/stream`, {
+      headers: {
+        authorization: 'Bearer agent-key',
+        'x-systemapi-tenant': 'acme',
+        'x-systemapi-host-id': HOST_A,
+        'x-systemapi-hostname': 'a.example',
+        'x-systemapi-ssh-pubkey': opensshEd25519(r.fm.signer.publicKeyRaw)
+      }
+    }));
+    const box = collect(ws);
+    const refused = await waitUntil('enroll_error', () => box.frames.find((f) => f.type === 'enroll_error'));
+    assert.equal(refused.error, 'host_connected');
+    await waitUntil('newcomer closed', () => box.closeCode !== null);
+    assert.equal(box.closeCode, 1008);
+    assert.equal(r.fm.connectedAgents.get(HOST_A), live);
+    assert.equal(first.box.closeCode, null);
+    assert.ok(r.fm.registry.securityEvents.find((e) => e.kind === 'agent_displace_refused'));
+  } finally {
+    await r.close();
+  }
+});
+
+test('a newcomer replaces a live socket that misses its ping; the replaced close does not mark the host offline', async () => {
+  const r = await rig({ SYSTEMAPI_AGENT_PROBE_MS: '200' });
+  try {
+    // A half-open socket: it stays open but never answers a ping.
+    const stale = r.track(new WebSocket(`${r.base}/api/v1/systems/stream`, {
+      autoPong: false,
+      headers: {
+        authorization: 'Bearer agent-key',
+        'x-systemapi-tenant': 'acme',
+        'x-systemapi-host-id': HOST_A,
+        'x-systemapi-hostname': 'a.example',
+        'x-systemapi-ssh-pubkey': opensshEd25519(r.fm.signer.publicKeyRaw)
+      }
+    }));
+    const staleBox = collect(stale);
+    await waitUntil('enrolled', () => staleBox.frames.find((f) => f.type === 'enrolled'));
     const second = await connectAgent(r);
-    assert.equal(r.fm.connectedAgents.get(HOST_A) !== undefined, true);
-    first.ws.close();
-    await waitUntil('first closed', () => first.box.closeCode !== null);
+    await waitUntil('stale dropped', () => staleBox.closeCode !== null);
     await new Promise((resolve) => setTimeout(resolve, 50));
     assert.equal(r.fm.connectedAgents.size, 1);
+    assert.notEqual(r.fm.connectedAgents.get(HOST_A), undefined);
     assert.equal((await r.fm.registry.getHost(['acme'], HOST_A)).status, 'online');
     second.ws.close();
     await waitUntil('offline', () => r.fm.connectedAgents.size === 0);

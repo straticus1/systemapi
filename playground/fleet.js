@@ -17,6 +17,16 @@
  * notes); this file routes their
  * upgrade path, agent frames and binary data, and ends them when the agent
  * connection drops.
+ * One live agent per host: a second connection for a host whose agent is
+ * connected (it already passed enroll, so it holds the same key and SSH public
+ * key) wins only when the live socket fails a ping probe
+ * (SYSTEMAPI_AGENT_PROBE_MS, 5 s); while the live agent answers, the newcomer
+ * gets enroll_error host_connected (today's agent treats that as fatal and
+ * exits; systemd's Restart=on-failure retries in 30 s). An agent reconnecting
+ * after a network drop gets in once the server's half-open socket stops
+ * answering. Does NOT prove
+ * the newcomer holds the SSH private key: with the real agent offline, a
+ * stolen API key plus the (public) host key still enrolls.
  */
 
 const WebSocket = require('ws');
@@ -51,6 +61,7 @@ const PTY_RENEW_MS = 30_000;
 const PTY_LEASE_TTL_S = 60;
 const PTY_MAX_SECONDS_DEFAULT = 28800;
 const PTY_MAX_SECONDS_CAP = 7 * 86400;
+const AGENT_PROBE_MS_DEFAULT = 5000;
 const PURPOSE_ACTIONS = new Map([
     ['terminal:open', 'pty'],
     ['terminal:root', 'pty_root'],
@@ -142,6 +153,8 @@ class FleetManager {
         this.hostTenants = new Map();
         this.alertCooldown = new Map();
         this.pendingExecutions = new Map();
+        // Hosts whose live agent is being ping-probed for a newcomer.
+        this.agentProbes = new Set();
         this.signer = null;
         this.tickets = null;
         this.registry = null;
@@ -844,6 +857,13 @@ class FleetManager {
                 platform: '',
                 sshPubkey: enroll.sshPubkey
             });
+            const live = this.connectedAgents.get(host.host_id);
+            if (live && live !== ws && !(await this.displaceStaleAgent(host.host_id, live))) {
+                await this.noteSecurity('agent_displace_refused', fingerprint(keyId), { host_id: host.host_id });
+                ws.send(JSON.stringify({ type: 'enroll_error', error: 'host_connected' }));
+                ws.close(1008);
+                return;
+            }
             hostId = host.host_id;
             this.hostTenants.set(hostId, host.tenant_id);
             this.agentCaps.set(ws, request.systemapiCapabilities || new Set());
@@ -857,6 +877,41 @@ class FleetManager {
             await this.noteSecurity('enroll_rejected', fingerprint(keyId), { error: err.code || 'enroll_failed' });
             ws.send(JSON.stringify({ type: 'enroll_error', error: err.code || 'enroll_failed' }));
             ws.close();
+        }
+    }
+
+    // A newcomer for hostId may replace the live agent socket only when that
+    // socket does not answer a ping within the probe window. True when live
+    // is gone or was dropped (and unregistered, so its close does not mark
+    // the host offline); false while it answers, while another probe for the
+    // host runs, or when a third socket took the host meanwhile.
+    async displaceStaleAgent(hostId, live) {
+        if (this.agentProbes.has(hostId)) return false;
+        this.agentProbes.add(hostId);
+        try {
+            const answered = live.readyState !== WebSocket.OPEN ? false : await new Promise((resolve) => {
+                let timer = null;
+                const done = (value) => {
+                    clearTimeout(timer);
+                    live.off('pong', onPong);
+                    live.off('close', onClose);
+                    resolve(value);
+                };
+                const onPong = () => done(true);
+                const onClose = () => done(false);
+                live.on('pong', onPong);
+                live.on('close', onClose);
+                timer = setTimeout(() => done(false), envInt(this.env, 'SYSTEMAPI_AGENT_PROBE_MS', AGENT_PROBE_MS_DEFAULT, 10, 60000));
+                try { live.ping(); } catch { done(false); }
+            });
+            if (answered) return false;
+            const current = this.connectedAgents.get(hostId);
+            if (current && current !== live) return false;
+            this.connectedAgents.delete(hostId);
+            live.terminate();
+            return true;
+        } finally {
+            this.agentProbes.delete(hostId);
         }
     }
 
