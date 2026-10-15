@@ -10,8 +10,10 @@
 // file entries are absolute directories with read, or read and write (never
 // "/", "~" or root), and the host must resolve to exactly one host of the
 // named tenant. `set` replaces BOTH host columns, so nothing from an earlier
-// policy lingers; `clear` sets both to null (back to the tenant default, else
-// deny). Every set and clear appends an audit-chain row (actor
+// policy lingers; `clear` is an explicit deny on the host (tcp_policy
+// {allow:[]}, file_policy {roots:[]}), which a tenant default does not
+// override; `inherit` sets both to null (back to the tenant default, else
+// deny). Every set, clear and inherit appends an audit-chain row (actor
 // "cli:channel-policy", the old and new policies); if that write fails the
 // previous policy is put back and the command fails. Does NOT check who runs
 // it: whoever can read the env file can already write the database. Does NOT
@@ -24,6 +26,7 @@
 //        node scripts/channel-policy.js set   --tenant <t> --host <hostname|host_id>
 //               [--tcp-local <port>]... [--file-read <dir>]... [--file-write <dir>]...
 //        node scripts/channel-policy.js clear --tenant <t> --host <hostname|host_id>
+//        node scripts/channel-policy.js inherit --tenant <t> --host <hostname|host_id>
 // Database and env file: as scripts/sso-bind.js (ENV_FILE, else
 // .env.production beside server.js).
 'use strict';
@@ -35,9 +38,15 @@ const { validateFileRoot, effectivePolicies } = require('../controlplane/channel
 const ACTOR = 'cli:channel-policy';
 const MAX_ENTRIES = 16;
 const HOST_RE = /^[A-Za-z0-9._-]{1,253}$/;
-const USAGE = 'usage: node scripts/channel-policy.js show|set|clear --tenant <t> --host <hostname|host_id> '
+const USAGE = 'usage: node scripts/channel-policy.js show|set|clear|inherit --tenant <t> --host <hostname|host_id> '
   + '[--tcp-local <port>]... [--file-read <dir>]... [--file-write <dir>]...';
-const COMMANDS = new Set(['show', 'set', 'clear']);
+const COMMANDS = new Set(['show', 'set', 'clear', 'inherit']);
+// What each writing command stores in the two host columns and its audit
+// action. clear is an explicit deny; inherit (null) defers to the tenant.
+const WRITES = {
+  clear: { action: 'channel_policy_clear', policy: () => ({ tcp_policy: { allow: [] }, file_policy: { roots: [] } }) },
+  inherit: { action: 'channel_policy_inherit', policy: () => ({ tcp_policy: null, file_policy: null }) }
+};
 const ONCE_FLAGS = new Set(['--tenant', '--host']);
 const LIST_FLAGS = new Set(['--tcp-local', '--file-read', '--file-write']);
 
@@ -100,7 +109,7 @@ function parseArgs(argv) {
   const reads = [...new Set(lists['--file-read'].map((d) => parseDir('--file-read', d)))]
     .filter((d) => !writes.includes(d));
   if (ports.length === 0 && reads.length === 0 && writes.length === 0) {
-    throw usage('set needs at least one --tcp-local, --file-read or --file-write; use clear to remove a policy');
+    throw usage('set needs at least one --tcp-local, --file-read or --file-write; use clear to deny all, inherit for the tenant default');
   }
   if (ports.length > MAX_ENTRIES || reads.length + writes.length > MAX_ENTRIES) {
     throw usage(`at most ${MAX_ENTRIES} ports and ${MAX_ENTRIES} directories`);
@@ -155,7 +164,8 @@ async function run(argv, { registry }) {
   };
   const next = args.command === 'set'
     ? { tcp_policy: args.tcpPolicy, file_policy: args.filePolicy }
-    : { tcp_policy: null, file_policy: null };
+    : WRITES[args.command].policy();
+  const action = args.command === 'set' ? 'channel_policy_set' : WRITES[args.command].action;
 
   await registry.setHostChannelPolicy(host.host_id, next);
   try {
@@ -163,7 +173,7 @@ async function run(argv, { registry }) {
       tenant_id: host.tenant_id,
       host_id: host.host_id,
       actor: ACTOR,
-      action: args.command === 'set' ? 'channel_policy_set' : 'channel_policy_clear',
+      action,
       payload: { ...next, previous_tcp_policy: previous.tcp_policy, previous_file_policy: previous.file_policy }
     });
   } catch {

@@ -73,30 +73,54 @@ test('set replaces both columns; nothing from the earlier policy lingers', async
   assert.equal(await policyDecision(reg, HOST_A, 'tcp:open', { target: { host: 'local', port: 3003 } }), 'target_denied');
 });
 
-test('every set and clear appends one audit row with the old and new policy', async () => {
+test('every set, clear and inherit appends one audit row with the old and new policy', async () => {
   const reg = await fixture();
   await run(SET, { registry: reg });
   await run(['clear', '--tenant', 'afterdark', '--host', HOST_A], { registry: reg });
+  await run(['inherit', '--tenant', 'afterdark', '--host', HOST_A], { registry: reg });
   const rows = reg.audit.filter((r) => r.actor === ACTOR);
-  assert.equal(rows.length, 2);
+  assert.equal(rows.length, 3);
   assert.equal(rows[0].action, 'channel_policy_set');
   assert.equal(rows[0].tenant_id, 'afterdark');
   assert.equal(rows[0].host_id, HOST_A);
   assert.deepEqual(rows[0].payload.tcp_policy, { allow: [{ local: true, ports: [3003] }] });
   assert.equal(rows[0].payload.previous_tcp_policy, null);
   assert.equal(rows[1].action, 'channel_policy_clear');
-  assert.equal(rows[1].payload.tcp_policy, null);
+  assert.deepEqual(rows[1].payload.tcp_policy, { allow: [] });
+  assert.deepEqual(rows[1].payload.file_policy, { roots: [] });
   assert.deepEqual(rows[1].payload.previous_file_policy, { roots: [{ path: '/var/tmp/sah-filetest', read: true, write: true }] });
+  assert.equal(rows[2].action, 'channel_policy_inherit');
+  assert.equal(rows[2].payload.tcp_policy, null);
+  assert.equal(rows[2].payload.file_policy, null);
+  assert.deepEqual(rows[2].payload.previous_tcp_policy, { allow: [] });
 });
 
-test('clear falls back to the tenant default, else deny', async () => {
+test('clear denies on the host even when a tenant default allows', async () => {
   const reg = await fixture();
+  await reg.setTenantChannelPolicy('afterdark', {
+    tcp_policy: { allow: [{ local: true, ports: [3003] }] },
+    file_policy: { roots: [{ path: '/var/tmp/sah-filetest', read: true, write: true }] }
+  });
   await run(SET, { registry: reg });
   const out = await run(['clear', '--tenant', 'afterdark', '--host', 'miniapps1'], { registry: reg });
+  assert.deepEqual(out.host_tcp_policy, { allow: [] });
+  assert.deepEqual(out.host_file_policy, { roots: [] });
+  assert.deepEqual(out.effective_tcp_policy, { allow: [] });
+  assert.deepEqual(out.effective_file_policy, { roots: [] });
+  assert.equal(await policyDecision(reg, HOST_A, 'tcp:open', { target: { host: 'local', port: 3003 } }), 'target_denied');
+  assert.equal(await policyDecision(reg, HOST_A, 'file:read', { root: '/var/tmp/sah-filetest' }), 'root_denied');
+});
+
+test('inherit falls back to the tenant default, else deny', async () => {
+  const reg = await fixture();
+  await run(SET, { registry: reg });
+  const out = await run(['inherit', '--tenant', 'afterdark', '--host', 'miniapps1'], { registry: reg });
   assert.equal(out.host_tcp_policy, null);
   assert.equal(out.host_file_policy, null);
   assert.deepEqual(out.effective_tcp_policy, { allow: [] });
   assert.equal(await policyDecision(reg, HOST_A, 'tcp:open', { target: { host: 'local', port: 3003 } }), 'target_denied');
+  await reg.setTenantChannelPolicy('afterdark', { tcp_policy: { allow: [{ local: true, ports: [3003] }] } });
+  assert.equal(await policyDecision(reg, HOST_A, 'tcp:open', { target: { host: 'local', port: 3003 } }), null);
 });
 
 test('show changes nothing and writes no audit row', async () => {
@@ -189,7 +213,8 @@ test('parseArgs refuses anything wider or malformed', () => {
     ['set', '--tenant', 'afterdark', '--host', 'mini apps1', '--tcp-local', '3003'],
     ['set', '--tenant', 'afterdark', '--host', 'a/../b', '--tcp-local', '3003'],
     ['show', '--tenant', 'afterdark', '--host', 'miniapps1', '--tcp-local', '3003'],
-    ['clear', '--tenant', 'afterdark', '--host', 'miniapps1', '--file-write', '/srv']
+    ['clear', '--tenant', 'afterdark', '--host', 'miniapps1', '--file-write', '/srv'],
+    ['inherit', '--tenant', 'afterdark', '--host', 'miniapps1', '--tcp-local', '22']
   ];
   for (const argv of bad) {
     assert.throws(() => parseArgs(argv), (err) => err.code === 'usage', JSON.stringify(argv));
