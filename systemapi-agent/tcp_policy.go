@@ -4,8 +4,10 @@
 // --tcp-allow list (deny by default, empty refuses everything) is checked
 // against the exact address the agent will dial, and the always-refused
 // classes (unspecified, link-local, multicast, broadcast, 240/4, cloud
-// metadata 100.100.100.200 and fd00:ec2::254, loopback by any spelling but
-// "local") are refused whatever either policy says. Targets are IP literals
+// metadata 100.100.100.200, fd00:ec2::254 and the Azure WireServer
+// 168.63.129.16, the IPv4-embedding IPv6 ranges ::/96, 64:ff9b::/96,
+// 64:ff9b:1::/48 and 2002::/16, loopback by any spelling but "local") are
+// refused whatever either policy says. Targets are IP literals
 // only: a name is never resolved, so DNS rebinding has nothing to work on.
 // The target must be in canonical form (the server normalizes it), so one
 // address has one spelling in the lease, the allowlist check and the dial.
@@ -34,8 +36,11 @@ var tcpForbiddenPrefixes = func() []netip.Prefix {
 	var out []netip.Prefix
 	for _, s := range []string{
 		"0.0.0.0/8", "169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4", "255.255.255.255/32", "100.100.100.200/32",
-		"127.0.0.0/8",
-		"::/128", "fe80::/10", "ff00::/8", "fd00:ec2::254/128", "::1/128",
+		"168.63.129.16/32", "127.0.0.0/8",
+		// ::/96 (IPv4-compatible) covers :: and ::1; NAT64 and 6to4 embed
+		// IPv4 and are refused whole. Keep in sync with FORBIDDEN_V4/V6 in
+		// controlplane/channels.js.
+		"::/96", "fe80::/10", "ff00::/8", "fd00:ec2::254/128", "64:ff9b::/96", "64:ff9b:1::/48", "2002::/16",
 	} {
 		out = append(out, netip.MustParsePrefix(s))
 	}

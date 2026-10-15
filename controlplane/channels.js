@@ -146,9 +146,14 @@ function inCIDR(ip, cidr) {
 }
 
 // TCP §4.1. Loopback is listed separately: as a literal it is bad_target
-// (TCP §2), reached any other way it is target_forbidden.
-const FORBIDDEN_V4 = ['0.0.0.0/8', '169.254.0.0/16', '224.0.0.0/4', '240.0.0.0/4', '255.255.255.255/32', '100.100.100.200/32'].map(parseCIDR);
-const FORBIDDEN_V6 = ['::/128', 'fe80::/10', 'ff00::/8', 'fd00:ec2::254/128'].map(parseCIDR);
+// (TCP §2), reached any other way it is target_forbidden. The IPv6 ranges
+// that embed an IPv4 address (NAT64 64:ff9b::/96 and 64:ff9b:1::/48, 6to4
+// 2002::/16, IPv4-compatible ::/96) are refused whole, so no refused IPv4
+// class is reachable through them. Keep in sync with tcpForbiddenPrefixes
+// in systemapi-agent/tcp_policy.go.
+const FORBIDDEN_V4 = ['0.0.0.0/8', '169.254.0.0/16', '224.0.0.0/4', '240.0.0.0/4', '255.255.255.255/32', '100.100.100.200/32',
+    '168.63.129.16/32'].map(parseCIDR);
+const FORBIDDEN_V6 = ['::/96', 'fe80::/10', 'ff00::/8', 'fd00:ec2::254/128', '64:ff9b::/96', '64:ff9b:1::/48', '2002::/16'].map(parseCIDR);
 const LOOPBACK = ['127.0.0.0/8', '::1/128'].map(parseCIDR);
 
 function isLoopback(ip) {

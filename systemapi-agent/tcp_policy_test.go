@@ -71,6 +71,9 @@ func TestTCPTargetRefusedClasses(t *testing.T) {
 	for _, host := range []string{
 		"169.254.169.254", "0.0.0.0", "0.1.2.3", "224.0.0.1", "239.255.255.250", "255.255.255.255", "240.0.0.1",
 		"100.100.100.200", "::", "fe80::1", "ff02::1", "fd00:ec2::254",
+		// Azure WireServer and the IPv6 ranges that embed IPv4 (same
+		// vectors as tests/channels.test.js).
+		"168.63.129.16", "64:ff9b::a9fe:a9fe", "64:ff9b::a00:7", "64:ff9b:1::a00:7", "64:ff9b:1:ffff::1", "2002:a9fe:a9fe::1", "2002::1", "::a00:7", "::a9fe:a9fe",
 		// Loopback by any spelling but "local".
 		"127.0.0.1", "127.9.9.9", "::1",
 		// Non-canonical spellings and names are refused, never resolved.
@@ -80,7 +83,8 @@ func TestTCPTargetRefusedClasses(t *testing.T) {
 			t.Fatalf("%s: code %q, want target_forbidden", host, code)
 		}
 	}
-	for _, host := range []string{"10.0.0.7", "2001:db8::1", "100.100.100.201", "169.255.0.1", "fd00:ec2::253"} {
+	for _, host := range []string{"10.0.0.7", "2001:db8::1", "100.100.100.201", "169.255.0.1", "fd00:ec2::253",
+		"168.63.129.17", "64:ff9b:2::1", "64:ff9c::1", "2003::1", "::1:0:0:1"} {
 		a, local, code := tcpTargetAddr(host)
 		if code != "" || local || a.String() != host {
 			t.Fatalf("%s: %v %v %q", host, a, local, code)

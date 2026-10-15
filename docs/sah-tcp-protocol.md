@@ -107,9 +107,17 @@ All of these must pass.
    - multicast: `224.0.0.0/4`, `ff00::/8`;
    - `255.255.255.255`;
    - `240.0.0.0/4`;
-   - `100.100.100.200`;
-   - `fd00:ec2::254`;
+   - cloud metadata and host agents: `100.100.100.200`, `fd00:ec2::254`, and
+     the Azure WireServer `168.63.129.16`;
+   - the IPv6 ranges that embed an IPv4 address, refused whole so no refused
+     IPv4 class is reachable through them: IPv4-compatible `::/96` (which
+     also covers `::` and `::1`), NAT64 `64:ff9b::/96` and `64:ff9b:1::/48`,
+     and 6to4 `2002::/16`;
    - loopback reached any way other than `"local"`.
+
+   The server (`controlplane/channels.js`) and the agent
+   (`systemapi-agent/tcp_policy.go`) keep identical lists, and their tests
+   share the same vectors.
 
    A match gives `target_forbidden`. No policy can override this.
 2. **Server policy.** Per host, falling back to a tenant default

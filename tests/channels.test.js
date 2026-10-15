@@ -63,10 +63,15 @@ test('tcp target: always-refused classes give target_forbidden', () => {
   // TCP §14: 169.254.169.254 gives target_forbidden.
   for (const host of ['169.254.169.254', '0.0.0.0', '0.1.2.3', '224.0.0.1', '239.255.255.250', '255.255.255.255',
     '240.0.0.1', '100.100.100.200', '::', 'fe80::1', 'febf::1', 'ff02::1', 'fd00:ec2::254',
-    '::ffff:169.254.169.254', '::ffff:0.0.0.0']) {
+    '::ffff:169.254.169.254', '::ffff:0.0.0.0',
+    // Azure WireServer and the IPv6 ranges that embed IPv4 (same vectors as
+    // systemapi-agent/tcp_policy_test.go).
+    '168.63.129.16', '64:ff9b::a9fe:a9fe', '64:ff9b::a00:7', '64:ff9b:1::a00:7', '64:ff9b:1:ffff::1', '2002:a9fe:a9fe::1', '2002::1',
+    '::a00:7', '::a9fe:a9fe', '64:ff9b::169.254.169.254']) {
     assert.equal(ch.validateTcpTarget({ host, port: 80 }).error, 'target_forbidden', host);
   }
-  for (const host of ['100.100.100.201', '169.255.0.1', 'fec0::1', 'fd00:ec2::253', '223.255.255.255']) {
+  for (const host of ['100.100.100.201', '169.255.0.1', 'fec0::1', 'fd00:ec2::253', '223.255.255.255',
+    '168.63.129.17', '64:ff9b:2::1', '64:ff9c::1', '2003::1', '::1:0:0:1']) {
     assert.equal(ch.validateTcpTarget({ host, port: 80 }).ok, true, host);
   }
 });
