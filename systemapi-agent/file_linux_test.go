@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -841,6 +842,26 @@ func TestFileLinuxStaleUploadsExpire(t *testing.T) {
 	}
 	if len(loadUploads(h.ch.stateDir)) != 0 {
 		t.Fatal("stale record not removed")
+	}
+}
+
+// The first file session starts the hourly sweeper and later ones do not:
+// two sessions, one sweeper.
+func TestFileLinuxSessionStartsTheSweeperOnce(t *testing.T) {
+	needOpenat2(t)
+	var starts atomic.Int32
+	prevRun := uploadSweeperRun
+	uploadSweeperOnce = sync.Once{}
+	uploadSweeperRun = func(string, time.Duration, <-chan struct{}, func(root, path, id string) error) { starts.Add(1) }
+	t.Cleanup(func() { uploadSweeperRun = prevRun })
+	h := newFileHarness(t)
+	root := t.TempDir()
+	h.ready(t, h.open(t, root, fileOpenOpts{}))
+	waitFor(t, "the sweeper to start", 5*time.Second, func() bool { return starts.Load() >= 1 })
+	h.ready(t, h.open(t, root, fileOpenOpts{}))
+	time.Sleep(100 * time.Millisecond)
+	if n := starts.Load(); n != 1 {
+		t.Fatalf("sweeper started %d times, want 1", n)
 	}
 }
 

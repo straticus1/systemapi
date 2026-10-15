@@ -199,7 +199,11 @@ func countUploads(stateDir, actor, root string, now time.Time) int {
 	return n
 }
 
-var uploadSweeperOnce sync.Once
+var (
+	uploadSweeperOnce sync.Once
+	// uploadSweeperRun is the sweeper loop; a test swaps it to count starts.
+	uploadSweeperRun = runUploadSweeper
+)
 
 // startUploadSweeper sweeps expired uploads every uploadSweepEvery for the
 // life of the process, so temp files of an agent that sees no new file
@@ -209,7 +213,7 @@ func startUploadSweeper(stateDir string) {
 		return
 	}
 	uploadSweeperOnce.Do(func() {
-		go runUploadSweeper(stateDir, uploadSweepEvery, nil, removeUploadTemp)
+		go uploadSweeperRun(stateDir, uploadSweepEvery, nil, removeUploadTemp)
 	})
 }
 
