@@ -1748,3 +1748,25 @@ test('audit verify is refused for a caller in no tenant', async () => {
     server.close();
   }
 });
+
+test('a member id must match USER_RE, so it can never be a JWT principal ("oidc:<sub>")', async () => {
+  const fm = fleet();
+  await seed(fm);
+  const admin = await listen(appFor(fm, await ssoUser(fm, 'user-1')));
+  const add = (user_id) => call(`${admin.url}/api/v1/tenants/acme/members`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ user_id, role: 'viewer' })
+  });
+  try {
+    for (const bad of ['oidc:ryan', 'a:b', ' ryan', '']) {
+      const res = await add(bad);
+      assert.equal(res.status, 400, bad);
+      assert.equal(res.body.error, 'bad_user');
+    }
+    assert.equal(fm.registry.members.some((m) => m.user_id.includes(':')), false);
+    assert.equal((await add('viewer-9')).status, 201);
+  } finally {
+    admin.server.close();
+  }
+});

@@ -82,7 +82,26 @@ test('a token signed by the issuer key, for the audience, inside its lifetime ve
   const auth = manager();
   const payload = await auth.verifyJWTToken(sign(claims()));
   assert.equal(payload.sub, 'authentik-sub-123');
-  assert.equal(await auth.getUserFromToken(sign(claims())), 'authentik-sub-123');
+  assert.equal(await auth.getUserFromToken(sign(claims())), 'oidc:authentik-sub-123');
+});
+
+test('rejects a token with no sub, an empty or non-string sub, and a user_id-only token', async () => {
+  const auth = manager();
+  const noSub = claims();
+  delete noSub.sub;
+  assert.equal(await auth.verifyJWTToken(sign(noSub)), null);
+  assert.equal(await auth.getUserFromToken(sign(noSub)), null);
+  assert.equal(await auth.getUserFromToken(sign({ ...noSub, user_id: 'ryan' })), null);
+  assert.equal(await auth.getUserFromToken(sign(claims({ sub: '' }))), null);
+  assert.equal(await auth.getUserFromToken(sign(claims({ sub: 42 }))), null);
+  assert.equal(await auth.getUserFromToken(sign(claims({ sub: 'x'.repeat(251) }))), null);
+});
+
+test('the JWT principal is namespaced and can never be a control-plane member id', async () => {
+  const { USER_RE } = require('../controlplane/oauth');
+  const principal = await manager().getUserFromToken(sign(claims({ sub: 'ryan' })));
+  assert.equal(principal, `${AuthManager.JWT_PRINCIPAL_PREFIX}ryan`);
+  assert.equal(USER_RE.test(principal), false);
 });
 
 test('rejects a token from the wrong issuer', async () => {
@@ -211,4 +230,122 @@ test('constructing an AuthManager does no network I/O', () => {
   const setup = issuerFetch();
   manager(setup);
   assert.deepEqual(setup.calls, { discovery: 0, jwks: 0 });
+});
+
+// M1: a JWT whose sub equals a member id ("ryan") must not act for that
+// member through the playground key routes, and the key it mints must carry
+// no tenant powers in the control plane.
+
+const express = require('express');
+const bcrypt = require('bcryptjs');
+const createPlaygroundRouter = require('../playground/router');
+const FleetManager = require('../playground/fleet');
+const { MemoryRegistry } = require('../controlplane/registry');
+const { authenticate } = require('../controlplane/router');
+
+// Just the playground_api_keys statements the key routes and key checks run.
+function keysPool() {
+  const rows = [];
+  async function query(sql, params = []) {
+    const q = sql.replace(/\s+/g, ' ').trim();
+    if (q.startsWith('INSERT INTO playground_api_keys')) {
+      const [key_id, key_hash, user_id, name, api_site, description] = params;
+      rows.push({ key_id, key_hash, user_id, name, api_site, description, is_active: true, is_locked: false, created_at: new Date() });
+      return { rows: [], rowCount: 1 };
+    }
+    if (q.includes('FROM playground_api_keys WHERE key_id = $1 AND api_site = $2 AND is_active = true AND is_locked = false')) {
+      const r = rows.filter((k) => k.key_id === params[0] && k.api_site === params[1] && k.is_active && !k.is_locked);
+      return { rows: r, rowCount: r.length };
+    }
+    if (q.startsWith('SELECT user_id FROM playground_api_keys WHERE key_id = $1 AND api_site = $2')) {
+      const r = rows.filter((k) => k.key_id === params[0] && k.api_site === params[1]);
+      return { rows: r, rowCount: r.length };
+    }
+    if (q.includes('FROM playground_api_keys WHERE user_id = $1 AND api_site = $2')) {
+      const r = rows.filter((k) => k.user_id === params[0] && k.api_site === params[1]);
+      return { rows: r, rowCount: r.length };
+    }
+    if (q.includes('FROM playground_api_keys WHERE key_id = $1')) {
+      const r = rows.filter((k) => k.key_id === params[0]);
+      return { rows: r, rowCount: r.length };
+    }
+    if (q.startsWith('UPDATE playground_api_keys SET is_active = false WHERE key_id = $1')) {
+      rows.filter((k) => k.key_id === params[0]).forEach((k) => { k.is_active = false; });
+      return { rows: [], rowCount: 1 };
+    }
+    if (q.startsWith('UPDATE playground_api_keys SET is_locked = $1 WHERE key_id = $2')) {
+      rows.filter((k) => k.key_id === params[1]).forEach((k) => { k.is_locked = params[0]; });
+      return { rows: [], rowCount: 1 };
+    }
+    if (q.startsWith('UPDATE playground_api_keys SET last_used_at')) return { rows: [], rowCount: 1 };
+    throw new Error(`unexpected SQL in test pool: ${q}`);
+  }
+  return { rows, query, async connect() { return { query, release() {} }; } };
+}
+
+test('a JWT whose sub equals a member id cannot list, lock or delete that member\'s keys, and its key has no tenant powers', async () => {
+  const setup = issuerFetch();
+  const realFetch = globalThis.fetch;
+  const savedEnv = { AUTHENTIK_ISSUER: process.env.AUTHENTIK_ISSUER, OIDC_AUDIENCE: process.env.OIDC_AUDIENCE };
+  // The router builds its own AuthManager from process.env; serve the issuer
+  // in-process and pass every other request (the test's own) through.
+  globalThis.fetch = (url, opts) => (String(url).startsWith('https://issuer.test/') ? setup.fetch(url, opts) : realFetch(url, opts));
+  process.env.AUTHENTIK_ISSUER = ISSUER;
+  process.env.OIDC_AUDIENCE = AUDIENCE;
+
+  const pool = keysPool();
+  const adminSecret = 'ak_live_ryanbootstrap0.ryanbootstrapsecret';
+  pool.rows.push({
+    key_id: 'ak_live_ryanbootstrap0', key_hash: await bcrypt.hash(adminSecret, 4), user_id: 'ryan',
+    name: 'bootstrap', api_site: 'systemapi', is_active: true, is_locked: false, created_at: new Date()
+  });
+  const registry = new MemoryRegistry({ NODE_ENV: 'test' });
+  await registry.enroll({ tenantId: 'acme', userId: 'ryan', keyId: 'ak_live_ryanbootstrap0', hostId: '11111111-1111-4111-8111-111111111111', hostname: 'a', os: '', platform: '', sshPubkey: 'x' });
+  const fleet = { registry, db: pool, apiSite: 'systemapi', env: { NODE_ENV: 'test' } };
+  fleet.verifyApiKey = FleetManager.prototype.verifyApiKey.bind(fleet);
+  const principalFor = (secret) => authenticate({ query: {}, get: (h) => (h === 'x-api-key' ? secret : undefined) }, fleet);
+  assert.equal((await principalFor(adminSecret)).memberships.length, 1);
+
+  const app = express();
+  app.use(express.json());
+  app.use('/playground', createPlaygroundRouter({ db: pool, redis: null, keycloakURL: 'https://unused.test', keycloakRealm: 'unused', keycloakClientID: 'systemapi-client', apiSite: 'systemapi', baseURL: 'http://127.0.0.1' }));
+  const server = await new Promise((resolve) => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
+  const base = `http://127.0.0.1:${server.address().port}/playground`;
+  const headers = { authorization: `Bearer ${sign(claims({ sub: 'ryan' }))}`, 'content-type': 'application/json' };
+  try {
+    const list = await realFetch(`${base}/api-keys`, { headers });
+    assert.equal(list.status, 200);
+    assert.deepEqual((await list.json()).api_keys, []);
+
+    const lock = await realFetch(`${base}/api-keys/ak_live_ryanbootstrap0/lock`, { method: 'PATCH', headers, body: JSON.stringify({ locked: true }) });
+    assert.equal(lock.status, 403);
+    const del = await realFetch(`${base}/api-keys/ak_live_ryanbootstrap0`, { method: 'DELETE', headers });
+    assert.equal(del.status, 403);
+    const admin = pool.rows.find((k) => k.key_id === 'ak_live_ryanbootstrap0');
+    assert.equal(admin.is_locked, false);
+    assert.equal(admin.is_active, true);
+
+    const mint = await realFetch(`${base}/api-keys`, { method: 'POST', headers, body: JSON.stringify({ name: 'mine' }) });
+    assert.equal(mint.status, 201);
+    const minted = await mint.json();
+    assert.equal(pool.rows.find((k) => k.key_id === minted.key_id).user_id, 'oidc:ryan');
+    const principal = await principalFor(minted.key_secret);
+    assert.equal(principal.userId, 'oidc:ryan');
+    assert.deepEqual(principal.memberships, []);
+
+    // The JWT user still owns and manages its own key.
+    const own = await realFetch(`${base}/api-keys`, { headers });
+    assert.deepEqual((await own.json()).api_keys.map((k) => k.key_id), [minted.key_id]);
+    const ownLock = await realFetch(`${base}/api-keys/${minted.key_id}/lock`, { method: 'PATCH', headers, body: JSON.stringify({ locked: true }) });
+    assert.equal(ownLock.status, 200);
+    const ownDel = await realFetch(`${base}/api-keys/${minted.key_id}`, { method: 'DELETE', headers });
+    assert.equal(ownDel.status, 200);
+  } finally {
+    server.close();
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
 });

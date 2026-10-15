@@ -851,7 +851,9 @@ function mount(app, fleet) {
     requireScope(fleet, principal, tenantId, 'admin');
     const role = req.body && req.body.role;
     const userId = req.body && req.body.user_id;
-    if (typeof userId !== 'string' || userId.length === 0 || userId.length > 200) throw http(400, 'bad_user');
+    // USER_RE has no colon, so a member id can never be a JWT principal
+    // ("oidc:<sub>", playground/auth.js).
+    if (typeof userId !== 'string' || !USER_RE.test(userId)) throw http(400, 'bad_user');
     const row = await fleet.registry.addMember(tenantId, userId, role, req.body.email);
     res.status(201).json(row);
   }));

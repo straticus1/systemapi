@@ -12,8 +12,12 @@
  * from jose against the issuer's jwks_uri. Every failure returns null (no
  * user). Audience is OIDC_AUDIENCE, else the configured client id; with
  * neither every token is refused. The jwks_uri must be https and on the
- * issuer's origin. Does NOT mint tokens, decide what a user
- * may do, or log tokens (only error codes).
+ * issuer's origin. The token must carry a non-empty string sub; the
+ * principal is JWT_PRINCIPAL_PREFIX + sub ("oidc:<sub>"), never the raw sub,
+ * so a sub can never equal a control-plane member id (USER_RE allows no
+ * colon) and a key minted by a JWT user has no tenant powers unless a member
+ * row is made for that exact principal. Does NOT mint tokens, decide what a
+ * user may do, or log tokens (only error codes).
  */
 
 const bcrypt = require('bcryptjs');
@@ -26,6 +30,12 @@ const JWKS_TIMEOUT_MS = 5000;
 // After a failed discovery, tokens are refused without a new attempt for
 // this long, so a flood of bearer tokens cannot become a flood of fetches.
 const DISCOVERY_RETRY_MS = 30000;
+// JWT principals live in their own namespace: control-plane member ids match
+// USER_RE (controlplane/oauth.js), which has no colon, so "oidc:<sub>" can
+// never be a member id an admin or the bootstrap made.
+const JWT_PRINCIPAL_PREFIX = 'oidc:';
+// playground_api_keys.user_id is VARCHAR(255).
+const JWT_SUB_MAX = 255 - JWT_PRINCIPAL_PREFIX.length;
 
 class AuthManager {
   /**
@@ -292,7 +302,7 @@ class AuthManager {
         audience,
         algorithms: JWT_ALGORITHMS,
         clockTolerance: 30,
-        requiredClaims: ['exp']
+        requiredClaims: ['exp', 'sub']
       });
       return payload;
     } catch (error) {
@@ -302,18 +312,19 @@ class AuthManager {
   }
 
   /**
-   * Get user ID from JWT token
+   * The namespaced principal for a verified JWT: "oidc:<sub>". No other
+   * claim (user_id, email, preferred_username) is ever used as identity.
    * @param {string} token - JWT token
-   * @returns {Promise<string|null>} user_id or null
+   * @returns {Promise<string|null>} principal or null
    */
   async getUserFromToken(token) {
     const payload = await this.verifyJWTToken(token);
     if (!payload) {
       return null;
     }
-
-    // Authentik/Keycloak uses 'sub' as user ID
-    return payload.sub || payload.user_id || null;
+    const sub = payload.sub;
+    if (typeof sub !== 'string' || sub.length === 0 || sub.length > JWT_SUB_MAX) return null;
+    return JWT_PRINCIPAL_PREFIX + sub;
   }
 
   /**
@@ -376,3 +387,4 @@ class AuthManager {
 }
 
 module.exports = AuthManager;
+module.exports.JWT_PRINCIPAL_PREFIX = JWT_PRINCIPAL_PREFIX;
