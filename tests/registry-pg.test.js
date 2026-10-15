@@ -1,7 +1,7 @@
 'use strict';
 
 // PgRegistry against a real PostgreSQL: the enroll upsert, and the fleet's
-// agent-key lookup. A fresh database per run with the schema applied by
+// agent-key lookup (expiry and the optional tenant binding). A fresh database per run with the schema applied by
 // createRegistry. Needs SYSTEMAPI_TEST_DATABASE_URL (a role that may CREATE DATABASE); it fails,
 // not skips, without it. Not part of npm test.
 //
@@ -92,4 +92,15 @@ test('fleet.verifyApiKey refuses an expired key and accepts an unexpired one', a
   assert.equal(await FleetManager.prototype.verifyApiKey.call(fleet, 'ak_live_pgexpired.s1'), null);
   assert.equal((await FleetManager.prototype.verifyApiKey.call(fleet, 'ak_live_pgcurrent.s2')).key_id, 'ak_live_pgcurrent');
   assert.equal((await FleetManager.prototype.verifyApiKey.call(fleet, 'ak_live_pgnoexpiry.s3')).key_id, 'ak_live_pgnoexpiry');
+});
+
+test('fleet.verifyApiKey returns the key\'s tenant binding, null when unset', async () => {
+  const fleet = { db: pool, apiSite: 'systemapi', env: { NODE_ENV: 'production' } };
+  await pool.query(
+    `INSERT INTO playground_api_keys (key_id, key_hash, user_id, name, api_site, tenant_id)
+     VALUES ($1, $2, 'user-1', 'agent', 'systemapi', $3)`,
+    ['ak_live_pgbound', await bcrypt.hash('ak_live_pgbound.s4', 4), 'acme']
+  );
+  assert.equal((await FleetManager.prototype.verifyApiKey.call(fleet, 'ak_live_pgbound.s4')).tenant_id, 'acme');
+  assert.equal((await FleetManager.prototype.verifyApiKey.call(fleet, 'ak_live_pgnoexpiry.s3')).tenant_id, null);
 });

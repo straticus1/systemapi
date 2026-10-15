@@ -31,6 +31,11 @@ CREATE TABLE IF NOT EXISTS playground_api_keys (
     CONSTRAINT playground_api_keys_key_id_unique UNIQUE (key_id)
 );
 
+-- Optional enrollment binding: when set, an agent dialing with this key may
+-- enroll only into this tenant (playground/fleet.js). NULL keeps the old rule
+-- (any tenant the key's user is a member of). Set by an admin in SQL.
+ALTER TABLE playground_api_keys ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(63);
+
 CREATE INDEX IF NOT EXISTS idx_playground_api_keys_user_id ON playground_api_keys(user_id);
 CREATE INDEX IF NOT EXISTS idx_playground_api_keys_key_id ON playground_api_keys(key_id);
 CREATE INDEX IF NOT EXISTS idx_playground_api_keys_api_site ON playground_api_keys(api_site);

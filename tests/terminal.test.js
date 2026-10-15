@@ -647,6 +647,33 @@ test('a key check that errors twice in a row closes the agent', async () => {
   }
 });
 
+test('a key bound to a tenant enrolls only into that tenant', async () => {
+  const r = await rig();
+  try {
+    r.fm.verifyApiKey = async (key) => (key === 'agent-key' ? { key_id: 'k1', user_id: 'user-1', tenant_id: 'other' } : null);
+    const ws = r.track(new WebSocket(`${r.base}/api/v1/systems/stream`, {
+      headers: {
+        authorization: 'Bearer agent-key',
+        'x-systemapi-tenant': 'acme',
+        'x-systemapi-host-id': HOST_A,
+        'x-systemapi-hostname': 'a.example',
+        'x-systemapi-ssh-pubkey': opensshEd25519(r.fm.signer.publicKeyRaw)
+      }
+    }));
+    const box = collect(ws);
+    const refused = await waitUntil('enroll_error', () => box.frames.find((f) => f.type === 'enroll_error'));
+    assert.equal(refused.error, 'key_tenant_mismatch');
+    await waitUntil('closed', () => box.closeCode !== null);
+    assert.equal(await r.fm.registry.getHost(['acme'], HOST_A), null);
+    assert.equal(r.fm.registry.tenants.has('acme'), false, 'no tenant was created');
+    r.fm.verifyApiKey = async (key) => (key === 'agent-key' ? { key_id: 'k1', user_id: 'user-1', tenant_id: 'acme' } : null);
+    await connectAgent(r);
+    assert.equal(r.fm.connectedAgents.has(HOST_A), true);
+  } finally {
+    await r.close();
+  }
+});
+
 test('an agent dialing with the same key and host id but another SSH key is refused', async () => {
   const r = await rig();
   try {

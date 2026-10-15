@@ -27,6 +27,8 @@
  * answering. Does NOT prove
  * the newcomer holds the SSH private key: with the real agent offline, a
  * stolen API key plus the (public) host key still enrolls.
+ * A key whose playground_api_keys.tenant_id is set enrolls only into that
+ * tenant (enroll_error key_tenant_mismatch otherwise).
  * A revoked key loses its live agents: the /playground/api-keys delete and
  * lock routes call closeAgentsForKey, and every ping (30 s) re-checks
  * registry.keyActive for the socket's key, so a key expired, locked or
@@ -710,7 +712,7 @@ class FleetManager {
             if (parts.length !== 2) return null;
             const keyId = parts[0];
             const res = await this.db.query(
-                `SELECT key_id, user_id, key_hash FROM playground_api_keys
+                `SELECT key_id, user_id, key_hash, tenant_id FROM playground_api_keys
                  WHERE key_id = $1 AND api_site = $2 AND is_active = true AND is_locked = false
                    AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)`,
                 [keyId, this.apiSite]
@@ -720,7 +722,7 @@ class FleetManager {
             const isValid = await bcrypt.compare(secretProvided, res.rows[0].key_hash);
             if (!isValid) return null;
             await this.db.query('UPDATE playground_api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE key_id = $1', [keyId]);
-            return { key_id: res.rows[0].key_id, user_id: res.rows[0].user_id };
+            return { key_id: res.rows[0].key_id, user_id: res.rows[0].user_id, tenant_id: res.rows[0].tenant_id ?? null };
         } catch (err) {
             console.error('[Fleet] API key verification failed:', err.message);
             return null;
@@ -872,6 +874,13 @@ class FleetManager {
         }
         if (!enroll || !this.registry) {
             ws.send(JSON.stringify({ type: 'enroll_error', error: 'enroll_required' }));
+            ws.close();
+            return;
+        }
+        // A key bound to a tenant enrolls only into that tenant.
+        if (keyData.tenant_id != null && keyData.tenant_id !== enroll.tenant) {
+            await this.noteSecurity('enroll_rejected', fingerprint(keyId), { error: 'key_tenant_mismatch' });
+            ws.send(JSON.stringify({ type: 'enroll_error', error: 'key_tenant_mismatch' }));
             ws.close();
             return;
         }
