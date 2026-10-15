@@ -140,6 +140,11 @@ All of these must pass.
   the agent dials only what was signed.
   - The session id matches `^tcs_[A-Za-z0-9_-]{16,64}$`.
   - The lease TTL is 60 s, and the server renews it every 30 s.
+  - Every renewal re-checks the grant first, as the upgrade does: the actor's
+    membership and scopes, an API key still active (not revoked, locked or
+    expired), and the target policy. A denial ends the stream with `stopped`
+    and no new lease is signed. A failed lookup only skips that renewal, so
+    the stream ends at the agent when the last lease lapses.
   - The agent ends the stream when the lease lapses or at the deadline.
 - **Limits.** Each one is enforced by both the server and the agent. Settings:
   - `SYSTEMAPI_TCP_MAX_SECONDS`: default 28800 (8 h).
@@ -206,7 +211,7 @@ All of these must pass.
 | `byte_cap` | The byte cap was reached. |
 | `max_duration` | The maximum duration passed. |
 | `agent_disconnected` | The agent's connection dropped. |
-| `stopped` | The server or an admin ended the stream, or renewal was rejected. |
+| `stopped` | The server or an admin ended the stream, the grant was withdrawn at a renewal (§5), or renewal was rejected. |
 
 - **Client close.** When the client closes its socket, the agent closes the
   target. The audit reason is then `client_closed`; no frame is sent.

@@ -5,7 +5,8 @@ this. Change it only by editing this file and both implementations in the same
 change. List the call in `sah-suite.md` Wired join when it ships. Conventions
 follow `sahconnect-terminal-protocol.md` (the PTY contract). **(rec)** marks a
 recommendation that is not yet in the code. Owner decisions (2026-10-14) are
-folded in: see §13.
+folded in: see §13. The choices the implementation made where this text was
+silent or ambiguous are in §14.
 
 ## 0. Model
 
@@ -89,22 +90,26 @@ The same as PTY:
 ## 4. Requests and responses
 
 - **Request shape.** Every request is a JSON text frame with `type`,
-  `request_id` and `op`.
+  `request_id` and `op` (both spellings of `type` are in §14).
   - `request_id` matches `^[A-Za-z0-9_-]{1,64}$` and is unique per session. A
-    reused id is a `protocol_error`.
+    reused id is a `protocol_error`. The one exception is a write: its
+    chunks, commit and abort carry the `write_open`'s `request_id` (§14).
 - **Response shape.** Exactly one response per operation:
 
       {"type":"file_result","request_id":"r7","op":"<op>","status":"ok"|"error","error":null|"<code>", ...op fields}
 
 - **Field formats.**
   - `sha256` is 64 lowercase hex characters.
-  - `mtime_ns` is integer nanoseconds since the epoch.
+  - `mtime_ns` is integer nanoseconds since the epoch, a signed 64-bit
+    integer (-2^63 ≤ v < 2^63). It exceeds 2^53, so a client in JavaScript
+    MUST parse and send it exactly (not as a double). An `if_match` whose
+    `mtime_ns` is outside that range is `bad_request`.
   - An entry is
     `{"name":"<component>","type":"file"|"dir"|"symlink"|"other","size":N,"mode":"0644","mtime_ns":N}`.
     A symlink's target is never returned.
 - **Sequencing.** A new request before the previous `file_result` is a
-  `protocol_error`. The only exception is `write_chunk` and `write_abort` for
-  the open write.
+  `protocol_error`. The only exception is `write_chunk`, `write_commit` and
+  `write_abort` for the open write.
 - **Unknown `op`.** Gets a `bad_request` result. The session stays open.
 
 | op | Request fields | ok-response fields |
@@ -203,6 +208,19 @@ The same as PTY:
   A partial or corrupt upload is never visible at the target path.
 - **Abort.** `write_abort` deletes the temp file and its record. With no open
   write, the result is `upload_not_found`.
+- **Kept or discarded.** A write that ends without a commit either keeps its
+  temp file and record for resume, or discards both:
+  - **discarded**: `write_abort`; `sha256_mismatch`; the client's own faults,
+    which a resume could not repair: a chunk at the wrong offset or a commit
+    before the last byte (`offset_mismatch`), data past the declared size
+    (`too_large`), a malformed chunk (`bad_request`);
+  - **kept**: the session ending or the connection dropping mid-write, and a
+    host fault on a chunk or the commit (`no_space`, `permission_denied`,
+    `io_error`, ...). A `write_open` whose audit row cannot be written is
+    answered `internal` and its upload is kept.
+- **Chunks after the write ended.** Chunks the client sent before it saw the
+  write end are read and dropped, at most `write_window` per write; one more
+  is a `protocol_error`.
 - **Resume an upload.**
   - The client sends `write_open` with `resume:true` and the same path, size
     and sha256.
@@ -211,8 +229,23 @@ The same as PTY:
     written) and `prefix_sha256`.
   - The client MUST compare `prefix_sha256` with its own local prefix. On a
     mismatch, abort and restart.
-  - Interrupted uploads are kept for 24 h, in the agent's state directory,
-    never in the target tree.
+  - Interrupted uploads are kept for 24 h. Where each part lives (this
+    settles §5.5 against the line above it in earlier drafts):
+    - the **record** (actor hash, root, path, size, sha256, creation time)
+      lives in the agent's state directory, as
+      `<state dir>/file-uploads/<upload_id>.json` (0600, in a 0700
+      directory), never in the target tree;
+    - the **bytes** stay in `.sahsync-<upload_id>.part` beside the target,
+      in its parent directory (§5.5), because the commit must be an atomic
+      rename within one directory.
+  - Expired uploads (temp file, then record) are swept at every session
+    start and hourly while the agent runs.
+  - **Upload cap.** One actor holds at most 16 live uploads (open or
+    interrupted) under one root on one agent. A new `write_open` past that is
+    `no_space`; a resume of an existing one is not a new upload. The client
+    frees a slot by resuming and committing or aborting, or by letting an
+    upload expire. Only the agent can see the records, so only the agent
+    enforces this cap.
 - **Download.**
   1. `stat` the file.
   2. `read` it in ranges, with `if_match`, into a local temp file.
@@ -248,6 +281,12 @@ The same as PTY:
     `"<session_id>\n<deadline_unix>\n<start|renew>\n<read|write>\n<root>"`.
   - The agent refuses a write op on a read lease.
   - The TTL is 60 s, renewed every 30 s.
+  - **Every renewal re-checks the grant** first, as the upgrade does: the
+    actor's membership and scopes, an API key still active (not revoked,
+    locked or expired), and the root policy. A denial ends the session with
+    `stopped` and no new lease is signed. A failed lookup only skips that
+    renewal: nothing is signed, and the agent ends the session when the last
+    lease lapses.
   - The session id matches `^fls_[A-Za-z0-9_-]{16,64}$`.
 - **Limits** (defaults; owner-accepted):
 
@@ -262,6 +301,15 @@ The same as PTY:
 
   Fixed: `chunk_max` 1 MiB, `read_max` 8 MiB, `list_max` 1000. There are no
   batch operations.
+- **Per-agent cap.** 16 live file sessions per agent, enforced by the server
+  and the agent. 2 of them are reserved for `file:root`: `file:read` and
+  `file:write` sessions get at most 14, so an admin can always reach a host
+  that operators have filled.
+- **Roots the agent refuses.** Whatever the policy says, a session other than
+  `file:root` is refused with `root_denied` when its root is `/` (also `"~"`
+  for an account whose home is unset or `/`) or contains the agent's state
+  directory (its identity seed and upload records), compared as given and
+  with symlinks resolved.
 
 ## 8. Error codes
 
@@ -275,7 +323,7 @@ The same as PTY:
 | `agent_unsupported` | The agent lacks file support, or the kernel has no `openat2`. |
 | `lease_required` | No signer on the server. |
 | `cap_reached` | A per-actor or per-agent cap is full. |
-| `root_denied` | The server policy refuses the root. |
+| `root_denied` | The server policy refuses the root, or the agent refuses it (§7: `/`, or a root holding its state directory, outside `file:root`). |
 | `root_invalid` | The root contains a symlink, is missing, or is not a directory. |
 | `pty_user_unset` | The agent has no `pty_user` to run as. |
 | `root_unavailable` | `file:root` on an agent that cannot run as root. |
@@ -298,7 +346,7 @@ The same as PTY:
 | `permission_denied` | The kernel refused for this identity. |
 | `read_only` | A write op in a `file:read` session. |
 | `too_large` | Over a size limit, or past the declared size. |
-| `no_space` | The filesystem is full. |
+| `no_space` | The filesystem is full, or the actor already holds 16 live uploads under this root (§6). |
 | `changed` | `if_match` failed. |
 | `sha256_mismatch` | The committed bytes do not match the declared hash. |
 | `offset_mismatch` | A chunk did not start at the next expected offset. |
@@ -311,7 +359,8 @@ The same as PTY:
   - `byte_cap`
   - `op_cap`
   - `agent_disconnected`
-  - `stopped`
+  - `stopped` (also: the grant was withdrawn at a renewal, §7, or the lease
+    lapsed at the agent)
   - `client_closed` (audit only)
 
 ## 9. Audit (owner decision on volume, 2026-10-14)
@@ -329,12 +378,17 @@ Every column is hashed in the chain.
   - a **result row**: op, path, size, sha256, result.
   - `write_open` and `write_abort` get one row each, including the
     `upload_id`.
-- **Reads** are coalesced into one `file_read` row per path per session: path,
-  total bytes, ranges count, and the last `hash` sha256 if one was taken.
+- **Reads** are coalesced into `file_read` rows per path: path, bytes,
+  ranges count, and the last `hash` sha256 if one was taken. The rows are
+  flushed every 60 s, as soon as one path's unflushed bytes reach 1 GiB, and
+  at the session end; each flush resets the counters, so a long session has
+  several rows for one path and every byte is in exactly one of them.
 - **`stat` and `list`** get no individual rows. They are counted in
   `file_session_end` (`stat_count` and `list_count`).
 - **`file_session_end`:** reason, ops, `bytes_read`, `bytes_written`,
-  `stat_count`, `list_count`, `duration_s`.
+  `stat_count`, `list_count`, `failed_reads` (`read` and `hash` results that
+  were errors, `permission_denied` say), `duration_s`. It follows every
+  `file_read` row of the session.
 - **File content is not recorded.** Path, size and sha256 identify exactly
   what moved. Keeping a second copy of every file would be an unbounded
   retention and breach liability.
@@ -421,3 +475,44 @@ Every column is hashed in the chain.
   privileges.
 - **Kernel.** `openat2` is required, with no fallback.
 - **Defaults.** As listed in §7.
+
+## 14. Implementation decisions (where §1–§12 were silent)
+
+- **Request `type`.** A request is either
+  `{"type":"file_request","request_id":...,"op":"<op>",...}` or names the op
+  in `type` itself: `{"type":"<op>","request_id":...}` (`op` then omitted or
+  equal to `type`). An `op` with any other `type` is a `protocol_error`; a
+  request that names no known op either way gets `bad_request`. A chunk
+  header is `{"type":"write_chunk",...}`.
+- **Write `request_id` reuse.** `write_open` opens a write under its
+  `request_id`. Its `write_chunk` headers, its `write_ack`s and its
+  `write_commit` or `write_abort` all carry that same id; this is the one
+  allowed reuse. While a write is open, any other request (a commit or abort
+  under another id included) is a `protocol_error`; with no write open, a
+  `write_commit` or `write_abort` gets `upload_not_found`.
+- **Kept versus discarded temp files.** As listed in §6 ("Kept or
+  discarded").
+- **Exact `mtime_ns`.** The server parses every integer literal of 16 or more
+  digits exactly and relays it with the same digits; the agent decodes it as
+  int64. A request the agent cannot decode but whose `request_id` it can
+  read is answered `bad_request` rather than dropped, so the session never
+  waits on it.
+- **Default modes.** A new file gets 0644 unless `mode` is given; an
+  overwritten regular file keeps its current mode unless `mode` is given. A
+  new directory gets 0755 unless `mode` is given. The helper runs with umask
+  0, so the mode is exact.
+- **`list`.** Entries named `.sahsync-*.part` (the agent's temp files) and
+  names that are not valid UTF-8 (no request could address them, §5.1) are
+  left out.
+- **`list` cursor.** `next_cursor` is the unpadded base64url encoding of the
+  last returned name; a request's `cursor` resumes after that name in
+  bytewise order. Clients treat it as opaque. It is at most 1024 characters.
+- **Session caps.** 16 file sessions per agent, 2 reserved for `file:root`
+  (§7), plus `SYSTEMAPI_FILE_MAX_PER_ACTOR`.
+- **Upload cap.** 16 live uploads per actor and root on the agent, `no_space`
+  past it (§6).
+- **Audit action names.** `ticket_issued`; `file_session_start`;
+  `file_intent` (the intent row before `write_commit`, `mkdir` and
+  `remove`); `file_op` (one row each for `write_open`, `write_commit`,
+  `write_abort`, `mkdir` and `remove`, with `result`); `file_read`;
+  `file_session_end`.
