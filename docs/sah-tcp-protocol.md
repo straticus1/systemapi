@@ -149,7 +149,10 @@ All of these must pass.
     `bytes_out`.
   - The agent's dial timeout is 10 s. The server's start timeout is 30 s.
 - **Caps.** Over a cap gives `cap_reached`.
-  - Live TCP sessions per actor: `SYSTEMAPI_TCP_MAX_PER_ACTOR`, default 32.
+  - Live TCP sessions per actor: `SYSTEMAPI_TCP_MAX_PER_ACTOR`, default 32,
+    at most 63. It is always below the per-agent cap, so one actor can never
+    take every stream of an agent; a value of 64 or more is refused and the
+    default applies.
   - Streams per agent: 64. These are separate from PTY slots, so TCP can never
     starve the reserved break-glass and root slots.
 - **Frames.** At most 64 KiB on every hop.

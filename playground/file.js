@@ -21,7 +21,7 @@
  * back only while the client's bufferedAmount is under 8 MiB; at most
  * write_window unacknowledged chunks; never drop bytes), sessions without
  * end (idle timeout, max duration, session byte cap, op cap, per-actor and
- * per-agent caps, a signed 60 s lease renewed every 30 s only while the
+ * per-agent caps with 2 of the 16 agent slots kept for file:root, a signed 60 s lease renewed every 30 s only while the
  * actor's scope, membership, key and the root policy still allow it), and
  * changes without an audit trail (file_session_start is written before ready; an
  * intent row is written before every write_commit, mkdir and remove is
@@ -66,6 +66,9 @@ const FILE_BYTES_CAP = 2 ** 50;
 const FILE_MAX_OPS_DEFAULT = 100000;
 const FILE_PER_ACTOR_DEFAULT = 4;
 const FILE_PER_AGENT = 16;
+// Of the per-agent slots, this many are only for file:root sessions, so an
+// admin can always reach a host that operators have filled.
+const FILE_ROOT_RESERVED = 2;
 const PATH_MAX = 4096;
 const COMPONENT_MAX = 255;
 const CURSOR_MAX = 1024;
@@ -337,7 +340,8 @@ class FileChannels {
         }
         const actor = row.actor || null;
         const perActor = envInt(this.env, 'SYSTEMAPI_FILE_MAX_PER_ACTOR', FILE_PER_ACTOR_DEFAULT, 1, 100000);
-        if (this.liveFor((s) => s.actor === actor) >= perActor || this.liveFor((s) => s.agent === agentWs) >= FILE_PER_AGENT) {
+        const agentCap = purpose === 'file:root' ? FILE_PER_AGENT : FILE_PER_AGENT - FILE_ROOT_RESERVED;
+        if (this.liveFor((s) => s.actor === actor) >= perActor || this.liveFor((s) => s.agent === agentWs) >= agentCap) {
             console.warn('[Fleet] file refused: session cap reached');
             this.failSocket(ws, 'cap_reached');
             return;
@@ -1114,6 +1118,8 @@ module.exports = {
     READ_MAX,
     WRITE_WINDOW,
     LIST_MAX,
+    FILE_PER_AGENT,
+    FILE_ROOT_RESERVED,
     CLOSE_REASONS,
     SESSION_ERRORS
 };

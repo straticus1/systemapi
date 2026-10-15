@@ -395,17 +395,34 @@ test('agent_offline, agent_unsupported, lease_required, cap_reached', async () =
   }
 });
 
-test('64 streams per agent, separate from PTY slots', async () => {
-  const r = await rig({ SYSTEMAPI_TCP_MAX_PER_ACTOR: '1000' });
+test('64 streams per agent, separate from PTY slots; one actor can never fill an agent', async () => {
+  const r = await rig({ SYSTEMAPI_TCP_MAX_PER_ACTOR: '63' });
   try {
     const agent = await connectAgent(r);
-    for (let i = 0; i < 64; i += 1) openRaw(r);
-    await waitUntil('64 opens', () => agentFrames(agent, 'tcp_open').length === 64);
+    await r.fm.registry.addMember('acme', 'op-1', 'operator', null);
+    for (let i = 0; i < 63; i += 1) openRaw(r);
+    await waitUntil('63 opens', () => agentFrames(agent, 'tcp_open').length === 63);
+    // The per-actor cap is below the per-agent cap: another actor still gets a stream.
     await failsWith(openRaw(r), 'cap_reached');
+    openRaw(r, { ticket: ticketFor(r, { actor: 'op-1' }) });
+    await waitUntil('64 opens', () => agentFrames(agent, 'tcp_open').length === 64);
+    await failsWith(openRaw(r, { ticket: ticketFor(r, { actor: 'op-1' }) }), 'cap_reached');
     // A terminal still opens.
     const ticket = issueTicket(r.fm.tickets, { hostId: HOST_A, purpose: 'terminal:open', tenantId: 'acme', actor: 'user-1' });
     r.track(new WebSocket(`${r.base}/api/v1/systems/terminal/${HOST_A}?ticket=${ticket}&purpose=terminal:open`));
     await waitUntil('pty_start', () => agentFrames(agent, 'pty_start').length === 1);
+  } finally {
+    await r.close();
+  }
+});
+
+test('a per-actor TCP cap at or above the per-agent cap is refused and the default 32 applies', async () => {
+  const r = await rig({ SYSTEMAPI_TCP_MAX_PER_ACTOR: '64' });
+  try {
+    const agent = await connectAgent(r);
+    for (let i = 0; i < 32; i += 1) openRaw(r);
+    await waitUntil('32 opens', () => agentFrames(agent, 'tcp_open').length === 32);
+    await failsWith(openRaw(r), 'cap_reached');
   } finally {
     await r.close();
   }

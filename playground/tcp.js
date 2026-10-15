@@ -14,8 +14,8 @@
  * 30 s), a client or agent growing server memory (credit windows of 256 KiB
  * per direction, client bufferedAmount gate of 1 MiB, never drop bytes; an
  * agent past its window is disconnected), one actor or one agent taking every
- * stream (SYSTEMAPI_TCP_MAX_PER_ACTOR, default 32; 64 streams per agent,
- * separate from PTY slots), and a session without an audit trail (tcp_start
+ * stream (SYSTEMAPI_TCP_MAX_PER_ACTOR, default 32, at most 63; 64 streams
+ * per agent, separate from PTY slots), and a session without an audit trail (tcp_start
  * is written before "connected" and before any byte flows; tcp_end is
  * retried). Ticket values are never logged.
  * Does NOT inspect or record content (owner-accepted, TCP §9), does NOT
@@ -183,7 +183,8 @@ class TcpChannels {
             return;
         }
         const actor = row.actor || null;
-        const perActor = envInt(this.env, 'SYSTEMAPI_TCP_MAX_PER_ACTOR', TCP_PER_ACTOR_DEFAULT, 1, 100000);
+        // Always below the per-agent cap, so one actor never takes every stream.
+        const perActor = envInt(this.env, 'SYSTEMAPI_TCP_MAX_PER_ACTOR', TCP_PER_ACTOR_DEFAULT, 1, TCP_PER_AGENT - 1);
         if (this.liveFor((s) => s.actor === actor) >= perActor || this.liveFor((s) => s.agent === agentWs) >= TCP_PER_AGENT) {
             console.warn('[Fleet] tcp refused: session cap reached');
             this.failSocket(ws, 'cap_reached');

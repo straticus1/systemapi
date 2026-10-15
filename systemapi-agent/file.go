@@ -35,6 +35,9 @@ import (
 
 const (
 	fileMaxSessions = 16
+	// fileRootReserved of those slots only take file_root sessions, as on
+	// the server.
+	fileRootReserved = 2
 	fileTaskQueue   = 64
 	fileMaxDeadline = 7*24*time.Hour + time.Minute
 	fileHelperGrace = 2 * time.Second
@@ -275,7 +278,14 @@ func (c *channelConn) openFile(msg fileMsg, now time.Time) {
 		lastActivity: now,
 	}
 	c.mu.Lock()
-	if c.closed || c.files[sid] != nil || len(c.files) >= fileMaxSessions {
+	nonRoot := 0
+	for _, f := range c.files {
+		if f.action != "file_root" {
+			nonRoot++
+		}
+	}
+	if c.closed || c.files[sid] != nil || len(c.files) >= fileMaxSessions ||
+		(msg.Action != "file_root" && nonRoot >= fileMaxSessions-fileRootReserved) {
 		c.mu.Unlock()
 		log.Printf("file refused: duplicate session or no free slot")
 		fileStatusError(c.out, sid, "cap_reached")

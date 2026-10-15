@@ -394,6 +394,25 @@ test('agent_offline, agent_unsupported, lease_required, cap_reached, agent start
   }
 });
 
+test('16 file sessions per agent, 2 of them kept for file:root', async () => {
+  const r = await rig({ SYSTEMAPI_FILE_MAX_PER_ACTOR: '100' });
+  try {
+    const agent = await connectAgent(r);
+    for (let i = 0; i < 14; i += 1) openRaw(r);
+    await waitUntil('14 opens', () => agentFrames(agent, 'file_open').length === 14);
+    // Operators can never take the reserved slots, for read or write.
+    await failsWith(openRaw(r), 'cap_reached');
+    await failsWith(openRaw(r, { purpose: 'file:read', root: '/srv/b' }), 'cap_reached');
+    // file:root still gets both.
+    openRaw(r, { purpose: 'file:root', root: '/etc' });
+    openRaw(r, { purpose: 'file:root', root: '/etc' });
+    await waitUntil('16 opens', () => agentFrames(agent, 'file_open').length === 16);
+    await failsWith(openRaw(r, { purpose: 'file:root', root: '/etc' }), 'cap_reached');
+  } finally {
+    await r.close();
+  }
+});
+
 test('one op at a time: pipelined request, reused id, bad request_id and non-JSON are protocol_error', async () => {
   const r = await rig();
   try {

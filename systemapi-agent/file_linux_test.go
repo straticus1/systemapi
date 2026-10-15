@@ -682,6 +682,27 @@ func TestFileLinuxStaleUploadsExpire(t *testing.T) {
 	}
 }
 
+// Of the 16 agent slots, 2 only take file_root sessions.
+func TestFileLinuxRootSlotsReserved(t *testing.T) {
+	needOpenat2(t)
+	h := newFileHarness(t)
+	root := t.TempDir()
+	for i := 0; i < fileMaxSessions-fileRootReserved; i++ {
+		h.ready(t, h.open(t, root, fileOpenOpts{}))
+	}
+	if got := h.errorOf(t, h.open(t, root, fileOpenOpts{})); got != "cap_reached" {
+		t.Fatalf("non-root session past the unreserved slots: %q", got)
+	}
+	if got := h.errorOf(t, h.open(t, root, fileOpenOpts{mode: "read"})); got != "cap_reached" {
+		t.Fatalf("read session past the unreserved slots: %q", got)
+	}
+	// A file_root session is not refused for a slot (this agent is not
+	// root, so it fails later, at the identity).
+	if got := h.errorOf(t, h.open(t, root, fileOpenOpts{action: "file_root"})); got != "root_unavailable" {
+		t.Fatalf("file_root session: %q", got)
+	}
+}
+
 func TestFileLinuxIdleAndDeadline(t *testing.T) {
 	needOpenat2(t)
 	h := newFileHarness(t)
