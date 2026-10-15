@@ -10,7 +10,8 @@
 // ticketScopesHeld re-checks a channel ticket's scopes at the WebSocket
 // upgrade against the actor's CURRENT membership (and, for an API key, its
 // current key scopes), so a role or key downgraded in the ticket's 60 s
-// lifetime cannot open the channel. It does NOT re-read SSO groups: a group
+// lifetime cannot open the channel; an API key must also still be active
+// (not revoked, locked or expired). It does NOT re-read SSO groups: a group
 // boost seen at ticket issue is kept for that one ticket.
 'use strict';
 
@@ -96,6 +97,9 @@ async function ticketScopesHeld(registry, row, needed) {
     let scopes;
     if (auth.kind === 'key') {
       if (typeof auth.keyId !== 'string') return false;
+      // A key revoked, locked or expired since the ticket was issued no
+      // longer opens anything; a registry that cannot say is a refusal.
+      if (typeof registry.keyActive !== 'function' || (await registry.keyActive(auth.keyId)) !== true) return false;
       scopes = intersectScopes(await registry.scopesForKey(auth.keyId), member.role);
     } else {
       scopes = scopesForRole(auth.groupRole || member.role);

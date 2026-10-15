@@ -13,11 +13,13 @@ const { scopesForKeyRows } = require('./authz');
 const { escapeLike, efficiency: efficiencyOf } = require('./stats');
 const { fingerprint } = require('./token');
 const { assertPolicyShape } = require('./channels');
+const { demoKeyAllowed } = require('./httpauth');
 
 const METRICS = new Set(['cpu.usage_percent', 'memory.used_percent', 'disk.used_percent']);
 const ROLES = new Set(['admin', 'operator', 'viewer']);
 const SCHEMA_SQL = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
 const TELEMETRY_CAP = 5000;
+const DEMO_KEY_ID = 'ak_live_1234';
 
 function http(status, code) {
   const err = new Error(code);
@@ -111,6 +113,7 @@ class MemoryRegistry {
     this.securityEvents = [];
     this.securitySeq = 1;
     this.scopes = new Map();
+    this.revokedKeys = new Set();
         this.software = [];
     this.cves = [];
     // Channel policies live apart from host rows so publicHost never sees them.
@@ -413,6 +416,16 @@ class MemoryRegistry {
 
   async setScopes(keyId, scopes) {
     this.scopes.set(keyId, [...scopes]);
+  }
+
+  // The memory registry holds no key rows (verifyApiKey needs the database),
+  // so a key is active until revokeKey marks it.
+  async keyActive(keyId) {
+    return typeof keyId === 'string' && keyId.length > 0 && !this.revokedKeys.has(keyId);
+  }
+
+  async revokeKey(keyId) {
+    this.revokedKeys.add(keyId);
   }
 
   async recentAlert(hostId, ruleName, withinMs, now = Date.now()) {
@@ -943,6 +956,21 @@ class PgRegistry {
     return scopesForKeyRows(res.rows.map((r) => r.scope), this.env);
   }
 
+  // True only while the key row exists, is active, is not locked and has
+  // not expired: the same rules verifyApiKey applies. The demo key has no
+  // row and is active only where demoKeyAllowed says so.
+  async keyActive(keyId) {
+    if (typeof keyId !== 'string' || keyId.length === 0) return false;
+    if (keyId === DEMO_KEY_ID) return demoKeyAllowed(this.env);
+    const res = await this.pool.query(
+      `SELECT 1 FROM playground_api_keys
+       WHERE key_id = $1 AND is_active = true AND is_locked = false
+         AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)`,
+      [keyId]
+    );
+    return res.rows.length > 0;
+  }
+
   async setScopes(keyId, scopes) {
     const client = await this.pool.connect();
     try {
@@ -1199,6 +1227,7 @@ async function createRegistry({ pool, env, logger = console }) {
 
 module.exports = {
   MemoryRegistry,
+  PgRegistry,
   createRegistry,
   fingerprint
 };

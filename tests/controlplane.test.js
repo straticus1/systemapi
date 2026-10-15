@@ -10,7 +10,7 @@ const { EventEmitter } = require('node:events');
 const express = require('express');
 const session = require('express-session');
 
-const { MemoryRegistry } = require('../controlplane/registry');
+const { MemoryRegistry, PgRegistry } = require('../controlplane/registry');
 const { mount, clampEntitlements } = require('../controlplane/router');
 const { TEST_SEED, privateKeyFromSeed, rawPublicKey, buildSigner } = require('../controlplane/keys');
 const { issueLease, verifyLease, canonicalLease, payloadHash } = require('../controlplane/lease');
@@ -19,7 +19,7 @@ const { demoKeyAllowed, agentAuthFromRequest, ticketFromRequest, corsOrigins, co
 const { validateSSHPublicKey } = require('../controlplane/sshkey');
 const { assertWebhookURL } = require('../controlplane/webhook');
 const { cronValid, cronMatches, zscore } = require('../controlplane/stats');
-const { OPERATOR, scopesForKeyRows, scopesForRole } = require('../controlplane/authz');
+const { OPERATOR, scopesForKeyRows, scopesForRole, ticketScopesHeld } = require('../controlplane/authz');
 const { sealSecret, openSecret } = require('../controlplane/seal');
 const { refreshGauges } = require('../controlplane/index');
 const { startDevice, pollToken, completeExternal, approveUserCode, safeReturnPath, sessionOwnsUser } = require('../controlplane/oauth');
@@ -398,6 +398,44 @@ test('an API key with no scope rows cannot read or execute', () => {
   assert.equal(legacy.has('admin'), false);
   const explicit = scopesForKeyRows(['hosts:read'], {});
   assert.deepEqual([...explicit], ['hosts:read']);
+});
+
+test('a channel ticket from a revoked, locked or expired API key fails the upgrade re-check', async () => {
+  const operator = async () => [{ tenant_id: 'acme', user_id: 'user-1', role: 'operator' }];
+  const reg = new MemoryRegistry({ NODE_ENV: 'test' });
+  reg.membershipsForUser = operator;
+  await reg.setScopes('k1', ['tcp:open']);
+  const row = { actor: 'user-1', tenantId: 'acme', auth: { kind: 'key', keyId: 'k1' } };
+  assert.equal(await ticketScopesHeld(reg, row, ['tcp:open']), true);
+  await reg.revokeKey('k1');
+  assert.equal(await ticketScopesHeld(reg, row, ['tcp:open']), false);
+  // A registry that cannot say whether the key is active refuses.
+  const blind = new MemoryRegistry({ NODE_ENV: 'test' });
+  blind.membershipsForUser = operator;
+  await blind.setScopes('k1', ['tcp:open']);
+  blind.keyActive = undefined;
+  assert.equal(await ticketScopesHeld(blind, row, ['tcp:open']), false);
+  blind.keyActive = async () => { throw new Error('db down'); };
+  assert.equal(await ticketScopesHeld(blind, row, ['tcp:open']), false);
+  blind.keyActive = async () => 1;
+  assert.equal(await ticketScopesHeld(blind, row, ['tcp:open']), false);
+
+  // PgRegistry asks the key table with the verifyApiKey rules, parameterized.
+  const queries = [];
+  let rows = [];
+  const pg = new PgRegistry({ query: async (sql, params) => { queries.push({ sql, params }); return { rows }; } }, { NODE_ENV: 'production' });
+  assert.equal(await pg.keyActive('ak_gone'), false);
+  rows = [{ '?column?': 1 }];
+  assert.equal(await pg.keyActive('ak_live'), true);
+  assert.deepEqual(queries.map((q) => q.params), [['ak_gone'], ['ak_live']]);
+  assert.match(queries[0].sql, /is_active = true AND is_locked = false/);
+  assert.match(queries[0].sql, /expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP/);
+  assert.equal(await pg.keyActive(''), false);
+  assert.equal(await pg.keyActive(null), false);
+  // The demo key has no row: active only where the demo key is allowed.
+  assert.equal(await pg.keyActive('ak_live_1234'), false);
+  const dev = new PgRegistry({ query: async () => ({ rows: [] }) }, { NODE_ENV: 'development', SYSTEMAPI_ALLOW_DEMO: '1' });
+  assert.equal(await dev.keyActive('ak_live_1234'), true);
 });
 
 test('an unscored key is denied on the fleet routes', async () => {

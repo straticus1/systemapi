@@ -322,7 +322,7 @@ test('upgrade rules: api_key in the query is 401, a foreign Origin 403, no Origi
   }
 });
 
-test('re-check at the upgrade: empty policy, refused class, lost scope, downgraded key', async () => {
+test('re-check at the upgrade: empty policy, refused class, lost scope, downgraded key, revoked key', async () => {
   const r = await rig();
   try {
     const agent = await connectAgent(r, { policy: null });
@@ -347,6 +347,11 @@ test('re-check at the upgrade: empty policy, refused class, lost scope, downgrad
     await r.fm.registry.setScopes('k9', ['hosts:read']);
     await failsWith(openRaw(r, { ticket: ticketFor(r, { auth: { kind: 'key', keyId: 'k9' } }) }), 'scope_denied');
     await r.fm.registry.setScopes('k9', ['tcp:open']);
+    // A key revoked after the ticket was issued fails the upgrade re-check.
+    const revokedTicket = ticketFor(r, { auth: { kind: 'key', keyId: 'k8' } });
+    await r.fm.registry.setScopes('k8', ['tcp:open']);
+    await r.fm.registry.revokeKey('k8');
+    await failsWith(openRaw(r, { ticket: revokedTicket }), 'scope_denied');
     await connected(r, agent, { ticket: ticketFor(r, { auth: { kind: 'key', keyId: 'k9' } }) });
     assert.equal(agentFrames(agent, 'tcp_open').length, 1);
   } finally {
