@@ -21,8 +21,9 @@
  * back only while the client's bufferedAmount is under 8 MiB; at most
  * write_window unacknowledged chunks; never drop bytes), sessions without
  * end (idle timeout, max duration, session byte cap, op cap, per-actor and
- * per-agent caps, a signed 60 s lease renewed every 30 s), and changes
- * without an audit trail (file_session_start is written before ready; an
+ * per-agent caps, a signed 60 s lease renewed every 30 s only while the
+ * actor's scope, membership, key and the root policy still allow it), and
+ * changes without an audit trail (file_session_start is written before ready; an
  * intent row is written before every write_commit, mkdir and remove is
  * forwarded and a failure refuses the op with internal; result rows,
  * write_open and write_abort rows, coalesced file_read rows and
@@ -376,6 +377,7 @@ class FileChannels {
             hostId,
             tenantId: row.tenantId,
             actor,
+            auth: row.auth || null,
             purpose,
             action,
             mode,
@@ -409,6 +411,7 @@ class FileChannels {
             deadlineUnix,
             startedMs,
             renewTimer: null,
+            renewing: false,
             maxTimer: null,
             startTimer: null,
             idleTimer: null,
@@ -447,15 +450,38 @@ class FileChannels {
             actor: actor === null ? '' : String(actor),
             lease
         });
-        s.renewTimer = unref(setInterval(() => this.renew(s), this.renewMs));
+        s.renewTimer = unref(setInterval(() => { this.renew(s); }, this.renewMs));
         s.maxTimer = unref(setTimeout(() => this.end(s, 'max_duration', { notifyClient: true, notifyAgent: true }), maxSeconds * 1000));
         s.startTimer = unref(setTimeout(() => {
             if (!s.ready) this.end(s, 'start_timeout', { error: 'internal', notifyAgent: true });
         }, this.startTimeoutMs));
     }
 
-    renew(s) {
-        if (s.ended || !this.fm.signer) return;
+    // Each renewal re-checks the ticket's grant first: an actor who lost the
+    // scope or the membership, a revoked key, or a root the policy stopped
+    // allowing ends the session with stopped and gets no new lease. A failed
+    // lookup only skips this renewal: the agent ends the session when the
+    // last lease lapses.
+    async renew(s) {
+        if (s.ended || !this.fm.signer || s.renewing) return;
+        s.renewing = true;
+        let denied;
+        try {
+            denied = await recheckChannelTicket(this.fm.registry,
+                { actor: s.actor, tenantId: s.tenantId, auth: s.auth, hostId: s.hostId }, s.purpose, { root: s.root });
+        } finally {
+            s.renewing = false;
+        }
+        if (s.ended) return;
+        if (denied === 'internal') {
+            console.error('[Fleet] file lease renewal skipped: re-check unavailable');
+            return;
+        }
+        if (denied) {
+            console.warn(`[Fleet] file ${s.id}: grant withdrawn (${denied}); ending session`);
+            this.end(s, 'stopped', { notifyClient: true, notifyAgent: true });
+            return;
+        }
         try {
             const lease = issueLease(this.fm.signer, {
                 hostId: s.hostId,

@@ -823,6 +823,58 @@ test('the lease is renewed with a renew-phase, mode- and root-bound lease', asyn
   }
 });
 
+test('revocation reaches a live session: the next renewal re-checks and ends it with stopped, unsigned', async () => {
+  const r = await rig({ SYSTEMAPI_FILE_MAX_PER_ACTOR: '10' });
+  r.fm.file.renewMs = 50;
+  try {
+    const agent = await connectAgent(r);
+    const renewsFor = (sid) => agentFrames(agent, 'file_renew').filter((f) => f.session_id === sid).length;
+    // The member is removed mid-session.
+    await r.fm.registry.addMember('acme', 'op-1', 'operator', null);
+    const a = await ready(r, agent, { actor: 'op-1' });
+    await waitUntil('a renewed', () => renewsFor(a.sid) >= 1);
+    r.fm.registry.members = r.fm.registry.members.filter((m) => m.user_id !== 'op-1');
+    await waitUntil('a stopped', () => closeFrame(a.client.box));
+    assert.equal(closeFrame(a.client.box).payload.reason, 'stopped');
+    const renewedA = renewsFor(a.sid);
+    await waitUntil('a file_stop', () => agentFrames(agent, 'file_stop').some((f) => f.session_id === a.sid));
+    // The policy is emptied mid-session.
+    const b = await ready(r, agent);
+    await waitUntil('b renewed', () => renewsFor(b.sid) >= 1);
+    await r.fm.registry.setHostChannelPolicy(HOST_A, { file_policy: { roots: [] } });
+    await waitUntil('b stopped', () => closeFrame(b.client.box));
+    assert.equal(closeFrame(b.client.box).payload.reason, 'stopped');
+    await r.fm.registry.setHostChannelPolicy(HOST_A, { file_policy: POLICY });
+    // A key revoked mid-session.
+    await r.fm.registry.setScopes('k7', ['file:read', 'file:write']);
+    const c = await ready(r, agent, { ticket: ticketFor(r, { auth: { kind: 'key', keyId: 'k7' } }) });
+    await waitUntil('c renewed', () => renewsFor(c.sid) >= 1);
+    await r.fm.registry.revokeKey('k7');
+    await waitUntil('c stopped', () => closeFrame(c.client.box));
+    assert.equal(closeFrame(c.client.box).payload.reason, 'stopped');
+    // No lease was signed after the denial.
+    const renewedB = renewsFor(b.sid);
+    const renewedC = renewsFor(c.sid);
+    await sleep(200);
+    assert.equal(renewsFor(a.sid), renewedA);
+    assert.equal(renewsFor(b.sid), renewedB);
+    assert.equal(renewsFor(c.sid), renewedC);
+    const ends = await waitUntil('ends', () => auditRows(r, 'file_session_end').length === 3 && auditRows(r, 'file_session_end'));
+    assert.deepEqual(ends.map((e) => e.payload.reason), ['stopped', 'stopped', 'stopped']);
+    // A failed policy lookup only skips the renewal (the lease then lapses
+    // at the agent); the session is not signed for.
+    const d = await ready(r, agent);
+    await waitUntil('d renewed', () => renewsFor(d.sid) >= 1);
+    r.fm.registry.channelPolicies = async () => { throw new Error('db down'); };
+    const before = renewsFor(d.sid);
+    await sleep(200);
+    assert.equal(renewsFor(d.sid), before);
+    assert.equal(closeFrame(d.client.box), undefined);
+  } finally {
+    await r.close();
+  }
+});
+
 test('a failed file_session_start write ends the session with internal before ready', async () => {
   const r = await rig();
   try {

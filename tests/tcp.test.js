@@ -617,6 +617,38 @@ test('the lease is renewed with a renew-phase, target-bound lease; start times o
   }
 });
 
+test('revocation reaches a live stream: the next renewal re-checks and ends it with stopped, unsigned', async () => {
+  const r = await rig();
+  try {
+    r.fm.tcp.renewMs = 50;
+    const agent = await connectAgent(r);
+    const renewsFor = (sid) => agentFrames(agent, 'tcp_renew').filter((f) => f.session_id === sid).length;
+    // The member is removed mid-stream.
+    await r.fm.registry.addMember('acme', 'op-1', 'operator', null);
+    const a = await connected(r, agent, { ticket: ticketFor(r, { actor: 'op-1' }) });
+    await waitUntil('a renewed', () => renewsFor(a.sid) >= 1);
+    r.fm.registry.members = r.fm.registry.members.filter((m) => m.user_id !== 'op-1');
+    await waitUntil('a stopped', () => closeFrame(a.client.box));
+    assert.equal(closeFrame(a.client.box).payload.reason, 'stopped');
+    await waitUntil('a tcp_stop', () => agentFrames(agent, 'tcp_stop').some((f) => f.session_id === a.sid));
+    // The policy is emptied mid-stream.
+    const b = await connected(r, agent);
+    await waitUntil('b renewed', () => renewsFor(b.sid) >= 1);
+    await r.fm.registry.setHostChannelPolicy(HOST_A, { tcp_policy: { allow: [] } });
+    await waitUntil('b stopped', () => closeFrame(b.client.box));
+    assert.equal(closeFrame(b.client.box).payload.reason, 'stopped');
+    const renewedA = renewsFor(a.sid);
+    const renewedB = renewsFor(b.sid);
+    await sleep(200);
+    assert.equal(renewsFor(a.sid), renewedA);
+    assert.equal(renewsFor(b.sid), renewedB);
+    const ends = await waitUntil('ends', () => auditRows(r, 'tcp_end').length === 2 && auditRows(r, 'tcp_end'));
+    assert.deepEqual(ends.map((e) => e.payload.reason), ['stopped', 'stopped']);
+  } finally {
+    await r.close();
+  }
+});
+
 test('a failed tcp_start audit write ends the stream with internal; no byte flows', async () => {
   const r = await rig();
   try {

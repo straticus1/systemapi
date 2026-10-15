@@ -7,7 +7,8 @@
  * the actor's scope re-checked at the upgrade; the lease signs the exact
  * target; the agent applies its own allowlist), a replayed or swapped ticket
  * (consumed on first upgrade, bound to host, purpose and target), a stream
- * outliving its lease (signed 60 s lease renewed every 30 s, deadline
+ * outliving its lease or its grant (signed 60 s lease renewed every 30 s,
+ * each renewal after re-checking scope, membership, key and policy; deadline
  * SYSTEMAPI_TCP_MAX_SECONDS), a stream that never ends (idle timeout
  * SYSTEMAPI_TCP_IDLE_SECONDS, byte cap SYSTEMAPI_TCP_MAX_BYTES, start timeout
  * 30 s), a client or agent growing server memory (credit windows of 256 KiB
@@ -220,6 +221,7 @@ class TcpChannels {
             hostId,
             tenantId: row.tenantId,
             actor,
+            auth: row.auth || null,
             target,
             peer: null,
             expectedPeer: expectedPeer(target),
@@ -246,6 +248,7 @@ class TcpChannels {
             deadlineUnix,
             startedMs,
             renewTimer: null,
+            renewing: false,
             maxTimer: null,
             startTimer: null,
             idleTimer: null,
@@ -278,7 +281,7 @@ class TcpChannels {
             max_bytes: maxBytes,
             lease
         });
-        s.renewTimer = unref(setInterval(() => this.renew(s), this.renewMs));
+        s.renewTimer = unref(setInterval(() => { this.renew(s); }, this.renewMs));
         s.maxTimer = unref(setTimeout(() => {
             this.end(s, 'max_duration', { notifyClient: true, notifyAgent: true });
         }, maxSeconds * 1000));
@@ -287,8 +290,31 @@ class TcpChannels {
         }, this.startTimeoutMs));
     }
 
-    renew(s) {
-        if (s.ended || !this.fm.signer) return;
+    // Each renewal re-checks the ticket's grant first (TCP §4.2): an actor
+    // who lost the scope or the membership, a revoked key, or a target the
+    // policy stopped allowing ends the stream with stopped and gets no new
+    // lease. A failed lookup only skips this renewal: the agent ends the
+    // stream when the last lease lapses.
+    async renew(s) {
+        if (s.ended || !this.fm.signer || s.renewing) return;
+        s.renewing = true;
+        let denied;
+        try {
+            denied = await recheckChannelTicket(this.fm.registry,
+                { actor: s.actor, tenantId: s.tenantId, auth: s.auth, hostId: s.hostId }, TCP_PURPOSE, { target: s.target });
+        } finally {
+            s.renewing = false;
+        }
+        if (s.ended) return;
+        if (denied === 'internal') {
+            console.error('[Fleet] tcp lease renewal skipped: re-check unavailable');
+            return;
+        }
+        if (denied) {
+            console.warn(`[Fleet] tcp ${s.id}: grant withdrawn (${denied}); ending stream`);
+            this.end(s, 'stopped', { notifyClient: true, notifyAgent: true });
+            return;
+        }
         try {
             const lease = issueLease(this.fm.signer, {
                 hostId: s.hostId,
