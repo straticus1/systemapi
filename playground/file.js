@@ -159,7 +159,10 @@ function checkPath(p) {
 }
 
 const isCount = (v) => Number.isSafeInteger(v) && v >= 0;
-const isNs = (v) => (typeof v === 'bigint') || Number.isSafeInteger(v);
+// mtime_ns is a signed 64-bit integer on the agent: -2^63 <= v < 2^63.
+const NS_MIN = -(2n ** 63n);
+const NS_LIMIT = 2n ** 63n;
+const isNs = (v) => (typeof v === 'bigint' && v >= NS_MIN && v < NS_LIMIT) || Number.isSafeInteger(v);
 
 function checkIfMatch(m) {
     if (m === undefined || m === null) return { ok: true, value: undefined };

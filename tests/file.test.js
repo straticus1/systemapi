@@ -449,7 +449,7 @@ test('one op at a time: pipelined request, reused id, bad request_id and non-JSO
   }
 });
 
-test('unknown op and malformed fields are bad_request; bad paths never reach the agent; the session stays open', async () => {
+test('unknown op and malformed fields (an mtime_ns outside int64 too) are bad_request; bad paths never reach the agent; the session stays open', async () => {
   const r = await rig();
   try {
     const agent = await connectAgent(r);
@@ -478,11 +478,29 @@ test('unknown op and malformed fields are bad_request; bad paths never reach the
     assert.equal(await ask({ op: 'mkdir', path: 'd', mode: '0644x' }), 'bad_request');
     assert.equal(await ask({ op: 'write_abort' }), 'upload_not_found');
     assert.equal(await ask({ op: 'write_commit' }), 'upload_not_found');
+    // mtime_ns must fit a signed 64-bit integer (the agent's int64).
+    for (const ns of ['9223372036854775808', '-9223372036854775809', '99999999999999999999999']) {
+      for (const op of ['read', 'hash']) {
+        const rid = `q${n += 1}`;
+        s.client.ws.send(`{"type":"file_request","request_id":"${rid}","op":"${op}","path":"f","offset":0,"length":1,"if_match":{"size":1,"mtime_ns":${ns}}}`);
+        assert.equal((await waitResult(s.client.box, rid)).error, 'bad_request', `${op} ${ns}`);
+      }
+    }
     assert.equal(agentReqs(agent, s.sid).length, 0);
     // The session is still open: the op-name-as-type spelling works too.
     sendJSON(s.client.ws, { type: 'stat', request_id: 'ok1', path: 'f' });
     const fwd = await waitUntil('forwarded', () => agentReqs(agent, s.sid)[0]);
     assert.deepEqual(fwd, { request_id: 'ok1', op: 'stat', path: 'f' });
+    agentResult(agent, s.sid, 'ok1', 'stat', {});
+    await waitResult(s.client.box, 'ok1');
+    // The int64 bounds themselves are relayed exactly.
+    for (const [rid, ns] of [['ok2', '9223372036854775807'], ['ok3', '-9223372036854775808']]) {
+      s.client.ws.send(`{"type":"file_request","request_id":"${rid}","op":"hash","path":"f","if_match":{"size":1,"mtime_ns":${ns}}}`);
+      await waitUntil(`forwarded ${rid}`, () => agent.box.raw.find((t) => t.includes(`"request_id":"${rid}"`)));
+      assert.ok(agent.box.raw.find((t) => t.includes(`"request_id":"${rid}"`)).includes(`"mtime_ns":${ns}}`));
+      agentResult(agent, s.sid, rid, 'hash', {}, 'changed');
+      await waitResult(s.client.box, rid);
+    }
   } finally {
     await r.close();
   }

@@ -74,6 +74,9 @@ type fileChunkIn struct {
 type fileTask struct {
 	req   *fileReq
 	chunk *fileChunkIn
+	// bad is a request that did not decode but whose request_id did: it
+	// is answered bad_request in order.
+	bad bool
 }
 
 type agentWrite struct {
@@ -348,7 +351,23 @@ func (s *fileSession) queueRequest(raw json.RawMessage) {
 	var req fileReq
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	if err := dec.Decode(&req); err != nil || !requestIDRe.MatchString(req.RequestID) {
-		log.Printf("file %s: malformed request ignored", s.id)
+		// A request the server is waiting on must get an answer, or the
+		// session wedges: when its request_id is recoverable it gets
+		// bad_request (an mtime_ns outside int64, say).
+		var head struct {
+			RequestID string `json:"request_id"`
+			Op        string `json:"op"`
+		}
+		if json.Unmarshal(raw, &head) != nil || !requestIDRe.MatchString(head.RequestID) {
+			log.Printf("file %s: malformed request ignored", s.id)
+			return
+		}
+		if !fileKnownOps[head.Op] {
+			head.Op = ""
+		}
+		log.Printf("file %s: malformed request refused", s.id)
+		s.touch()
+		s.queue(fileTask{req: &fileReq{RequestID: head.RequestID, Op: head.Op}, bad: true})
 		return
 	}
 	// Agent-only fields never come from the server.
@@ -607,6 +626,9 @@ func (s *fileSession) do(t fileTask) error {
 	}
 	s.ops++
 	switch {
+	case t.bad:
+		s.result(req.RequestID, req.Op, "bad_request", nil)
+		return nil
 	case !fileKnownOps[req.Op] || req.Op == "write_chunk":
 		s.result(req.RequestID, req.Op, "bad_request", nil)
 		return nil

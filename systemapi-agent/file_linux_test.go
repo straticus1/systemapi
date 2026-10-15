@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -379,6 +380,17 @@ func TestFileLinuxReadHashIfMatch(t *testing.T) {
 	}
 	if got := h.code(t, sid, map[string]interface{}{"op": "read", "path": "nope", "offset": 0, "length": 1}); got != "not_found" {
 		t.Fatalf("read missing: %q", got)
+	}
+	// An mtime_ns that does not fit int64 fails to decode: the request is
+	// answered bad_request (never dropped), and the session goes on.
+	huge := map[string]interface{}{"size": 11, "mtime_ns": json.Number("99999999999999999999")}
+	for _, op := range []string{"read", "hash"} {
+		if got := h.code(t, sid, map[string]interface{}{"op": op, "path": "f.txt", "offset": 0, "length": 5, "if_match": huge}); got != "bad_request" {
+			t.Fatalf("%s with an mtime_ns past int64: %q", op, got)
+		}
+	}
+	if got := h.code(t, sid, map[string]interface{}{"op": "stat", "path": "f.txt"}); got != "" {
+		t.Fatalf("stat after a malformed request: %q", got)
 	}
 }
 
