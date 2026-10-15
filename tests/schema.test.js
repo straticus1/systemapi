@@ -80,3 +80,14 @@ test('playground_hosts.key_id has the same type as playground_api_keys.key_id', 
   assert.ok(keyType && hostType);
   assert.equal(hostType[1], keyType[1]);
 });
+
+test('the playground trigger function is namespaced, and the generic name is neither created nor dropped', () => {
+  const body = KEYS.replace(/--.*$/gm, '');
+  const created = [...body.matchAll(/CREATE\s+OR\s+REPLACE\s+FUNCTION\s+(\w+)/gi)].map((m) => m[1]);
+  for (const name of created) assert.match(name, /playground/, `function ${name} is not namespaced`);
+  const used = [...body.matchAll(/EXECUTE\s+FUNCTION\s+(\w+)/gi)].map((m) => m[1]);
+  assert.ok(used.length >= 2);
+  for (const name of used) assert.equal(name, 'playground_set_updated_at');
+  assert.doesNotMatch(body, /update_updated_at_column/);
+  assert.doesNotMatch(body, /DROP\s+FUNCTION/i);
+});

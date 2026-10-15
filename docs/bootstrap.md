@@ -24,14 +24,16 @@ SELECT tablename, tableowner FROM pg_tables
  WHERE schemaname = 'public'
    AND (tablename LIKE 'playground_%' OR tablename IN ('anonymous_rate_limits', 'saved_requests'));
 SELECT proname, pg_get_userbyid(proowner) FROM pg_proc
- WHERE proname IN ('update_updated_at_column', 'reset_playground_credits', 'cleanup_old_playground_usage');
+ WHERE proname IN ('playground_set_updated_at', 'reset_playground_credits', 'cleanup_old_playground_usage');
 ```
 
 Every owner must be `DB_USER`. If one is not, have a superuser run
 `ALTER TABLE <t> OWNER TO <DB_USER>;` (and `ALTER FUNCTION <f>() OWNER TO
-<DB_USER>;`). `update_updated_at_column()` has a generic name. If another
-application in the same database owns a function with that name, the boot
-replaces it or fails, so give this app its own database.
+<DB_USER>;`). The trigger function is `playground_set_updated_at()`.
+Earlier versions created the generic `update_updated_at_column()`; the boot
+now re-points both triggers to the namespaced function and leaves the old one
+in place, because another application may own it. Drop it by hand only once
+you know nothing else uses it.
 
 ## Run it once
 

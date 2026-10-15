@@ -197,8 +197,12 @@ CREATE INDEX IF NOT EXISTS idx_saved_requests_tags ON saved_requests USING GIN(t
 -- Functions & Triggers
 -- ============================================================================
 
--- Auto-update updated_at timestamp
-CREATE OR REPLACE FUNCTION update_updated_at_column()
+-- Auto-update updated_at timestamp. Namespaced: this file runs at every boot,
+-- and CREATE OR REPLACE on a common name would overwrite another app's
+-- function in a shared database. Earlier versions created
+-- update_updated_at_column(); it is deliberately NOT dropped here, because
+-- another application may own a function with that name.
+CREATE OR REPLACE FUNCTION playground_set_updated_at()
 RETURNS TRIGGER AS $$
 BEGIN
     NEW.updated_at = CURRENT_TIMESTAMP;
@@ -208,11 +212,11 @@ $$ language 'plpgsql';
 
 DROP TRIGGER IF EXISTS update_playground_credits_updated_at ON playground_credits;
 CREATE TRIGGER update_playground_credits_updated_at BEFORE UPDATE ON playground_credits
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+    FOR EACH ROW EXECUTE FUNCTION playground_set_updated_at();
 
 DROP TRIGGER IF EXISTS update_saved_requests_updated_at ON saved_requests;
 CREATE TRIGGER update_saved_requests_updated_at BEFORE UPDATE ON saved_requests
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+    FOR EACH ROW EXECUTE FUNCTION playground_set_updated_at();
 
 -- Auto-reset daily/monthly counters
 CREATE OR REPLACE FUNCTION reset_playground_credits()
