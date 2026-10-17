@@ -14,18 +14,27 @@
 // <start|renew>\n<read|write>\n<root>"), so the agent dials only the signed
 // target and opens only the signed root in the signed mode. The builders
 // refuse a newline or control byte in any field, so fields cannot be shifted.
+// sahxfer grant actions (xfer, xfer_root) follow the same rule with the
+// 8-line payload of sahxfer docs/design.md §3.4 ("<grant_id>\n<deadline_unix>
+// \n<start|renew>\n<put|get>\n<root>\n<path>\n<size>\n<sha256>"), so a put
+// lease cannot authorize a get and the agent writes only the signed path,
+// size and hash. The payload deadline is the lease deadline (§3.4: TTL 60 s,
+// renewed every 30 s).
 'use strict';
 
 const crypto = require('node:crypto');
+const { validateFileRoot } = require('./channels');
 const { randomBytes, timingSafeEqual } = crypto;
 
-const ACTIONS = new Set(['sysscript', 'pty', 'pty_root', 'breakglass', 'tcp', 'file', 'file_root']);
+const ACTIONS = new Set(['sysscript', 'pty', 'pty_root', 'breakglass', 'tcp', 'file', 'file_root', 'xfer', 'xfer_root']);
 const TERMINAL_ACTIONS = new Set(['pty', 'pty_root', 'breakglass']);
 const CHANNEL_ACTIONS = new Set(['tcp', 'file', 'file_root']);
+const XFER_ACTIONS = new Set(['xfer', 'xfer_root']);
 // Actions whose hash covers "<action>\n<payload>".
-const SESSION_ACTIONS = new Set([...TERMINAL_ACTIONS, ...CHANNEL_ACTIONS]);
+const SESSION_ACTIONS = new Set([...TERMINAL_ACTIONS, ...CHANNEL_ACTIONS, ...XFER_ACTIONS]);
 const TCP_SESSION_RE = /^tcs_[A-Za-z0-9_-]{16,64}$/;
 const FILE_SESSION_RE = /^fls_[A-Za-z0-9_-]{16,64}$/;
+const XFER_GRANT_RE = /^xfr_[A-Za-z0-9_-]{8,64}$/;
 const MAX_TTL_S = 300;
 const SKEW_S = 30;
 
@@ -140,14 +149,37 @@ function filePayload(sessionId, deadlineUnix, phase, mode, root) {
   return `${sessionId}\n${deadlineUnix}\n${phase}\n${mode}\n${root}`;
 }
 
+// sahxfer design §3.4. dir is "put" or "get"; root is absolute; path is
+// relative; size is a safe integer; sha256 is 64 lowercase hex. The route
+// already checked root and path; they are checked again here (FILE §2 root
+// shape, FILE §5.1 path shape, byte limits) so no caller can sign a payload
+// whose lines shift or whose path climbs out of the root.
+function xferPayload(grantId, deadlineUnix, phase, dir, root, path, size, sha256) {
+  checkCommon(grantId, XFER_GRANT_RE, deadlineUnix, phase);
+  if (dir !== 'put' && dir !== 'get') throw badPayload();
+  if (!validateFileRoot(root, 'file:root').ok) throw badPayload();
+  if (typeof path !== 'string' || !path.isWellFormed() || /[\u0000-\u001f\u007f\\]/.test(path)) throw badPayload();
+  const pathBytes = Buffer.byteLength(path, 'utf8');
+  if (pathBytes < 1 || pathBytes > 4096 || path.startsWith('/')) throw badPayload();
+  for (const c of path.split('/')) {
+    if (c === '' || c === '.' || c === '..' || Buffer.byteLength(c, 'utf8') > 255) throw badPayload();
+  }
+  if (!Number.isSafeInteger(size) || size < 0) throw badPayload();
+  if (typeof sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(sha256)) throw badPayload();
+  return `${grantId}\n${deadlineUnix}\n${phase}\n${dir}\n${root}\n${path}\n${size}\n${sha256}`;
+}
+
 module.exports = {
   TERMINAL_ACTIONS,
   CHANNEL_ACTIONS,
   TCP_SESSION_RE,
   FILE_SESSION_RE,
+  XFER_ACTIONS,
+  XFER_GRANT_RE,
   terminalPayload,
   tcpPayload,
   filePayload,
+  xferPayload,
   payloadHash,
   canonicalLease,
   issueLease,

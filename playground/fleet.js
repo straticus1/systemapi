@@ -52,6 +52,7 @@ const { CreditLedger } = require('../controlplane/credit');
 const { deliverWebhooks, COOLDOWN_MS } = require('../controlplane/router');
 const { TcpChannels } = require('./tcp');
 const { FileChannels } = require('./file');
+const { XferGrants } = require('./xfer');
 const { rejectUpgrade } = require('./channel');
 
 const PTY_FRAME_MAX = 64 * 1024;
@@ -177,6 +178,8 @@ class FleetManager {
         this.tcp = new TcpChannels(this);
         // File channel sessions (playground/file.js).
         this.file = new FileChannels(this);
+        // sahxfer grants (playground/xfer.js).
+        this.xfer = new XferGrants(this);
 
         const accessKey = process.env.DARKSTORAGE_ACCESS_KEY;
         const secretKey = process.env.DARKSTORAGE_SECRET_KEY;
@@ -806,6 +809,9 @@ class FleetManager {
                     const id = hostId;
                     const raw = messageBuffer;
                     if (id) inOrder(() => this.file.onAgentFrame(ws, id, msg, raw));
+                } else if (msg.type === 'xfer_status' || msg.type === 'xfer_result') {
+                    const id = hostId;
+                    if (id) inOrder(() => this.xfer.onAgentFrame(ws, id, msg));
                 }
             } catch (err) {
                 console.error('[Fleet] message error:', err.message);
@@ -823,6 +829,7 @@ class FleetManager {
                 }
                 this.tcp.onAgentGone(ws);
                 this.file.onAgentGone(ws);
+                this.xfer.onAgentGone(ws);
             }, 0, true);
             // A connection that a newer one for the same host already
             // replaced does not mark the host offline.

@@ -18,6 +18,7 @@ const { sealSecret, openSecret } = require('./seal');
 const { assertWebhookURL } = require('./webhook');
 const { bucketName, linearForecast, toCSV, cronValid, zscore } = require('./stats');
 const { listPlaybooks, readPlaybook } = require('./playbooks');
+const xfer = require('../playground/xfer');
 
 const SCRIPT_MAX = 64 * 1024;
 const COOLDOWN_MS = 5 * 60 * 1000;
@@ -566,6 +567,37 @@ function mount(app, fleet) {
       if (denied) throw http(denied === 'bad_target' || denied === 'bad_root' ? 400 : 403, denied);
     }
     res.json(await issueAuditedTicket(fleet, principal, host, purpose, parsed.binding));
+  }));
+
+  // sahxfer grant (sahxfer docs/design.md §3; playground/xfer.js). Same
+  // order as a file ticket: shape (400), scope in some tenant (403), host
+  // (404), scope in the host's tenant (403), the file policy root (403), then
+  // the rate budget of the matching file purpose (429). xfer:put is checked
+  // as file:write, xfer:get as file:read, xfer:root as file:root.
+  app.post('/api/v1/xfer/grant', wrap(async (req, res) => {
+    noStore(res);
+    const principal = await authenticate(req, fleet);
+    const parsed = xfer.parseGrantRequest(req.body, fleet.env || {});
+    if (!parsed.ok) throw http(parsed.status, parsed.error);
+    const request = parsed.request;
+    const filePurpose = xfer.PURPOSES[request.purpose];
+    const scopes = PURPOSE_SCOPES[filePurpose];
+    requireScopeAnywhere(fleet, principal, scopes);
+    const host = await requireHost(fleet, principal, request.host_id);
+    for (const scope of scopes) requireScope(fleet, principal, host.tenant_id, scope);
+    const denied = await policyDecision(fleet.registry, host.host_id, filePurpose, { root: request.root });
+    if (denied) throw http(denied === 'bad_root' ? 400 : 403, denied);
+    if (!fleet.xfer) throw http(501, 'agent_unsupported');
+    if (!ticketAllowed(fleet, principal.userId, host.host_id, filePurpose)) throw http(429, 'rate_limited');
+    // A client that hangs up before the response is written cancels the
+    // grant, so no key stays live for a caller that never received it.
+    const client = { gone: false, onGone: null };
+    res.on('close', () => {
+      if (res.writableFinished) return;
+      client.gone = true;
+      if (client.onGone) client.onGone();
+    });
+    res.json(await fleet.xfer.grant({ principal, host, request, client }));
   }));
 
   app.get('/api/v1/hosts/resolve', wrap(async (req, res) => {
