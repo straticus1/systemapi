@@ -378,7 +378,7 @@ test('agent_offline, agent_unsupported, lease_required, cap_reached, agent start
     await failsWith(openRaw(r), 'lease_required');
     r.fm.signer = signerWas;
 
-    for (const code of ['root_invalid', 'pty_user_unset', 'root_unavailable', 'agent_unsupported', 'bogus']) {
+    for (const code of ['root_invalid', 'pty_user_unset', 'account_unmapped', 'root_unavailable', 'agent_unsupported', 'bogus']) {
       const c = openRaw(r);
       const open = await waitUntil('file_open', () => agentFrames(agent, 'file_open').find((f) => !f.seen && (f.seen = true)));
       sendJSON(agent.ws, { type: 'file_status', session_id: open.session_id, payload: { error: code } });

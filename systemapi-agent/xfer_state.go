@@ -10,7 +10,8 @@
 // sweep passes only root, path and grant id to `recv --sweep`, which removes
 // the one temp name fixed by the grant id), and a record whose identity no
 // longer matches the configuration (the sweep runs only as the identity
-// resolveFileIdentity gives today, and only when it equals the record's).
+// resolveFileIdentity gives today for the record's actor, and only when it
+// equals the record's).
 // A restarted agent reports ok only when `recv --sweep --report` finds the
 // target holding the grant's size and hash, aborted agent_restart with
 // committed false when the target is absent or different, and nothing at
@@ -53,6 +54,7 @@ type xferRecord struct {
 	Size        int64                  `json:"size"`
 	SHA256      string                 `json:"sha256"`
 	Identity    xferRecordIdentity     `json:"identity"`
+	Actor       string                 `json:"actor,omitempty"`
 	CreatedUnix int64                  `json:"created_unix"`
 	Result      map[string]interface{} `json:"result,omitempty"`
 }
@@ -246,7 +248,7 @@ func sweepIdentity(rec xferRecord) (*ptyIdentity, error) {
 	default:
 		return nil, errors.New("record has a bad action")
 	}
-	id, code := resolveFileIdentity(action, ptyCfg, agentEUID())
+	id, code := resolveFileIdentity(action, rec.Actor, ptyCfg, agentEUID())
 	if code != "" {
 		return nil, errors.New("identity: " + code)
 	}

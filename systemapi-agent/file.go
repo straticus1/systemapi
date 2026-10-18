@@ -189,14 +189,15 @@ func (c *channelConn) fileData(sid string, payload []byte) {
 	}
 }
 
-// resolveFileIdentity picks the account a file session runs as (FILE §7).
-func resolveFileIdentity(action string, cfg ptySettings, euid int) (*ptyIdentity, string) {
+// resolveFileIdentity picks the account a file or xfer session runs as
+// (FILE §7), through the same per-identity resolution as terminal:open.
+func resolveFileIdentity(action, actor string, cfg ptySettings, euid int) (*ptyIdentity, string) {
 	if action == "file_root" {
 		if euid != 0 {
 			log.Printf("file:root needs an agent running as root")
 			return nil, "root_unavailable"
 		}
-		id, code := resolvePTYIdentity("pty_root", cfg, euid)
+		id, code := resolvePTYIdentity("pty_root", actor, cfg, euid)
 		if code != "" {
 			return nil, "internal"
 		}
@@ -206,11 +207,11 @@ func resolveFileIdentity(action string, cfg ptySettings, euid int) (*ptyIdentity
 		log.Printf("file session refused: the agent is not root and --pty-allow-agent-user is not set")
 		return nil, "pty_user_unset"
 	}
-	id, code := resolvePTYIdentity("pty", cfg, euid)
+	id, code := resolvePTYIdentity("pty", actor, cfg, euid)
 	switch code {
 	case "":
 		return id, ""
-	case "pty_user_unset":
+	case "pty_user_unset", "account_unmapped":
 		return nil, code
 	}
 	return nil, "internal"
@@ -552,7 +553,7 @@ func checkSessionRoot(action, root, home, stateDir string) string {
 }
 
 func (s *fileSession) start() (string, int64, string) {
-	id, code := resolveFileIdentity(s.action, ptyCfg, agentEUID())
+	id, code := resolveFileIdentity(s.action, s.actor, ptyCfg, agentEUID())
 	if code != "" {
 		return "", 0, code
 	}

@@ -28,3 +28,5 @@ func signalTree(pgid int, sig syscall.Signal) bool { return false }
 func freeBytes(path string) (uint64, error) {
 	return 0, errors.New("pty_unsupported")
 }
+
+func fileOwner(st os.FileInfo) (uint32, bool) { return 0, false }

@@ -916,7 +916,7 @@ test('new agent refusals: host codes pass through, lease_required reaches the cl
   const r = await rig();
   try {
     const agent = await connectAgent(r);
-    for (const [error, status, client] of [['pty_user_unset', 503, 'pty_user_unset'], ['root_unavailable', 503, 'root_unavailable'],
+    for (const [error, status, client] of [['pty_user_unset', 503, 'pty_user_unset'], ['account_unmapped', 403, 'account_unmapped'], ['root_unavailable', 503, 'root_unavailable'],
       ['no_space', 507, 'no_space'], ['io', 500, 'io'], ['lease_required', 500, 'internal']]) {
       agent.reply = { error };
       const res = await grant(r, { path: `e-${error}` });

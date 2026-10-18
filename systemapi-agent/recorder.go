@@ -251,7 +251,9 @@ func (r *recorder) fail(code string) {
 	}
 }
 
-// add queues bytes without blocking. kind is "i" (input) or "o" (output).
+// add queues bytes without blocking. kind is "i" (input), "o" (output) or
+// "w" (a watch event: the agent's JSON note of a watch request, its answer
+// or its end; counted as output).
 // It returns false, and ends the session through onFail, when the queue is
 // full; bytes are never dropped silently.
 func (r *recorder) add(kind string, data []byte) bool {

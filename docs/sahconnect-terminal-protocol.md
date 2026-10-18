@@ -50,7 +50,8 @@ POST /api/v1/ws-ticket   {"host_id": "...", "purpose": "terminal:open" | "termin
 ```
 
 - `terminal:open` needs scope `terminal:open` (operator). The shell runs as
-  the host's non-root `pty_user`.
+  the caller's own account from the host's `--pty-user-map` (§6), or, on a
+  host without a map, as the host's single non-root `pty_user`.
 - `terminal:root` needs scope `terminal:root`, a new scope granted to admin
   only. The shell runs as root.
 - Response: `{"ticket": "stk_...", "expires_at": "<iso8601>"}`. The ticket is
@@ -95,7 +96,7 @@ server's allowlist (`SYSTEMAPI_ALLOWED_ORIGINS`).
 |---|---|
 | `{"type":"pty_status","payload":{"status":"starting"}}` | The ticket was accepted and the agent was asked to start. |
 | `{"type":"pty_status","payload":{"status":"started","session_id":"..."}}` | The shell is running. |
-| `{"type":"pty_status","payload":{"error":"<code>"}}` | Failure. Codes: `ticket_invalid`, `scope_denied`, `agent_offline`, `lease_required`, `pty_user_unset`, `recording_unavailable`, `root_unavailable`, `pty_start_failed`, `internal`. `root_unavailable` means the host cannot run a `terminal:root` shell: the agent is not root, or it would not record the session itself. The socket is then closed with code 1011. |
+| `{"type":"pty_status","payload":{"error":"<code>"}}` | Failure. Codes: `ticket_invalid`, `scope_denied`, `agent_offline`, `lease_required`, `pty_user_unset`, `account_unmapped`, `recording_unavailable`, `root_unavailable`, `pty_start_failed`, `internal`. `root_unavailable` means the host cannot run a `terminal:root` shell: the agent is not root, or it would not record the session itself. The socket is then closed with code 1011. |
 | `{"type":"pty_exit","payload":{"session_id":"...","code":N,"reason":"exited"\|"max_duration"\|"agent_disconnected"\|"stopped"}}` | The session ended. `code` is the shell's exit status, or -1 when there is none. The server then closes with code 1000. |
 
 ## 4. Session lifetime
@@ -151,3 +152,129 @@ expires. A dead server therefore cannot leave a shell running for long.
 - Audit rows hash every column (actor, host, tenant, action, payload), so
   rewriting who did something breaks verification.
 - Client frames are unchanged by recording.
+- The monitoring notice (§7.1) and the watch prompts and lines (§7) are
+  recorded as output. Each watch request, answer and stop is also recorded
+  as a `w` line holding the agent's JSON note of it. The keystrokes that
+  answer a consent prompt are not recorded and never reach the shell.
+
+## 6. One Unix account per identity
+
+- **Server → agent.** `pty_start` carries `"actor": "<user id>"`, the
+  identity that asked for the ticket. `file_open` and `xfer_grant` already
+  carry `actor`. The actor rides the authenticated agent socket; it is not
+  in the signed lease.
+- **Agent.** `--pty-user-map <file>` maps each identity to its own Unix
+  account (`identity = unixuser` lines; the file is `0600` or stricter and
+  owned by root or the agent user). Terminal, file and xfer sessions resolve
+  the account through one function (`resolvePTYIdentity`), so the same
+  identity gets the same account on every channel.
+  - With a map, an identity that has no entry is refused with
+    `account_unmapped` (`pty_status`, `file_status`, or the xfer refusal),
+    and `--pty-user` is never used as a fallback.
+  - A map that uses `*`, repeats an identity, names `root`, or gives two
+    identities one account stops the agent at startup.
+  - Without a map, `--pty-user` keeps serving every identity, and the agent
+    logs one warning line at startup that all identities share one account.
+  - On a non-root agent (`--pty-allow-agent-user`) only the identity mapped
+    to the agent's own account can open a session.
+  - An xfer state record stores its actor; the sweep after a restart
+    resolves that actor and runs only if it still gives the recorded uid,
+    gid and groups.
+- `terminal:root`, `file:root` and `xfer:root` still run as root and do not
+  consult the map.
+
+## 7. Monitoring notice and session watching
+
+### 7.1 Notice
+
+Every terminal session (`terminal:open`, `terminal:root`, break-glass)
+starts with a notice that the agent sends as session output after
+`started` and before any shell output; no client input reaches the shell
+before it is sent. The default text is:
+
+```
+[systemapi] This session is recorded and may be viewed by an administrator.
+[systemapi] Tenant: <tenant>
+```
+
+`--pty-notice <file>` replaces the first line's text (control characters are
+stripped); the tenant line is always added. An empty notice file stops the
+agent at startup. Nothing a client or a watched user sends can turn the
+notice off. There is no option to silence the notice or the watch lines for
+an investigation: the forced notice is the only behavior.
+
+### 7.2 Watching
+
+Status: the agent implements this section. The server does not have a watch
+feature yet: no route asks to watch, no relay sends a session's output to a
+watcher, and nothing writes the audit rows below. The server side must be
+built to this contract.
+
+**Rules.**
+
+- View-only watching (`mode` `ro`) by support or an admin needs the watched
+  user's consent, unless the actor has the `admin` scope and the request
+  carries a non-empty `reason`. Only then may the server set `override`.
+- Read-write watching (`mode` `rw`) always needs consent. The agent asks
+  even when `override` is set.
+- The watched user is told on the terminal when watching starts (by consent
+  or by override) and when it stops.
+
+**Server → agent frames.**
+
+| Frame | Meaning |
+|---|---|
+| `{"type":"watch_request","session_id":"pts_…","watch_id":"wch_…","mode":"ro"\|"rw","actor":"<user id>","reason":"<text>","override":bool,"lease":{…}}` | Ask to watch. `watch_id` matches `^wch_[A-Za-z0-9_-]{16,64}$`. `reason` is at most 256 printable characters, no tabs or newlines. The lease is for the session's own action (`pty`, `pty_root` or `breakglass`) over the payload `"<session_id>\n<deadline_unix>\nwatch\n<watch_id>\n<ro\|rw>\n<true\|false>\n<reason>"`, so only the lease signer can claim an override, and a start or renew lease cannot be used. |
+| `{"type":"watch_stop","session_id":"pts_…","watch_id":"wch_…"}` | The watcher left, or the server withdraws an unanswered request. |
+| `{"type":"pty_input","session_id":"pts_…","watch_id":"wch_…","data_b64":"…"}` | Input typed by a watcher. The agent accepts it only while that watch has read-write consent, and drops it otherwise. |
+
+**Agent → server frame.** One `watch_consent` per `watch_request`, and one
+when a granted watch stops:
+
+```
+{"type":"watch_consent","session_id":"pts_…","payload":{
+  "watch_id":"wch_…","granted":bool,"consent":bool,
+  "result":"granted"|"denied"|"timeout"|"override"|"cancelled"|"session_ended"|"stopped",
+  "mode":"ro"|"rw","actor":"…","reason":"…"}}
+```
+
+or, when the request is refused before anyone is asked,
+`{"watch_id":"…","granted":false,"consent":false,"error":"<code>"}` with
+`unknown_session`, `bad_request`, `lease_required`, `reason_required`
+(override with no reason), `busy` (another prompt is open) or
+`session_ended`.
+
+- `consent` is true only when the user answered yes. An override grant is
+  `granted: true, consent: false, result: "override"`.
+
+**Consent prompt.** The agent writes one line to the user's terminal:
+
+```
+[systemapi] <actor> asks to watch this session, view only. Reason: <reason>. Allow? [y/N] (30 s)
+```
+
+(`with control (they can type into it)` for `rw`). Until it is answered,
+every input byte from the client goes to the prompt: none of it reaches the
+shell or the recording, and none of it is echoed. A keystroke that is
+exactly `y` or `Y` (optionally with Enter) allows; `n`, `N`, Ctrl-C or
+Ctrl-D anywhere refuses; anything else is dropped. No answer in 30 s is a
+refusal (`timeout`). The session ending answers `session_ended`. One prompt
+is open at a time per session.
+
+**Lines the watched user always sees.**
+
+- start by consent: `You allowed <actor> to watch this session, view only.`
+- start by override: `An administrator (<actor>) started watching this session, view only. Reason: <reason>`
+- refusal: `Watching refused.` / `No answer in 30 s; watching refused.`
+- stop: `<actor> stopped watching this session.`
+
+**Audit rows the server must write** (in the audit chain, actor = the
+watcher):
+
+- `watch_started`: `{session_id, host_id, watch_id, mode, actor, reason,
+  consent: true|false}`, written when the agent answers `granted: true`,
+  before the server relays a single byte to the watcher. `consent` is false
+  for an admin override.
+- `watch_refused`: `{session_id, watch_id, mode, actor, reason, result}` for
+  `denied`, `timeout`, `cancelled`, `session_ended` or an `error`.
+- `watch_stopped`: `{session_id, watch_id, actor, duration}`.

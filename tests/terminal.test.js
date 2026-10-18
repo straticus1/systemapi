@@ -139,6 +139,8 @@ test('pty_start carries a signed, session-bound lease, sizes and a deadline', as
     assert.equal(start.action, 'pty');
     assert.equal(start.rows, 40);
     assert.equal(start.cols, 120);
+    // The agent maps this identity to its own account (--pty-user-map).
+    assert.equal(start.actor, 'user-1');
     const now = Math.floor(Date.now() / 1000);
     assert.ok(Math.abs(start.deadline_unix - (now + 28800)) <= 2);
     const ok = verifyLease(PUBLIC_KEY, start.lease, terminalPayload(start.session_id, start.deadline_unix, 'start'));
@@ -327,7 +329,7 @@ test('start failures are pty_status errors closed with 1011', async () => {
 
     // Agent-reported refusal, and an unknown code is reported as internal.
     const agent = await connectAgent(r);
-    for (const [reported, expected] of [['pty_user_unset', 'pty_user_unset'], ['recording_unavailable', 'recording_unavailable'], ['root_unavailable', 'root_unavailable'], ['bad_signature', 'internal']]) {
+    for (const [reported, expected] of [['pty_user_unset', 'pty_user_unset'], ['account_unmapped', 'account_unmapped'], ['recording_unavailable', 'recording_unavailable'], ['root_unavailable', 'root_unavailable'], ['bad_signature', 'internal']]) {
       const before = agentFrames(agent, 'pty_start').length;
       const c = openClient(r);
       const start = await waitUntil('pty_start', () => agentFrames(agent, 'pty_start')[before]);

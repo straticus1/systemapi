@@ -33,6 +33,11 @@ type CommandMessage struct {
 	Cols         int           `json:"cols,omitempty"`
 	Action       string        `json:"action,omitempty"`
 	Lease        *Lease        `json:"lease,omitempty"`
+	Actor        string        `json:"actor,omitempty"`
+	WatchID      string        `json:"watch_id,omitempty"`
+	Mode         string        `json:"mode,omitempty"`
+	Reason       string        `json:"reason,omitempty"`
+	Override     bool          `json:"override,omitempty"`
 }
 
 // ResponseMessage is an outgoing WebSocket message.
@@ -59,6 +64,8 @@ func main() {
 	hostnameFlag := flag.String("hostname", "", "hostname (default: this machine)")
 	stateFlag := flag.String("state", "", "state file (default: ~/.systemapi/agent.json)")
 	ptyUserFlag := flag.String("pty-user", "", "account for terminal:open shells; required when the agent runs as root")
+	ptyUserMapFlag := flag.String("pty-user-map", "", "file of 'identity = unixuser' lines (mode 0600, owned by root or the agent user); each identity runs as its own account and an unmapped identity is refused; overrides --pty-user")
+	ptyNoticeFlag := flag.String("pty-notice", "", "file holding the monitoring notice shown at the start of every terminal session (owned by root or the agent user, not group or other writable); the tenant name is always appended, and the notice cannot be turned off")
 	ptyAllowAgentUserFlag := flag.Bool("pty-allow-agent-user", false, "let a non-root agent run terminal:open shells as its own user (the shell can read the agent's key and state; recording is user_owned)")
 	ptyRecordFlag := flag.Bool("pty-record", true, "record every terminal session in an HMAC-chained file")
 	ptyRecordDirFlag := flag.String("pty-record-dir", "", "terminal recordings (default: "+ptyRootRecordDir+" as root, else <state dir>/recordings)")
@@ -87,6 +94,29 @@ func main() {
 		RecordDir:      *ptyRecordDirFlag,
 		RecordMaxBytes: *ptyRecordMaxFlag,
 		RecordMinFree:  *ptyRecordMinFreeFlag,
+		Tenant:         *tenantFlag,
+	}
+	if *ptyUserMapFlag != "" {
+		m, err := loadPTYUserMap(*ptyUserMapFlag, os.Geteuid())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: --pty-user-map: %v\n", err)
+			os.Exit(2)
+		}
+		ptyCfg.UserMap = m
+		log.Printf("terminal, file and xfer sessions run as per-identity accounts from --pty-user-map (%d identities)", len(m))
+		if ptyCfg.User != "" {
+			log.Printf("WARNING: --pty-user is ignored because --pty-user-map is set")
+		}
+	} else if ptyCfg.User != "" {
+		log.Printf("WARNING: --pty-user maps every identity to the one account %s; people sharing it can signal, ptrace and plant files for each other (use --pty-user-map)", ptyCfg.User)
+	}
+	if *ptyNoticeFlag != "" {
+		text, err := loadPTYNotice(*ptyNoticeFlag, os.Geteuid())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: --pty-notice: %v\n", err)
+			os.Exit(2)
+		}
+		ptyCfg.Notice = text
 	}
 	if !ptyCfg.Record {
 		log.Printf("WARNING: terminal recording is OFF (--pty-record=false)")
@@ -243,6 +273,7 @@ func processIncomingMessage(out ptyOut, hostID, stateDir string, message []byte)
 			Rows:         cmd.Rows,
 			Cols:         cmd.Cols,
 			DeadlineUnix: cmd.DeadlineUnix,
+			Actor:        cmd.Actor,
 			Lease:        cmd.Lease,
 		}, time.Now())
 
@@ -262,6 +293,10 @@ func processIncomingMessage(out ptyOut, hostID, stateDir string, message []byte)
 			log.Printf("pty_input rejected: bad base64")
 			return
 		}
+		if cmd.WatchID != "" {
+			handleWatcherInput(cmd.SessionID, cmd.WatchID, data)
+			return
+		}
 		handlePTYInput(cmd.SessionID, data)
 
 	case "pty_eof":
@@ -269,6 +304,21 @@ func processIncomingMessage(out ptyOut, hostID, stateDir string, message []byte)
 
 	case "pty_resize":
 		handlePTYResize(cmd.SessionID, cmd.Rows, cmd.Cols)
+
+	case "watch_request":
+		log.Printf("watch_request %s mode=%s", cmd.SessionID, cmd.Mode)
+		handleWatchRequest(out, hostID, watchRequest{
+			SessionID: cmd.SessionID,
+			WatchID:   cmd.WatchID,
+			Mode:      cmd.Mode,
+			Actor:     cmd.Actor,
+			Reason:    cmd.Reason,
+			Override:  cmd.Override,
+			Lease:     cmd.Lease,
+		}, time.Now())
+
+	case "watch_stop":
+		handleWatchStop(cmd.SessionID, cmd.WatchID)
 
 	case "pty_stop":
 		log.Printf("pty_stop %s", cmd.SessionID)

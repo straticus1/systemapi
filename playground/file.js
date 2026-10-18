@@ -88,7 +88,7 @@ const MUTATING = new Set(['write_open', 'write_chunk', 'write_commit', 'write_ab
 const INTENT_OPS = new Set(['write_commit', 'mkdir', 'remove']);
 const SESSION_ERRORS = new Set([
     'ticket_invalid', 'scope_denied', 'agent_offline', 'agent_unsupported', 'lease_required', 'cap_reached',
-    'root_denied', 'root_invalid', 'pty_user_unset', 'root_unavailable', 'protocol_error', 'internal'
+    'root_denied', 'root_invalid', 'pty_user_unset', 'account_unmapped', 'root_unavailable', 'protocol_error', 'internal'
 ]);
 const OP_ERRORS = new Set([
     'bad_request', 'bad_path', 'reserved_name', 'not_found', 'not_a_file', 'not_a_dir', 'exists', 'not_empty',

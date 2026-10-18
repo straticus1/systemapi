@@ -5,12 +5,14 @@
 // session is keyed by a server-generated session id and needs a signed lease
 // bound to that id, its deadline and its phase (start or renew); it ends at
 // the deadline or when the last renewed lease expires, whichever is first.
-// Action "pty" runs as --pty-user with uid, gid and supplementary groups
-// dropped, and only on a root agent; a non-root agent refuses unless
+// Action "pty" runs as the actor's own account from --pty-user-map
+// (pty_usermap.go), or as --pty-user when no map is set, with uid, gid and
+// supplementary groups dropped, and only on a root agent; a non-root agent refuses unless
 // --pty-allow-agent-user is set, because the shell would then run as the
 // agent's own user and could read its key and state. "pty_root" is a
 // separate lease action. The agent records every input and output byte in an
-// HMAC-chained file (recorder.go) unless --pty-record=false. Each session has
+// HMAC-chained file (recorder.go) unless --pty-record=false. Every session
+// starts with a monitoring notice, and watching goes through watch.go. Each session has
 // its own bounded input queue and writer goroutine; an overflow ends that
 // session only. Ending a session signals its process group and, on Linux,
 // every process in its session. Does NOT contain a process that starts a new
@@ -106,6 +108,13 @@ type ptySettings struct {
 	RecordMaxBytes int64  // 0 means recordMaxBytesDefault
 	RecordMinFree  uint64 // 0 means recordMinFreeDefault
 	Shell          string
+	// UserMap maps each server identity to its own account. When set, it
+	// replaces User and an unmapped identity is refused (account_unmapped).
+	UserMap map[string]string
+	// Notice is the monitoring notice shown at the start of every terminal
+	// session; empty means ptyNoticeDefault. Tenant is appended to it.
+	Notice string
+	Tenant string
 }
 
 var (
@@ -119,6 +128,7 @@ var (
 type ptySession struct {
 	id       string
 	action   string
+	actor    string
 	deadline time.Time
 	out      ptyOut
 	ptmx     *os.File
@@ -135,6 +145,8 @@ type ptySession struct {
 	ending    bool
 	inQueued  int
 	inClosed  bool
+	consent   *watchPrompt          // the watch consent prompt waiting for y/n
+	watchers  map[string]*watchInfo // active watches by watch id
 
 	reapMu sync.Mutex
 	reaped bool
@@ -146,6 +158,7 @@ type ptyStartRequest struct {
 	Rows         int
 	Cols         int
 	DeadlineUnix int64
+	Actor        string
 	Lease        *Lease
 }
 
@@ -286,15 +299,22 @@ func groupNames(id *ptyIdentity) []string {
 }
 
 // resolvePTYIdentity picks the account a session runs as, or returns a
-// contract error code.
-func resolvePTYIdentity(action string, cfg ptySettings, euid int) (*ptyIdentity, string) {
+// contract error code. For "pty" the account is the actor's entry in
+// --pty-user-map when a map is configured, else --pty-user. Terminal, file
+// and xfer sessions all resolve through here.
+func resolvePTYIdentity(action, actor string, cfg ptySettings, euid int) (*ptyIdentity, string) {
 	switch action {
 	case "pty":
+		acct, code := ptyAccountFor(actor, cfg)
+		if code != "" {
+			log.Printf("terminal:open refused: identity has no entry in --pty-user-map")
+			return nil, code
+		}
 		if euid == 0 {
-			if cfg.User == "" {
+			if acct == "" {
 				return nil, "pty_user_unset"
 			}
-			u, err := user.Lookup(cfg.User)
+			u, err := user.Lookup(acct)
 			if err != nil {
 				log.Printf("pty user lookup failed")
 				return nil, "pty_start_failed"
@@ -317,7 +337,7 @@ func resolvePTYIdentity(action string, cfg ptySettings, euid int) (*ptyIdentity,
 		if err != nil {
 			return nil, "pty_start_failed"
 		}
-		if cfg.User != "" && cfg.User != u.Username {
+		if acct != "" && acct != u.Username {
 			log.Printf("pty user differs from the agent user and the agent is not root")
 			return nil, "pty_start_failed"
 		}
@@ -451,7 +471,7 @@ func startPTYSession(out ptyOut, hostID, stateDir string, req ptyStartRequest, n
 	}
 
 	euid := agentEUID()
-	id, code := resolvePTYIdentity(req.Action, ptyCfg, euid)
+	id, code := resolvePTYIdentity(req.Action, req.Actor, ptyCfg, euid)
 	if code != "" {
 		ptyStatusError(out, sid, code)
 		return
@@ -488,6 +508,7 @@ func startPTYSession(out ptyOut, hostID, stateDir string, req ptyStartRequest, n
 	s := &ptySession{
 		id:       sid,
 		action:   req.Action,
+		actor:    req.Actor,
 		deadline: deadline,
 		out:      out,
 		leaseExp: leaseExp,
@@ -565,6 +586,11 @@ func startPTYSession(out ptyOut, hostID, stateDir string, req ptyStartRequest, n
 		"pty_user_privileged_groups": privileged,
 	}})
 
+	// The notice goes out before the reader starts, so it precedes every
+	// byte of shell output, and before the input loop, so nothing the
+	// client typed reaches the shell first.
+	s.notifyUser(sessionNotice(ptyCfg))
+
 	go s.inputLoop()
 
 	readerDone := make(chan struct{})
@@ -628,6 +654,7 @@ func startPTYSession(out ptyOut, hostID, stateDir string, req ptyStartRequest, n
 		recordErr := s.recordErr
 		s.inClosed = true
 		close(s.inCh)
+		s.cancelConsentLocked()
 		s.mu.Unlock()
 		if reason == "" {
 			reason = "exited"
@@ -677,6 +704,13 @@ func (s *ptySession) queueInput(data []byte) {
 	s.mu.Lock()
 	if s.inClosed || s.ending {
 		s.mu.Unlock()
+		return
+	}
+	if p := s.consent; p != nil {
+		// A watch consent prompt owns the keyboard: these bytes never reach
+		// the shell or its recording.
+		s.mu.Unlock()
+		p.feed(data)
 		return
 	}
 	if s.inQueued+len(data) > inputQueueMax {
@@ -738,6 +772,7 @@ func (s *ptySession) end(reason string) {
 	if s.reason == "" {
 		s.reason = reason
 	}
+	s.cancelConsentLocked()
 	if s.timer != nil {
 		s.timer.Stop()
 	}

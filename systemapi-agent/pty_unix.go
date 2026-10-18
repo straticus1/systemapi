@@ -101,3 +101,12 @@ func freeBytes(path string) (uint64, error) {
 	}
 	return uint64(st.Bavail) * uint64(st.Bsize), nil
 }
+
+// fileOwner is the owning uid of a file, when the platform has one.
+func fileOwner(st os.FileInfo) (uint32, bool) {
+	sys, ok := st.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return sys.Uid, true
+}

@@ -138,6 +138,40 @@ the API, with an admin credential.
 3. Revoke the bootstrap key (`DELETE /playground/api-keys/:keyId`, called with
    that key). It does not expire on its own.
 
+## Agent flags: accounts, notice and watching
+
+Set these on each host's `systemapi-agent` once the first admin exists.
+
+- `--pty-user-map <file>`: one Unix account per identity for `terminal:open`,
+  `file:read`/`file:write` and `xfer:put`/`xfer:get`. Each line is
+  `identity = unixuser`, where the identity is the actor the server sends
+  (the member's user id); `#` starts a comment. The file must be a regular
+  file, mode `0600` or stricter, owned by root or by the agent user. The
+  agent refuses to start when a line uses `*`, repeats an identity, maps to
+  `root`, or maps two identities to one account. With a map, an identity
+  that has no line is refused with `account_unmapped`, and `--pty-user` is
+  ignored. Create the accounts first (`useradd --create-home sah_alice`); a
+  mapped account that does not exist refuses that session.
+
+  ```
+  # /etc/systemapi/pty-users  (root:root 0600)
+  17 = sah_alice
+  23 = sah_bob
+  ```
+
+- `--pty-user <name>`: the old single account. Without a map it still works
+  for every identity, and the agent logs at startup that it maps all
+  identities to one account: people sharing it can signal, ptrace (with
+  `kernel.yama.ptrace_scope` 0) and plant profile files for each other.
+- `--pty-notice <file>`: the monitoring notice every terminal session shows
+  before the shell accepts input. The default is "This session is recorded
+  and may be viewed by an administrator."; the agent always appends
+  `Tenant: <--tenant>`. The file must be owned by root or the agent user and
+  not group or other writable. An empty file is refused at startup: the
+  notice can be reworded, never turned off.
+
+See `docs/sahconnect-terminal-protocol.md` §6 and §7.
+
 ## Tests
 
 `npm test` runs `tests/bootstrap.test.js` (the registry transaction on a

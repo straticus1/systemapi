@@ -84,7 +84,7 @@ const PURPOSE_ACTIONS = new Map([
 ]);
 const PTY_ERRORS = new Set([
     'ticket_invalid', 'scope_denied', 'agent_offline', 'lease_required',
-    'pty_user_unset', 'recording_unavailable', 'root_unavailable', 'pty_start_failed', 'internal'
+    'pty_user_unset', 'account_unmapped', 'recording_unavailable', 'root_unavailable', 'pty_start_failed', 'internal'
 ]);
 const PTY_EXIT_REASONS = new Set(['exited', 'max_duration', 'stopped']);
 const B64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
@@ -404,6 +404,9 @@ class FleetManager {
             rows,
             cols,
             deadline_unix: deadlineUnix,
+            // The agent picks the Unix account from this identity when it
+            // has a --pty-user-map (one account per identity).
+            actor: actor === null ? '' : String(actor),
             lease
         });
         session.renewTimer = unref(setInterval(() => this.renewTerminal(session), this.ptyRenewMs));

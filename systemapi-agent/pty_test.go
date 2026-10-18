@@ -388,20 +388,20 @@ func TestPTYIdentityDropsToConfiguredUser(t *testing.T) {
 			t.Fatalf("nobody: %v", err)
 		}
 	}
-	id, code := resolvePTYIdentity("pty", ptySettings{User: me.Username}, 0)
+	id, code := resolvePTYIdentity("pty", "", ptySettings{User: me.Username}, 0)
 	if code != "" {
 		t.Fatalf("code %s", code)
 	}
 	if !id.drop || strconv.FormatUint(uint64(id.uid), 10) != me.Uid || strconv.FormatUint(uint64(id.gid), 10) != me.Gid || id.home != me.HomeDir {
 		t.Fatalf("identity %+v", id)
 	}
-	if _, code := resolvePTYIdentity("pty", ptySettings{User: "root"}, 0); code != "pty_start_failed" {
+	if _, code := resolvePTYIdentity("pty", "", ptySettings{User: "root"}, 0); code != "pty_start_failed" {
 		t.Fatalf("root as pty user: %q", code)
 	}
-	if _, code := resolvePTYIdentity("pty", ptySettings{User: "no-such-user-systemapi"}, 0); code != "pty_start_failed" {
+	if _, code := resolvePTYIdentity("pty", "", ptySettings{User: "no-such-user-systemapi"}, 0); code != "pty_start_failed" {
 		t.Fatalf("unknown pty user: %q", code)
 	}
-	if _, code := resolvePTYIdentity("pty", ptySettings{User: "no-such-user-systemapi"}, 1000); code != "pty_start_failed" {
+	if _, code := resolvePTYIdentity("pty", "", ptySettings{User: "no-such-user-systemapi"}, 1000); code != "pty_start_failed" {
 		t.Fatalf("non-root agent switching user: %q", code)
 	}
 	t.Setenv("SYSTEMAPI_API_KEY", "secret")

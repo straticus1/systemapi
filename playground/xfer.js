@@ -103,7 +103,7 @@ const DIRECT_ALLOW_DEFAULT = '127.0.0.0/8,::1/128';
 const AGENT_ERRORS = Object.freeze({
     bad_root: 400, bad_path: 400, reserved_name: 400, symlink_refused: 403, not_a_file: 409, root_denied: 403,
     not_found: 404, exists: 409, too_large: 413, agent_unsupported: 501, cap_reached: 429, changed: 409, internal: 500,
-    pty_user_unset: 503, root_unavailable: 503, lease_required: 500, no_space: 507, io: 500
+    pty_user_unset: 503, account_unmapped: 403, root_unavailable: 503, lease_required: 500, no_space: 507, io: 500
 });
 // Agent codes the client sees as another code.
 const CLIENT_CODES = Object.freeze({ lease_required: 'internal' });

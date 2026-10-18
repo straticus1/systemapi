@@ -658,7 +658,7 @@ func (m *xferManager) grant(c *channelConn, msg xferMsg, now time.Time) {
 	if msg.Action == "xfer_root" {
 		fileAction = "file_root"
 	}
-	id, code := resolveFileIdentity(fileAction, ptyCfg, agentEUID())
+	id, code := resolveFileIdentity(fileAction, msg.Actor, ptyCfg, agentEUID())
 	if code != "" {
 		m.release(x)
 		refuse(code, "identity")
@@ -678,7 +678,7 @@ func (m *xferManager) grant(c *channelConn, msg xferMsg, now time.Time) {
 	x.recordDir = stateDir
 	rec := xferRecord{
 		GrantID: gid, TransferID: msg.TransferID, Action: msg.Action, Root: msg.Root, Path: msg.Path,
-		Size: msg.Size, SHA256: msg.SHA256, Identity: recordIdentity(id), CreatedUnix: nowUnix,
+		Size: msg.Size, SHA256: msg.SHA256, Identity: recordIdentity(id), Actor: msg.Actor, CreatedUnix: nowUnix,
 	}
 	if err := saveXferRecord(stateDir, rec); err != nil {
 		m.release(x)

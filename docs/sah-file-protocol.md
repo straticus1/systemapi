@@ -280,7 +280,10 @@ The same as PTY:
     safely per goroutine.
   - `file:root` runs the helper as root, and only on a root agent.
   - A non-root agent refuses everything unless `--pty-allow-agent-user` is set.
-  - Errors: `pty_user_unset`, `root_unavailable`.
+  - With `--pty-user-map`, the account is the `actor`'s own entry, resolved
+    exactly as for `terminal:open` (`docs/sahconnect-terminal-protocol.md`
+    §6); an actor with no entry is refused with `account_unmapped`.
+  - Errors: `pty_user_unset`, `account_unmapped`, `root_unavailable`.
 - **Lease.** Actions `file` and `file_root`.
   - The signed payload is
     `"<session_id>\n<deadline_unix>\n<start|renew>\n<read|write>\n<root>"`.
@@ -331,6 +334,7 @@ The same as PTY:
 | `root_denied` | The server policy refuses the root, or the agent refuses it (§7: `/`, or a root holding its state directory, outside `file:root`). |
 | `root_invalid` | The root contains a symlink, is missing, or is not a directory. |
 | `pty_user_unset` | The agent has no `pty_user` to run as. |
+| `account_unmapped` | The agent has a `--pty-user-map` and the actor has no entry in it. |
 | `root_unavailable` | `file:root` on an agent that cannot run as root. |
 | `protocol_error` | The client broke a framing rule. |
 | `internal` | Any other failure. |

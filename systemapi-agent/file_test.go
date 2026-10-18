@@ -226,21 +226,21 @@ func TestCountUploadsPerActorAndRoot(t *testing.T) {
 }
 
 func TestFileIdentityRules(t *testing.T) {
-	if _, code := resolveFileIdentity("file_root", ptySettings{AllowAgentUser: true}, 1000); code != "root_unavailable" {
+	if _, code := resolveFileIdentity("file_root", "", ptySettings{AllowAgentUser: true}, 1000); code != "root_unavailable" {
 		t.Fatalf("file:root on a non-root agent: %q", code)
 	}
-	if _, code := resolveFileIdentity("file", ptySettings{}, 1000); code != "pty_user_unset" {
+	if _, code := resolveFileIdentity("file", "", ptySettings{}, 1000); code != "pty_user_unset" {
 		t.Fatalf("non-root agent without --pty-allow-agent-user: %q", code)
 	}
-	if _, code := resolveFileIdentity("file", ptySettings{}, 0); code != "pty_user_unset" {
+	if _, code := resolveFileIdentity("file", "", ptySettings{}, 0); code != "pty_user_unset" {
 		t.Fatalf("root agent without --pty-user: %q", code)
 	}
 	if runtime.GOOS != "windows" {
-		if _, code := resolveFileIdentity("file", ptySettings{User: "root"}, 0); code != "internal" {
+		if _, code := resolveFileIdentity("file", "", ptySettings{User: "root"}, 0); code != "internal" {
 			t.Fatalf("pty_user root: %q", code)
 		}
 	}
-	id, code := resolveFileIdentity("file", ptySettings{AllowAgentUser: true}, 1000)
+	id, code := resolveFileIdentity("file", "", ptySettings{AllowAgentUser: true}, 1000)
 	if code != "" || id.drop {
 		t.Fatalf("agent user: %q %+v", code, id)
 	}
