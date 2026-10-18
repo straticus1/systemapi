@@ -55,6 +55,48 @@ the router.
   `SYSTEMAPI_TICKET_RATE_PRIVILEGED` (default 20) budget for `terminal:root`
   and break-glass; more return 429 `rate_limited`.
   `terminal:root` needs the admin-only scope `terminal:root`.
+- Watching another user's terminal session: `POST /api/v1/ws-ticket` with
+  `purpose` `terminal:watch` (view only) or `terminal:watch_rw` (read-write)
+  and `{"session_id": "pts_...", "reason": "<text>", "override": false}`
+  (`mode`, if sent, must be `ro` or `rw` to match the purpose). The rules:
+  - `reason` is required for every watch: 1 to 256 UTF-8 bytes of printable
+    characters, no tabs, newlines or control characters. Missing or blank is
+    400 `reason_required`; any other bad reason is 400 `bad_reason`.
+  - View only with the user's consent needs the scope `terminal:watch` in
+    the session's tenant. It is a new scope, admin only (admin implies it);
+    a support key is an admin's key restricted to `terminal:watch`.
+  - `override: true` (view only, no prompt) and `terminal:watch_rw` need the
+    `admin` scope. Read-write is always sent to the agent with override
+    false, so the user is always asked.
+  - The server signs a watch lease, sends `watch_request` to the agent, and
+    waits up to 35 s for `watch_consent`. On a grant it writes the audit row
+    `watch_started` and returns the ticket:
+    `{"ticket", "expires_at", "expires_in", "host_id", "purpose", "session_id", "watch_id", "mode", "consent"}`.
+    `consent` is false only for an admin override.
+  - Refusals: 403 `watch_denied` (the user said no, or no answer in time;
+    the request is then withdrawn with `watch_stop`), 404 `unknown_session`
+    (no such live session, or not in the caller's tenants), 409 `busy`
+    (a consent prompt is already open on that session), 403 `scope_denied`,
+    429 `rate_limited` (the privileged ticket budget), 502 `agent_error`
+    (the agent reported a grant the server did not ask for), 502
+    `lease_required` (the agent refused the lease). Each answer from the
+    agent writes `watch_refused`.
+  - The watcher opens
+    `/api/v1/systems/terminal/<host_id>?ticket=<ticket>&purpose=terminal:watch`
+    (or `terminal:watch_rw`) within 60 s; a ticket never opened stops the
+    watch. The first frame is
+    `pty_status {"status": "started", "session_id", "watch_id", "mode"}`, then
+    the session's output as binary frames from that point on. A view-only
+    watcher's input is dropped by the server; a read-write watcher's
+    `pty_input` is forwarded with its `watch_id`. Resize and EOF from a
+    watcher are dropped. When the session ends the watcher gets `pty_exit`
+    and close 1000. When the watcher closes, the agent gets `watch_stop` and
+    the server writes `watch_stopped`.
+- `GET /api/v1/systems/terminal/sessions?host_id=<host_id>` lists live
+  terminal sessions for `terminal:watch` holders (support and admin), in the
+  tenants where the caller holds that scope. `host_id` is optional (404 for a
+  host the caller cannot see). Response:
+  `{"sessions": [{"session_id", "host_id", "hostname", "tenant", "actor", "purpose", "started_at", "watchers"}]}`.
 - Agents: `Authorization: Bearer <key>` on the WebSocket upgrade, plus the
   enrollment headers described in `cli_docs.md`.
 
@@ -180,12 +222,18 @@ proxy cached data from DNSScience (`DNSSCIENCE_API_URL`) and DarkAPI.
   - server to agent: `pty_start {session_id, action, rows, cols, deadline_unix, lease}`,
     `pty_renew {session_id, lease}`, `pty_input {session_id, data_b64}`,
     `pty_resize {session_id, rows, cols}`, `pty_eof {session_id}`,
-    `pty_stop {session_id}`;
+    `pty_stop {session_id}`, `watch_request {session_id, watch_id, mode,
+    actor, reason, override, lease}`, `watch_stop {session_id, watch_id}`,
+    and `pty_input {session_id, watch_id, data_b64}` from a read-write
+    watcher;
   - agent to server: `pty_status {session_id, payload}`, `pty_exit {session_id,
     payload: {code, reason}}`, `pty_renew_rejected {session_id, payload: {error}}`,
+    `watch_consent {session_id, payload: {watch_id, granted, consent, result|error, mode, actor, reason}}`,
     and binary output frames `[len(session_id)][session_id][bytes]`.
   Terminal lease actions are `pty`, `pty_root` and `breakglass`; each signs
-  `<action>\n<session_id>\n<deadline_unix>\n<start|renew>`. The agent's
+  `<action>\n<session_id>\n<deadline_unix>\n<start|renew>`. A watch lease
+  uses the session's own action and signs
+  `<action>\n<session_id>\n<deadline_unix>\nwatch\n<watch_id>\n<ro|rw>\n<true|false>\n<reason>`. The agent's
   `pty_status` "started" payload carries `recording` (`agent`, `user_owned` or
   `off`) and `pty_user_privileged_groups`; its `pty_exit` payload carries
   `record {path, digest, bytes_in, bytes_out}` and, on failure,

@@ -205,10 +205,9 @@ an investigation: the forced notice is the only behavior.
 
 ### 7.2 Watching
 
-Status: the agent implements this section. The server does not have a watch
-feature yet: no route asks to watch, no relay sends a session's output to a
-watcher, and nothing writes the audit rows below. The server side must be
-built to this contract.
+Status: the agent and the server both implement this section. The server
+half is `playground/watch.js`, the routes in `controlplane/router.js`, and
+"Server side" below.
 
 **Rules.**
 
@@ -277,4 +276,90 @@ watcher):
   for an admin override.
 - `watch_refused`: `{session_id, watch_id, mode, actor, reason, result}` for
   `denied`, `timeout`, `cancelled`, `session_ended` or an `error`.
-- `watch_stopped`: `{session_id, watch_id, actor, duration}`.
+- `watch_stopped`: `{session_id, watch_id, actor, duration}`. The server
+  also adds `mode`, `reason` (why it stopped) and `bytes_relayed`.
+
+**Server side.**
+
+Asking. `POST /api/v1/ws-ticket` with purpose `terminal:watch` (mode `ro`)
+or `terminal:watch_rw` (mode `rw`), and the body
+`{"session_id": "pts_…", "reason": "<text>", "override": bool}`. `mode` may
+be sent and must match the purpose. The server checks, in this order:
+
+1. The body: a session id of the `pts_` shape (400 `bad_session_id`), a
+   boolean `override` (400 `bad_override`), and a reason. The server needs
+   a reason for every watch, not only an override: missing or blank is 400
+   `reason_required`, and one the agent would refuse (over 256 bytes, a
+   tab, newline or other non-printable character) is 400 `bad_reason`.
+2. The scope in some tenant (403 `scope_denied`). View only without
+   override needs `terminal:watch`, a new admin-only scope (admin implies
+   it; a support key is an admin's key restricted to it). Override, and
+   any read-write watch, need `admin`.
+3. A live, started session whose host the caller can see (404
+   `unknown_session`), then the same scope in the session's tenant.
+4. A consent prompt already waiting on that session (409 `busy`). An
+   override request does not open a prompt and is not held back by one.
+5. The privileged ticket budget (429 `rate_limited`).
+
+Then the server signs the watch lease for the session's own action and
+deadline, sends `watch_request`, and waits up to 35 s. Read-write is
+always sent with `override: false`. The agent's answer maps to:
+
+| Agent answer | HTTP | Audit |
+|---|---|---|
+| `granted`, `consent: true`, `result: "granted"` | 200 with the ticket | `watch_started` (consent true) |
+| `granted`, `consent: false`, `result: "override"`, only when the server sent override | 200 with the ticket | `watch_started` (consent false) |
+| any other grant (for example an override grant for `rw`) | 502 `agent_error`; the server sends `watch_stop` | `watch_refused`, result `invalid_grant` |
+| `denied`, `timeout`, `cancelled` | 403 `watch_denied` | `watch_refused` |
+| `session_ended`, or error `unknown_session` / `session_ended` | 404 `unknown_session` | `watch_refused` |
+| error `busy` | 409 `busy` | `watch_refused` |
+| error `reason_required` / `bad_request` | 400 | `watch_refused` |
+| error `lease_required` | 502 `lease_required` | `watch_refused` |
+| no answer in 35 s | 403 `watch_denied`; the server sends `watch_stop` to withdraw the prompt | `watch_refused`, result `timeout` |
+| the HTTP client hangs up while waiting | none; the server sends `watch_stop` | `watch_refused`, result `cancelled` |
+
+`watch_started` is written before the ticket is issued, so before any byte
+can be relayed. If it cannot be written, the server sends `watch_stop` and
+answers 500 `internal`. The 200 body is the usual ticket
+(`ticket`, `expires_at`, `expires_in`, `host_id`, `purpose`) plus
+`session_id`, `watch_id`, `mode` and `consent`. The `ticket_issued` row
+carries the session id, watch id and mode.
+
+Watching. The watcher opens
+`/api/v1/systems/terminal/<host_id>?ticket=<ticket>&purpose=terminal:watch`
+(or `terminal:watch_rw`). The ticket is single-use and bound to the one
+granted watch. At the upgrade the server checks again that the caller holds
+the scope the watch needed (`pty_status` error `scope_denied` otherwise).
+Then:
+
+- The first frame is
+  `{"type":"pty_status","payload":{"status":"started","session_id":"…","watch_id":"…","mode":"ro"|"rw"}}`.
+- The session's output is relayed as binary frames from then on. Output
+  sent before the watcher connected is not replayed.
+- From a view-only watcher, the server drops every `pty_input`. From a
+  read-write watcher, `pty_input` goes to the agent as
+  `{"type":"pty_input","session_id":"…","watch_id":"…","data_b64":"…"}`.
+  `pty_resize` and `pty_eof` from any watcher are dropped.
+- A watcher whose send buffer passes `SYSTEMAPI_PTY_CLIENT_BUFFER_MAX` is
+  closed. The session goes on.
+
+Stopping. A watch stops, and `watch_stopped` is written, when:
+
+- the watcher closes its socket (`reason` `watcher_closed`); the agent gets
+  `watch_stop`;
+- the ticket is not opened within its 60 s (`ticket_unused`); the agent gets
+  `watch_stop`;
+- the session ends (`session_ended`); the watcher gets the session's
+  `pty_exit` and close 1000;
+- the scope re-check at the upgrade fails (`scope_denied`), or the watcher
+  cannot keep up (`watcher_too_slow`).
+
+The agent's `watch_consent` with `result: "stopped"`, sent after a
+`watch_stop`, needs no answer and is ignored.
+
+Finding a session. `GET /api/v1/systems/terminal/sessions?host_id=<id>`
+lists the live, started terminal sessions in the tenants where the caller
+holds `terminal:watch`: `{"sessions": [{"session_id", "host_id",
+"hostname", "tenant", "actor", "purpose", "started_at", "watchers"}]}`.
+`host_id` is optional. A caller without the scope gets 403, and a host it
+cannot see gets 404.

@@ -3,7 +3,9 @@
 // ticket even when the host or purpose does not match. Channel tickets
 // (tcp:open, file:*) are also bound to their target or root: the binding is
 // stored on the ticket, a channel ticket without one is refused at consume,
-// and a caller that passes an expected binding must match it exactly. Tickets
+// and a caller that passes an expected binding must match it exactly. A watch
+// ticket (terminal:watch, terminal:watch_rw) is bound to one granted watch
+// (session id, watch id, mode) and is refused at consume without it. Tickets
 // live in this process's memory: they do not survive a restart and are not
 // shared between server nodes (known residual until phase 4).
 'use strict';
@@ -19,7 +21,7 @@ function frozenTarget(target) {
 
 // auth ({ kind, keyId, groupRole }) is what the upgrade needs to re-check the
 // actor's scopes (authz.ticketScopesHeld); it is never sent anywhere.
-function issueTicket(store, { hostId, purpose, tenantId, actor = null, auth = null, target = null, root = null }) {
+function issueTicket(store, { hostId, purpose, tenantId, actor = null, auth = null, target = null, root = null, watch = null }) {
   const ticket = `stk_${randomToken(32)}`;
   store.set(ticket, {
     hostId,
@@ -29,6 +31,7 @@ function issueTicket(store, { hostId, purpose, tenantId, actor = null, auth = nu
     auth: auth ? Object.freeze({ kind: auth.kind, keyId: auth.keyId || null, groupRole: auth.groupRole || null }) : null,
     target: frozenTarget(target),
     root: typeof root === 'string' ? root : null,
+    watch: watch ? Object.freeze({ sessionId: watch.sessionId, watchId: watch.watchId, mode: watch.mode }) : null,
     exp: Date.now() + TTL_MS
   });
   return ticket;
@@ -47,6 +50,9 @@ function bindingOk(row, expect) {
     if (typeof row.root !== 'string' || row.root.length === 0) return false;
     if (expect && expect.root !== undefined && expect.root !== row.root) return false;
     return true;
+  }
+  if (row.purpose === 'terminal:watch' || row.purpose === 'terminal:watch_rw') {
+    return !!(row.watch && typeof row.watch.watchId === 'string' && row.watch.mode === (row.purpose === 'terminal:watch' ? 'ro' : 'rw'));
   }
   return true;
 }

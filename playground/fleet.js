@@ -16,7 +16,9 @@
  * live in playground/tcp.js and playground/file.js (with their own Threats
  * notes); this file routes their
  * upgrade path, agent frames and binary data, and ends them when the agent
- * connection drops.
+ * connection drops. Session watching (§7.2) lives in playground/watch.js;
+ * this file routes watch tickets on the terminal path, watch_consent frames
+ * and the session's output to its watchers.
  * One live agent per host: a second connection for a host whose agent is
  * connected (it already passed enroll, so it holds the same key and SSH public
  * key) wins only when the live socket fails a ping probe
@@ -56,6 +58,7 @@ const { deliverWebhooks, COOLDOWN_MS } = require('../controlplane/router');
 const { TcpChannels } = require('./tcp');
 const { FileChannels } = require('./file');
 const { XferGrants } = require('./xfer');
+const { TerminalWatches } = require('./watch');
 const { rejectUpgrade } = require('./channel');
 
 const PTY_FRAME_MAX = 64 * 1024;
@@ -183,6 +186,8 @@ class FleetManager {
         this.file = new FileChannels(this);
         // sahxfer grants (playground/xfer.js).
         this.xfer = new XferGrants(this);
+        // Terminal session watches (playground/watch.js).
+        this.watch = new TerminalWatches(this);
 
         const accessKey = process.env.DARKSTORAGE_ACCESS_KEY;
         const secretKey = process.env.DARKSTORAGE_SECRET_KEY;
@@ -314,8 +319,15 @@ class FleetManager {
 
     openTerminal(ws, parsed, hostId, rows, cols) {
         ws.on('error', (err) => console.error('[Fleet] terminal socket error:', err.message));
-        const ticketRes = ticketFromRequest(parsed);
         const purpose = parsed.searchParams.get('purpose') || 'terminal:open';
+        if (TerminalWatches.purposeMode(purpose)) {
+            this.watch.attach(ws, parsed, hostId, purpose).catch((err) => {
+                console.error('[Fleet] watch open failed:', err.message);
+                this.failTerminalSocket(ws, 'internal');
+            });
+            return;
+        }
+        const ticketRes = ticketFromRequest(parsed);
         const action = PURPOSE_ACTIONS.get(purpose);
         if (!this.tickets) {
             this.failTerminalSocket(ws, 'internal');
@@ -507,6 +519,7 @@ class FleetManager {
         this.terminalSessions.delete(session.id);
         session.pending = [];
         session.heldInput = [];
+        this.watch.onSessionEnd(session, reason, code);
         if (opts.error) {
             this.failTerminalSocket(session.client, opts.error);
         } else if (opts.notifyClient && session.client.readyState === WebSocket.OPEN) {
@@ -608,6 +621,7 @@ class FleetManager {
             return;
         }
         this.sendOutput(session, data);
+        if (!session.ended) this.watch.relay(session, data);
     }
 
     // Output goes out in slices of at most 64 KiB; clients cap frames at 1 MiB.
@@ -805,6 +819,9 @@ class FleetManager {
                 } else if (msg.type === 'pty_exit') {
                     const id = hostId;
                     if (id) inOrder(() => this.onAgentPtyExit(ws, id, msg));
+                } else if (msg.type === 'watch_consent') {
+                    const id = hostId;
+                    if (id) inOrder(() => this.watch.onAgentConsent(ws, id, msg));
                 } else if (msg.type === 'pty_renew_rejected') {
                     const id = hostId;
                     if (id) inOrder(() => this.onAgentRenewRejected(ws, id, msg));

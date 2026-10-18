@@ -24,6 +24,11 @@
 // the server keeps only that hash for renewals. The payload deadline is the
 // lease deadline (§3.4: TTL 60 s, renewed every 30 s). The shared golden
 // vector is sahxfer docs/golden-xfer-lease-v2.txt.
+// A watch request (docs/sahconnect-terminal-protocol.md §7.2) is signed for
+// the watched session's own terminal action over "<session_id>\n
+// <deadline_unix>\nwatch\n<watch_id>\n<ro|rw>\n<true|false>\n<reason>", so
+// only the lease signer can claim an override and a start or renew lease
+// cannot be replayed as a watch (or the reverse).
 'use strict';
 
 const crypto = require('node:crypto');
@@ -39,6 +44,12 @@ const SESSION_ACTIONS = new Set([...TERMINAL_ACTIONS, ...CHANNEL_ACTIONS, ...XFE
 const TCP_SESSION_RE = /^tcs_[A-Za-z0-9_-]{16,64}$/;
 const FILE_SESSION_RE = /^fls_[A-Za-z0-9_-]{16,64}$/;
 const XFER_GRANT_RE = /^xfr_[A-Za-z0-9_-]{8,64}$/;
+const PTY_SESSION_RE = /^pts_[A-Za-z0-9_-]{16,64}$/;
+const WATCH_ID_RE = /^wch_[A-Za-z0-9_-]{16,64}$/;
+const WATCH_REASON_MAX = 256;
+// The agent's terminalText keeps Go unicode.IsPrint characters: letters,
+// marks, numbers, punctuation, symbols and the ASCII space.
+const WATCH_REASON_RE = /^[\p{L}\p{M}\p{N}\p{P}\p{S} ]+$/u;
 const XFER_TRANSFER_RE = /^[0-9a-f]{16}$/;
 const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
 const XFER_MAX_S = 3600;
@@ -156,6 +167,28 @@ function filePayload(sessionId, deadlineUnix, phase, mode, root) {
   return `${sessionId}\n${deadlineUnix}\n${phase}\n${mode}\n${root}`;
 }
 
+// A watch reason: 1..256 UTF-8 bytes of printable characters with some
+// non-space content; no tab, newline or other control character, and no
+// U+FFFD (the agent refuses all of these as bad_request).
+function watchReasonOk(reason) {
+  if (typeof reason !== 'string' || !reason.isWellFormed() || reason.trim() === '') return false;
+  if (Buffer.byteLength(reason, 'utf8') > WATCH_REASON_MAX) return false;
+  return WATCH_REASON_RE.test(reason) && !reason.includes('\uFFFD');
+}
+
+// §7.2 watch lease payload. The deadline is the watched session's own
+// deadline (the one its start lease carried); override is signed as the
+// words true or false.
+function watchPayload(sessionId, deadlineUnix, watchId, mode, override, reason) {
+  if (typeof sessionId !== 'string' || !PTY_SESSION_RE.test(sessionId)) throw badPayload();
+  if (!Number.isInteger(deadlineUnix) || deadlineUnix <= 0) throw badPayload();
+  if (typeof watchId !== 'string' || !WATCH_ID_RE.test(watchId)) throw badPayload();
+  if (mode !== 'ro' && mode !== 'rw') throw badPayload();
+  if (typeof override !== 'boolean') throw badPayload();
+  if (!watchReasonOk(reason)) throw badPayload();
+  return `${sessionId}\n${deadlineUnix}\nwatch\n${watchId}\n${mode}\n${override}\n${reason}`;
+}
+
 // host:port with a numeric port 1..65535; the host is an IP literal or a DNS
 // name (IPv6 in brackets). Returns the string or null.
 function peerAddress(raw) {
@@ -223,6 +256,10 @@ module.exports = {
   FILE_SESSION_RE,
   XFER_ACTIONS,
   XFER_GRANT_RE,
+  PTY_SESSION_RE,
+  WATCH_ID_RE,
+  watchReasonOk,
+  watchPayload,
   terminalPayload,
   tcpPayload,
   filePayload,

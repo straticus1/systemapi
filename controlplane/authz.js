@@ -5,7 +5,8 @@
 // breakglass:open, terminal:root, file:root and admin. Does NOT bind a
 // session to a tenant by itself. admin implies every scope. terminal:root (a
 // root shell) and file:root (file operations as root) are granted to admin
-// only. tcp:open, file:read and file:write are operator scopes; the
+// only, and so is terminal:watch (view another user's terminal session; an
+// admin can hand a support key only this scope). tcp:open, file:read and file:write are operator scopes; the
 // file:write purpose needs both file:read and file:write (channels.js).
 // ticketScopesHeld re-checks a channel ticket's scopes at the WebSocket
 // upgrade against the actor's CURRENT membership (and, for an API key, its
@@ -22,6 +23,7 @@ const ALL = Object.freeze([
   'exec:run',
   'terminal:open',
   'terminal:root',
+  'terminal:watch',
   'breakglass:open',
   'tcp:open',
   'file:read',

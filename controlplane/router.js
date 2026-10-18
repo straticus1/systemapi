@@ -13,7 +13,7 @@ const express = require('express');
 const axios = require('axios');
 const { hasScope, roleFromGroups, scopesForRole, intersectScopes, ALL } = require('./authz');
 const oauth = require('./oauth');
-const { issueLease } = require('./lease');
+const { issueLease, PTY_SESSION_RE, watchReasonOk } = require('./lease');
 const { issueTicket, TTL_MS: TICKET_TTL_MS } = require('./tickets');
 const { CHANNEL_PURPOSES, PURPOSE_SCOPES, validateBinding, policyDecision } = require('./channels');
 const { fingerprint, randomToken, tokenEqual } = require('./token');
@@ -22,6 +22,7 @@ const { assertWebhookURL } = require('./webhook');
 const { bucketName, linearForecast, toCSV, cronValid, zscore } = require('./stats');
 const { listPlaybooks, readPlaybook } = require('./playbooks');
 const xfer = require('../playground/xfer');
+const { WATCH_PURPOSES, watchScopes } = require('../playground/watch');
 
 const SCRIPT_MAX = 64 * 1024;
 const COOLDOWN_MS = 5 * 60 * 1000;
@@ -29,7 +30,7 @@ const USER_RE = /^[a-zA-Z0-9][a-zA-Z0-9._@-]{0,128}$/;
 const RESOLVE_NAME_RE = /^[A-Za-z0-9._-]{1,253}$/;
 const RESOLVE_STALE_HOURS_DEFAULT = 24;
 const RETIRE_REASON_MAX = 256;
-const TICKET_PURPOSES = new Set(['terminal:open', 'terminal:root', 'breakglass:open', ...CHANNEL_PURPOSES]);
+const TICKET_PURPOSES = new Set(['terminal:open', 'terminal:root', 'breakglass:open', ...CHANNEL_PURPOSES, ...WATCH_PURPOSES.keys()]);
 const TICKET_RATE_DEFAULT = 20;
 const TICKET_RATE_TCP_DEFAULT = 120;
 const PRIVILEGED_PURPOSES = new Set(['breakglass:open', 'terminal:root', 'file:root']);
@@ -346,7 +347,9 @@ async function runScript(fleet, principal, host, script, entitlements) {
 // Ticket rate, per actor and host, per minute. Four separate budgets:
 // - terminal: terminal:open, file:read, file:write;
 //   SYSTEMAPI_TICKET_RATE_PER_HOST (default 20);
-// - privileged: breakglass:open, terminal:root, file:root, xfer:root;
+// - privileged: breakglass:open, terminal:root, file:root, xfer:root,
+//   terminal:watch, terminal:watch_rw (one request is one prompt on
+//   somebody's terminal);
 //   SYSTEMAPI_TICKET_RATE_PRIVILEGED (default 20), so one operator cannot
 //   starve another user or an admin's break-glass;
 // - tcp: tcp:open; SYSTEMAPI_TICKET_RATE_TCP (default 120), because one RDP
@@ -356,7 +359,7 @@ async function runScript(fleet, principal, host, script, entitlements) {
 //   or file session needed to diagnose it.
 // In process memory, like the tickets themselves.
 function ticketBudget(purpose) {
-  if (PRIVILEGED_PURPOSES.has(purpose) || purpose === 'xfer:root') return 'privileged';
+  if (PRIVILEGED_PURPOSES.has(purpose) || purpose === 'xfer:root' || WATCH_PURPOSES.has(purpose)) return 'privileged';
   if (purpose === 'tcp:open') return 'tcp';
   if (purpose === 'xfer:put' || purpose === 'xfer:get') return 'xfer';
   return 'terminal';
@@ -392,10 +395,14 @@ function ticketAllowed(fleet, actor, hostId, purpose, now = Date.now()) {
 // issues nothing. The ticket itself is never written to the audit log.
 // binding is null, { target } (tcp:open) or { root } (file:*); it is
 // audited and stored on the ticket.
+// binding.watch ({ sessionId, watchId, mode }) is a granted watch whose
+// rate budget the route already spent.
 async function issueAuditedTicket(fleet, principal, host, purpose, binding = null) {
   if (!fleet.tickets) throw http(503, 'tickets_unavailable');
-  if (!ticketAllowed(fleet, principal.userId, host.host_id, purpose)) throw http(429, 'rate_limited');
+  const watch = binding && binding.watch;
+  if (!watch && !ticketAllowed(fleet, principal.userId, host.host_id, purpose)) throw http(429, 'rate_limited');
   const payload = { purpose };
+  if (watch) Object.assign(payload, { session_id: watch.sessionId, watch_id: watch.watchId, mode: watch.mode });
   if (binding && binding.target) payload.target = { host: binding.target.host, port: binding.target.port };
   if (binding && binding.root) payload.root = binding.root;
   await fleet.registry.appendAudit({
@@ -412,7 +419,8 @@ async function issueAuditedTicket(fleet, principal, host, purpose, binding = nul
     actor: principal.userId,
     auth: { kind: principal.kind, keyId: principal.keyId || null, groupRole: principal.groupRole || null },
     target: binding && binding.target,
-    root: binding && binding.root
+    root: binding && binding.root,
+    watch
   });
   return {
     ticket,
@@ -454,6 +462,62 @@ async function deliverWebhooks(fleet, tenantId, body) {
       console.error('[control] webhook delivery failed:', err.message);
     });
   }
+}
+
+// §7.2 watch request. Order: body shape (400), scope in some tenant (403),
+// the session visible to the actor (404), scope in the session's tenant
+// (403), the privileged rate budget (429), then the agent's answer: a grant
+// returns the ticket; denied or no answer in 35 s is 403 watch_denied, a
+// prompt already open is 409 busy. A view-only watch with consent needs
+// terminal:watch; override (view only) and read-write need admin, and
+// override needs a reason. Every request needs a reason.
+async function watchTicket(fleet, principal, purpose, body, res) {
+  const mode = WATCH_PURPOSES.get(purpose);
+  const sessionId = body.session_id;
+  if (typeof sessionId !== 'string' || !PTY_SESSION_RE.test(sessionId)) throw http(400, 'bad_session_id');
+  if (body.mode !== undefined && body.mode !== mode) throw http(400, 'bad_mode');
+  if (body.override !== undefined && typeof body.override !== 'boolean') throw http(400, 'bad_override');
+  const override = body.override === true;
+  const reason = body.reason;
+  if (reason === undefined || reason === null || (typeof reason === 'string' && reason.trim() === '')) throw http(400, 'reason_required');
+  if (!watchReasonOk(reason)) throw http(400, 'bad_reason');
+  const scopes = watchScopes(mode, override);
+  requireScopeAnywhere(fleet, principal, scopes);
+  const session = fleet.terminalSessions.get(sessionId);
+  if (!session || session.ended || !session.announced) throw http(404, 'unknown_session');
+  let host;
+  try {
+    host = await requireHost(fleet, principal, session.hostId);
+  } catch (err) {
+    if (err.status === 404) throw http(404, 'unknown_session');
+    throw err;
+  }
+  if (host.tenant_id !== session.tenantId) throw http(404, 'unknown_session');
+  for (const scope of scopes) requireScope(fleet, principal, session.tenantId, scope);
+  if (!fleet.watch) throw http(501, 'agent_unsupported');
+  if (!fleet.tickets) throw http(503, 'tickets_unavailable');
+  if (!ticketAllowed(fleet, principal.userId, host.host_id, purpose)) throw http(429, 'rate_limited');
+  // A client that hangs up while the user is being asked withdraws the request.
+  const client = { gone: false, onGone: null };
+  res.on('close', () => {
+    if (res.writableFinished) return;
+    client.gone = true;
+    if (client.onGone) client.onGone();
+  });
+  const w = await fleet.watch.request({ actor: principal.userId, session, mode, override, reason, client });
+  let out;
+  try {
+    out = await issueAuditedTicket(fleet, principal, host, purpose, { watch: { sessionId: session.id, watchId: w.id, mode } });
+  } catch (err) {
+    await fleet.watch.stop(w, 'ticket_failed');
+    throw err;
+  }
+  if (client.gone) {
+    fleet.tickets.delete(out.ticket);
+    await fleet.watch.stop(w, 'client_gone');
+    throw http(499, 'client_gone');
+  }
+  return { ...out, session_id: session.id, watch_id: w.id, mode, consent: w.consent };
 }
 
 function mount(app, fleet) {
@@ -587,6 +651,11 @@ function mount(app, fleet) {
     const purpose = req.body && req.body.purpose;
     const hostId = req.body && req.body.host_id;
     if (typeof purpose !== 'string' || !TICKET_PURPOSES.has(purpose)) throw http(400, 'bad_purpose');
+    if (WATCH_PURPOSES.has(purpose)) {
+      noStore(res);
+      res.json(await watchTicket(fleet, principal, purpose, req.body || {}, res));
+      return;
+    }
     // Channel purposes: shape first (400), then scope in some tenant (403),
     // host (404), scope in the host's tenant (403), refused classes and
     // server policy (403), then the rate budget (429).
@@ -634,6 +703,39 @@ function mount(app, fleet) {
       if (client.onGone) client.onGone();
     });
     res.json(await fleet.xfer.grant({ principal, host, request, client }));
+  }));
+
+  // Live terminal sessions a support or admin actor may ask to watch
+  // (terminal:watch in the session's tenant). host_id narrows to one host.
+  app.get('/api/v1/systems/terminal/sessions', wrap(async (req, res) => {
+    noStore(res);
+    const principal = await authenticate(req, fleet);
+    requireScopeAnywhere(fleet, principal, ['terminal:watch']);
+    const hostId = req.query && req.query.host_id;
+    if (hostId !== undefined) {
+      if (typeof hostId !== 'string' || !hostId) throw http(400, 'bad_host_id');
+      const host = await requireHost(fleet, principal, hostId);
+      requireScope(fleet, principal, host.tenant_id, 'terminal:watch');
+    }
+    const tenants = new Set(tenantIds(principal).filter((id) => hasScope(scopesFor(principal, id), 'terminal:watch')));
+    const live = [...fleet.terminalSessions.values()].filter((s) => s.announced && !s.ended && tenants.has(s.tenantId) &&
+      (hostId === undefined || s.hostId === hostId));
+    const hosts = new Map();
+    for (const s of live) {
+      if (!hosts.has(s.hostId)) hosts.set(s.hostId, await fleet.registry.getHost([s.tenantId], s.hostId));
+    }
+    res.json({
+      sessions: live.map((s) => ({
+        session_id: s.id,
+        host_id: s.hostId,
+        hostname: hosts.get(s.hostId) ? hosts.get(s.hostId).hostname : null,
+        tenant: s.tenantId,
+        actor: s.actor,
+        purpose: s.purpose,
+        started_at: new Date(s.startedMs).toISOString(),
+        watchers: s.watchers ? s.watchers.size : 0
+      }))
+    });
   }));
 
   app.get('/api/v1/hosts/resolve', wrap(async (req, res) => {
