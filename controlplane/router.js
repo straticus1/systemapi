@@ -314,25 +314,31 @@ async function runScript(fleet, principal, host, script, entitlements) {
   return { request_id: requestId, result };
 }
 
-// Ticket rate, per actor and host, per minute. Three separate budgets:
+// Ticket rate, per actor and host, per minute. Four separate budgets:
 // - terminal: terminal:open, file:read, file:write;
 //   SYSTEMAPI_TICKET_RATE_PER_HOST (default 20);
-// - privileged: breakglass:open, terminal:root, file:root;
+// - privileged: breakglass:open, terminal:root, file:root, xfer:root;
 //   SYSTEMAPI_TICKET_RATE_PRIVILEGED (default 20), so one operator cannot
 //   starve another user or an admin's break-glass;
 // - tcp: tcp:open; SYSTEMAPI_TICKET_RATE_TCP (default 120), because one RDP
-//   or HTTP session opens several connections (TCP §2).
+//   or HTTP session opens several connections (TCP §2);
+// - xfer: xfer:put, xfer:get grants; SYSTEMAPI_TICKET_RATE_XFER (default
+//   20), so a scripted put loop cannot lock the operator out of the shell
+//   or file session needed to diagnose it.
 // In process memory, like the tickets themselves.
 function ticketBudget(purpose) {
-  if (PRIVILEGED_PURPOSES.has(purpose)) return 'privileged';
+  if (PRIVILEGED_PURPOSES.has(purpose) || purpose === 'xfer:root') return 'privileged';
   if (purpose === 'tcp:open') return 'tcp';
+  if (purpose === 'xfer:put' || purpose === 'xfer:get') return 'xfer';
   return 'terminal';
 }
 
 function ticketAllowed(fleet, actor, hostId, purpose, now = Date.now()) {
   const env = fleet.env || {};
   const budget = ticketBudget(purpose);
-  const setting = { privileged: 'SYSTEMAPI_TICKET_RATE_PRIVILEGED', tcp: 'SYSTEMAPI_TICKET_RATE_TCP', terminal: 'SYSTEMAPI_TICKET_RATE_PER_HOST' }[budget];
+  const setting = {
+    privileged: 'SYSTEMAPI_TICKET_RATE_PRIVILEGED', tcp: 'SYSTEMAPI_TICKET_RATE_TCP', terminal: 'SYSTEMAPI_TICKET_RATE_PER_HOST', xfer: 'SYSTEMAPI_TICKET_RATE_XFER'
+  }[budget];
   const raw = Number(env[setting]);
   const fallback = budget === 'tcp' ? TICKET_RATE_TCP_DEFAULT : TICKET_RATE_DEFAULT;
   const limit = Number.isInteger(raw) && raw > 0 ? raw : fallback;
@@ -572,8 +578,9 @@ function mount(app, fleet) {
   // sahxfer grant (sahxfer docs/design.md §3; playground/xfer.js). Same
   // order as a file ticket: shape (400), scope in some tenant (403), host
   // (404), scope in the host's tenant (403), the file policy root (403), then
-  // the rate budget of the matching file purpose (429). xfer:put is checked
-  // as file:write, xfer:get as file:read, xfer:root as file:root.
+  // the xfer rate budget (429; xfer:root spends the privileged budget).
+  // Scopes and policy: xfer:put is checked as file:write, xfer:get as
+  // file:read, xfer:root as file:root.
   app.post('/api/v1/xfer/grant', wrap(async (req, res) => {
     noStore(res);
     const principal = await authenticate(req, fleet);
@@ -588,7 +595,7 @@ function mount(app, fleet) {
     const denied = await policyDecision(fleet.registry, host.host_id, filePurpose, { root: request.root });
     if (denied) throw http(denied === 'bad_root' ? 400 : 403, denied);
     if (!fleet.xfer) throw http(501, 'agent_unsupported');
-    if (!ticketAllowed(fleet, principal.userId, host.host_id, filePurpose)) throw http(429, 'rate_limited');
+    if (!ticketAllowed(fleet, principal.userId, host.host_id, request.purpose)) throw http(429, 'rate_limited');
     // A client that hangs up before the response is written cancels the
     // grant, so no key stays live for a caller that never received it.
     const client = { gone: false, onGone: null };

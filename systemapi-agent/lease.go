@@ -11,6 +11,9 @@
 // §7. The agent rebuilds the payload from what it is about to dial or open,
 // so a lease for one target, root or mode never verifies for another. The
 // builders refuse newlines and control bytes so fields cannot be shifted.
+// Xfer actions (xfer, xfer_root) sign "<action>\n<payload>" with the 18-line
+// payload of sahxfer docs/plans/2026-10-18-end-to-end-wiring.md ("Frames and
+// payloads"), checked against the shared golden vector in testdata.
 package main
 
 import (
@@ -22,8 +25,10 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"crypto/subtle"
 )
@@ -66,7 +71,7 @@ func payloadHash(action, payload string) string {
 }
 
 func payloadFor(action, payload string) string {
-	if terminalAction(action) || channelAction(action) {
+	if terminalAction(action) || channelAction(action) || xferAction(action) {
 		return action + "\n" + payload
 	}
 	return payload
@@ -90,7 +95,12 @@ func hashEqual(a, b string) bool {
 }
 
 func knownAction(action string) bool {
-	return action == "sysscript" || terminalAction(action) || channelAction(action)
+	return action == "sysscript" || terminalAction(action) || channelAction(action) || xferAction(action)
+}
+
+// xferAction reports the sahxfer grant lease actions.
+func xferAction(action string) bool {
+	return action == "xfer" || action == "xfer_root"
 }
 
 // channelAction reports the SAH channel lease actions.
@@ -150,6 +160,177 @@ func fileLeasePayload(sessionID string, deadlineUnix int64, phase, mode, root st
 		}
 	}
 	return sessionID + "\n" + strconv.FormatInt(deadlineUnix, 10) + "\n" + phase + "\n" + mode + "\n" + root, nil
+}
+
+const (
+	xferMaxSeconds = 3600
+	// xferMaxInt is Number.MAX_SAFE_INTEGER, the server's integer bound.
+	xferMaxInt = 1<<53 - 1
+)
+
+var (
+	xferGrantRe    = regexp.MustCompile(`^xfr_[A-Za-z0-9_-]{8,64}$`)
+	xferTransferRe = regexp.MustCompile(`^[0-9a-f]{16}$`)
+	xferPeerAddrRe = regexp.MustCompile(`^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):([1-9][0-9]{0,4})$`)
+)
+
+// xferLeaseFields are the 18 signed fields of an xfer lease, in line order.
+type xferLeaseFields struct {
+	GrantID      string
+	DeadlineUnix int64
+	Phase        string
+	Dir          string
+	Root         string
+	Path         string
+	Size         int64
+	SHA256       string
+	Overwrite    bool
+	TransferID   string
+	ExpiresUnix  int64
+	IdleS        int64
+	MaxS         int64
+	ByteCap      int64
+	Profile      string
+	Transport    string
+	Peer         string
+	Material     string
+}
+
+func noControl(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// xferRootOK is the server's rootShapeOk: absolute, at most 4096 bytes, no
+// control byte, no empty, "." or ".." component, no trailing slash.
+func xferRootOK(root string) bool {
+	if !utf8.ValidString(root) || !strings.HasPrefix(root, "/") || len(root) > 4096 || !noControl(root) {
+		return false
+	}
+	if root == "/" {
+		return true
+	}
+	for _, c := range strings.Split(root[1:], "/") {
+		if c == "" || c == "." || c == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+// xferPathOK is the server's xferPayload path rule: relative, 1 to 4096
+// bytes, no control byte or backslash, components non-empty, not "." or
+// "..", each at most 255 bytes.
+func xferPathOK(path string) bool {
+	if !utf8.ValidString(path) || len(path) < 1 || len(path) > 4096 || strings.HasPrefix(path, "/") ||
+		!noControl(path) || strings.Contains(path, "\\") {
+		return false
+	}
+	for _, c := range strings.Split(path, "/") {
+		if c == "" || c == "." || c == ".." || len(c) > 255 {
+			return false
+		}
+	}
+	return true
+}
+
+// xferPeerOK accepts "listen" or "dial:<host:port>" (the server's peerAddress).
+func xferPeerOK(peer string) bool {
+	if peer == "listen" {
+		return true
+	}
+	addr, ok := strings.CutPrefix(peer, "dial:")
+	if !ok || addr == "" || len(addr) > 256 || !noControl(addr) || strings.ContainsAny(addr, " \t") {
+		return false
+	}
+	m := xferPeerAddrRe.FindStringSubmatch(addr)
+	if m == nil {
+		return false
+	}
+	port, err := strconv.Atoi(m[2])
+	return err == nil && port <= 65535
+}
+
+func intIn(n, lo, hi int64) bool { return n >= lo && n <= hi }
+
+// xferLeasePayload is the signed payload of an xfer or xfer_root lease. It
+// validates every field as the server's controlplane/lease.js xferPayload
+// does, so a field the server would never sign is never accepted here.
+func xferLeasePayload(f xferLeaseFields) (string, error) {
+	if !xferGrantRe.MatchString(f.GrantID) {
+		return "", errors.New("bad_grant_id")
+	}
+	if f.DeadlineUnix <= 0 {
+		return "", errors.New("bad_deadline")
+	}
+	if f.Phase != "start" && f.Phase != "renew" {
+		return "", errors.New("bad_phase")
+	}
+	if f.Dir != "put" && f.Dir != "get" {
+		return "", errors.New("bad_dir")
+	}
+	if !xferRootOK(f.Root) {
+		return "", errors.New("bad_root")
+	}
+	if !xferPathOK(f.Path) {
+		return "", errors.New("bad_path")
+	}
+	if !intIn(f.Size, 0, xferMaxInt) {
+		return "", errors.New("bad_size")
+	}
+	if !hashHexRe.MatchString(f.SHA256) {
+		return "", errors.New("bad_sha256")
+	}
+	if !xferTransferRe.MatchString(f.TransferID) || f.TransferID == "0000000000000000" {
+		return "", errors.New("bad_transfer_id")
+	}
+	if !intIn(f.ExpiresUnix, 1, xferMaxInt) {
+		return "", errors.New("bad_expires")
+	}
+	if !intIn(f.MaxS, 1, xferMaxSeconds) || !intIn(f.IdleS, 1, f.MaxS) {
+		return "", errors.New("bad_limits")
+	}
+	if !intIn(f.ByteCap, f.Size, xferMaxInt) {
+		return "", errors.New("bad_byte_cap")
+	}
+	if f.Profile != "internet" && f.Profile != "dc" {
+		return "", errors.New("bad_profile")
+	}
+	if f.Transport != "udp" {
+		return "", errors.New("bad_transport")
+	}
+	if !xferPeerOK(f.Peer) {
+		return "", errors.New("bad_peer")
+	}
+	if !hashHexRe.MatchString(f.Material) {
+		return "", errors.New("bad_material")
+	}
+	ow := "0"
+	if f.Overwrite {
+		ow = "1"
+	}
+	i := func(n int64) string { return strconv.FormatInt(n, 10) }
+	return strings.Join([]string{
+		f.GrantID, i(f.DeadlineUnix), f.Phase, f.Dir, f.Root, f.Path, i(f.Size), f.SHA256, ow, f.TransferID,
+		i(f.ExpiresUnix), i(f.IdleS), i(f.MaxS), i(f.ByteCap), f.Profile, f.Transport, f.Peer, f.Material,
+	}, "\n"), nil
+}
+
+// xferMaterial is lease line 18: hex SHA-256 of "sahxfer-material-v1\n" ||
+// key || route_token over the raw 32 and 16 bytes.
+func xferMaterial(key, routeToken []byte) (string, error) {
+	if len(key) != 32 || len(routeToken) != 16 {
+		return "", errors.New("bad_material")
+	}
+	h := sha256.New()
+	h.Write([]byte("sahxfer-material-v1\n"))
+	h.Write(key)
+	h.Write(routeToken)
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // verifyLease checks the signature and the time window. It does not record

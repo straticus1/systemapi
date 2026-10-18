@@ -16,10 +16,15 @@ import (
 	"time"
 )
 
-// The test binary doubles as the file-helper child, as the agent binary does.
+// The test binary doubles as the file-helper child, as the agent binary does,
+// and as a fake sahxfer recv.
 func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && os.Args[1] == "file-helper" {
 		os.Exit(runFileHelper(os.Stdin, os.Stdout))
+	}
+	if len(os.Args) > 1 && os.Args[1] == "recv" {
+		// A fake sahxfer recv speaking the fd 3 / fd 4 protocol (xfer_test.go).
+		os.Exit(runFakeRecv(os.Args[2:]))
 	}
 	os.Exit(m.Run())
 }

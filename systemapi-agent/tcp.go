@@ -99,6 +99,9 @@ func (c *channelConn) handle(typ string, message []byte) (bool, error) {
 	if handled, err := c.handleFile(typ, message); handled {
 		return true, err
 	}
+	if c.handleXfer(typ, message) {
+		return true, nil
+	}
 	switch typ {
 	case "tcp_open", "tcp_renew", "tcp_eof", "tcp_stop", "tcp_credit":
 	default:

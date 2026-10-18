@@ -1,0 +1,73 @@
+sahxfer xfer lease payload v2: shared golden vector
+====================================================
+
+Used by sahxfer (internal/grant/lease_test.go), systemapi
+(tests/xfer.test.js) and systemapi-agent (lease_test.go). Every copy must
+produce the same payload string and the same message hash. Do not edit one
+copy without the others.
+
+Inputs (18 payload fields, in line order)
+-----------------------------------------
+ 1 grant_id       xfr_GoldenVectorAAAAAAAAAA
+ 2 deadline_unix  1760745600
+ 3 phase          start
+ 4 dir            put
+ 5 root           /srv/app
+ 6 path           releases/app.tar.gz
+ 7 size           1048576
+ 8 sha256         fce1b8bb923aa974c6756658f3e59e5dedfe1ad2f3082a484cd7a2fe593c29e5
+                  (sha256 of the 32 ASCII bytes "sahxfer golden vector contents..")
+ 9 overwrite      0
+10 transfer_id    0123456789abcdef
+11 expires_unix   1760745600
+12 idle_s         30
+13 max_s          3600
+14 byte_cap       1048576
+15 profile        internet
+16 transport      udp
+17 peer           listen
+18 material       b23ea5d376d27f2cc2bb3d42be53bb07c06da9693649646bbe64dfd4b087802c
+
+Material inputs
+---------------
+key          32 bytes 0x01 0x02 ... 0x20
+             hex 0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
+             base64 (std, padded) AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=
+route_token  16 bytes 0xa1 0xa2 ... 0xb0
+             hex a1a2a3a4a5a6a7a8a9aaabacadaeafb0
+             base64 (std, padded) oaKjpKWmp6ipqqusra6vsA==
+material     hex(sha256("sahxfer-material-v1\n" || key || route_token)), raw bytes,
+             no separator between key and route_token
+
+Payload
+-------
+Lines joined by "\n" (0x0a), no trailing newline. The 18 lines between the
+BEGIN and END markers below are the payload exactly; the marker lines and the
+newline after the last payload line are not part of it.
+
+-----BEGIN PAYLOAD-----
+xfr_GoldenVectorAAAAAAAAAA
+1760745600
+start
+put
+/srv/app
+releases/app.tar.gz
+1048576
+fce1b8bb923aa974c6756658f3e59e5dedfe1ad2f3082a484cd7a2fe593c29e5
+0
+0123456789abcdef
+1760745600
+30
+3600
+1048576
+internet
+udp
+listen
+b23ea5d376d27f2cc2bb3d42be53bb07c06da9693649646bbe64dfd4b087802c
+-----END PAYLOAD-----
+
+Signed message hash
+-------------------
+The lease signs "<action>\n<payload>" with action "xfer".
+sha256("xfer\n" + payload) =
+234e6abdf170097f94d2c8e3f6dafb006e5d1cf761159b6a4a226f3f6ca32380

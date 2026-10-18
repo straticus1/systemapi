@@ -15,8 +15,8 @@ const FleetManager = require('../playground/fleet');
 const { mount } = require('../controlplane/router');
 const { MemoryRegistry } = require('../controlplane/registry');
 const { TEST_SEED, privateKeyFromSeed, rawPublicKey, buildSigner } = require('../controlplane/keys');
-const { verifyLease, xferPayload } = require('../controlplane/lease');
-const { parseGrantRequest } = require('../playground/xfer');
+const { verifyLease, xferPayload, xferMaterial } = require('../controlplane/lease');
+const { parseGrantRequest, directAllowList, directPeer } = require('../playground/xfer');
 
 const HOST_A = '11111111-1111-4111-8111-111111111111';
 const HOST_B = '22222222-2222-4222-8222-222222222222';
@@ -145,6 +145,37 @@ function rows(r, action) {
   return r.fm.registry.audit.filter((row) => row.action === action);
 }
 
+// The 18 payload fields the agent rebuilds from an xfer_grant frame, the
+// way systemapi-agent does before it verifies the lease.
+function fieldsFromFrame(push, phase = 'start', deadlineUnix = push.deadline_unix) {
+  return {
+    grantId: push.grant_id, deadlineUnix, phase, dir: push.dir, root: push.root, path: push.path, size: push.size,
+    sha256: push.sha256, overwrite: push.overwrite, transferId: push.transfer_id, expiresUnix: push.expires_unix,
+    idleS: push.idle_s, maxS: push.max_s, byteCap: push.byte_cap, profile: push.profile, transport: push.transport,
+    peer: push.peer, material: xferMaterial(Buffer.from(push.key, 'base64'), Buffer.from(push.route_token, 'base64'))
+  };
+}
+
+// One changed value per field; each must break the lease.
+const TAMPER = {
+  grantId: 'xfr_tamperedAAAAAAAA', deadlineUnix: (v) => v + 1, phase: (v) => (v === 'start' ? 'renew' : 'start'), dir: 'get',
+  root: '/srv/b', path: 'releases/other.tar.gz', size: (v) => v - 1, sha256: 'cd'.repeat(32), overwrite: (v) => !v,
+  transferId: 'fedcba9876543210', expiresUnix: (v) => v + 1, idleS: (v) => v + 1, maxS: (v) => v - 1, byteCap: (v) => v + 1,
+  profile: 'dc', transport: 'udp', peer: (v) => (v === 'listen' ? 'dial:198.51.100.1:4700' : 'listen'), material: 'ef'.repeat(32)
+};
+
+function assertEveryFieldBound(lease, fields) {
+  assert.equal(verifyLease(PUBLIC_KEY, lease, xferPayload(fields)).ok, true);
+  for (const [k, change] of Object.entries(TAMPER)) {
+    if (k === 'transport') continue; // only udp is signable in v1; covered by the builder refusal
+    const v = typeof change === 'function' ? change(fields[k]) : change;
+    assert.notDeepEqual(v, fields[k], k);
+    const res = verifyLease(PUBLIC_KEY, lease, xferPayload({ ...fields, [k]: v }));
+    assert.equal(res.ok, false, k);
+    assert.equal(res.error, 'payload_mismatch', k);
+  }
+}
+
 test('request shapes: design §3.2 path, root, size, hash and transport rules', () => {
   const ok = parseGrantRequest(body());
   assert.equal(ok.ok, true);
@@ -171,25 +202,88 @@ test('request shapes: design §3.2 path, root, size, hash and transport rules', 
   }
 });
 
-test('lease payload: the 8-line §3.4 form, and fields that would shift lines are refused', () => {
-  assert.equal(xferPayload('xfr_abcdefgh', 1700000060, 'start', 'put', '/srv/a', 'r/app', 5, SHA),
-    `xfr_abcdefgh\n1700000060\nstart\nput\n/srv/a\nr/app\n5\n${SHA}`);
-  for (const args of [
-    ['bad', 1, 'start', 'put', '/srv/a', 'p', 1, SHA],
-    ['xfr_abcdefgh', 1, 'begin', 'put', '/srv/a', 'p', 1, SHA],
-    ['xfr_abcdefgh', 1, 'start', 'both', '/srv/a', 'p', 1, SHA],
-    ['xfr_abcdefgh', 1, 'start', 'put', '/srv/a', 'p\n2', 1, SHA],
-    ['xfr_abcdefgh', 1, 'start', 'put', 'srv', 'p', 1, SHA],
-    ['xfr_abcdefgh', 1, 'start', 'put', '/srv/a', '/p', 1, SHA],
-    ['xfr_abcdefgh', 1, 'start', 'put', '/srv/a', 'p', -1, SHA],
-    ['xfr_abcdefgh', 1, 'start', 'put', '/srv/a', 'p', 1, 'AB'.repeat(32)],
-    ['xfr_abcdefgh', 1, 'start', 'put', '/srv/a', 'a/../../etc', 1, SHA],
-    ['xfr_abcdefgh', 1, 'start', 'put', '/srv/a', 'a//b', 1, SHA],
-    ['xfr_abcdefgh', 1, 'start', 'put', '/srv/a', 'é'.repeat(128), 1, SHA],
-    ['xfr_abcdefgh', 1, 'start', 'put', '/srv/../etc', 'p', 1, SHA],
-    ['xfr_abcdefgh', 1, 'start', 'put', '/' + 'a'.repeat(4096), 'p', 1, SHA]
+// sahxfer docs/golden-xfer-lease-v2.txt, copied byte for byte. The same
+// vector is in sahxfer internal/grant/lease_test.go and systemapi-agent
+// lease_test.go; do not edit one copy without the others.
+const GOLDEN = {
+  key: Buffer.from('0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20', 'hex'),
+  routeToken: Buffer.from('a1a2a3a4a5a6a7a8a9aaabacadaeafb0', 'hex'),
+  material: 'b23ea5d376d27f2cc2bb3d42be53bb07c06da9693649646bbe64dfd4b087802c',
+  fields: {
+    grantId: 'xfr_GoldenVectorAAAAAAAAAA', deadlineUnix: 1760745600, phase: 'start', dir: 'put', root: '/srv/app',
+    path: 'releases/app.tar.gz', size: 1048576, sha256: 'fce1b8bb923aa974c6756658f3e59e5dedfe1ad2f3082a484cd7a2fe593c29e5',
+    overwrite: false, transferId: '0123456789abcdef', expiresUnix: 1760745600, idleS: 30, maxS: 3600, byteCap: 1048576,
+    profile: 'internet', transport: 'udp', peer: 'listen'
+  },
+  payload: 'xfr_GoldenVectorAAAAAAAAAA\n1760745600\nstart\nput\n/srv/app\nreleases/app.tar.gz\n1048576\n' +
+    'fce1b8bb923aa974c6756658f3e59e5dedfe1ad2f3082a484cd7a2fe593c29e5\n0\n0123456789abcdef\n1760745600\n30\n3600\n1048576\n' +
+    'internet\nudp\nlisten\nb23ea5d376d27f2cc2bb3d42be53bb07c06da9693649646bbe64dfd4b087802c',
+  messageSha256: '234e6abdf170097f94d2c8e3f6dafb006e5d1cf761159b6a4a226f3f6ca32380'
+};
+
+test('lease payload v2: the shared golden vector, byte for byte', () => {
+  assert.equal(GOLDEN.key.toString('base64'), 'AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=');
+  assert.equal(GOLDEN.routeToken.toString('base64'), 'oaKjpKWmp6ipqqusra6vsA==');
+  assert.equal(crypto.createHash('sha256').update('sahxfer golden vector contents..').digest('hex'), GOLDEN.fields.sha256);
+  const material = xferMaterial(GOLDEN.key, GOLDEN.routeToken);
+  assert.equal(material, GOLDEN.material);
+  const payload = xferPayload({ ...GOLDEN.fields, material });
+  assert.equal(payload, GOLDEN.payload);
+  assert.equal(payload.split('\n').length, 18);
+  assert.deepEqual(Buffer.from(payload, 'utf8'), Buffer.from(GOLDEN.payload, 'utf8'));
+  assert.equal(crypto.createHash('sha256').update(Buffer.from(`xfer\n${payload}`, 'utf8')).digest('hex'), GOLDEN.messageSha256);
+  // The lease hash is the same computation.
+  assert.equal(require('../controlplane/lease').payloadHash('xfer', payload), GOLDEN.messageSha256);
+});
+
+test('lease payload v2: every field is validated, and fields that would shift lines are refused', () => {
+  const base = { ...GOLDEN.fields, material: GOLDEN.material };
+  assert.equal(xferPayload({ ...base, overwrite: true }).split('\n')[8], '1');
+  assert.equal(xferPayload({ ...base, peer: 'dial:203.0.113.10:4700' }).split('\n')[16], 'dial:203.0.113.10:4700');
+  assert.equal(xferPayload({ ...base, peer: 'dial:[2001:db8::1]:4700' }).split('\n')[16], 'dial:[2001:db8::1]:4700');
+  assert.equal(xferPayload({ ...base, profile: 'dc', size: 0, byteCap: 0, idleS: 1, maxS: 1 }).split('\n').length, 18);
+  assert.throws(() => xferMaterial(Buffer.alloc(31), Buffer.alloc(16)), /bad_payload/);
+  assert.throws(() => xferMaterial(Buffer.alloc(32), Buffer.alloc(15)), /bad_payload/);
+  assert.throws(() => xferMaterial('a'.repeat(32), Buffer.alloc(16)), /bad_payload/);
+  for (const over of [
+    { grantId: 'bad' }, { grantId: 'xfr_abc\ndefgh' }, { deadlineUnix: 0 }, { deadlineUnix: 1.5 }, { deadlineUnix: '1760745600' },
+    { phase: 'begin' }, { dir: 'both' },
+    { root: 'srv' }, { root: '/srv/../etc' }, { root: '/' + 'a'.repeat(4096) },
+    { path: 'p\n2' }, { path: '/p' }, { path: 'a/../../etc' }, { path: 'a//b' }, { path: 'é'.repeat(128) }, { path: 'a\\b' },
+    { size: -1 }, { size: 2 ** 53 }, { size: '5' },
+    { sha256: 'AB'.repeat(32) }, { sha256: 'ab' }, { sha256: null },
+    { overwrite: 0 }, { overwrite: 'false' }, { overwrite: undefined },
+    { transferId: '0000000000000000' }, { transferId: '0123456789ABCDEF' }, { transferId: '0123456789abcde' }, { transferId: 81985529216486895 },
+    { expiresUnix: 0 }, { expiresUnix: -5 }, { expiresUnix: '1' },
+    { idleS: 0 }, { idleS: 3601, maxS: 3600 }, { idleS: 31, maxS: 30 }, { maxS: 0 }, { maxS: 3601, idleS: 30 }, { idleS: 1.5 },
+    { byteCap: 1048575 }, { byteCap: -1 }, { byteCap: '1048576' },
+    { profile: 'lan' }, { profile: '' }, { transport: 'quic-stream' }, { transport: 'tcp' },
+    { peer: 'dial:' }, { peer: 'dial:host' }, { peer: 'dial:1.2.3.4:0' }, { peer: 'dial:1.2.3.4:65536' }, { peer: 'dial:a b:1' },
+    { peer: 'dial:1.2.3.4:4700\nlisten' }, { peer: 'listen:127.0.0.1:1' }, { peer: '' }, { peer: undefined },
+    { material: 'AB'.repeat(32) }, { material: 'ab'.repeat(31) }, { material: undefined }
   ]) {
-    assert.throws(() => xferPayload(...args), /bad_payload/, JSON.stringify(args));
+    assert.throws(() => xferPayload({ ...base, ...over }), /bad_payload/, JSON.stringify(over));
+  }
+  assert.throws(() => xferPayload(), /bad_payload/);
+});
+
+test('direct mode allow list: CIDR parsing and the address check', () => {
+  const lo = directAllowList(undefined);
+  assert.ok(lo);
+  assert.equal(directPeer('127.0.0.1:47000', lo), '127.0.0.1:47000');
+  assert.equal(directPeer('127.9.9.9:1', lo), '127.9.9.9:1');
+  assert.equal(directPeer('[::1]:47000', lo), '[::1]:47000');
+  for (const raw of ['10.0.0.1:47000', '[2001:db8::1]:47000', 'localhost:47000', 'example.com:47000', '127.0.0.1', '127.0.0.1:0',
+    '127.0.0.1:70000', ' 127.0.0.1:1', undefined, 47000, '[::ffff:10.0.0.1]:1']) {
+    assert.equal(directPeer(raw, lo), null, JSON.stringify(raw));
+  }
+  assert.equal(directPeer('127.0.0.1:1', null), null);
+  const lan = directAllowList('10.0.0.0/8, 2001:db8::/32');
+  assert.equal(directPeer('10.1.2.3:47000', lan), '10.1.2.3:47000');
+  assert.equal(directPeer('[2001:db8::1]:47000', lan), '[2001:db8::1]:47000');
+  assert.equal(directPeer('127.0.0.1:47000', lan), null);
+  for (const bad of ['10.0.0.0', '10.0.0.0/33', '::1/129', 'example.com/8', '10.0.0.0/8,', ',', '10.0.0.0/-1', '0x7f000001/8']) {
+    assert.equal(directAllowList(bad), null, bad);
   }
 });
 
@@ -233,17 +327,31 @@ test('a put grant: intent row first, signed push to the agent, exact response, r
     const [push] = frames(agent, 'xfer_grant');
     assert.deepEqual(agent.intentBeforeGrant, [true]);
     for (const k of ['grant_id', 'transfer_id', 'root', 'path', 'size', 'sha256', 'overwrite', 'key', 'route_token']) assert.deepEqual(push[k], doc[k], k);
-    assert.equal(push.peer_udp, PEER);
+    assert.deepEqual(Object.keys(push).sort(), ['action', 'actor', 'aead', 'byte_cap', 'deadline_unix', 'dir', 'expires_unix', 'grant_id',
+      'idle_s', 'key', 'lease', 'max_s', 'overwrite', 'path', 'peer', 'profile', 'purpose', 'root', 'route_token', 'sha256', 'size',
+      'transfer_id', 'transport', 'type'].sort());
+    assert.equal(push.peer, `dial:${PEER}`);
     assert.equal(push.action, 'xfer');
     assert.equal(push.dir, 'put');
     assert.equal(push.actor, 'user-1');
-    const payload = xferPayload(push.grant_id, push.deadline_unix, 'start', 'put', '/srv/a', 'releases/app.tar.gz', 123456789, SHA);
-    assert.equal(verifyLease(PUBLIC_KEY, push.lease, payload).ok, true);
-    // Bound to the host, the direction and the action.
+    assert.equal(push.idle_s, doc.idle_seconds);
+    assert.equal(push.max_s, doc.max_seconds);
+    assert.equal(push.byte_cap, doc.byte_cap);
+    assert.equal(push.expires_unix, Math.floor(Date.parse(doc.expires_at) / 1000));
+    const fields = fieldsFromFrame(push);
+    const payload = xferPayload(fields);
+    assert.equal(payload.split('\n').length, 18);
+    // Every one of the 18 fields is bound.
+    assertEveryFieldBound(push.lease, fields);
+    // Bound to the host and the action.
     assert.equal(push.lease.host_id, HOST_A);
-    assert.equal(verifyLease(PUBLIC_KEY, push.lease, payload.replace('\nput\n', '\nget\n')).ok, false);
     assert.equal(verifyLease(PUBLIC_KEY, { ...push.lease, action: 'xfer_root' }, payload).ok, false);
     assert.equal(verifyLease(PUBLIC_KEY, { ...push.lease, host_id: HOST_B }, payload).ok, false);
+    // Signed by the pinned key only.
+    const other = crypto.generateKeyPairSync('ed25519').publicKey;
+    assert.equal(verifyLease(other, push.lease, payload).error, 'bad_signature');
+    // Expired past the skew allowance.
+    assert.equal(verifyLease(PUBLIC_KEY, push.lease, payload, (push.lease.expires_unix + 31) * 1000).error, 'expired');
 
     const [intent] = rows(r, 'xfer_intent');
     assert.equal(intent.actor, 'user-1');
@@ -254,12 +362,18 @@ test('a put grant: intent row first, signed push to the agent, exact response, r
     assert.equal(intent.payload.size, 123456789);
     assert.equal(intent.payload.sha256, SHA);
     assert.equal(r.fm.xfer.grants.size, 1);
+    // The grant keeps the material hash, never the key or the token.
+    const kept = r.fm.xfer.grants.get(doc.grant_id);
+    assert.equal(kept.material, fields.material);
+    assert.equal(Object.values(kept).some((v) => v === doc.key || v === doc.route_token), false);
 
-    agent.ws.send(JSON.stringify({ type: 'xfer_result', grant_id: doc.grant_id, payload: { status: 'ok', bytes: 123456789, sha256: SHA } }));
+    agent.ws.send(JSON.stringify({ type: 'xfer_result', grant_id: doc.grant_id, payload: { status: 'ok', bytes: 123456789, sha256: SHA, committed: true } }));
     const result = await waitUntil('result row', () => rows(r, 'xfer_result')[0]);
     assert.equal(result.payload.status, 'ok');
     assert.equal(result.payload.bytes, 123456789);
     assert.equal(result.payload.grant_id, doc.grant_id);
+    assert.equal(result.payload.committed, true);
+    assert.equal('reason' in result.payload, false);
     assert.equal(r.fm.xfer.grants.size, 0);
 
     // Neither secret reaches the audit log.
@@ -458,9 +572,11 @@ test('renewal sends a signed renew lease, and cancels once the actor loses the s
     assert.equal(res.status, 200);
     const renew = await waitUntil('renew', () => frames(agent, 'xfer_renew')[0]);
     assert.equal(renew.grant_id, res.body.grant_id);
-    const payload = xferPayload(renew.grant_id, renew.deadline_unix, 'renew', 'put', '/srv/a', 'releases/app.tar.gz', 123456789, SHA);
-    assert.equal(verifyLease(PUBLIC_KEY, renew.lease, payload).ok, true);
-    assert.equal(verifyLease(PUBLIC_KEY, renew.lease, payload.replace('\nrenew\n', '\nstart\n')).ok, false);
+    // A renew is the start payload with only phase and deadline changed.
+    const [push] = frames(agent, 'xfer_grant');
+    const fields = fieldsFromFrame(push, 'renew', renew.deadline_unix);
+    assertEveryFieldBound(renew.lease, fields);
+    assert.equal(verifyLease(PUBLIC_KEY, renew.lease, xferPayload({ ...fields, phase: 'start' })).ok, false);
     await r.fm.registry.setScopes('k-op', ['hosts:read', 'file:read']);
     const cancel = await waitUntil('cancel', () => frames(agent, 'xfer_cancel')[0]);
     assert.equal(cancel.reason, 'stopped');
@@ -629,6 +745,186 @@ test('N7: an agent error after ready ends the grant with a result row', async ()
     const row = await waitUntil('result row', () => rows(r, 'xfer_result')[0]);
     assert.equal(row.payload.status, 'aborted');
     assert.equal(row.payload.error, 'not_found');
+    assert.equal(r.fm.xfer.grants.size, 0);
+  } finally {
+    await r.close();
+  }
+});
+
+test('direct mode: the agent-reported address becomes peer.udp, and the lease signs "listen"', async () => {
+  const r = await rig({ SYSTEMAPI_XFER_PEER_MODE: 'direct' });
+  try {
+    const agent = await connectAgent(r, { reply: { status: 'ready', udp: '127.0.0.1:47000' } });
+    const res = await grant(r);
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.deepEqual(res.body.peer, { udp: '127.0.0.1:47000', quic: null });
+    const [push] = frames(agent, 'xfer_grant');
+    assert.equal(push.peer, 'listen');
+    const fields = fieldsFromFrame(push);
+    assert.equal(xferPayload(fields).split('\n')[16], 'listen');
+    assertEveryFieldBound(push.lease, fields);
+    // IPv6 loopback is in the default list too.
+    agent.reply = { status: 'ready', udp: '[::1]:47001' };
+    const v6 = await grant(r, { path: 'v6' });
+    assert.equal(v6.status, 200, JSON.stringify(v6.body));
+    assert.equal(v6.body.peer.udp, '[::1]:47001');
+  } finally {
+    await r.close();
+  }
+});
+
+test('direct mode: a ready without udp, or with an address outside the allow list, is internal and cancels the grant', async () => {
+  const r = await rig({ SYSTEMAPI_XFER_PEER_MODE: 'direct' });
+  try {
+    const agent = await connectAgent(r, { reply: { status: 'ready' } });
+    let res = await grant(r);
+    assert.equal(res.status, 500);
+    assert.equal(res.body.error, 'internal');
+    let cancel = await waitUntil('cancel', () => frames(agent, 'xfer_cancel')[0]);
+    assert.equal(cancel.reason, 'peer_missing');
+    let row = await waitUntil('result row', () => rows(r, 'xfer_result')[0]);
+    // The agent said ready, so its receiver may be running: not "aborted".
+    assert.equal(row.payload.status, 'unknown');
+    assert.equal(row.payload.error, 'peer_missing');
+    for (const [i, udp] of ['203.0.113.10:4700', 'localhost:4700', '10.0.0.1:4700', '127.0.0.1', 'example.com:1'].entries()) {
+      agent.reply = { status: 'ready', udp };
+      res = await grant(r, { path: `p${i}` });
+      assert.equal(res.status, 500, udp);
+      assert.equal(res.body.error, 'internal', udp);
+      cancel = await waitUntil('cancel', () => frames(agent, 'xfer_cancel')[i + 1]);
+      assert.equal(cancel.reason, 'peer_refused', udp);
+      await waitUntil('slot freed', () => r.fm.xfer.grants.size === 0);
+    }
+    assert.equal(JSON.stringify(r.fm.registry.audit).includes('203.0.113.10'), false);
+  } finally {
+    await r.close();
+  }
+  // A configured list replaces the loopback default.
+  const lan = await rig({ SYSTEMAPI_XFER_PEER_MODE: 'direct', SYSTEMAPI_XFER_DIRECT_ALLOW: '10.0.0.0/8' });
+  try {
+    const agent = await connectAgent(lan, { reply: { status: 'ready', udp: '10.1.2.3:47000' } });
+    const res = await grant(lan);
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.equal(res.body.peer.udp, '10.1.2.3:47000');
+    agent.reply = { status: 'ready', udp: '127.0.0.1:47000' };
+    assert.equal((await grant(lan, { path: 'lo' })).body.error, 'internal');
+  } finally {
+    await lan.close();
+  }
+});
+
+test('peer mode configuration: relay ignores a reported address; an unknown mode or a bad allow list is agent_unsupported', async () => {
+  const relay = await rig({ SYSTEMAPI_XFER_PEER_MODE: 'relay', SYSTEMAPI_XFER_PEER_UDP: PEER });
+  try {
+    await connectAgent(relay, { reply: { status: 'ready', udp: '127.0.0.1:47000' } });
+    const res = await grant(relay);
+    assert.equal(res.status, 200);
+    assert.equal(res.body.peer.udp, PEER);
+  } finally {
+    await relay.close();
+  }
+  for (const env of [
+    { SYSTEMAPI_XFER_PEER_MODE: 'hole-punch', SYSTEMAPI_XFER_PEER_UDP: PEER },
+    { SYSTEMAPI_XFER_PEER_MODE: 'DIRECT' },
+    { SYSTEMAPI_XFER_PEER_MODE: 'direct', SYSTEMAPI_XFER_DIRECT_ALLOW: '127.0.0.1' },
+    { SYSTEMAPI_XFER_PEER_MODE: 'relay', SYSTEMAPI_XFER_PEER_UDP: 'not an address' }
+  ]) {
+    const r = await rig(env);
+    try {
+      const agent = await connectAgent(r);
+      const res = await grant(r);
+      assert.equal(res.status, 501, JSON.stringify(env));
+      assert.equal(res.body.error, 'agent_unsupported');
+      assert.equal(frames(agent, 'xfer_grant').length, 0);
+      assert.equal(rows(r, 'xfer_intent').length, 0);
+    } finally {
+      await r.close();
+    }
+  }
+});
+
+test('xfer has its own rate budget: a put loop does not spend the file or terminal budget', async () => {
+  const r = await rig({ SYSTEMAPI_XFER_PEER_UDP: PEER, SYSTEMAPI_TICKET_RATE_XFER: '1', SYSTEMAPI_TICKET_RATE_PER_HOST: '1' });
+  try {
+    const agent = await connectAgent(r);
+    const first = await grant(r);
+    assert.equal(first.status, 200);
+    const limited = await grant(r, { path: 'b' });
+    assert.equal(limited.status, 429);
+    assert.equal(limited.body.error, 'rate_limited');
+    assert.equal(frames(agent, 'xfer_grant').length, 1);
+    // The terminal budget (file:write tickets) is untouched.
+    const ticket = await fetch(`${r.url}/api/v1/ws-ticket`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'op-key' },
+      body: JSON.stringify({ host_id: HOST_A, purpose: 'file:write', root: '/srv/a' })
+    });
+    assert.equal(ticket.status, 200, await ticket.text());
+  } finally {
+    await r.close();
+  }
+  // And file tickets do not spend the xfer budget.
+  const r2 = await rig({ SYSTEMAPI_XFER_PEER_UDP: PEER, SYSTEMAPI_TICKET_RATE_XFER: '1', SYSTEMAPI_TICKET_RATE_PER_HOST: '1' });
+  try {
+    await connectAgent(r2);
+    const ticket = await fetch(`${r2.url}/api/v1/ws-ticket`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'op-key' },
+      body: JSON.stringify({ host_id: HOST_A, purpose: 'file:write', root: '/srv/a' })
+    });
+    assert.equal(ticket.status, 200);
+    assert.equal((await grant(r2)).status, 200);
+  } finally {
+    await r2.close();
+  }
+});
+
+test('xfer_result records a known reason and committed; an unknown reason is dropped', async () => {
+  const r = await rig();
+  try {
+    const agent = await connectAgent(r);
+    const a = await grant(r);
+    const b = await grant(r, { path: 'b' });
+    assert.equal(a.status, 200);
+    assert.equal(b.status, 200);
+    agent.ws.send(JSON.stringify({ type: 'xfer_result', grant_id: a.body.grant_id,
+      payload: { status: 'aborted', reason: 'cancelled', bytes: 10, committed: false } }));
+    agent.ws.send(JSON.stringify({ type: 'xfer_result', grant_id: b.body.grant_id,
+      payload: { status: 'aborted', reason: 'rm -rf /', committed: 'yes' } }));
+    await waitUntil('result rows', () => rows(r, 'xfer_result').length === 2);
+    const byId = Object.fromEntries(rows(r, 'xfer_result').map((row) => [row.payload.grant_id, row.payload]));
+    assert.equal(byId[a.body.grant_id].reason, 'cancelled');
+    assert.equal(byId[a.body.grant_id].committed, false);
+    assert.equal(byId[a.body.grant_id].bytes, 10);
+    assert.equal('reason' in byId[b.body.grant_id], false);
+    assert.equal('committed' in byId[b.body.grant_id], false);
+    // Every listed reason passes through.
+    for (const reason of ['size_mismatch', 'hash_mismatch', 'expired', 'policy', 'io', 'protocol', 'auth', 'cancelled', 'byte_cap',
+      'idle', 'no_space', 'stopped', 'agent_restart']) {
+      const g = await grant(r, { path: `r-${reason}` });
+      assert.equal(g.status, 200);
+      agent.ws.send(JSON.stringify({ type: 'xfer_result', grant_id: g.body.grant_id, payload: { status: 'aborted', reason, committed: false } }));
+      const row = await waitUntil('row', () => rows(r, 'xfer_result').find((x) => x.payload.grant_id === g.body.grant_id));
+      assert.equal(row.payload.reason, reason);
+    }
+  } finally {
+    await r.close();
+  }
+});
+
+test('new agent refusals: host codes pass through, lease_required reaches the client as internal', async () => {
+  const r = await rig();
+  try {
+    const agent = await connectAgent(r);
+    for (const [error, status, client] of [['pty_user_unset', 503, 'pty_user_unset'], ['root_unavailable', 503, 'root_unavailable'],
+      ['no_space', 507, 'no_space'], ['io', 500, 'io'], ['lease_required', 500, 'internal']]) {
+      agent.reply = { error };
+      const res = await grant(r, { path: `e-${error}` });
+      assert.equal(res.status, status, error);
+      assert.equal(res.body.error, client, error);
+      const row = await waitUntil('row', () => rows(r, 'xfer_result').find((x) => x.payload.error === error));
+      assert.equal(row.payload.status, 'aborted');
+    }
     assert.equal(r.fm.xfer.grants.size, 0);
   } finally {
     await r.close();

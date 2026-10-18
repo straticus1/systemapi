@@ -15,11 +15,15 @@
 // target and opens only the signed root in the signed mode. The builders
 // refuse a newline or control byte in any field, so fields cannot be shifted.
 // sahxfer grant actions (xfer, xfer_root) follow the same rule with the
-// 8-line payload of sahxfer docs/design.md §3.4 ("<grant_id>\n<deadline_unix>
-// \n<start|renew>\n<put|get>\n<root>\n<path>\n<size>\n<sha256>"), so a put
-// lease cannot authorize a get and the agent writes only the signed path,
-// size and hash. The payload deadline is the lease deadline (§3.4: TTL 60 s,
-// renewed every 30 s).
+// 18-line payload of sahxfer docs/design.md §3.4 (grant id, deadline, phase,
+// dir, root, path, size, sha256, overwrite, transfer id, first-packet
+// deadline, idle_s, max_s, byte cap, profile, transport, peer, material), so
+// a put lease cannot authorize a get and the agent acts only on signed
+// fields. material is the hex SHA-256 of "sahxfer-material-v1\n" || key ||
+// route_token (raw bytes): the lease binds the key without carrying it, and
+// the server keeps only that hash for renewals. The payload deadline is the
+// lease deadline (§3.4: TTL 60 s, renewed every 30 s). The shared golden
+// vector is sahxfer docs/golden-xfer-lease-v2.txt.
 'use strict';
 
 const crypto = require('node:crypto');
@@ -35,6 +39,9 @@ const SESSION_ACTIONS = new Set([...TERMINAL_ACTIONS, ...CHANNEL_ACTIONS, ...XFE
 const TCP_SESSION_RE = /^tcs_[A-Za-z0-9_-]{16,64}$/;
 const FILE_SESSION_RE = /^fls_[A-Za-z0-9_-]{16,64}$/;
 const XFER_GRANT_RE = /^xfr_[A-Za-z0-9_-]{8,64}$/;
+const XFER_TRANSFER_RE = /^[0-9a-f]{16}$/;
+const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
+const XFER_MAX_S = 3600;
 const MAX_TTL_S = 300;
 const SKEW_S = 30;
 
@@ -149,12 +156,40 @@ function filePayload(sessionId, deadlineUnix, phase, mode, root) {
   return `${sessionId}\n${deadlineUnix}\n${phase}\n${mode}\n${root}`;
 }
 
-// sahxfer design §3.4. dir is "put" or "get"; root is absolute; path is
-// relative; size is a safe integer; sha256 is 64 lowercase hex. The route
-// already checked root and path; they are checked again here (FILE §2 root
-// shape, FILE §5.1 path shape, byte limits) so no caller can sign a payload
-// whose lines shift or whose path climbs out of the root.
-function xferPayload(grantId, deadlineUnix, phase, dir, root, path, size, sha256) {
+// host:port with a numeric port 1..65535; the host is an IP literal or a DNS
+// name (IPv6 in brackets). Returns the string or null.
+function peerAddress(raw) {
+  if (typeof raw !== 'string' || raw.length === 0 || raw.length > 256 || /[\s\u0000-\u001f\u007f]/.test(raw)) return null;
+  const m = /^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):([1-9][0-9]{0,4})$/.exec(raw);
+  if (!m || Number(m[2]) > 65535) return null;
+  return raw;
+}
+
+// Lease line 18: hex SHA-256 of "sahxfer-material-v1\n" || key || route_token
+// over the raw 32 and 16 bytes.
+function xferMaterial(key, routeToken) {
+  if (!Buffer.isBuffer(key) || key.length !== 32 || !Buffer.isBuffer(routeToken) || routeToken.length !== 16) throw badPayload();
+  return crypto.createHash('sha256').update('sahxfer-material-v1\n', 'utf8').update(key).update(routeToken).digest('hex');
+}
+
+function intIn(n, lo, hi) {
+  return Number.isSafeInteger(n) && n >= lo && n <= hi;
+}
+
+// sahxfer design §3.4, the 18-line form. dir is "put" or "get"; root is
+// absolute; path is relative; size is a safe integer; sha256 is 64 lowercase
+// hex; overwrite is a boolean, signed as 0 or 1; transfer_id is 16 lowercase
+// hex, not all zero; expires_unix is the first-packet deadline; max_s is
+// 1..3600, idle_s 1..max_s; byte_cap is at least size; profile is internet
+// or dc; transport is udp (v1); peer is "listen" or "dial:<host:port>";
+// material is 64 lowercase hex (xferMaterial). The route already checked
+// root and path; they are checked again here (FILE §2 root shape, FILE §5.1
+// path shape, byte limits) so no caller can sign a payload whose lines shift
+// or whose path climbs out of the root.
+function xferPayload({
+  grantId, deadlineUnix, phase, dir, root, path, size, sha256, overwrite, transferId,
+  expiresUnix, idleS, maxS, byteCap, profile, transport, peer, material
+} = {}) {
   checkCommon(grantId, XFER_GRANT_RE, deadlineUnix, phase);
   if (dir !== 'put' && dir !== 'get') throw badPayload();
   if (!validateFileRoot(root, 'file:root').ok) throw badPayload();
@@ -164,9 +199,21 @@ function xferPayload(grantId, deadlineUnix, phase, dir, root, path, size, sha256
   for (const c of path.split('/')) {
     if (c === '' || c === '.' || c === '..' || Buffer.byteLength(c, 'utf8') > 255) throw badPayload();
   }
-  if (!Number.isSafeInteger(size) || size < 0) throw badPayload();
-  if (typeof sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(sha256)) throw badPayload();
-  return `${grantId}\n${deadlineUnix}\n${phase}\n${dir}\n${root}\n${path}\n${size}\n${sha256}`;
+  if (!intIn(size, 0, Number.MAX_SAFE_INTEGER)) throw badPayload();
+  if (typeof sha256 !== 'string' || !SHA256_HEX_RE.test(sha256)) throw badPayload();
+  if (typeof overwrite !== 'boolean') throw badPayload();
+  if (typeof transferId !== 'string' || !XFER_TRANSFER_RE.test(transferId) || transferId === '0000000000000000') throw badPayload();
+  if (!intIn(expiresUnix, 1, Number.MAX_SAFE_INTEGER)) throw badPayload();
+  if (!intIn(maxS, 1, XFER_MAX_S) || !intIn(idleS, 1, maxS)) throw badPayload();
+  if (!intIn(byteCap, size, Number.MAX_SAFE_INTEGER)) throw badPayload();
+  if (profile !== 'internet' && profile !== 'dc') throw badPayload();
+  if (transport !== 'udp') throw badPayload();
+  if (peer !== 'listen' && !(typeof peer === 'string' && peer.startsWith('dial:') && peerAddress(peer.slice(5)))) throw badPayload();
+  if (typeof material !== 'string' || !SHA256_HEX_RE.test(material)) throw badPayload();
+  return [
+    grantId, deadlineUnix, phase, dir, root, path, size, sha256, overwrite ? 1 : 0, transferId,
+    expiresUnix, idleS, maxS, byteCap, profile, transport, peer, material
+  ].join('\n');
 }
 
 module.exports = {
@@ -180,6 +227,8 @@ module.exports = {
   tcpPayload,
   filePayload,
   xferPayload,
+  xferMaterial,
+  peerAddress,
   payloadHash,
   canonicalLease,
   issueLease,

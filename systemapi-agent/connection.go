@@ -6,7 +6,9 @@
 // fatal error: a rejected API key (HTTP 401/403), a permanent enrollment
 // refusal, or a changed control public key. Channel streams (tcp.go, file.go) are
 // per connection and end with it; a control plane that overruns a stream's
-// credit window gets its connection dropped.
+// credit window gets its connection dropped. Xfer transfers (xfer.go) are
+// not: they survive a drop, and their results go out once the next
+// connection has enrolled.
 package main
 
 import (
@@ -115,6 +117,7 @@ func (a *agentConn) runOnce(stop <-chan struct{}) (bool, error) {
 	defer c.Close()
 	c.SetReadLimit(256 * 1024)
 	out := &wsWriter{c: c}
+	defer xferMgr().detach(out)
 	// Channel streams (TCP forward) live and die with this connection.
 	ch := newChannelConn(out, a.st.HostID)
 	ch.stateDir = filepath.Dir(a.statePath)
@@ -199,6 +202,8 @@ func (a *agentConn) runOnce(stop <-chan struct{}) (bool, error) {
 			}
 			enrolledOK = true
 			log.Printf("enrolled host_id=%s", a.st.HostID)
+			// Queued xfer results go out on an enrolled socket only.
+			xferMgr().attach(out)
 		case <-enrollTimer.C:
 			if !enrolledOK {
 				return false, errors.New("enrollment timed out")
@@ -228,6 +233,9 @@ func (a *agentConn) runOnce(stop <-chan struct{}) (bool, error) {
 			log.Println("signal received, stopping terminal sessions and disconnecting")
 			stopAllSessions("stopped", 3*time.Second)
 			ch.close("stopped")
+			// Cancel xfer children while this connection can still carry
+			// their results.
+			xferMgr().stopAll("stopped", xferStopTimeout)
 			_ = out.WriteClose()
 			select {
 			case <-done:

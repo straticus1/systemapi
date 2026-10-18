@@ -5,59 +5,75 @@
  * never touch this process: they move on UDP between the client and the
  * address in peer.udp.
  *
+ * Peer modes (SYSTEMAPI_XFER_PEER_MODE): "relay" (default) signs
+ * "dial:<SYSTEMAPI_XFER_PEER_UDP>" and returns that relay as peer.udp; unset
+ * or malformed SYSTEMAPI_XFER_PEER_UDP is agent_unsupported. "direct" signs
+ * "listen"; the agent reports the address its receiver bound in the ready
+ * frame, and that address becomes peer.udp only if it is an IP literal
+ * inside SYSTEMAPI_XFER_DIRECT_ALLOW (comma-separated CIDRs, default
+ * 127.0.0.0/8,::1/128), so an agent cannot aim a client at a third party. A
+ * missing or refused address is internal and the grant is cancelled. Any
+ * other mode, or a malformed allow list, is agent_unsupported.
+ *
  * Threats: a write through read-only authority (xfer:put needs file:read and
  * file:write in the host's tenant and a policy root with read and write;
  * xfer:root needs the admin-only file:root and a root-flagged policy entry,
  * the same rules as the file channel), a grant for a path outside the root
  * (FILE §5.1 shapes refused here, the agent's openat2 helper refuses again),
  * a grant for host A used on host B (the lease is signed for one host id and
- * one grant id), a put lease used for a get (the signed payload names the
- * direction), a grant with no audit trail (the xfer_intent row is written
- * before the agent sees the key; a failed write issues nothing; no result
- * row is written for a grant that was never pushed past its intent row), a
- * grant that outlives the operator's authority (renewal every 30 s re-checks
- * scopes, membership, key and policy; a refusal cancels the grant and the
- * agent's last lease lapses in 60 s), a grant nobody uses (no "active"
- * progress within 60 s of ready, or none for idle_seconds after it, cancels
- * it; a client that hangs up before the response cancels it), unbounded
- * grants (two live per actor, counting grants still in their tombstone
- * window, and a hard max of SYSTEMAPI_XFER_MAX_SECONDS), a result recorded
- * wrongly (a grant the server cancels, or whose agent socket drops, is kept
- * as a tombstone for the agent's remaining lease window; a late xfer_result
- * from any authenticated socket of the same host is recorded, and with none
- * the row says "unknown", never "aborted", because the agent may have
- * committed) and a leaked key or route token (both come from the OS CSPRNG,
- * are sent only in the no-store response and the xfer_grant frame, and are
- * never logged or audited; JavaScript strings holding them are not wiped).
+ * one grant id), a frame field changed after signing (the 18-line lease
+ * payload of controlplane/lease.js xferPayload binds every field the agent
+ * acts on, including overwrite, transfer id, timers, byte cap, peer and a
+ * hash of the key and route token; a renewal is rebuilt from the stored
+ * grant with only phase and deadline changed), a grant with no audit trail
+ * (the xfer_intent row is written before the agent sees the key; a failed
+ * write issues nothing; no result row is written for a grant that was never
+ * pushed past its intent row), a grant that outlives the operator's
+ * authority (renewal every 30 s re-checks scopes, membership, key and
+ * policy; a refusal cancels the grant and the agent's last lease lapses in
+ * 60 s), a grant nobody uses (no "active" progress within 60 s of ready, or
+ * none for idle_seconds after it, cancels it; a client that hangs up before
+ * the response cancels it), unbounded grants (two live per actor, counting
+ * grants still in their tombstone window, a hard max of
+ * SYSTEMAPI_XFER_MAX_SECONDS, and the xfer ticket budget in router.js), a
+ * result recorded wrongly (a grant the server cancels, or whose agent socket
+ * drops, is kept as a tombstone for the agent's remaining lease window; a
+ * late xfer_result from any authenticated socket of the same host is
+ * recorded, and with none the row says "unknown", never "aborted", because
+ * the agent may have committed) and a leaked key or route token (both come
+ * from the OS CSPRNG, are sent only in the no-store response and the
+ * xfer_grant frame, and are never logged or audited; the grant keeps only
+ * their material hash; JavaScript strings holding them are not wiped).
  * Does NOT carry or inspect file bytes, does NOT run the relay that
- * peer.udp names (SYSTEMAPI_XFER_PEER_UDP must point at one; unset is
- * agent_unsupported), does NOT issue get grants yet (design §15: put ships
- * first; the agent hash step has no wire frame), does NOT persist grants
- * across a server restart (a restart loses the result row), and does NOT
- * sign overwrite, peer_udp, max_s, idle_s, byte_cap or transfer_id: the
- * design §3.4 lease payload covers only grant id, deadline, phase, dir,
- * root, path, size and sha256 (docs/sah-suite.md, Partially wired).
+ * SYSTEMAPI_XFER_PEER_UDP names, does NOT issue get grants yet (design §15:
+ * put ships first; the agent hash step has no wire frame), and does NOT
+ * persist grants across a server restart (a restart loses the result row).
  *
- * Agent frames (no agent implements them yet; an agent that does advertises
- * the "xfer" capability):
+ * Agent frames (an agent that implements them advertises the "xfer"
+ * capability):
  *   server -> agent  xfer_grant  {grant_id, transfer_id, action, purpose, dir,
  *                    root, path, size, sha256, overwrite, profile, transport,
- *                    peer_udp, aead, key, route_token, expires_unix,
- *                    deadline_unix, idle_s, max_s, byte_cap, actor, lease}
- *   agent -> server  xfer_status {grant_id, payload:{status:"ready"} | {error}}
- *                    then {status:"active", bytes} as progress; an {error}
- *                    after ready ends the grant
+ *                    peer, aead, key, route_token, expires_unix,
+ *                    deadline_unix, idle_s, max_s, byte_cap, actor, lease};
+ *                    peer is "listen" or "dial:<host:port>"
+ *   agent -> server  xfer_status {grant_id, payload:{status:"ready", udp} |
+ *                    {error}}; udp ("host:port") is required for "listen"
+ *                    and ignored for "dial:"; then {status:"active", bytes}
+ *                    as progress; an {error} after ready ends the grant
  *   server -> agent  xfer_renew  {grant_id, deadline_unix, lease}
  *   server -> agent  xfer_cancel {grant_id, reason}
- *   agent -> server  xfer_result {grant_id, payload:{status, bytes, sha256}},
- *                    accepted from any socket of the same host until the
- *                    tombstone window closes
+ *   agent -> server  xfer_result {grant_id, payload:{status, reason, bytes,
+ *                    sha256, committed}}, accepted from any socket of the
+ *                    same host until the tombstone window closes; reason is
+ *                    recorded only when it is a PROTOCOL.md §4.4 ABORT name,
+ *                    "stopped" or "agent_restart"
  */
 'use strict';
 
 const crypto = require('node:crypto');
+const net = require('node:net');
 const WebSocket = require('ws');
-const { issueLease, xferPayload } = require('../controlplane/lease');
+const { issueLease, xferPayload, xferMaterial, peerAddress } = require('../controlplane/lease');
 const { validateFileRoot } = require('../controlplane/channels');
 const { randomToken } = require('../controlplane/token');
 const { checkPath } = require('./file');
@@ -79,11 +95,18 @@ const IDLE_SECONDS_DEFAULT = 30;
 const PER_ACTOR_DEFAULT = 2;
 const MAX_BYTES_DEFAULT = 256 * 1024 ** 3;
 const RESULT_STATUSES = new Set(['ok', 'hash_mismatch', 'aborted', 'expired', 'io_error']);
+// xfer_result reason: the PROTOCOL.md §4.4 ABORT names, plus the agent's own.
+const RESULT_REASONS = new Set(['size_mismatch', 'hash_mismatch', 'expired', 'policy', 'io', 'protocol', 'auth', 'cancelled',
+    'byte_cap', 'idle', 'no_space', 'stopped', 'agent_restart']);
+const DIRECT_ALLOW_DEFAULT = '127.0.0.0/8,::1/128';
 // Agent refusals passed through to the client, with their HTTP status.
 const AGENT_ERRORS = Object.freeze({
     bad_root: 400, bad_path: 400, reserved_name: 400, symlink_refused: 403, not_a_file: 409, root_denied: 403,
-    not_found: 404, exists: 409, too_large: 413, agent_unsupported: 501, cap_reached: 429, changed: 409, internal: 500
+    not_found: 404, exists: 409, too_large: 413, agent_unsupported: 501, cap_reached: 429, changed: 409, internal: 500,
+    pty_user_unset: 503, root_unavailable: 503, lease_required: 500, no_space: 507, io: 500
 });
+// Agent codes the client sees as another code.
+const CLIENT_CODES = Object.freeze({ lease_required: 'internal' });
 
 function httpError(status, code) {
     const err = new Error(code);
@@ -135,13 +158,31 @@ function parseGrantRequest(body, env = {}) {
     };
 }
 
-// host:port with a numeric port 1..65535; the host is an IP literal or a DNS
-// name (IPv6 in brackets). Returns the string or null.
-function peerAddress(raw) {
-    if (typeof raw !== 'string' || raw.length === 0 || raw.length > 256 || /[\s\u0000-\u001f\u007f]/.test(raw)) return null;
-    const m = /^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):([1-9][0-9]{0,4})$/.exec(raw);
-    if (!m || Number(m[2]) > 65535) return null;
-    return raw;
+// SYSTEMAPI_XFER_DIRECT_ALLOW: comma-separated "ip/prefix" entries. Returns
+// a net.BlockList, or null when any entry is malformed (fail closed).
+function directAllowList(raw) {
+    const text = raw === undefined || raw === null || raw === '' ? DIRECT_ALLOW_DEFAULT : String(raw);
+    const list = new net.BlockList();
+    for (const entry of text.split(',')) {
+        const m = /^([0-9A-Fa-f:.]+)\/([0-9]{1,3})$/.exec(entry.trim());
+        const family = m ? net.isIP(m[1]) : 0;
+        if (!family) return null;
+        const prefix = Number(m[2]);
+        if (prefix > (family === 4 ? 32 : 128)) return null;
+        list.addSubnet(m[1], prefix, family === 4 ? 'ipv4' : 'ipv6');
+    }
+    return list;
+}
+
+// Direct mode: the agent's reported "host:port" must be an IP literal inside
+// the allow list. Returns the address or null.
+function directPeer(raw, allow) {
+    const addr = peerAddress(raw);
+    if (!addr || !allow) return null;
+    const host = addr.slice(0, addr.lastIndexOf(':')).replace(/^\[(.*)\]$/, '$1');
+    const family = net.isIP(host);
+    if (!family) return null;
+    return allow.check(host, family === 4 ? 'ipv4' : 'ipv6') ? addr : null;
 }
 
 class XferGrants {
@@ -181,7 +222,12 @@ class XferGrants {
         const lease = issueLease(this.fm.signer, {
             hostId: g.hostId,
             action: g.action,
-            payload: xferPayload(g.id, deadlineUnix, phase, g.dir, g.root, g.path, g.size, g.sha256),
+            payload: xferPayload({
+                grantId: g.id, deadlineUnix, phase, dir: g.dir, root: g.root, path: g.path, size: g.size,
+                sha256: g.sha256, overwrite: g.overwrite, transferId: g.transferId, expiresUnix: g.expiresUnix,
+                idleS: g.idleS, maxS: g.maxS, byteCap: g.byteCap, profile: g.profile, transport: g.transport,
+                peer: g.peer, material: g.material
+            }),
             ttl: LEASE_TTL_S,
             now: nowMs
         });
@@ -197,8 +243,18 @@ class XferGrants {
         const env = this.env;
         if (request.dir !== 'put') throw httpError(501, 'agent_unsupported');
         if (request.transport !== 'udp') throw httpError(501, 'agent_unsupported');
-        const peerUdp = peerAddress(env.SYSTEMAPI_XFER_PEER_UDP);
-        if (!peerUdp) throw httpError(501, 'agent_unsupported');
+        const mode = env.SYSTEMAPI_XFER_PEER_MODE === undefined || env.SYSTEMAPI_XFER_PEER_MODE === '' ? 'relay' : env.SYSTEMAPI_XFER_PEER_MODE;
+        let relayUdp = null;
+        let allow = null;
+        if (mode === 'relay') {
+            relayUdp = peerAddress(env.SYSTEMAPI_XFER_PEER_UDP);
+            if (!relayUdp) throw httpError(501, 'agent_unsupported');
+        } else if (mode === 'direct') {
+            allow = directAllowList(env.SYSTEMAPI_XFER_DIRECT_ALLOW);
+            if (!allow) throw httpError(501, 'agent_unsupported');
+        } else {
+            throw httpError(501, 'agent_unsupported');
+        }
         const agentWs = fm.connectedAgents && fm.connectedAgents.get(host.host_id);
         if (!agentWs || agentWs.readyState !== WebSocket.OPEN) throw httpError(503, 'agent_offline');
         if (!fm.agentSupports(host.host_id, 'xfer')) throw httpError(501, 'agent_unsupported');
@@ -210,6 +266,17 @@ class XferGrants {
         const maxSeconds = envInt(env, 'SYSTEMAPI_XFER_MAX_SECONDS', MAX_SECONDS_DEFAULT, 1, 3600);
         const idleSeconds = Math.min(envInt(env, 'SYSTEMAPI_XFER_IDLE_SECONDS', IDLE_SECONDS_DEFAULT, 1, 3600), maxSeconds);
         const nowMs = Date.now();
+        const expiresMs = nowMs + FIRST_PACKET_S * 1000;
+        // The key and route token leave this process only in the response and
+        // the xfer_grant frame; the grant keeps their material hash, which the
+        // lease signs.
+        const keyRaw = crypto.randomBytes(32);
+        const tokenRaw = crypto.randomBytes(16);
+        const material = xferMaterial(keyRaw, tokenRaw);
+        const key = keyRaw.toString('base64');
+        const routeToken = tokenRaw.toString('base64');
+        keyRaw.fill(0);
+        tokenRaw.fill(0);
         const g = {
             id: `xfr_${randomToken(16)}`,
             transferId: this.newTransferId(),
@@ -226,6 +293,16 @@ class XferGrants {
             size: request.size,
             sha256: request.sha256,
             overwrite: request.overwrite,
+            expiresUnix: Math.floor(expiresMs / 1000),
+            idleS: idleSeconds,
+            maxS: maxSeconds,
+            byteCap: request.size,
+            profile: 'internet',
+            transport: 'udp',
+            peer: mode === 'direct' ? 'listen' : `dial:${relayUdp}`,
+            relayUdp,
+            allow,
+            material,
             agent: agentWs,
             startedMs: nowMs,
             idleMs: idleSeconds * 1000,
@@ -276,9 +353,6 @@ class XferGrants {
             throw httpError(code === 'client_gone' ? 499 : 503, code);
         }
 
-        const key = crypto.randomBytes(32).toString('base64');
-        const routeToken = crypto.randomBytes(16).toString('base64');
-        const expiresMs = nowMs + FIRST_PACKET_S * 1000;
         const doc = {
             grant_id: g.id,
             host_id: g.hostId,
@@ -287,16 +361,16 @@ class XferGrants {
             expires_in: FIRST_PACKET_S,
             idle_seconds: idleSeconds,
             max_seconds: maxSeconds,
-            byte_cap: g.size,
+            byte_cap: g.byteCap,
             purpose: g.purpose,
             root: g.root,
             path: g.path,
             size: g.size,
             sha256: g.sha256,
             overwrite: g.overwrite,
-            profile: 'internet',
-            transport: 'udp',
-            peer: { udp: peerUdp, quic: null },
+            profile: g.profile,
+            transport: g.transport,
+            peer: { udp: null, quic: null },
             aead: AEAD,
             key,
             route_token: routeToken
@@ -326,23 +400,26 @@ class XferGrants {
                 overwrite: g.overwrite,
                 profile: doc.profile,
                 transport: doc.transport,
-                peer_udp: peerUdp,
+                peer: g.peer,
                 aead: AEAD,
                 key,
                 route_token: routeToken,
-                expires_unix: Math.floor(expiresMs / 1000),
+                expires_unix: g.expiresUnix,
                 deadline_unix: first.deadlineUnix,
-                idle_s: idleSeconds,
-                max_s: maxSeconds,
+                idle_s: g.idleS,
+                max_s: g.maxS,
                 byte_cap: doc.byte_cap,
                 actor: actor === null || actor === undefined ? '' : String(actor),
                 lease: first.lease
             });
-            await readyP;
+            doc.peer.udp = await readyP;
         } catch (err) {
             const code = err.code || 'internal';
             if (g.state === 'live') {
-                if (code === 'agent_offline' || code === 'client_gone' || !err.status) {
+                if (err.cancelReason) {
+                    // The agent said ready: its receiver is running.
+                    this.cancel(g, err.cancelReason);
+                } else if (code === 'agent_offline' || code === 'client_gone' || !err.status) {
                     // The agent may have accepted the frame: wait for a result.
                     this.cancel(g, code === 'agent_offline' && agentWs.readyState === WebSocket.OPEN ? 'start_timeout' : code);
                 } else {
@@ -350,7 +427,7 @@ class XferGrants {
                     await this.end(g, 'aborted', { error: code });
                 }
             }
-            throw httpError(err.status || 500, code);
+            throw httpError(err.status || 500, CLIENT_CODES[code] || code);
         } finally {
             if (g.ready) clearTimeout(g.ready.timer);
             g.ready = null;
@@ -433,7 +510,20 @@ class XferGrants {
             if (g.agent !== ws || g.state !== 'live') return;
             if (g.ready) {
                 if (p.status === 'ready') {
-                    g.ready.resolve();
+                    // Relay mode ignores a reported address; direct mode
+                    // requires one inside the allow list.
+                    if (g.peer !== 'listen') {
+                        g.ready.resolve(g.relayUdp);
+                        return;
+                    }
+                    const udp = directPeer(p.udp, g.allow);
+                    if (udp) {
+                        g.ready.resolve(udp);
+                        return;
+                    }
+                    const err = httpError(500, 'internal');
+                    err.cancelReason = p.udp === undefined ? 'peer_missing' : 'peer_refused';
+                    g.ready.reject(err);
                     return;
                 }
                 const code = Object.prototype.hasOwnProperty.call(AGENT_ERRORS, p.error) ? p.error : 'internal';
@@ -462,7 +552,9 @@ class XferGrants {
             const status = RESULT_STATUSES.has(p.status) ? p.status : 'aborted';
             const bytes = Number.isSafeInteger(p.bytes) && p.bytes >= 0 ? p.bytes : null;
             const sha256 = typeof p.sha256 === 'string' && SHA256_RE.test(p.sha256) ? p.sha256 : null;
-            this.end(g, status, { bytes, sha256, error: g.retireReason });
+            const reason = typeof p.reason === 'string' && RESULT_REASONS.has(p.reason) ? p.reason : null;
+            const committed = typeof p.committed === 'boolean' ? p.committed : null;
+            this.end(g, status, { bytes, sha256, error: g.retireReason, reason, committed });
         }
     }
 
@@ -481,7 +573,7 @@ class XferGrants {
     // different hash is recorded as hash_mismatch. "unknown" means the
     // server stopped hearing about a grant the agent may still have
     // committed.
-    async end(g, status, { error = null, bytes = null, sha256 = null } = {}) {
+    async end(g, status, { error = null, bytes = null, sha256 = null, reason = null, committed = null } = {}) {
         if (g.state === 'done') return;
         g.state = 'done';
         clearInterval(g.renewTimer);
@@ -496,6 +588,8 @@ class XferGrants {
             status: final, duration_ms: Date.now() - g.startedMs
         };
         if (error) payload.error = error;
+        if (reason) payload.reason = reason;
+        if (committed !== null) payload.committed = committed;
         await appendAuditRetrying(this.fm.registry, {
             tenant_id: g.tenantId, host_id: g.hostId, actor: g.actor, action: 'xfer_result', payload
         }, this.fm.auditRetryDelaysMs || [200, 1000], (err) => {
@@ -504,4 +598,4 @@ class XferGrants {
     }
 }
 
-module.exports = { XferGrants, PURPOSES, parseGrantRequest, checkXferPath, peerAddress };
+module.exports = { XferGrants, PURPOSES, AGENT_ERRORS, parseGrantRequest, checkXferPath, peerAddress, directAllowList, directPeer };

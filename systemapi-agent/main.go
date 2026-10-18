@@ -64,6 +64,10 @@ func main() {
 	ptyRecordDirFlag := flag.String("pty-record-dir", "", "terminal recordings (default: "+ptyRootRecordDir+" as root, else <state dir>/recordings)")
 	ptyRecordMaxFlag := flag.Int64("pty-record-max-bytes", recordMaxBytesDefault, "end a terminal session once it has recorded this many bytes")
 	tcpAllowFlag := flag.String("tcp-allow", "", "TCP-forward targets this agent may dial, e.g. local:5432,10.0.0.0/24:3389,10.0.0.0/24:8000-8099 (default: none)")
+	xferBinFlag := flag.String("xfer-bin", "", "absolute path of the sahxfer binary started for xfer grants (owned by root or the agent user, not group or other writable)")
+	xferListenFlag := flag.String("xfer-udp-listen", "", "address recv binds for listen-mode grants: ip:port or ip:lo-hi (unset refuses listen mode)")
+	xferAdvertiseFlag := flag.String("xfer-udp-advertise", "", "IP reported to the server in place of the bound one (a published port behind NAT or Docker)")
+	xferAllowDarwinFlag := flag.Bool("xfer-allow-darwin", false, "advertise xfer on macOS (development only: no openat2, no Pdeathsig)")
 	ptyRecordMinFreeFlag := flag.Uint64("pty-record-min-free", recordMinFreeDefault, "refuse a terminal session when the recording filesystem has less free space (bytes)")
 	flag.Parse()
 	if *ptyRecordMaxFlag <= 0 || *ptyRecordMinFreeFlag == 0 {
@@ -89,6 +93,15 @@ func main() {
 	}
 	if ptyCfg.AllowAgentUser {
 		log.Printf("WARNING: --pty-allow-agent-user: terminal shells run as the agent's own user and can read its API key and state")
+	}
+	xcfg, err := parseXferFlags(*xferBinFlag, *xferListenFlag, *xferAdvertiseFlag, *xferAllowDarwinFlag, os.Geteuid())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(2)
+	}
+	xferCfg = xcfg
+	if xferCfg.allowDarwin {
+		log.Printf("WARNING: --xfer-allow-darwin: xfer on macOS has no openat2 and no Pdeathsig; development only")
 	}
 
 	apiKey, warn, err := resolveAPIKey(*apiKeyFlag, *apiKeyFileFlag)
@@ -127,6 +140,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("state: %v", err)
 	}
+	// Interrupted transfers from a previous run: sweep their temp files and
+	// report them. This runs in the background, since a sweep may hash a
+	// large target: results found before the first connection enrolls wait
+	// in the queue, later ones go out on the live connection. The server
+	// ignores a result for a grant id it no longer holds, so a result sent
+	// again after another restart is harmless.
+	xferMgr().setStateDir(filepath.Dir(statePath))
+	go xferMgr().sweepXferRecords()
 	pubLine, err := sshEd25519PublicLine(st.Ed25519Seed)
 	if err != nil {
 		log.Fatalf("ssh identity: %v", err)
@@ -177,7 +198,11 @@ func main() {
 		maxBackoff:     60 * time.Second,
 		telemetry:      gatherTelemetry,
 	}
-	if err := conn.run(stop); err != nil {
+	err = conn.run(stop)
+	// Graceful shutdown: each xfer child gets cancel and deletes its temp
+	// file; results not sent stay in their records for the next start.
+	xferMgr().stopAll("stopped", xferStopTimeout)
+	if err != nil {
 		log.Printf("fatal: %v", err)
 		os.Exit(1)
 	}
