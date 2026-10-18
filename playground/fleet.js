@@ -34,6 +34,9 @@
  * registry.keyActive for the socket's key, so a key expired, locked or
  * deleted by any other path is caught within one ping; a check that errors
  * twice in a row also closes. Each close is code 4403 with an audit row.
+ * A retired host (POST /api/v1/hosts/:host_id/retire with force) loses its
+ * live agent the same way: close 4403 "host_retired" (retireAgent), and the
+ * registry refuses that host_id's re-enroll as host_retired.
  */
 
 const WebSocket = require('ws');
@@ -993,6 +996,22 @@ class FleetManager {
             console.error('[Fleet] agent revoke audit failed:', err.message);
             await this.noteSecurity('audit_write_failed', fingerprint(keyId), { action: 'agent_key_revoked' });
         }
+    }
+
+    // Ends a retired host's live agent: close 4403 "host_retired" (terminate
+    // after the grace period). The socket's close handler ends its terminal,
+    // TCP, file and xfer sessions and marks the row offline; its re-enroll
+    // is then refused host_retired. False when no agent is connected.
+    retireAgent(hostId) {
+        const ws = this.connectedAgents.get(hostId);
+        if (!ws) return false;
+        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+            ws.close(AGENT_REVOKED_CLOSE, 'host_retired');
+        }
+        unref(setTimeout(() => {
+            if (ws.readyState !== WebSocket.CLOSED) ws.terminate();
+        }, AGENT_CLOSE_GRACE_MS));
+        return true;
     }
 
     // True when the live agent for hostId advertised capability on dial.

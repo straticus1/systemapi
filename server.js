@@ -35,6 +35,14 @@ if (process.env.NODE_ENV === 'production') {
 } else if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET === DEFAULT_SESSION_SECRET) {
     console.warn('[control] SESSION_SECRET is the default; set a real secret before production');
 }
+// The lease signing key, checked before anything listens: production
+// refuses an unset or malformed SYSTEMAPI_ED25519_SEED (controlplane/keys.js).
+try {
+    require('./controlplane/keys').assertSignerConfig(process.env);
+} catch (err) {
+    console.error('[control] ' + err.message + '; refusing to start');
+    process.exit(1);
+}
 
 function dbSsl(env) {
     if (env.DB_SSL === 'disable') return false;

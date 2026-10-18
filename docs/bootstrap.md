@@ -35,6 +35,26 @@ now re-points both triggers to the namespaced function and leaves the old one
 in place, because another application may own it. Drop it by hand only once
 you know nothing else uses it.
 
+## Lease signing key
+
+Set `SYSTEMAPI_ED25519_SEED` in the production env file before the first boot:
+64 hex characters, generated once and never changed.
+
+```bash
+openssl rand -hex 32   # paste into /etc/sahcore/sahcore.env as SYSTEMAPI_ED25519_SEED=
+```
+
+With `NODE_ENV=production` the server refuses to start (exit 1, before it
+listens) when the seed is unset or not 64 hex characters:
+`[control] SYSTEMAPI_ED25519_SEED is not set; production refuses an ephemeral
+signing key ...; refusing to start`. An ephemeral key would change at every
+restart, and every enrolled agent pins the first key it sees and exits with
+`control_pubkey_changed` when it changes. A PEM key in
+`SYSTEMAPI_SIGNING_KEY` is also accepted. Outside production the server keeps
+an ephemeral key and logs `ephemeral signing key; set SYSTEMAPI_ED25519_SEED
+to persist`. Treat the seed as a secret: it signs every lease. On miniapps1
+it lives in `/etc/sahcore/sahcore.env` with the other secrets.
+
 ## Run it once
 
 Run it on the server, as the sahcore service user, with the production env

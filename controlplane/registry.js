@@ -3,7 +3,11 @@
 // public key (refused host_key_mismatch; the stored ssh_pubkey never changes
 // on re-enroll, so an intentional rotation is an admin resetting the cp_hosts
 // row on the server: UPDATE its ssh_pubkey, or DELETE it so the agent
-// enrolls afresh; there is no HTTP route for it), a rewritten audit row, and a security event with no tenant shown to every
+// enrolls afresh; there is no HTTP route for it), a retired host coming back
+// (retireHost stamps retired_at with a host_retired audit row in one step; a
+// retired host_id is refused re-enroll as host_retired and is left out of
+// resolveHosts, listHosts unless asked, countHosts and channelPolicies; the
+// row is never deleted), a rewritten audit row, and a security event with no tenant shown to every
 // audit reader. Queries are parameterized. A host id that belongs to another
 // tenant is returned as not found. Webhook HMAC secrets are sealed before
 // insert; this store does not log them. listSecurity returns only rows whose
@@ -51,6 +55,7 @@ function publicHost(row) {
     last_seen_at: row.last_seen_at,
     tags: row.tags || [],
     created_at: row.created_at,
+    retired_at: row.retired_at || null,
     cpu_percent: row.cpu_percent ?? null,
     sparkline: row.sparkline || []
   };
@@ -153,6 +158,28 @@ function channelPolicyAuditEntry(tenantId, hostId, actor, action, reason, tcpPol
   };
 }
 
+// The audit row for a host retirement: why, who, and what the row was.
+function hostRetiredAuditEntry(row, actor, reason, forced) {
+  return {
+    tenant_id: row.tenant_id,
+    host_id: row.host_id,
+    actor,
+    action: 'host_retired',
+    payload: {
+      reason,
+      hostname: row.hostname,
+      forced: forced === true,
+      last_seen_at: row.last_seen_at ? new Date(row.last_seen_at).toISOString() : null
+    }
+  };
+}
+
+function retireReason(reason) {
+  if (typeof reason !== 'string' || reason.trim() === '') throw http(400, 'reason_required');
+  if (reason.length > 256) throw http(400, 'bad_reason');
+  return reason.trim();
+}
+
 class MemoryRegistry {
   constructor(env = {}) {
     this.env = env;
@@ -200,6 +227,7 @@ class MemoryRegistry {
     if (prev && (prev.tenant_id !== tenantId || prev.key_id !== keyId)) {
       throw http(403, 'host_steal');
     }
+    if (prev && prev.retired_at) throw http(403, 'host_retired');
     if (prev && sshKeyMaterial(prev.ssh_pubkey) !== sshKeyMaterial(sshPubkey)) {
       throw http(403, 'host_key_mismatch');
     }
@@ -215,7 +243,8 @@ class MemoryRegistry {
       status: 'online',
       last_seen_at: now,
       tags: prev ? prev.tags : [],
-      created_at: prev ? prev.created_at : now
+      created_at: prev ? prev.created_at : now,
+      retired_at: null
     });
     return this.getHost([tenantId], hostId);
   }
@@ -282,9 +311,10 @@ class MemoryRegistry {
     return publicHost({ ...row, sparkline: series, cpu_percent: series.length ? series[series.length - 1] : null });
   }
 
-  async listHosts(tenantIds, query) {
+  // Retired rows only when includeRetired is true.
+  async listHosts(tenantIds, query, { includeRetired = false } = {}) {
     const allow = new Set(tenantIds || []);
-    let rows = [...this.hosts.values()].filter((h) => allow.has(h.tenant_id));
+    let rows = [...this.hosts.values()].filter((h) => allow.has(h.tenant_id) && (includeRetired || !h.retired_at));
     if (query) {
       const needle = String(query).toLowerCase();
       rows = rows.filter((h) => h.hostname.toLowerCase().includes(needle));
@@ -300,13 +330,14 @@ class MemoryRegistry {
   }
 
   // Exact host_id, else exact case-insensitive hostname, inside tenantIds.
+  // Retired rows never resolve.
   async resolveHosts(tenantIds, name) {
     const allow = new Set(tenantIds || []);
     const byId = this.hosts.get(name);
-    if (byId && allow.has(byId.tenant_id)) return [this.decorate(byId)];
+    if (byId && allow.has(byId.tenant_id) && !byId.retired_at) return [this.decorate(byId)];
     const needle = String(name).toLowerCase();
     return [...this.hosts.values()]
-      .filter((h) => allow.has(h.tenant_id) && String(h.hostname).toLowerCase() === needle)
+      .filter((h) => allow.has(h.tenant_id) && !h.retired_at && String(h.hostname).toLowerCase() === needle)
       .map((row) => this.decorate(row));
   }
 
@@ -323,7 +354,7 @@ class MemoryRegistry {
   // effectivePolicies for the host -> tenant -> deny-all fallback.
   async channelPolicies(hostId) {
     const row = this.hosts.get(hostId);
-    if (!row) return null;
+    if (!row || row.retired_at) return null;
     const h = this.hostPolicies.get(hostId) || {};
     const t = this.tenantPolicies.get(row.tenant_id) || {};
     return {
@@ -377,10 +408,24 @@ class MemoryRegistry {
     if (row) row.status = status;
   }
 
+  // Stamps retired_at and appends the host_retired audit row (written
+  // first; the row changes only once it is in, see PgRegistry). The row
+  // must belong to tenantId; a second retire is 409 already_retired.
+  async retireHost({ tenantId, hostId, actor, reason, forced }) {
+    const text = retireReason(reason);
+    const row = this.hosts.get(hostId);
+    if (!row || row.tenant_id !== tenantId) throw http(404, 'not_found');
+    if (row.retired_at) throw http(409, 'already_retired');
+    await this.appendAudit(hostRetiredAuditEntry(row, actor, text, forced));
+    row.retired_at = new Date().toISOString();
+    row.status = 'offline';
+    return this.decorate(row);
+  }
+
   async countHosts() {
-    let online = 0;
-    for (const host of this.hosts.values()) if (host.status === 'online') online += 1;
-    return { total: this.hosts.size, online, offline: this.hosts.size - online };
+    const live = [...this.hosts.values()].filter((h) => !h.retired_at);
+    const online = live.filter((h) => h.status === 'online').length;
+    return { total: live.length, online, offline: live.length - online };
   }
 
   async countOpenAlerts() {
@@ -694,13 +739,14 @@ class PgRegistry {
       // A row that appears between the lock and the insert must carry the
       // presented line exactly, else the upsert matches nothing.
       const cur = await client.query(
-        'SELECT tenant_id, key_id, ssh_pubkey FROM cp_hosts WHERE host_id = $1 FOR UPDATE',
+        'SELECT tenant_id, key_id, ssh_pubkey, retired_at FROM cp_hosts WHERE host_id = $1 FOR UPDATE',
         [hostId]
       );
       let pubkey = sshPubkey;
       if (cur.rowCount > 0) {
         const row = cur.rows[0];
         if (row.tenant_id !== tenantId || row.key_id !== keyId) throw http(403, 'host_steal');
+        if (row.retired_at) throw http(403, 'host_retired');
         if (sshKeyMaterial(row.ssh_pubkey) !== sshKeyMaterial(sshPubkey)) throw http(403, 'host_key_mismatch');
         pubkey = row.ssh_pubkey;
       }
@@ -714,7 +760,7 @@ class PgRegistry {
            status = 'online',
            last_seen_at = now()
          WHERE cp_hosts.tenant_id = EXCLUDED.tenant_id AND cp_hosts.key_id = EXCLUDED.key_id
-           AND cp_hosts.ssh_pubkey = EXCLUDED.ssh_pubkey
+           AND cp_hosts.ssh_pubkey = EXCLUDED.ssh_pubkey AND cp_hosts.retired_at IS NULL
          RETURNING host_id`,
         [hostId, tenantId, keyId, hostname, os || '', platform || '', pubkey]
       );
@@ -842,16 +888,17 @@ class PgRegistry {
     return res.rows[0];
   }
 
-  async listHosts(tenantIds, query) {
+  async listHosts(tenantIds, query, { includeRetired = false } = {}) {
     if (!tenantIds || tenantIds.length === 0) return [];
     const like = query ? `%${escapeLike(query)}%` : null;
     const res = await this.pool.query(
-      `SELECT host_id, tenant_id, hostname, os, platform, ssh_pubkey, status, last_seen_at, tags, created_at
+      `SELECT host_id, tenant_id, hostname, os, platform, ssh_pubkey, status, last_seen_at, tags, created_at, retired_at
        FROM cp_hosts
        WHERE tenant_id = ANY($1::text[])
          AND ($2::text IS NULL OR hostname ILIKE $2 ESCAPE '\\')
+         AND ($3::boolean OR retired_at IS NULL)
        ORDER BY last_seen_at DESC NULLS LAST`,
-      [tenantIds, like]
+      [tenantIds, like, includeRetired === true]
     );
     const ids = res.rows.map((r) => r.host_id);
     const sparks = await this.sparklines(ids);
@@ -887,7 +934,7 @@ class PgRegistry {
   async getHost(tenantIds, hostId) {
     if (!tenantIds || tenantIds.length === 0) return null;
     const res = await this.pool.query(
-      `SELECT host_id, tenant_id, hostname, os, platform, ssh_pubkey, status, last_seen_at, tags, created_at
+      `SELECT host_id, tenant_id, hostname, os, platform, ssh_pubkey, status, last_seen_at, tags, created_at, retired_at
        FROM cp_hosts WHERE host_id = $1 AND tenant_id = ANY($2::text[])`,
       [hostId, tenantIds]
     );
@@ -905,14 +952,14 @@ class PgRegistry {
   async resolveHosts(tenantIds, name) {
     if (!tenantIds || tenantIds.length === 0) return [];
     const byId = await this.pool.query(
-      `SELECT host_id, tenant_id, hostname, status FROM cp_hosts
-       WHERE host_id = $1 AND tenant_id = ANY($2::text[])`,
+      `SELECT host_id, tenant_id, hostname, status, last_seen_at FROM cp_hosts
+       WHERE host_id = $1 AND tenant_id = ANY($2::text[]) AND retired_at IS NULL`,
       [name, tenantIds]
     );
     if (byId.rows.length > 0) return byId.rows;
     const res = await this.pool.query(
-      `SELECT host_id, tenant_id, hostname, status FROM cp_hosts
-       WHERE lower(hostname) = lower($1) AND tenant_id = ANY($2::text[])
+      `SELECT host_id, tenant_id, hostname, status, last_seen_at FROM cp_hosts
+       WHERE lower(hostname) = lower($1) AND tenant_id = ANY($2::text[]) AND retired_at IS NULL
        ORDER BY host_id LIMIT 100`,
       [name, tenantIds]
     );
@@ -934,7 +981,7 @@ class PgRegistry {
       `SELECT h.tcp_policy AS host_tcp_policy, h.file_policy AS host_file_policy,
               t.tcp_policy AS tenant_tcp_policy, t.file_policy AS tenant_file_policy
        FROM cp_hosts h JOIN cp_tenants t ON t.tenant_id = h.tenant_id
-       WHERE h.host_id = $1`,
+       WHERE h.host_id = $1 AND h.retired_at IS NULL`,
       [hostId]
     );
     return res.rows[0] || null;
@@ -997,11 +1044,41 @@ class PgRegistry {
     await this.pool.query('UPDATE cp_hosts SET status = $2 WHERE host_id = $1', [hostId, status]);
   }
 
+  // One transaction: lock the host row (it must belong to tenantId), stamp
+  // retired_at, append the host_retired audit row. Any failure rolls both
+  // back.
+  async retireHost({ tenantId, hostId, actor, reason, forced }) {
+    const text = retireReason(reason);
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const cur = await client.query(
+        `SELECT host_id, tenant_id, hostname, last_seen_at, retired_at FROM cp_hosts
+         WHERE host_id = $1 AND tenant_id = $2 FOR UPDATE`,
+        [hostId, tenantId]
+      );
+      if (cur.rowCount === 0) throw http(404, 'not_found');
+      if (cur.rows[0].retired_at) throw http(409, 'already_retired');
+      await client.query(
+        `UPDATE cp_hosts SET retired_at = now(), status = 'offline' WHERE host_id = $1`,
+        [hostId]
+      );
+      await auditInsert(client, hostRetiredAuditEntry(cur.rows[0], actor, text, forced));
+      await client.query('COMMIT');
+    } catch (err) {
+      try { await client.query('ROLLBACK'); } catch { /* connection already failed */ }
+      throw err;
+    } finally {
+      client.release();
+    }
+    return this.getHost([tenantId], hostId);
+  }
+
   async countHosts() {
     const res = await this.pool.query(
       `SELECT count(*)::int AS total,
               count(*) FILTER (WHERE status = 'online')::int AS online
-       FROM cp_hosts`
+       FROM cp_hosts WHERE retired_at IS NULL`
     );
     const total = res.rows[0].total || 0;
     const online = res.rows[0].online || 0;
@@ -1324,7 +1401,7 @@ class PgRegistry {
               avg(t.value) FILTER (WHERE t.metric = 'memory.used_percent') AS mem_avg
        FROM cp_hosts h
        LEFT JOIN cp_telemetry t ON t.host_id = h.host_id
-       WHERE h.tenant_id = ANY($1::text[])
+       WHERE h.tenant_id = ANY($1::text[]) AND h.retired_at IS NULL
        GROUP BY h.host_id, h.hostname`,
       [tenantIds]
     );

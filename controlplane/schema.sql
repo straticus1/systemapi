@@ -60,6 +60,11 @@ ALTER TABLE cp_hosts ADD COLUMN IF NOT EXISTS file_policy JSONB;
 ALTER TABLE cp_tenants ADD COLUMN IF NOT EXISTS tcp_policy JSONB;
 ALTER TABLE cp_tenants ADD COLUMN IF NOT EXISTS file_policy JSONB;
 
+-- Host retirement (POST /api/v1/hosts/:host_id/retire). A retired row is
+-- kept for audit but never resolves, is left out of the fleet listing by
+-- default and of channel policy lookups, and its host_id cannot re-enroll.
+ALTER TABLE cp_hosts ADD COLUMN IF NOT EXISTS retired_at TIMESTAMPTZ;
+
 CREATE TABLE IF NOT EXISTS cp_telemetry (
   id BIGSERIAL PRIMARY KEY,
   host_id TEXT NOT NULL,

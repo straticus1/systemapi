@@ -63,6 +63,10 @@ is a sample unit with `Restart=on-failure`; its `KillMode=control-group` also
 ends any shell process still in the agent's cgroup when the service stops.
 
 The enrolled `--hostname` is the name `GET /api/v1/hosts/resolve` finds.
+Re-enrolling under the same hostname with a new state file creates a new
+`host_id`; the old row goes offline and stops making the name ambiguous once
+it has been silent for `SYSTEMAPI_RESOLVE_STALE_HOURS` (default 24). Retire it
+at once with `node cli/systemapi.js retire --host <old_host_id> --reason ...`.
 Telemetry reports it as `host.hostname` and the OS hostname separately as
 `host.os_hostname`; the control plane never renames a host from telemetry.
 `terminal:root` on an agent that is not root, or that would not record the
@@ -84,8 +88,13 @@ SYSTEMAPI_URL=https://api.systemapi.io SYSTEMAPI_API_KEY=<key> node cli/systemap
   audit
   breakglass-ticket --host <id>
   host-json --host <id>
+  retire --host <id> --reason <text> [--force]
   login <username>
 ```
+
+`retire` needs an `admin` key and posts to `POST /api/v1/hosts/<id>/retire`
+(see `api_docs.md`). Without `--force` a host whose agent is connected is
+refused `host_online`. It prints the JSON response.
 
 The key is sent only as `X-API-Key`. A key in `SYSTEMAPI_URL` is refused.
 

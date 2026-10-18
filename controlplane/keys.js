@@ -1,6 +1,9 @@
 // Threats: a missing or attacker-supplied signing key. Ed25519 only (Node
 // stdlib). Does NOT log key material. An ephemeral key is process-local and
 // dies on restart; set SYSTEMAPI_ED25519_SEED (64 hex chars) to persist.
+// NODE_ENV=production refuses the ephemeral key (assertSignerConfig): a
+// restart would rotate it and every enrolled agent would stop with
+// control_pubkey_changed. Development keeps it with a warning.
 // TEST_SEED below is a fixture, not a production key.
 'use strict';
 
@@ -30,13 +33,30 @@ function signMessage(privateKey, message) {
   return crypto.sign(null, Buffer.from(message, 'utf8'), privateKey).toString('base64');
 }
 
+const SEED_RE = /^[0-9a-fA-F]{64}$/;
+
+// Throws when the signing key config is malformed, or absent under
+// NODE_ENV=production. Never prints the value.
+function assertSignerConfig(env) {
+  if (env.SYSTEMAPI_ED25519_SEED) {
+    if (!SEED_RE.test(env.SYSTEMAPI_ED25519_SEED)) {
+      throw new Error('SYSTEMAPI_ED25519_SEED must be 64 hex characters');
+    }
+    return;
+  }
+  if (env.SYSTEMAPI_SIGNING_KEY) return;
+  if (env.NODE_ENV === 'production') {
+    throw new Error('SYSTEMAPI_ED25519_SEED is not set; production refuses an ephemeral signing key '
+      + '(a restart would rotate it and every enrolled agent would stop with control_pubkey_changed). '
+      + 'Generate one once with `openssl rand -hex 32`, keep it in the env file, and never change it');
+  }
+}
+
 function loadSigner(env, logger = console) {
+  assertSignerConfig(env);
   let seed;
   let ephemeral = false;
   if (env.SYSTEMAPI_ED25519_SEED) {
-    if (!/^[0-9a-fA-F]{64}$/.test(env.SYSTEMAPI_ED25519_SEED)) {
-      throw new Error('SYSTEMAPI_ED25519_SEED must be 64 hex characters');
-    }
     seed = Buffer.from(env.SYSTEMAPI_ED25519_SEED, 'hex');
   } else if (env.SYSTEMAPI_SIGNING_KEY) {
     const privateKey = crypto.createPrivateKey(env.SYSTEMAPI_SIGNING_KEY);
@@ -76,5 +96,6 @@ module.exports = {
   privateKeyFromSeed,
   rawPublicKey,
   loadSigner,
+  assertSignerConfig,
   buildSigner
 };

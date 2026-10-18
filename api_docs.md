@@ -69,8 +69,9 @@ no scopes.
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| GET | `/api/v1/fleet` | Hosts in your tenants. `?q=` filters by hostname. |
-| GET | `/api/v1/hosts/resolve?name=` | Exact `host_id`, or exact case-insensitive hostname, in your tenants. 200, 404 `not_found`, 409 `ambiguous`, 400 `invalid_name`. See `docs/sahconnect-terminal-protocol.md`. |
+| GET | `/api/v1/fleet` | Hosts in your tenants. `?q=` filters by hostname. Retired hosts are left out unless `?include_retired=1`; each row carries `retired_at` (null when live). |
+| GET | `/api/v1/hosts/resolve?name=` | Exact `host_id`, or exact case-insensitive hostname, in your tenants; retired hosts never match. With several matches, the single online one wins when every other match is offline and last seen more than `SYSTEMAPI_RESOLVE_STALE_HOURS` (default 24) ago. 200, 404 `not_found`, 409 `ambiguous`, 400 `invalid_name`. See `docs/sahconnect-terminal-protocol.md`. |
+| POST | `/api/v1/hosts/:host_id/retire` | `admin` scope in the host's tenant. Body `{"reason": "<1-256 chars>", "force": false}`. Stamps `retired_at`, appends a `host_retired` audit row (reason, hostname, forced, last_seen_at) in the same transaction, and keeps the row. A retired host never resolves, is left out of the fleet listing and counts, has no channel policy (deny), and its `host_id` cannot re-enroll (`enroll_error host_retired`). A connected host is refused `409 {"error":"host_online","host_id":...}` unless `"force": true`, which also closes the agent socket (4403 `host_retired`) and so ends its terminal, TCP, file and xfer sessions. 200 `{"host_id","hostname","tenant","retired_at","forced","agent_closed"}`; 400 `reason_required`, `bad_reason`, `bad_force`; 403 `scope_denied`; 404 `not_found`; 409 `already_retired`. The API key the agent enrolled with is not revoked: it is the tenant's key and may serve other hosts. |
 | GET | `/api/v1/fleet/export` | Same list; `?format=csv` for CSV. |
 | GET | `/api/v1/fleet/efficiency` | Average CPU and memory per host over the last 100 samples. |
 | GET | `/api/v1/fleet/:hostId/software` | Installed software reported by the agent. |

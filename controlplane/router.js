@@ -4,6 +4,9 @@
 // Unknown hosts in another tenant are 404. Does NOT expire API keys; that stays in the key store.
 // OAuth access tokens are session principals. Device and IdP secrets stay in
 // controlplane/oauth.js and are not written to the audit log.
+// Host retirement is admin-only in the host's tenant, needs a reason, refuses
+// a connected host (409 host_online) unless force, and is one audited
+// registry write; a retired row never resolves by name or id.
 'use strict';
 
 const express = require('express');
@@ -24,6 +27,8 @@ const SCRIPT_MAX = 64 * 1024;
 const COOLDOWN_MS = 5 * 60 * 1000;
 const USER_RE = /^[a-zA-Z0-9][a-zA-Z0-9._@-]{0,128}$/;
 const RESOLVE_NAME_RE = /^[A-Za-z0-9._-]{1,253}$/;
+const RESOLVE_STALE_HOURS_DEFAULT = 24;
+const RETIRE_REASON_MAX = 256;
 const TICKET_PURPOSES = new Set(['terminal:open', 'terminal:root', 'breakglass:open', ...CHANNEL_PURPOSES]);
 const TICKET_RATE_DEFAULT = 20;
 const TICKET_RATE_TCP_DEFAULT = 120;
@@ -242,6 +247,30 @@ function requireScopeAnywhere(fleet, principal, scopes) {
     });
     throw http(403, 'scope_denied');
   }
+}
+
+// SYSTEMAPI_RESOLVE_STALE_HOURS: how long an offline row may have been
+// silent and still make its name ambiguous. Default 24; a value that is not
+// a number from 0 to 8760 falls back to the default.
+function resolveStaleMs(env) {
+  const raw = env && env.SYSTEMAPI_RESOLVE_STALE_HOURS;
+  const hours = raw === undefined || raw === '' ? NaN : Number(raw);
+  const ok = Number.isFinite(hours) && hours >= 0 && hours <= 8760;
+  return (ok ? hours : RESOLVE_STALE_HOURS_DEFAULT) * 3600 * 1000;
+}
+
+// One row for a name: the only match, or the single online match when every
+// other match is offline and last seen more than staleMs ago (never seen
+// counts as stale). Retired rows never reach here. Null means ambiguous.
+function pickResolved(matches, isOnline, staleMs, now = Date.now()) {
+  if (matches.length === 1) return matches[0];
+  const online = matches.filter(isOnline);
+  if (online.length !== 1) return null;
+  const stale = (row) => {
+    const seen = row.last_seen_at ? new Date(row.last_seen_at).getTime() : NaN;
+    return !Number.isFinite(seen) || now - seen > staleMs;
+  };
+  return matches.every((row) => row === online[0] || stale(row)) ? online[0] : null;
 }
 
 function clampList(value) {
@@ -614,14 +643,53 @@ function mount(app, fleet) {
     const ids = tenantIds(principal).filter((id) => hasScope(scopesFor(principal, id), 'hosts:read'));
     const matches = ids.length ? await fleet.registry.resolveHosts(ids, name) : [];
     if (matches.length === 0) throw http(404, 'not_found');
-    if (matches.length > 1) {
+    const isOnline = (row) => (fleet.connectedAgents ? fleet.connectedAgents.has(row.host_id) : row.status === 'online');
+    const host = pickResolved(matches, isOnline, resolveStaleMs(fleet.env));
+    if (!host) {
       res.status(409).json({ error: 'ambiguous', matches: matches.length });
       return;
     }
-    const host = matches[0];
-    let online = host.status === 'online';
-    if (fleet.connectedAgents) online = fleet.connectedAgents.has(host.host_id);
-    res.json({ host_id: host.host_id, hostname: host.hostname, tenant: host.tenant_id, status: online ? 'online' : 'offline' });
+    res.json({ host_id: host.host_id, hostname: host.hostname, tenant: host.tenant_id, status: isOnline(host) ? 'online' : 'offline' });
+  }));
+
+  // Retire a host record (a re-enrolled agent left the old row behind). The
+  // row stays for audit with retired_at set. A connected host is refused
+  // 409 host_online unless {"force": true}, which also closes its agent
+  // socket (and with it every live channel session of that host).
+  app.post('/api/v1/hosts/:hostId/retire', wrap(async (req, res) => {
+    noStore(res);
+    const principal = await authenticate(req, fleet);
+    requireScopeAnywhere(fleet, principal, ['admin']);
+    const host = await requireHost(fleet, principal, req.params.hostId);
+    requireScope(fleet, principal, host.tenant_id, 'admin');
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const reason = typeof body.reason === 'string' ? body.reason.trim() : '';
+    if (!reason) throw http(400, 'reason_required');
+    if (reason.length > RETIRE_REASON_MAX) throw http(400, 'bad_reason');
+    if (body.force !== undefined && typeof body.force !== 'boolean') throw http(400, 'bad_force');
+    if (host.retired_at) throw http(409, 'already_retired');
+    const online = fleet.connectedAgents ? fleet.connectedAgents.has(host.host_id) : host.status === 'online';
+    if (online && body.force !== true) {
+      res.status(409).json({ error: 'host_online', host_id: host.host_id });
+      return;
+    }
+    const row = await fleet.registry.retireHost({
+      tenantId: host.tenant_id,
+      hostId: host.host_id,
+      actor: String(principal.userId),
+      reason,
+      forced: online
+    });
+    // Also closes an agent that connected after the check above.
+    const agentClosed = typeof fleet.retireAgent === 'function' ? fleet.retireAgent(host.host_id) : false;
+    res.json({
+      host_id: row.host_id,
+      hostname: row.hostname,
+      tenant: row.tenant_id,
+      retired_at: row.retired_at,
+      forced: online,
+      agent_closed: agentClosed
+    });
   }));
 
   app.get('/api/v1/fleet/export', wrap(async (req, res) => {
@@ -661,7 +729,8 @@ function mount(app, fleet) {
     const principal = await authenticate(req, fleet);
     const ids = tenantIds(principal);
     for (const id of ids) requireScope(fleet, principal, id, 'hosts:read');
-    const hosts = await fleet.registry.listHosts(ids, typeof req.query.q === 'string' ? req.query.q : null);
+    const includeRetired = req.query.include_retired === '1' || req.query.include_retired === 'true';
+    const hosts = await fleet.registry.listHosts(ids, typeof req.query.q === 'string' ? req.query.q : null, { includeRetired });
     res.json({ hosts, user: principal.kind === 'session' ? { id: principal.userId, email: principal.email } : null });
   }));
 

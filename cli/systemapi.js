@@ -8,6 +8,8 @@
 // the access token to an absolute SYSTEMAPI_TOKEN_FILE (mode 0600) and
 // prints only the verification URI and the user code (typed in the browser
 // after After Dark SSO), then "approved" and that path.
+// retire needs an admin key: it posts the --reason (required) to
+// /api/v1/hosts/<id>/retire and sends force only when --force is given.
 'use strict';
 
 const fs = require('node:fs');
@@ -33,6 +35,7 @@ function usage() {
     '  audit',
     '  breakglass-ticket --host <id>',
     '  host-json --host <id>',
+    '  retire --host <id> --reason <text> [--force]',
     '  login <username>'
   ].join('\n');
 }
@@ -82,16 +85,24 @@ function visible(text, key) {
 }
 
 function parseArgs(argv) {
-  const opts = { host: '', scriptFile: '' };
+  const opts = { host: '', scriptFile: '', reason: '', force: false };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg !== '--host' && arg !== '--script-file') fail(2, usage());
+    if (arg === '--force') {
+      if (opts.force) fail(2, usage());
+      opts.force = true;
+      continue;
+    }
+    if (arg !== '--host' && arg !== '--script-file' && arg !== '--reason') fail(2, usage());
     const value = argv[i + 1];
     if (!value || value.startsWith('--')) fail(2, 'missing value for ' + arg);
     i += 1;
     if (arg === '--host') {
       if (opts.host) fail(2, usage());
       opts.host = value;
+    } else if (arg === '--reason') {
+      if (opts.reason) fail(2, usage());
+      opts.reason = value;
     } else {
       if (opts.scriptFile) fail(2, usage());
       opts.scriptFile = value;
@@ -336,14 +347,18 @@ async function emit(text, key) {
 async function main() {
   const argv = process.argv.slice(2);
   const cmd = argv[0];
-  const known = new Set(['hosts', 'exec', 'metrics', 'audit', 'breakglass-ticket', 'host-json', 'login']);
+  const known = new Set(['hosts', 'exec', 'metrics', 'audit', 'breakglass-ticket', 'host-json', 'login', 'retire']);
   if (!cmd || !known.has(cmd)) fail(2, usage());
   if (cmd === 'login') {
     await login(argv.slice(1));
     return;
   }
   const opts = parseArgs(argv.slice(1));
-  if (cmd === 'exec') {
+  if (cmd === 'retire') {
+    if (!opts.host || !opts.reason.trim() || opts.scriptFile) fail(2, usage());
+  } else if (opts.reason || opts.force) {
+    fail(2, usage());
+  } else if (cmd === 'exec') {
     if (!opts.host || !opts.scriptFile) fail(2, usage());
   } else if (cmd === 'metrics' || cmd === 'breakglass-ticket' || cmd === 'host-json') {
     if (!opts.host || opts.scriptFile) fail(2, usage());
@@ -386,6 +401,17 @@ async function main() {
       ? '/api/v1/audit'
       : '/api/v1/fleet/' + encodeURIComponent(requireHost(opts.host)) + '/metrics';
     const { status, parsed } = await request(cfg, 'GET', path);
+    if (status >= 400) fail(1, errorText(parsed, cfg.key));
+    if (!parsed || typeof parsed !== 'object') fail(1, 'bad_response');
+    await emit(JSON.stringify(parsed) + '\n', cfg.key);
+    return;
+  }
+
+  if (cmd === 'retire') {
+    const path = '/api/v1/hosts/' + encodeURIComponent(requireHost(opts.host)) + '/retire';
+    const { status, parsed } = await request(cfg, 'POST', path, opts.force
+      ? { reason: opts.reason, force: true }
+      : { reason: opts.reason });
     if (status >= 400) fail(1, errorText(parsed, cfg.key));
     if (!parsed || typeof parsed !== 'object') fail(1, 'bad_response');
     await emit(JSON.stringify(parsed) + '\n', cfg.key);

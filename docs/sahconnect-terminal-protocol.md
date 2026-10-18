@@ -30,7 +30,16 @@ GET /api/v1/hosts/resolve?name=<name>
 - `200 {"host_id": "...", "hostname": "...", "tenant": "...", "status": "online|offline"}`
 - `404 {"error": "not_found"}`
 - `409 {"error": "ambiguous", "matches": <n>}` when the hostname matches more
-  than one host the caller can see. The client must then use the `host_id`.
+  than one host the caller can see and the rule below does not pick one. The
+  client must then use the `host_id`, or an admin retires the stale row.
+- Retired hosts (`POST /api/v1/hosts/:host_id/retire`) never match, by
+  hostname or by `host_id`.
+- When the hostname matches several rows and exactly one of them has a
+  connected agent, that row is returned if every other match is offline and
+  was last seen more than `SYSTEMAPI_RESOLVE_STALE_HOURS` ago (default 24;
+  0 to 8760; another value means the default). A row never seen counts as
+  stale. This is the agent re-enrolled under the same hostname with a new
+  state file: the old row stops answering and the name keeps working.
 - `400 {"error": "invalid_name"}` when the name is empty, longer than 253
   characters, or contains characters outside `[A-Za-z0-9._-]`.
 

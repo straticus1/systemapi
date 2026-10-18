@@ -166,3 +166,48 @@ test('channel-policy main() against the database prints the summary and never th
   assert.equal(out.join('').includes(secret), false);
   assert.equal(err.join('').includes(secret), false);
 });
+
+test('retireHost stamps retired_at with its host_retired row, or neither; a retired row is hidden and cannot re-enroll', async () => {
+  const OLD = '55555555-5555-4555-8555-555555555555';
+  const NEW = '66666666-6666-4666-8666-666666666666';
+  const base = { tenantId: 'acme', userId: 'user-1', keyId: 'k1', os: '', platform: '' };
+  await registry.enroll({ ...base, hostId: OLD, hostname: 'r.example', sshPubkey: opensshEd25519(6) });
+  await registry.enroll({ ...base, hostId: NEW, hostname: 'r.example', sshPubkey: opensshEd25519(7) });
+  const retiredRows = async () => (await pool.query("SELECT count(*)::int AS n FROM cp_audit WHERE action = 'host_retired'")).rows[0].n;
+
+  await assert.rejects(registry.retireHost({ tenantId: 'other', hostId: OLD, actor: 'u', reason: 'x' }), (err) => err.status === 404);
+  await assert.rejects(registry.retireHost({ tenantId: 'acme', hostId: OLD, actor: 'u', reason: ' ' }), (err) => err.code === 'reason_required');
+
+  await pool.query(`CREATE FUNCTION test_refuse_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN RAISE EXCEPTION 'audit refused by test'; END $$`);
+  await pool.query('CREATE TRIGGER test_refuse_audit BEFORE INSERT ON cp_audit FOR EACH ROW EXECUTE FUNCTION test_refuse_audit()');
+  try {
+    await assert.rejects(registry.retireHost({ tenantId: 'acme', hostId: OLD, actor: 'u', reason: 'x' }), /audit refused/);
+  } finally {
+    await pool.query('DROP TRIGGER test_refuse_audit ON cp_audit');
+    await pool.query('DROP FUNCTION test_refuse_audit()');
+  }
+  assert.equal((await pool.query('SELECT retired_at FROM cp_hosts WHERE host_id = $1', [OLD])).rows[0].retired_at, null);
+  assert.equal(await retiredRows(), 0);
+
+  const row = await registry.retireHost({ tenantId: 'acme', hostId: OLD, actor: 'user-1', reason: 're-enrolled', forced: false });
+  assert.ok(row.retired_at instanceof Date);
+  assert.equal(row.status, 'offline');
+  assert.equal(await retiredRows(), 1);
+  const audit = (await pool.query("SELECT tenant_id, host_id, actor, payload FROM cp_audit WHERE action = 'host_retired'")).rows[0];
+  assert.match(audit.payload.last_seen_at, /^\d{4}-\d\d-\d\dT[\d:.]+Z$/);
+  assert.deepEqual({ ...audit, payload: { ...audit.payload, last_seen_at: 'x' } },
+    { tenant_id: 'acme', host_id: OLD, actor: 'user-1', payload: { reason: 're-enrolled', hostname: 'r.example', forced: false, last_seen_at: 'x' } });
+  assert.equal((await registry.verifyAudit()).ok, true);
+  await assert.rejects(registry.retireHost({ tenantId: 'acme', hostId: OLD, actor: 'u', reason: 'x' }), (err) => err.code === 'already_retired');
+
+  assert.deepEqual((await registry.resolveHosts(['acme'], 'r.example')).map((h) => h.host_id), [NEW]);
+  assert.deepEqual(await registry.resolveHosts(['acme'], OLD), []);
+  assert.equal(await registry.channelPolicies(OLD), null);
+  const ids = (await registry.listHosts(['acme'])).map((h) => h.host_id);
+  assert.ok(!ids.includes(OLD) && ids.includes(NEW));
+  assert.ok((await registry.listHosts(['acme'], null, { includeRetired: true })).some((h) => h.host_id === OLD));
+  assert.ok((await registry.getHost(['acme'], OLD)).retired_at);
+  await assert.rejects(registry.enroll({ ...base, hostId: OLD, hostname: 'r.example', sshPubkey: opensshEd25519(6) }),
+    (err) => err.code === 'host_retired');
+});
