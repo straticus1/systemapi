@@ -71,7 +71,7 @@ func payloadHash(action, payload string) string {
 }
 
 func payloadFor(action, payload string) string {
-	if terminalAction(action) || channelAction(action) || xferAction(action) {
+	if terminalAction(action) || channelAction(action) || xferAction(action) || sysAction(action) {
 		return action + "\n" + payload
 	}
 	return payload
@@ -95,7 +95,13 @@ func hashEqual(a, b string) bool {
 }
 
 func knownAction(action string) bool {
-	return action == "sysscript" || terminalAction(action) || channelAction(action) || xferAction(action)
+	return action == "sysscript" || terminalAction(action) || channelAction(action) || xferAction(action) || sysAction(action)
+}
+
+// sysAction reports the SAH OS-management channel lease actions
+// (docs/sah-os-management-design.md Phase 1).
+func sysAction(action string) bool {
+	return action == "sys_service"
 }
 
 // xferAction reports the sahxfer grant lease actions.
@@ -160,6 +166,21 @@ func fileLeasePayload(sessionID string, deadlineUnix int64, phase, mode, root st
 		}
 	}
 	return sessionID + "\n" + strconv.FormatInt(deadlineUnix, 10) + "\n" + phase + "\n" + mode + "\n" + root, nil
+}
+
+// sysServiceLeasePayload is the signed payload of a sys_service lease
+// (docs/sah-os-management-design.md Phase 1): "<unit>\n<action>". The agent
+// rebuilds it from the unit and action it is about to act on, so a lease for
+// one unit or verb never authorizes another. Phase 1 is restart only; the
+// unit shape mirrors the server's SERVICE_UNIT_RE (controlplane/lease.js).
+func sysServiceLeasePayload(unit, action string) (string, error) {
+	if action != "restart" {
+		return "", errors.New("bad_action")
+	}
+	if !serviceNameRE.MatchString(unit) {
+		return "", errors.New("bad_unit")
+	}
+	return unit + "\n" + action, nil
 }
 
 const (
