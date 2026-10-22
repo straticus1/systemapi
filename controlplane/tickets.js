@@ -14,6 +14,8 @@
 const { randomToken } = require('./token');
 
 const TTL_MS = 60_000;
+// The sys:service channel verbs; the lease binds the exact { unit, action }.
+const SERVICE_ACTIONS = new Set(['start', 'stop', 'restart', 'enable', 'disable']);
 
 function frozenTarget(target) {
   if (!target) return null;
@@ -62,7 +64,7 @@ function bindingOk(row, expect) {
     return !!(row.watch && typeof row.watch.watchId === 'string' && row.watch.mode === (row.purpose === 'terminal:watch' ? 'ro' : 'rw'));
   }
   if (row.purpose === 'sys:service') {
-    if (!row.sys || typeof row.sys.unit !== 'string' || row.sys.action !== 'restart') return false;
+    if (!row.sys || typeof row.sys.unit !== 'string' || !SERVICE_ACTIONS.has(row.sys.action)) return false;
     if (expect && expect.sys !== undefined) {
       const s = expect.sys;
       if (!s || s.unit !== row.sys.unit || s.action !== row.sys.action) return false;

@@ -171,13 +171,15 @@ function filePayload(sessionId, deadlineUnix, phase, mode, root) {
   return `${sessionId}\n${deadlineUnix}\n${phase}\n${mode}\n${root}`;
 }
 
-// sys_service lease payload (docs/sah-os-management-design.md Phase 1):
-// "<unit>\n<action>". Phase 1 signs restart only; the agent rebuilds this from
-// the unit it is about to act on (systemapi-agent/lease.go
-// sysServiceLeasePayload), so a lease for one unit never acts on another.
+// sys_service lease payload (docs/sah-os-management-design.md): "<unit>\n
+// <action>". action is one of SERVICE_LEASE_ACTIONS; the agent rebuilds this
+// from the unit and verb it is about to act on (systemapi-agent/lease.go
+// sysServiceLeasePayload), so a lease for one unit or verb never acts on
+// another.
+const SERVICE_LEASE_ACTIONS = new Set(['start', 'stop', 'restart', 'enable', 'disable']);
 function sysServicePayload(unit, action) {
   if (typeof unit !== 'string' || !SERVICE_UNIT_RE.test(unit)) throw badPayload();
-  if (action !== 'restart') throw badPayload();
+  if (!SERVICE_LEASE_ACTIONS.has(action)) throw badPayload();
   return `${unit}\n${action}`;
 }
 

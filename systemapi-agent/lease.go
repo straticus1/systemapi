@@ -169,12 +169,14 @@ func fileLeasePayload(sessionID string, deadlineUnix int64, phase, mode, root st
 }
 
 // sysServiceLeasePayload is the signed payload of a sys_service lease
-// (docs/sah-os-management-design.md Phase 1): "<unit>\n<action>". The agent
-// rebuilds it from the unit and action it is about to act on, so a lease for
-// one unit or verb never authorizes another. Phase 1 is restart only; the
-// unit shape mirrors the server's SERVICE_UNIT_RE (controlplane/lease.js).
+// (docs/sah-os-management-design.md): "<unit>\n<action>". The agent rebuilds
+// it from the unit and action it is about to act on, so a lease for one unit
+// or verb never authorizes another. action is one of sysServiceActions
+// (sys_policy.go), byte-for-byte the server's SERVICE_LEASE_ACTIONS
+// (controlplane/lease.js). The unit shape mirrors the server's
+// SERVICE_UNIT_RE.
 func sysServiceLeasePayload(unit, action string) (string, error) {
-	if action != "restart" {
+	if _, ok := sysServiceActions[action]; !ok {
 		return "", errors.New("bad_action")
 	}
 	if !serviceNameRE.MatchString(unit) {

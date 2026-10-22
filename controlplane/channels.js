@@ -24,8 +24,10 @@ const POLICY_MAX_PORTS = 256;
 // Service/unit name guard; mirrors systemapi-agent/platform.go serviceNameRE
 // and controlplane/lease.js SERVICE_UNIT_RE.
 const SERVICE_UNIT_RE = /^[a-zA-Z0-9][a-zA-Z0-9@._:-]{0,127}$/;
-// Phase 1 exposes restart only; status is the agent's confirm read.
-const SERVICE_ACTIONS = new Set(['restart']);
+// The sys:service channel exposes the mutating lifecycle verbs; status is
+// the agent's confirm read, not a channel verb. The lease binds the exact
+// { unit, action } so a lease for one verb can never perform another.
+const SERVICE_ACTIONS = new Set(['start', 'stop', 'restart', 'enable', 'disable']);
 
 // Scopes each purpose needs. file:write needs file:read too (FILE §2). A
 // service restart is root-equivalent but bounded by the per-host unit
@@ -316,7 +318,7 @@ function filePolicyAllows(policy, purpose, root) {
 }
 
 // validateServiceBinding checks a ws-ticket `service` object (the sys:service
-// binding): { unit, action }. Phase 1 action is restart only.
+// binding): { unit, action }. action is one of SERVICE_ACTIONS.
 function validateServiceBinding(service) {
   if (!service || typeof service !== 'object' || Array.isArray(service)) return { ok: false, error: 'bad_unit' };
   const { unit, action } = service;

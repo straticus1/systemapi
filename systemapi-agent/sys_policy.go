@@ -5,7 +5,7 @@
 // host cannot or must not touch. The agent keeps its own fail-closed gate,
 // independent of the signed lease: it refuses unless the host actually
 // advertises the service capability (the same probe sent on dial), the verb
-// is in the closed set (Phase 1: restart only), and the unit passes the shape
+// is in the closed set (the service lifecycle verbs), and the unit passes the shape
 // guard. The unit binding itself is enforced by the lease (sys.go rebuilds the
 // signed "<unit>\n<action>" payload from the unit it is about to act on, so a
 // lease for one unit never acts on another). An unsupported platform returns
@@ -21,9 +21,14 @@ var (
 	errSysBadAction   = errors.New("bad_action")
 )
 
-// sysServiceActions is the closed set of mutating verbs this channel exposes.
-// Phase 1 is restart only; status is the confirm read, not a channel verb.
-var sysServiceActions = map[string]struct{}{"restart": {}}
+// sysServiceActions is the closed set of mutating verbs this channel exposes:
+// the service lifecycle verbs. status is the confirm read, not a channel verb.
+// Kept byte-for-byte in sync with platform_service.go serviceVerbs, the
+// server's SERVICE_LEASE_ACTIONS (controlplane/lease.js) and SERVICE_ACTIONS
+// (controlplane/channels.js, controlplane/tickets.js).
+var sysServiceActions = map[string]struct{}{
+	"start": {}, "stop": {}, "restart": {}, "enable": {}, "disable": {},
+}
 
 // checkSysServicePolicy is the agent's own gate, run after the lease verifies.
 // It fails closed on an unsupported platform, an unknown verb, or a badly

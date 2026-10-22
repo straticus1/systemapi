@@ -407,11 +407,13 @@ test('channel leases: payload builders, vectors, and negative cases', () => {
 
 test('service policy: binding, allowlist, decision, and the sys_service lease', async () => {
   const lease = require('../controlplane/lease');
-  // Binding: Phase 1 is restart only.
-  assert.deepEqual(ch.validateServiceBinding({ unit: 'nginx.service', action: 'restart' }),
-    { ok: true, service: { unit: 'nginx.service', action: 'restart' } });
+  // Binding: the service lifecycle verbs.
+  for (const action of ['start', 'stop', 'restart', 'enable', 'disable']) {
+    assert.deepEqual(ch.validateServiceBinding({ unit: 'nginx.service', action }),
+      { ok: true, service: { unit: 'nginx.service', action } });
+  }
   assert.equal(ch.validateServiceBinding({ unit: 'nginx\n.service', action: 'restart' }).error, 'bad_unit');
-  assert.equal(ch.validateServiceBinding({ unit: 'nginx.service', action: 'stop' }).error, 'bad_action');
+  assert.equal(ch.validateServiceBinding({ unit: 'nginx.service', action: 'reload' }).error, 'bad_action');
   assert.equal(ch.validateServiceBinding(null).error, 'bad_unit');
 
   // Policy parse: a well-formed unit list, else null (deny-all).
@@ -438,16 +440,18 @@ test('service policy: binding, allowlist, decision, and the sys_service lease', 
   // A malformed stored policy is refused on write (fail closed).
   await assert.rejects(reg.setHostChannelPolicy(HOST_A, { service_policy: { units: 'all' } }), /bad_policy/);
 
-  // The sys_service lease signs "<unit>\n<action>"; a tampered unit or action
-  // fails verification, and only restart is a valid payload.
+  // The sys_service lease signs "<unit>\n<action>"; a tampered unit or verb
+  // fails verification, and the verb must be a lifecycle verb.
   const svcSigner = buildSigner(privateKeyFromSeed(TEST_SEED), rawPublicKey(privateKeyFromSeed(TEST_SEED)));
   const svcPub = require('node:crypto').createPublicKey(privateKeyFromSeed(TEST_SEED));
   const svcNow = Date.now();
-  const svcPayload = lease.sysServicePayload('nginx.service', 'restart');
-  assert.equal(svcPayload, 'nginx.service\nrestart');
+  const svcPayload = lease.sysServicePayload('nginx.service', 'stop');
+  assert.equal(svcPayload, 'nginx.service\nstop');
   const sl = lease.issueLease(svcSigner, { hostId: HOST_A, action: 'sys_service', payload: svcPayload, now: svcNow });
   assert.equal(lease.verifyLease(svcPub, sl, svcPayload, svcNow).ok, true);
-  assert.equal(lease.verifyLease(svcPub, sl, lease.sysServicePayload('postgresql.service', 'restart'), svcNow).error, 'payload_mismatch');
-  assert.throws(() => lease.sysServicePayload('nginx.service', 'stop'), /bad_payload/);
+  // A lease signed for stop does not verify as restart (the verb is bound).
+  assert.equal(lease.verifyLease(svcPub, sl, lease.sysServicePayload('nginx.service', 'restart'), svcNow).error, 'payload_mismatch');
+  assert.equal(lease.verifyLease(svcPub, sl, lease.sysServicePayload('postgresql.service', 'stop'), svcNow).error, 'payload_mismatch');
+  assert.throws(() => lease.sysServicePayload('nginx.service', 'reload'), /bad_payload/);
   assert.throws(() => lease.sysServicePayload('nginx\n.service', 'restart'), /bad_payload/);
 });

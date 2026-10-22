@@ -14,8 +14,8 @@ func TestCheckSysServicePolicy(t *testing.T) {
 
 	sysServices = func() ServiceManager { return &fakeServiceMgr{avail: true} }
 
-	// A verb outside the closed set is refused (Phase 1 is restart only).
-	for _, verb := range []string{"stop", "start", "enable", "disable", ""} {
+	// A verb outside the closed lifecycle set is refused.
+	for _, verb := range []string{"reload", "status", "mask", ""} {
 		if err := checkSysServicePolicy("nginx.service", verb); err != errSysBadAction {
 			t.Fatalf("verb %q: got %v, want %v", verb, err, errSysBadAction)
 		}
@@ -28,8 +28,10 @@ func TestCheckSysServicePolicy(t *testing.T) {
 		}
 	}
 
-	// A well-shaped unit with restart on a capable host is allowed.
-	if err := checkSysServicePolicy("nginx.service", "restart"); err != nil {
-		t.Fatalf("good case: %v", err)
+	// Every lifecycle verb on a well-shaped unit and a capable host is allowed.
+	for _, verb := range []string{"start", "stop", "restart", "enable", "disable"} {
+		if err := checkSysServicePolicy("nginx.service", verb); err != nil {
+			t.Fatalf("good case %q: %v", verb, err)
+		}
 	}
 }

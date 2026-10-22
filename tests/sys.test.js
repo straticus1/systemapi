@@ -181,6 +181,37 @@ test('restart runs end to end: signed lease, agent result, intent and result aud
   }
 });
 
+test('a stop verb runs end to end and the lease binds stop', async () => {
+  const r = await rig();
+  try {
+    const agent = await connectAgent(r);
+    const client = openRaw(r, { ticket: ticketFor(r, { action: 'stop' }) });
+    const req = await waitUntil('sys_service frame', () => agent.requests[0]);
+    assert.equal(req.action, 'stop');
+    // The lease signs stop; it does not verify as any other verb.
+    assert.equal(verifyLease(PUBLIC_KEY, req.lease, sysServicePayload(UNIT, 'stop')).ok, true);
+    assert.equal(verifyLease(PUBLIC_KEY, req.lease, sysServicePayload(UNIT, 'restart')).ok, false);
+    await waitUntil('sys_result', () => okResult(client.box));
+    await waitUntil('result row', () => auditRows(r, 'sys_service_result').length === 1);
+    assert.equal(auditRows(r, 'sys_service_intent')[0].payload.action, 'stop');
+  } finally {
+    await r.close();
+  }
+});
+
+test('a verb outside the channel set is refused at the upgrade', async () => {
+  const r = await rig();
+  try {
+    await connectAgent(r);
+    // A ticket whose bound action is not a channel verb is refused at consume.
+    const client = openRaw(r, { ticket: ticketFor(r, { action: 'reload' }) });
+    await failsWith(client, 'ticket_invalid');
+    assert.equal(auditRows(r, 'sys_service_intent').length, 0);
+  } finally {
+    await r.close();
+  }
+});
+
 test('a failed restart still records ok:false and a result row', async () => {
   const r = await rig();
   try {

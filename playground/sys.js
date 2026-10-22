@@ -1,7 +1,8 @@
 /**
  * Service-management channel, server side (docs/sah-os-management-design.md
  * Phase 1), modelled on playground/tcp.js. One WebSocket carries one service
- * operation: Phase 1 is `service restart`, with the agent's status read as the
+ * operation: a service lifecycle verb (start/stop/restart/enable/disable),
+ * with the agent's status read as the
  * confirm. It is request/response, not a byte stream, so there is no credit
  * mux: the client opens the socket, the server mints a signed sys_service
  * lease and forwards one frame to the agent, and the agent answers one

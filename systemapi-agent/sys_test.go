@@ -206,18 +206,46 @@ func TestSysServiceRefusesWrongKey(t *testing.T) {
 	}
 }
 
-func TestSysServiceRefusesNonRestartAction(t *testing.T) {
+func TestSysServiceStopHappyPath(t *testing.T) {
 	h := newSysHarness(t, true)
 	rid := newSysRequestID(t)
-	// A "stop" action can never be signed (Phase 1 is restart only), so the
+	h.send(t, h.frame(t, rid, "nginx.service", "stop", "", "", inFuture(time.Minute)))
+	p := h.result(t, rid)
+	if p["ok"] != true || p["unit"] != "nginx.service" || p["action"] != "stop" {
+		t.Fatalf("unexpected result: %v", p)
+	}
+	if len(h.svc.actions) != 1 || h.svc.actions[0] != [2]string{"stop", "nginx.service"} {
+		t.Fatalf("actions=%v", h.svc.actions)
+	}
+}
+
+func TestSysServiceLeaseBindsAction(t *testing.T) {
+	h := newSysHarness(t, true)
+	rid := newSysRequestID(t)
+	// A lease signed for restart cannot drive a stop: the agent rebuilds the
+	// payload from the frame's verb, so the signature no longer verifies.
+	h.send(t, h.frame(t, rid, "nginx.service", "stop", "", "restart", inFuture(time.Minute)))
+	p := h.result(t, rid)
+	if p["ok"] != false || p["error"] != "lease_required" {
+		t.Fatalf("want lease_required for action mismatch, got %v", p)
+	}
+	if len(h.svc.actions) != 0 {
+		t.Fatalf("no action should have run, got %v", h.svc.actions)
+	}
+}
+
+func TestSysServiceRefusesUnknownAction(t *testing.T) {
+	h := newSysHarness(t, true)
+	rid := newSysRequestID(t)
+	// "reload" is not a channel verb, so no lease can be built for it and the
 	// agent refuses before any command runs.
 	h.send(t, map[string]interface{}{
-		"type": "sys_service", "request_id": rid, "unit": "nginx.service", "action": "stop",
-		"lease": signLease(t, h.priv, ptyTestHost, "sys_service", "nginx.service\nrestart", inFuture(time.Minute)),
+		"type": "sys_service", "request_id": rid, "unit": "nginx.service", "action": "reload",
+		"lease": signLease(t, h.priv, ptyTestHost, "sys_service", "nginx.service\nreload", inFuture(time.Minute)),
 	})
 	p := h.result(t, rid)
 	if p["ok"] != false || p["error"] != "lease_required" {
-		t.Fatalf("want lease_required for non-restart action, got %v", p)
+		t.Fatalf("want lease_required for unknown action, got %v", p)
 	}
 	if len(h.svc.actions) != 0 {
 		t.Fatalf("no action should have run, got %v", h.svc.actions)
@@ -242,15 +270,17 @@ func TestSysServiceReportsActionFailure(t *testing.T) {
 func TestSysServiceLeasePayloadBuilder(t *testing.T) {
 	// The Go builder must produce the exact string the server signs
 	// (controlplane/lease.js sysServicePayload): "<unit>\n<action>".
-	got, err := sysServiceLeasePayload("nginx.service", "restart")
-	if err != nil || got != "nginx.service\nrestart" {
-		t.Fatalf("payload %q err %v", got, err)
+	for _, action := range []string{"start", "stop", "restart", "enable", "disable"} {
+		got, err := sysServiceLeasePayload("nginx.service", action)
+		if err != nil || got != "nginx.service\n"+action {
+			t.Fatalf("payload %q err %v for %s", got, err, action)
+		}
 	}
 	for _, c := range []struct {
 		name         string
 		unit, action string
 	}{
-		{"bad action", "nginx.service", "stop"},
+		{"bad action", "nginx.service", "reload"},
 		{"empty action", "nginx.service", ""},
 		{"bad unit newline", "nginx\n.service", "restart"},
 		{"empty unit", "", "restart"},

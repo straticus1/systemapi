@@ -1762,18 +1762,24 @@ test('sys:service is an operator scope, gated by the host service allowlist, and
     assert.equal(row.actor, 'op-1');
     assert.deepEqual(row.sys, { unit: 'nginx.service', action: 'restart' });
 
-    // Only restart is a valid Phase 1 action; a bad unit or verb is 400.
+    // A lifecycle verb mints a ticket; a verb outside the set or a bad unit
+    // is 400.
     const stop = await svcTicket(opApp.url, { unit: 'nginx.service', action: 'stop' });
-    assert.equal(stop.status, 400);
-    assert.equal(stop.body.error, 'bad_action');
+    assert.equal(stop.status, 200);
+    assert.deepEqual(fm.tickets.get(stop.body.ticket).sys, { unit: 'nginx.service', action: 'stop' });
+    const reload = await svcTicket(opApp.url, { unit: 'nginx.service', action: 'reload' });
+    assert.equal(reload.status, 400);
+    assert.equal(reload.body.error, 'bad_action');
     const badUnit = await svcTicket(opApp.url, { unit: 'nginx\n.service', action: 'restart' });
     assert.equal(badUnit.status, 400);
     assert.equal(badUnit.body.error, 'bad_unit');
 
-    // The ticket_issued row records the service binding.
+    // Each successful ticket_issued row records its service binding (the
+    // restart above and the stop).
     const issued = fm.registry.audit.filter((r) => r.action === 'ticket_issued' && r.payload.purpose === 'sys:service');
-    assert.equal(issued.length, 1);
+    assert.equal(issued.length, 2);
     assert.deepEqual(issued[0].payload.service, { unit: 'nginx.service', action: 'restart' });
+    assert.deepEqual(issued[1].payload.service, { unit: 'nginx.service', action: 'stop' });
     assert.equal((await fm.registry.verifyAudit()).ok, true);
   } finally {
     opApp.server.close();
