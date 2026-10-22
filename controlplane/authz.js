@@ -8,10 +8,12 @@
 // only, and so is terminal:watch (view another user's terminal session; an
 // admin can hand a support key only this scope). tcp:open, file:read and file:write are operator scopes; the
 // file:write purpose needs both file:read and file:write (channels.js).
-// sys:service (control a unit) and sys:package (query/install/remove/upgrade
-// a package; their ws-ticket purposes) are also operator scopes, root-
-// equivalent but bounded by the deny-by-default per-host unit/package
-// allowlists (docs/sah-os-management-design.md).
+// sys:service (control a unit), sys:package (query/install/remove/upgrade a
+// package) and sys:config (read/write a config path, reload a unit; their
+// ws-ticket purposes) are also operator scopes, root-equivalent but bounded by
+// the deny-by-default per-host allowlists: units for service, names for
+// package, config paths for config read/write, and the unit allowlist for a
+// config reload (docs/sah-os-management-design.md).
 // ticketScopesHeld re-checks a channel ticket's scopes at the WebSocket
 // upgrade against the actor's CURRENT membership (and, for an API key, its
 // current key scopes), so a role or key downgraded in the ticket's 60 s
@@ -35,6 +37,7 @@ const ALL = Object.freeze([
   'file:root',
   'sys:service',
   'sys:package',
+  'sys:config',
   'alerts:write',
   'audit:read',
   'admin'
@@ -50,6 +53,7 @@ const OPERATOR = Object.freeze([
   'file:write',
   'sys:service',
   'sys:package',
+  'sys:config',
   'alerts:write',
   'hosts:write'
 ]);

@@ -16,7 +16,7 @@ const FleetManager = require('../playground/fleet');
 const { MemoryRegistry } = require('../controlplane/registry');
 const { TEST_SEED, privateKeyFromSeed, rawPublicKey, buildSigner } = require('../controlplane/keys');
 const { issueTicket } = require('../controlplane/tickets');
-const { verifyLease, sysServicePayload, sysPackagePayload } = require('../controlplane/lease');
+const { verifyLease, sysServicePayload, sysPackagePayload, sysConfigPayload } = require('../controlplane/lease');
 
 const HOST_A = '11111111-1111-4111-8111-111111111111';
 const PUBLIC_KEY = crypto.createPublicKey(privateKeyFromSeed(TEST_SEED));
@@ -24,6 +24,9 @@ const UNIT = 'nginx.service';
 const POLICY = { units: [UNIT] };
 const PKG = 'nginx';
 const PKG_POLICY = { names: [PKG] };
+const CFG_PATH = '/etc/nginx/nginx.conf';
+const CFG_POLICY = { paths: ['/etc/nginx'] };
+const sha256Hex = (s) => crypto.createHash('sha256').update(s, 'utf8').digest('hex');
 
 function signer() {
   const key = privateKeyFromSeed(TEST_SEED);
@@ -424,6 +427,167 @@ test('a failed package op records ok:false and a result row', async () => {
     assert.equal(f.payload.error, 'action_failed');
     await waitUntil('result row', () => auditRows(r, 'sys_package_result').length === 1);
     assert.equal(auditRows(r, 'sys_package_result')[0].payload.ok, false);
+  } finally {
+    await r.close();
+  }
+});
+
+// --- sys:config ---
+
+// Connects a fake config-capable agent. It answers read with content, write
+// with ok, reload with ok+output. configPolicy gates read/write paths; the
+// reload path reuses servicePolicy (a reload acts on a unit).
+async function connectConfigAgent(r, { caps = 'pty,config', configPolicy = CFG_POLICY, servicePolicy = POLICY, autoAnswer = true, fail = false } = {}) {
+  const ws = r.track(new WebSocket(`${r.base}/api/v1/systems/stream`, {
+    headers: {
+      authorization: 'Bearer agent-key',
+      'x-systemapi-tenant': 'acme',
+      'x-systemapi-host-id': HOST_A,
+      'x-systemapi-hostname': 'a.example',
+      'x-systemapi-ssh-pubkey': opensshEd25519(r.fm.signer.publicKeyRaw),
+      ...(caps === null ? {} : { 'x-systemapi-capabilities': caps })
+    }
+  }));
+  const box = collect(ws);
+  await waitUntil('enrolled', () => box.frames.find((f) => f.type === 'enrolled'));
+  const pol = {};
+  if (configPolicy) pol.config_policy = configPolicy;
+  if (servicePolicy) pol.service_policy = servicePolicy;
+  if (Object.keys(pol).length) await r.fm.registry.setHostChannelPolicy(HOST_A, pol);
+  const agent = { ws, box, requests: [] };
+  ws.on('message', (data, isBinary) => {
+    if (isBinary) return;
+    const msg = JSON.parse(data.toString());
+    if (msg.type !== 'sys_config') return;
+    agent.requests.push(msg);
+    if (!autoAnswer) return;
+    const payload = fail
+      ? { ok: false, action: msg.action, target: msg.target, error: 'action_failed' }
+      : msg.action === 'read'
+        ? { ok: true, action: msg.action, target: msg.target, output: 'listen 80;\n' }
+        : msg.action === 'reload'
+          ? { ok: true, action: msg.action, target: msg.target, output: 'reloaded' }
+          : { ok: true, action: msg.action, target: msg.target };
+    ws.send(JSON.stringify({ type: 'sys_result', request_id: msg.request_id, payload }));
+  });
+  return agent;
+}
+
+function cfgTicketFor(r, { action = 'read', path = CFG_PATH, unit = UNIT, content, actor = 'user-1' } = {}) {
+  const cfg = action === 'reload' ? { action, target: unit } : { action, target: path };
+  if (action === 'write') cfg.content = content ?? 'server {}\n';
+  return issueTicket(r.fm.tickets, { hostId: HOST_A, purpose: 'sys:config', tenantId: 'acme', actor, sys: cfg });
+}
+
+function openCfg(r, opts = {}) {
+  const t = opts.ticket || cfgTicketFor(r, opts);
+  const ws = r.track(new WebSocket(`${r.base}/api/v1/systems/sys/${HOST_A}?ticket=${t}&purpose=sys:config`));
+  return { ws, box: collect(ws), ticket: t };
+}
+
+test('config read runs end to end and audits a content hash, not the body', async () => {
+  const r = await rig();
+  try {
+    const agent = await connectConfigAgent(r);
+    const client = openCfg(r, { action: 'read' });
+    const req = await waitUntil('sys_config frame', () => agent.requests[0]);
+    assert.equal(req.action, 'read');
+    assert.equal(req.target, CFG_PATH);
+    assert.equal(verifyLease(PUBLIC_KEY, req.lease, sysConfigPayload('read', CFG_PATH)).ok, true);
+    const result = await waitUntil('sys_result', () => okResult(client.box));
+    assert.equal(result.payload.output, 'listen 80;\n');
+    await waitUntil('result row', () => auditRows(r, 'sys_config_result').length === 1);
+    const done = auditRows(r, 'sys_config_result')[0].payload;
+    // The audit stores the hash/size of the returned body, never the body.
+    assert.equal(done.content_sha256, sha256Hex('listen 80;\n'));
+    assert.equal(JSON.stringify(done).includes('listen 80'), false);
+    assert.equal((await r.fm.registry.verifyAudit()).ok, true);
+  } finally {
+    await r.close();
+  }
+});
+
+test('config write binds the content hash and audits only the hash', async () => {
+  const r = await rig();
+  try {
+    const agent = await connectConfigAgent(r);
+    const content = 'server { listen 8080; }\n';
+    const client = openCfg(r, { action: 'write', content });
+    const req = await waitUntil('sys_config frame', () => agent.requests[0]);
+    assert.equal(req.action, 'write');
+    assert.equal(req.content, content);
+    // The lease signs write\n<path>\n<sha256(content)>.
+    assert.equal(verifyLease(PUBLIC_KEY, req.lease, sysConfigPayload('write', CFG_PATH, sha256Hex(content))).ok, true);
+    await waitUntil('sys_result', () => okResult(client.box));
+    await waitUntil('result row', () => auditRows(r, 'sys_config_result').length === 1);
+    const intent = auditRows(r, 'sys_config_intent')[0].payload;
+    assert.equal(intent.content_sha256, sha256Hex(content));
+    assert.equal(intent.content_bytes, Buffer.byteLength(content, 'utf8'));
+    assert.equal(JSON.stringify(intent).includes('listen 8080'), false);
+  } finally {
+    await r.close();
+  }
+});
+
+test('config reload targets a unit gated by the service allowlist', async () => {
+  const r = await rig();
+  try {
+    const agent = await connectConfigAgent(r);
+    const client = openCfg(r, { action: 'reload', unit: UNIT });
+    const req = await waitUntil('sys_config frame', () => agent.requests[0]);
+    assert.equal(req.action, 'reload');
+    assert.equal(req.target, UNIT);
+    assert.equal(verifyLease(PUBLIC_KEY, req.lease, sysConfigPayload('reload', UNIT)).ok, true);
+    await waitUntil('sys_result', () => okResult(client.box));
+  } finally {
+    await r.close();
+  }
+});
+
+test('a config path the host policy does not allow is refused at the upgrade', async () => {
+  const r = await rig();
+  try {
+    await connectConfigAgent(r); // allows only /etc/nginx
+    const client = openCfg(r, { ticket: cfgTicketFor(r, { action: 'read', path: '/etc/postfix/main.cf' }) });
+    await failsWith(client, 'path_denied');
+    assert.equal(auditRows(r, 'sys_config_intent').length, 0);
+  } finally {
+    await r.close();
+  }
+});
+
+test('a config reload for a unit the service policy does not allow is refused', async () => {
+  const r = await rig();
+  try {
+    await connectConfigAgent(r); // service policy allows only nginx.service
+    const client = openCfg(r, { ticket: cfgTicketFor(r, { action: 'reload', unit: 'postgresql.service' }) });
+    await failsWith(client, 'unit_denied');
+    assert.equal(auditRows(r, 'sys_config_intent').length, 0);
+  } finally {
+    await r.close();
+  }
+});
+
+test('a host that does not advertise the config capability is refused', async () => {
+  const r = await rig();
+  try {
+    await connectConfigAgent(r, { caps: 'pty,service' });
+    const client = openCfg(r, { action: 'read' });
+    await failsWith(client, 'agent_unsupported');
+    assert.equal(auditRows(r, 'sys_config_intent').length, 0);
+  } finally {
+    await r.close();
+  }
+});
+
+test('a single-use config ticket cannot be replayed', async () => {
+  const r = await rig();
+  try {
+    await connectConfigAgent(r);
+    const first = openCfg(r, { action: 'read' });
+    await waitUntil('first result', () => first.box.frames.find((f) => f.type === 'sys_result'));
+    const replay = openCfg(r, { ticket: first.ticket });
+    await failsWith(replay, 'ticket_invalid');
   } finally {
     await r.close();
   }

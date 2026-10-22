@@ -196,8 +196,8 @@ function fakePool(failOn) {
           const q = sql.replace(/\s+/g, ' ').trim();
           log.push({ client: id, q, params });
           if (failOn && q.startsWith(failOn)) throw new Error('boom');
-          if (q.startsWith('SELECT tcp_policy, file_policy, service_policy, package_policy FROM cp_hosts')) {
-            return { rowCount: 1, rows: [{ tcp_policy: { allow: [{ local: true, ports: [3003] }] }, file_policy: null, service_policy: { units: ['nginx.service'] }, package_policy: { names: ['nginx'] } }] };
+          if (q.startsWith('SELECT tcp_policy, file_policy, service_policy, package_policy, config_policy FROM cp_hosts')) {
+            return { rowCount: 1, rows: [{ tcp_policy: { allow: [{ local: true, ports: [3003] }] }, file_policy: null, service_policy: { units: ['nginx.service'] }, package_policy: { names: ['nginx'] }, config_policy: { paths: ['/etc/nginx'] } }] };
           }
           if (q.startsWith('SELECT row_hash FROM cp_audit')) return { rowCount: 0, rows: [] };
           return { rowCount: 1, rows: [{}] };
@@ -218,9 +218,9 @@ test('PgRegistry writes the policy and its audit row in one transaction on one c
   assert.equal(pool.clients, 1);
   const qs = pool.log.map((e) => e.q);
   assert.equal(qs[0], 'BEGIN');
-  assert.match(qs[1], /^SELECT tcp_policy, file_policy, service_policy, package_policy FROM cp_hosts WHERE host_id = \$1 AND tenant_id = \$2 FOR UPDATE$/);
+  assert.match(qs[1], /^SELECT tcp_policy, file_policy, service_policy, package_policy, config_policy FROM cp_hosts WHERE host_id = \$1 AND tenant_id = \$2 FOR UPDATE$/);
   assert.deepEqual(pool.log[1].params, [HOST_A, 'afterdark']);
-  assert.match(qs[2], /^UPDATE cp_hosts SET tcp_policy = \$2::jsonb, file_policy = \$3::jsonb, service_policy = \$4::jsonb, package_policy = \$5::jsonb WHERE host_id = \$1$/);
+  assert.match(qs[2], /^UPDATE cp_hosts SET tcp_policy = \$2::jsonb, file_policy = \$3::jsonb, service_policy = \$4::jsonb, package_policy = \$5::jsonb, config_policy = \$6::jsonb WHERE host_id = \$1$/);
   assert.match(qs[3], /^SELECT row_hash FROM cp_audit .*FOR UPDATE$/);
   assert.match(qs[4], /^INSERT INTO cp_audit/);
   const audit = JSON.parse(pool.log[4].params[6]);
@@ -392,6 +392,22 @@ test('--package writes a per-host name allowlist the sys:package route then enfo
   // "*" is not a valid package name, so it can never be granted.
   await assert.rejects(run(['set', '--tenant', 'afterdark', '--host', 'miniapps1', '--reason', 'x', '--package', '*'], { registry: reg }),
     (err) => err.code === 'usage');
+});
+
+test('--config writes a per-host config-path allowlist the sys:config route then enforces', async () => {
+  const reg = await fixture();
+  const out = await run(['set', '--tenant', 'afterdark', '--host', 'miniapps1', '--reason', 'ticket 42',
+    '--config', '/etc/postfix', '--config', '/etc/nginx'], { registry: reg });
+  assert.deepEqual(out.host_config_policy, { paths: ['/etc/nginx', '/etc/postfix'] });
+  assert.equal(await policyDecision(reg, HOST_A, 'sys:config', { sys: { action: 'write', target: '/etc/nginx/nginx.conf', content: 'x\n' } }), null);
+  assert.equal(await policyDecision(reg, HOST_A, 'sys:config', { sys: { action: 'read', target: '/etc/shadow' } }), 'path_denied');
+  assert.equal(await policyDecision(reg, HOST_B, 'sys:config', { sys: { action: 'read', target: '/etc/nginx/nginx.conf' } }), 'path_denied');
+  // The agent's and server's own config/state can never be granted, nor can a
+  // one-level or too-wide path.
+  for (const bad of ['/etc/systemapi-agent', '/etc/sahcore', '/var/lib/systemapi-agent', '/etc', '/']) {
+    await assert.rejects(run(['set', '--tenant', 'afterdark', '--host', 'miniapps1', '--reason', 'x', '--config', bad], { registry: reg }),
+      (err) => err.code === 'usage', bad);
+  }
 });
 
 test('clear denies all services; inherit defers to the tenant; a bad unit is refused', async () => {

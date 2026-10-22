@@ -406,8 +406,22 @@ async function issueAuditedTicket(fleet, principal, host, purpose, binding = nul
   if (binding && binding.target) payload.target = { host: binding.target.host, port: binding.target.port };
   if (binding && binding.root) payload.root = binding.root;
   // sys:* bindings record under a resource-named key (service -> { unit,
-  // action }, package -> { name, action }).
-  if (binding && binding.sys) payload[purpose === 'sys:package' ? 'package' : 'service'] = { ...binding.sys };
+  // action }, package -> { name, action }, config -> { action, target } plus a
+  // content hash and size for a write; the config body itself is never
+  // audited).
+  if (binding && binding.sys) {
+    if (purpose === 'sys:config') {
+      const sys = binding.sys;
+      const row = { action: sys.action, target: sys.target };
+      if (sys.action === 'write' && typeof sys.content === 'string') {
+        row.content_sha256 = require('node:crypto').createHash('sha256').update(sys.content, 'utf8').digest('hex');
+        row.content_bytes = Buffer.byteLength(sys.content, 'utf8');
+      }
+      payload.config = row;
+    } else {
+      payload[purpose === 'sys:package' ? 'package' : 'service'] = { ...binding.sys };
+    }
+  }
   await fleet.registry.appendAudit({
     tenant_id: host.tenant_id,
     host_id: host.host_id,
@@ -672,7 +686,7 @@ function mount(app, fleet) {
     if (CHANNEL_PURPOSES.has(purpose) || SYS_PURPOSES.has(purpose)) {
       if (parsed.forbidden) throw http(403, 'target_forbidden');
       const denied = await policyDecision(fleet.registry, host.host_id, purpose, parsed.binding);
-      if (denied) throw http(['bad_target', 'bad_root', 'bad_unit', 'bad_action', 'bad_package'].includes(denied) ? 400 : 403, denied);
+      if (denied) throw http(['bad_target', 'bad_root', 'bad_unit', 'bad_action', 'bad_package', 'bad_config'].includes(denied) ? 400 : 403, denied);
     }
     res.json(await issueAuditedTicket(fleet, principal, host, purpose, parsed.binding));
   }));

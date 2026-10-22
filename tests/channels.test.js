@@ -506,3 +506,62 @@ test('package policy: binding, allowlist, decision, and the sys_package lease', 
   assert.throws(() => lease.sysPackagePayload('nginx', 'search'), /bad_payload/);
   assert.throws(() => lease.sysPackagePayload('ng*nx', 'install'), /bad_payload/);
 });
+
+test('config policy: binding, allowlist, decision, and the sys_config lease', async () => {
+  const lease = require('../controlplane/lease');
+  // Binding is canonical { action, target, content? } and idempotent.
+  assert.deepEqual(ch.validateConfigBinding({ action: 'read', target: '/etc/nginx/nginx.conf' }),
+    { ok: true, config: { action: 'read', target: '/etc/nginx/nginx.conf' } });
+  assert.deepEqual(ch.validateConfigBinding({ action: 'write', target: '/etc/nginx/nginx.conf', content: 'x\n' }),
+    { ok: true, config: { action: 'write', target: '/etc/nginx/nginx.conf', content: 'x\n' } });
+  assert.deepEqual(ch.validateConfigBinding({ action: 'reload', target: 'nginx.service' }),
+    { ok: true, config: { action: 'reload', target: 'nginx.service' } });
+  assert.equal(ch.validateConfigBinding({ action: 'read', target: 'relative/x' }).error, 'bad_config');
+  assert.equal(ch.validateConfigBinding({ action: 'read', target: '/' }).error, 'bad_config');
+  assert.equal(ch.validateConfigBinding({ action: 'reload', target: '/etc/x' }).error, 'bad_config');
+  assert.equal(ch.validateConfigBinding({ action: 'write', target: '/etc/x' }).error, 'bad_config'); // no content
+  assert.equal(ch.validateConfigBinding({ action: 'validate', target: '/etc/x' }).error, 'bad_action');
+
+  // Policy parse: absolute path prefixes, else null (deny-all).
+  assert.deepEqual(ch.parseConfigPolicy({ paths: ['/etc/nginx', '/etc/postfix'] }), { paths: ['/etc/nginx', '/etc/postfix'] });
+  assert.deepEqual(ch.parseConfigPolicy(null), { paths: [] });
+  assert.equal(ch.parseConfigPolicy({ paths: 'all' }), null);
+  assert.equal(ch.parseConfigPolicy({ paths: ['relative'] }), null);
+  assert.equal(ch.parseConfigPolicy([]), null);
+
+  // Allowlist: a path at or beneath an allowed prefix, on a boundary.
+  assert.equal(ch.configPolicyAllows({ paths: ['/etc/nginx'] }, '/etc/nginx/nginx.conf'), true);
+  assert.equal(ch.configPolicyAllows({ paths: ['/etc/nginx'] }, '/etc/nginx'), true);
+  assert.equal(ch.configPolicyAllows({ paths: ['/etc/nginx'] }, '/etc/nginx-evil/x'), false);
+  assert.equal(ch.configPolicyAllows({ paths: ['/etc/nginx'] }, '/etc/postfix/main.cf'), false);
+  assert.equal(ch.configPolicyAllows(null, '/etc/nginx/x'), false);
+
+  // policyDecision: read/write gated by the config paths; reload gated by the
+  // unit allowlist (a reload acts on a service).
+  const reg = new MemoryRegistry({ NODE_ENV: 'test' });
+  const pub2 = opensshEd25519(Buffer.alloc(32, 9));
+  await reg.enroll({ tenantId: 'acme', userId: 'u', keyId: 'k', hostId: HOST_A, hostname: 'a.example', os: 'linux', platform: 'amd64', sshPubkey: pub2 });
+  assert.equal(await ch.policyDecision(reg, HOST_A, 'sys:config', { sys: { action: 'read', target: '/etc/nginx/nginx.conf' } }), 'path_denied');
+  await reg.setHostChannelPolicy(HOST_A, { config_policy: { paths: ['/etc/nginx'] }, service_policy: { units: ['nginx.service'] } });
+  assert.equal(await ch.policyDecision(reg, HOST_A, 'sys:config', { sys: { action: 'read', target: '/etc/nginx/nginx.conf' } }), null);
+  assert.equal(await ch.policyDecision(reg, HOST_A, 'sys:config', { sys: { action: 'write', target: '/etc/nginx/nginx.conf', content: 'x\n' } }), null);
+  assert.equal(await ch.policyDecision(reg, HOST_A, 'sys:config', { sys: { action: 'read', target: '/etc/shadow' } }), 'path_denied');
+  assert.equal(await ch.policyDecision(reg, HOST_A, 'sys:config', { sys: { action: 'reload', target: 'nginx.service' } }), null);
+  assert.equal(await ch.policyDecision(reg, HOST_A, 'sys:config', { sys: { action: 'reload', target: 'postgresql.service' } }), 'unit_denied');
+
+  // The sys_config lease binds action + target, and write binds the content
+  // hash: a tampered body (different hash) no longer verifies.
+  const svcSigner = buildSigner(privateKeyFromSeed(TEST_SEED), rawPublicKey(privateKeyFromSeed(TEST_SEED)));
+  const svcPub = require('node:crypto').createPublicKey(privateKeyFromSeed(TEST_SEED));
+  const now = Date.now();
+  const sha = require('node:crypto').createHash('sha256').update('good\n', 'utf8').digest('hex');
+  const payload = lease.sysConfigPayload('write', '/etc/nginx/nginx.conf', sha);
+  assert.equal(payload, `write\n/etc/nginx/nginx.conf\n${sha}`);
+  const cl = lease.issueLease(svcSigner, { hostId: HOST_A, action: 'sys_config', payload, now });
+  assert.equal(lease.verifyLease(svcPub, cl, payload, now).ok, true);
+  const evilSha = require('node:crypto').createHash('sha256').update('evil\n', 'utf8').digest('hex');
+  assert.equal(lease.verifyLease(svcPub, cl, lease.sysConfigPayload('write', '/etc/nginx/nginx.conf', evilSha), now).error, 'payload_mismatch');
+  assert.equal(lease.verifyLease(svcPub, cl, lease.sysConfigPayload('read', '/etc/nginx/nginx.conf'), now).error, 'payload_mismatch');
+  assert.throws(() => lease.sysConfigPayload('reload', '/etc/x'), /bad_payload/);
+  assert.throws(() => lease.sysConfigPayload('write', '/etc/x', 'nothex'), /bad_payload/);
+});

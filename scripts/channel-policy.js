@@ -16,7 +16,10 @@
 // act only on a listed unit), and --package entries are package names on a
 // per-host allowlist (deny by default; each must match the package-name shape
 // so "*" is never allow-all; the sys:package channel may act only on a listed
-// name), and the host must resolve to exactly one host of the
+// name),
+// and --config entries are config-path prefixes on a per-host allowlist
+// (deny by default; sys:config may read or write only at or beneath a listed
+// path, and may never touch the agent's or server's own config), and the host must resolve to exactly one host of the
 // named tenant. `set` replaces ALL host policy columns, so nothing from an earlier
 // policy lingers; `clear` is an explicit deny on the host (tcp_policy
 // {allow:[]}, file_policy {roots:[]}, service_policy {units:[]}, package_policy {names:[]}),
@@ -35,7 +38,7 @@
 //
 // Usage: node scripts/channel-policy.js show  --tenant <t> --host <hostname|host_id>
 //        node scripts/channel-policy.js set   --tenant <t> --host <hostname|host_id> --reason <text>
-//               [--tcp-local <port>]... [--file-read <dir>]... [--file-write <dir>]... [--service <unit>]... [--package <name>]...
+//               [--tcp-local <port>]... [--file-read <dir>]... [--file-write <dir>]... [--service <unit>]... [--package <name>]... [--config <dir>]...
 //        node scripts/channel-policy.js clear --tenant <t> --host <hostname|host_id> --reason <text>
 //        node scripts/channel-policy.js inherit --tenant <t> --host <hostname|host_id> --reason <text>
 // Database and env file: as scripts/sso-bind.js (ENV_FILE, else
@@ -52,17 +55,22 @@ const HOST_RE = /^[A-Za-z0-9._-]{1,253}$/;
 const SYSTEM_ROOTS = ['/proc', '/sys', '/dev', '/boot', '/etc', '/root', '/var/lib/systemapi-agent',
   '/etc/systemapi-agent', '/var/lib/postgresql', '/etc/sahcore'];
 const USAGE = 'usage: node scripts/channel-policy.js show|set|clear|inherit --tenant <t> --host <hostname|host_id> '
-  + '[--reason <text>, required except for show] [--tcp-local <port>]... [--file-read <dir>]... [--file-write <dir>]... [--service <unit>]... [--package <name>]...';
+  + '[--reason <text>, required except for show] [--tcp-local <port>]... [--file-read <dir>]... [--file-write <dir>]... [--service <unit>]... [--package <name>]... [--config <dir>]...';
 const REASON_MAX = 256;
 const COMMANDS = new Set(['show', 'set', 'clear', 'inherit']);
 // What each writing command stores in the two host columns and its audit
 // action. clear is an explicit deny; inherit (null) defers to the tenant.
 const WRITES = {
-  clear: { action: 'channel_policy_clear', policy: () => ({ tcp_policy: { allow: [] }, file_policy: { roots: [] }, service_policy: { units: [] }, package_policy: { names: [] } }) },
-  inherit: { action: 'channel_policy_inherit', policy: () => ({ tcp_policy: null, file_policy: null, service_policy: null, package_policy: null }) }
+  clear: { action: 'channel_policy_clear', policy: () => ({ tcp_policy: { allow: [] }, file_policy: { roots: [] }, service_policy: { units: [] }, package_policy: { names: [] }, config_policy: { paths: [] } }) },
+  inherit: { action: 'channel_policy_inherit', policy: () => ({ tcp_policy: null, file_policy: null, service_policy: null, package_policy: null, config_policy: null }) }
 };
 const ONCE_FLAGS = new Set(['--tenant', '--host', '--reason']);
-const LIST_FLAGS = new Set(['--tcp-local', '--file-read', '--file-write', '--service', '--package']);
+const LIST_FLAGS = new Set(['--tcp-local', '--file-read', '--file-write', '--service', '--package', '--config']);
+// The agent's and server's own config/state: never an allowed sys:config path,
+// so the config channel can never rewrite the agent's own config (a lockout
+// risk the design calls out) or the server's.
+const CONFIG_SELF_ROOTS = ['/proc', '/sys', '/dev', '/boot', '/var/lib/systemapi-agent',
+  '/etc/systemapi-agent', '/var/lib/postgresql', '/etc/sahcore'];
 
 function fail(code, message = code) {
   const err = new Error(message);
@@ -95,6 +103,20 @@ function parsePackage(text) {
   return text;
 }
 
+// A --config path prefix: an absolute directory of at least two components
+// (so /etc alone is too broad), not the agent's or server's own config/state.
+// Unlike --file-* it may sit under /etc, which is the point of sys:config.
+function parseConfigDir(text) {
+  if (text === '/' || text === '~') throw usage(`bad --config: "${text}" is too wide; name one directory`);
+  const checked = validateFileRoot(text, 'file:write');
+  if (!checked.ok) throw usage('bad --config: an absolute directory with no "..", ".", "//", trailing "/" or control bytes');
+  const root = checked.root;
+  if (root.split('/').length - 1 < 2) throw usage(`bad --config: "${root}" is too wide; name a directory at least two levels down`);
+  const self = CONFIG_SELF_ROOTS.find((s) => root === s || root.startsWith(`${s}/`) || s.startsWith(`${root}/`));
+  if (self) throw usage(`bad --config: "${root}" is, sits in or contains the protected path ${self}`);
+  return root;
+}
+
 function parseDir(flag, text) {
   if (text === '/' || text === '~') throw usage(`bad ${flag}: "${text}" is too wide; name one directory`);
   const checked = validateFileRoot(text, 'file:write');
@@ -110,7 +132,7 @@ function parseArgs(argv) {
   if (!Array.isArray(argv) || argv.length === 0 || !COMMANDS.has(argv[0])) throw usage();
   const command = argv[0];
   const once = {};
-  const lists = { '--tcp-local': [], '--file-read': [], '--file-write': [], '--service': [], '--package': [] };
+  const lists = { '--tcp-local': [], '--file-read': [], '--file-write': [], '--service': [], '--package': [], '--config': [] };
   for (let i = 1; i < argv.length; i += 1) {
     const flag = argv[i];
     if (i + 1 >= argv.length) throw usage();
@@ -150,11 +172,13 @@ function parseArgs(argv) {
     .filter((d) => !writes.includes(d));
   const units = [...new Set(lists['--service'].map(parseUnit))].sort();
   const names = [...new Set(lists['--package'].map(parsePackage))].sort();
-  if (ports.length === 0 && reads.length === 0 && writes.length === 0 && units.length === 0 && names.length === 0) {
-    throw usage('set needs at least one --tcp-local, --file-read, --file-write, --service or --package; use clear to deny all, inherit for the tenant default');
+  const configs = [...new Set(lists['--config'].map(parseConfigDir))].sort();
+  if (ports.length === 0 && reads.length === 0 && writes.length === 0 && units.length === 0 && names.length === 0 && configs.length === 0) {
+    throw usage('set needs at least one --tcp-local, --file-read, --file-write, --service, --package or --config; use clear to deny all, inherit for the tenant default');
   }
-  if (ports.length > MAX_ENTRIES || reads.length + writes.length > MAX_ENTRIES || units.length > MAX_ENTRIES || names.length > MAX_ENTRIES) {
-    throw usage(`at most ${MAX_ENTRIES} ports, ${MAX_ENTRIES} directories, ${MAX_ENTRIES} units and ${MAX_ENTRIES} packages`);
+  if (ports.length > MAX_ENTRIES || reads.length + writes.length > MAX_ENTRIES || units.length > MAX_ENTRIES
+    || names.length > MAX_ENTRIES || configs.length > MAX_ENTRIES) {
+    throw usage(`at most ${MAX_ENTRIES} ports, ${MAX_ENTRIES} directories, ${MAX_ENTRIES} units, ${MAX_ENTRIES} packages and ${MAX_ENTRIES} config paths`);
   }
   out.tcpPolicy = { allow: ports.length ? [{ local: true, ports }] : [] };
   out.filePolicy = {
@@ -165,6 +189,7 @@ function parseArgs(argv) {
   };
   out.servicePolicy = { units };
   out.packagePolicy = { names };
+  out.configPolicy = { paths: configs };
   return out;
 }
 
@@ -188,10 +213,12 @@ async function summary(registry, host) {
     host_file_policy: raw.host_file_policy ?? null,
     host_service_policy: raw.host_service_policy ?? null,
     host_package_policy: raw.host_package_policy ?? null,
+    host_config_policy: raw.host_config_policy ?? null,
     effective_tcp_policy: effective.tcp,
     effective_file_policy: effective.file,
     effective_service_policy: effective.service,
-    effective_package_policy: effective.package
+    effective_package_policy: effective.package,
+    effective_config_policy: effective.config
   };
 }
 
@@ -206,7 +233,7 @@ async function run(argv, { registry }) {
   if (args.command === 'show') return summary(registry, host);
 
   const next = args.command === 'set'
-    ? { tcp_policy: args.tcpPolicy, file_policy: args.filePolicy, service_policy: args.servicePolicy, package_policy: args.packagePolicy }
+    ? { tcp_policy: args.tcpPolicy, file_policy: args.filePolicy, service_policy: args.servicePolicy, package_policy: args.packagePolicy, config_policy: args.configPolicy }
     : WRITES[args.command].policy();
   const action = args.command === 'set' ? 'channel_policy_set' : WRITES[args.command].action;
   try {
@@ -217,6 +244,7 @@ async function run(argv, { registry }) {
       filePolicy: next.file_policy,
       servicePolicy: next.service_policy,
       packagePolicy: next.package_policy,
+      configPolicy: next.config_policy,
       actor: ACTOR,
       action,
       reason: args.reason

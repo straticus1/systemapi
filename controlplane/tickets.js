@@ -18,6 +18,8 @@ const TTL_MS = 60_000;
 const SERVICE_ACTIONS = new Set(['start', 'stop', 'restart', 'enable', 'disable']);
 // The sys:package channel verbs; the lease binds the exact { name, action }.
 const PACKAGE_ACTIONS = new Set(['query', 'install', 'remove', 'upgrade']);
+// The sys:config channel verbs; the binding is { action, target, content? }.
+const CONFIG_ACTIONS = new Set(['read', 'write', 'reload']);
 
 function frozenTarget(target) {
   if (!target) return null;
@@ -81,6 +83,15 @@ function bindingOk(row, expect) {
     if (expect && expect.sys !== undefined) {
       const s = expect.sys;
       if (!s || s.name !== row.sys.name || s.action !== row.sys.action) return false;
+    }
+    return true;
+  }
+  if (row.purpose === 'sys:config') {
+    if (!row.sys || typeof row.sys.target !== 'string' || !CONFIG_ACTIONS.has(row.sys.action)) return false;
+    if (row.sys.action === 'write' && typeof row.sys.content !== 'string') return false;
+    if (expect && expect.sys !== undefined) {
+      const s = expect.sys;
+      if (!s || s.action !== row.sys.action || s.target !== row.sys.target) return false;
     }
     return true;
   }

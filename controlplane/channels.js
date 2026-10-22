@@ -17,7 +17,7 @@ const FILE_PURPOSES = new Set(['file:read', 'file:write', 'file:root']);
 const CHANNEL_PURPOSES = new Set([...TCP_PURPOSES, ...FILE_PURPOSES]);
 // SAH OS-management channels (docs/sah-os-management-design.md). Kept out of
 // CHANNEL_PURPOSES: each carries a resource binding, not a target or root.
-const SYS_PURPOSES = new Set(['sys:service', 'sys:package']);
+const SYS_PURPOSES = new Set(['sys:service', 'sys:package', 'sys:config']);
 const ROOT_MAX_BYTES = 4096;
 const POLICY_MAX_ENTRIES = 256;
 const POLICY_MAX_PORTS = 256;
@@ -32,6 +32,13 @@ const SERVICE_ACTIONS = new Set(['start', 'stop', 'restart', 'enable', 'disable'
 const PACKAGE_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9.+_-]{0,127}$/;
 // The sys:package channel verbs. query is a read; the rest are mutations.
 const PACKAGE_ACTIONS = new Set(['query', 'install', 'remove', 'upgrade']);
+// The sys:config channel verbs. read is a read; write/reload are mutations.
+// read/write target an absolute config path (gated by the config-path
+// allowlist); reload targets a unit (gated by the service allowlist, since a
+// reload acts on a service). write carries content, bound by its SHA-256 in
+// the lease (the file/xfer content-by-hash pattern).
+const CONFIG_ACTIONS = new Set(['read', 'write', 'reload']);
+const CONFIG_CONTENT_MAX = 64 * 1024;
 
 // Scopes each purpose needs. file:write needs file:read too (FILE §2). A
 // service restart is root-equivalent but bounded by the per-host unit
@@ -42,7 +49,8 @@ const PURPOSE_SCOPES = Object.freeze({
   'file:write': ['file:read', 'file:write'],
   'file:root': ['file:root'],
   'sys:service': ['sys:service'],
-  'sys:package': ['sys:package']
+  'sys:package': ['sys:package'],
+  'sys:config': ['sys:config']
 });
 
 const IPV4_OCTET = '(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])';
@@ -389,6 +397,52 @@ function packagePolicyAllows(policy, name) {
   return policy.names.includes(name);
 }
 
+// validateConfigBinding checks a sys:config binding { action, target,
+// content? }. It is idempotent (its output re-validates), so the same function
+// guards the ticket body at issue and the stored binding at the upgrade. For
+// read/write target is an absolute config path; for reload target is a unit.
+// write also carries content, a UTF-8 string of at most CONFIG_CONTENT_MAX
+// bytes, whose SHA-256 is signed into the lease (sys.js): the binding keeps the
+// bytes, the lease binds them.
+function validateConfigBinding(cfg) {
+  if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) return { ok: false, error: 'bad_config' };
+  const { action, target } = cfg;
+  if (!CONFIG_ACTIONS.has(action)) return { ok: false, error: 'bad_action' };
+  if (action === 'reload') {
+    if (typeof target !== 'string' || !SERVICE_UNIT_RE.test(target)) return { ok: false, error: 'bad_config' };
+    return { ok: true, config: { action, target } };
+  }
+  if (typeof target !== 'string' || !rootShapeOk(target) || target === '/') return { ok: false, error: 'bad_config' };
+  if (action === 'read') return { ok: true, config: { action, target } };
+  // write: content required, a bounded UTF-8 string.
+  if (typeof cfg.content !== 'string' || !cfg.content.isWellFormed()) return { ok: false, error: 'bad_config' };
+  if (Buffer.byteLength(cfg.content, 'utf8') > CONFIG_CONTENT_MAX) return { ok: false, error: 'bad_config' };
+  return { ok: true, config: { action, target, content: cfg.content } };
+}
+
+// parseConfigPolicy returns the normalized config-path allowlist, or null when
+// malformed (deny-all). Each entry is an absolute path prefix (the file-root
+// allowlist shape); a requested read/write path must sit at or beneath one.
+function parseConfigPolicy(raw) {
+  if (raw === null || raw === undefined) return { paths: [] };
+  if (typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const paths = raw.paths;
+  if (!Array.isArray(paths) || paths.length > POLICY_MAX_ENTRIES) return null;
+  const out = [];
+  for (const p of paths) {
+    if (typeof p !== 'string' || !rootShapeOk(p)) return null;
+    out.push(p);
+  }
+  return { paths: out };
+}
+
+// configPolicyAllows: the requested path equals or sits beneath an allowed
+// prefix on a component boundary. Deny by default.
+function configPolicyAllows(policy, path) {
+  if (!policy || !Array.isArray(policy.paths)) return false;
+  return policy.paths.some((base) => beneath(path, base));
+}
+
 // validateBinding parses the purpose-specific part of a ws-ticket body.
 // Returns { ok, binding } where binding is { target } or { root }, or
 // { ok:false, error }. target_forbidden is reported separately in
@@ -415,6 +469,11 @@ function validateBinding(purpose, body) {
     if (!checked.ok) return { ok: false, error: checked.error };
     return { ok: true, forbidden: false, binding: { sys: checked.package }, checked };
   }
+  if (purpose === 'sys:config') {
+    const checked = validateConfigBinding(body && body.config);
+    if (!checked.ok) return { ok: false, error: checked.error };
+    return { ok: true, forbidden: false, binding: { sys: checked.config }, checked };
+  }
   return { ok: true, forbidden: false, binding: null, checked: null };
 }
 
@@ -423,7 +482,7 @@ function validateBinding(purpose, body) {
 // support denies everything.
 async function effectivePolicies(registry, hostId) {
   if (!registry || typeof registry.channelPolicies !== 'function') {
-    return { tcp: { allow: [] }, file: { roots: [] }, service: { units: [] }, package: { names: [] } };
+    return { tcp: { allow: [] }, file: { roots: [] }, service: { units: [] }, package: { names: [] }, config: { paths: [] } };
   }
   const raw = await registry.channelPolicies(hostId);
   const pick = (hostVal, tenantVal) => (hostVal !== null && hostVal !== undefined ? hostVal : tenantVal);
@@ -431,7 +490,8 @@ async function effectivePolicies(registry, hostId) {
     tcp: parseTcpPolicy(pick(raw && raw.host_tcp_policy, raw && raw.tenant_tcp_policy)),
     file: parseFilePolicy(pick(raw && raw.host_file_policy, raw && raw.tenant_file_policy)),
     service: parseServicePolicy(pick(raw && raw.host_service_policy, raw && raw.tenant_service_policy)),
-    package: parsePackagePolicy(pick(raw && raw.host_package_policy, raw && raw.tenant_package_policy))
+    package: parsePackagePolicy(pick(raw && raw.host_package_policy, raw && raw.tenant_package_policy)),
+    config: parseConfigPolicy(pick(raw && raw.host_config_policy, raw && raw.tenant_config_policy))
   };
 }
 
@@ -462,6 +522,17 @@ async function policyDecision(registry, hostId, purpose, binding) {
     const { package: pkg } = await effectivePolicies(registry, hostId);
     return packagePolicyAllows(pkg, checked.package.name) ? null : 'package_denied';
   }
+  if (purpose === 'sys:config') {
+    const checked = validateConfigBinding(binding && binding.sys);
+    if (!checked.ok) return checked.error;
+    const pols = await effectivePolicies(registry, hostId);
+    // reload acts on a service, gated by the unit allowlist; read/write act on
+    // a path, gated by the config-path allowlist.
+    if (checked.config.action === 'reload') {
+      return servicePolicyAllows(pols.service, checked.config.target) ? null : 'unit_denied';
+    }
+    return configPolicyAllows(pols.config, checked.config.target) ? null : 'path_denied';
+  }
   return null;
 }
 
@@ -472,7 +543,8 @@ function assertPolicyShape(kind, raw) {
   const parsed = kind === 'tcp' ? parseTcpPolicy(raw)
     : kind === 'service' ? parseServicePolicy(raw)
       : kind === 'package' ? parsePackagePolicy(raw)
-        : parseFilePolicy(raw);
+        : kind === 'config' ? parseConfigPolicy(raw)
+          : parseFilePolicy(raw);
   if (!parsed || raw === undefined) {
     const err = new Error('bad_policy');
     err.status = 400;
@@ -519,6 +591,10 @@ module.exports = {
   validatePackageBinding,
   parsePackagePolicy,
   packagePolicyAllows,
+  CONFIG_CONTENT_MAX,
+  validateConfigBinding,
+  parseConfigPolicy,
+  configPolicyAllows,
   validateBinding,
   effectivePolicies,
   policyDecision,

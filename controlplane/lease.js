@@ -35,12 +35,12 @@ const crypto = require('node:crypto');
 const { validateFileRoot } = require('./channels');
 const { randomBytes, timingSafeEqual } = crypto;
 
-const ACTIONS = new Set(['sysscript', 'pty', 'pty_root', 'breakglass', 'tcp', 'file', 'file_root', 'xfer', 'xfer_root', 'sys_service', 'sys_package']);
+const ACTIONS = new Set(['sysscript', 'pty', 'pty_root', 'breakglass', 'tcp', 'file', 'file_root', 'xfer', 'xfer_root', 'sys_service', 'sys_package', 'sys_config']);
 const TERMINAL_ACTIONS = new Set(['pty', 'pty_root', 'breakglass']);
 const CHANNEL_ACTIONS = new Set(['tcp', 'file', 'file_root']);
 const XFER_ACTIONS = new Set(['xfer', 'xfer_root']);
 // SAH OS-management channel actions (docs/sah-os-management-design.md).
-const SYS_ACTIONS = new Set(['sys_service', 'sys_package']);
+const SYS_ACTIONS = new Set(['sys_service', 'sys_package', 'sys_config']);
 // Actions whose hash covers "<action>\n<payload>".
 const SESSION_ACTIONS = new Set([...TERMINAL_ACTIONS, ...CHANNEL_ACTIONS, ...XFER_ACTIONS, ...SYS_ACTIONS]);
 // Service/unit name guard; mirrors systemapi-agent/platform.go serviceNameRE.
@@ -196,6 +196,30 @@ function sysPackagePayload(name, action) {
   return `${name}\n${action}`;
 }
 
+// sys_config lease payload (docs/sah-os-management-design.md):
+//   read:   "read\n<path>"
+//   write:  "write\n<path>\n<content_sha256>"   (content rides the agent
+//           frame; the lease binds its SHA-256, the file/xfer content-by-hash
+//           pattern, so a tampered body is refused)
+//   reload: "reload\n<unit>"
+// The agent rebuilds this from the frame (recomputing the content hash for a
+// write), so a lease for one target, verb or body never acts on another. path
+// mirrors the server's config-path shape; unit mirrors SERVICE_UNIT_RE.
+function sysConfigPayload(action, target, contentSha256) {
+  if (action === 'reload') {
+    if (typeof target !== 'string' || !SERVICE_UNIT_RE.test(target)) throw badPayload();
+    return `reload\n${target}`;
+  }
+  if (action === 'read' || action === 'write') {
+    if (typeof target !== 'string' || target === '/' || target.length === 0 || target.length > 4096
+      || /[\u0000-\u001f\u007f]/.test(target) || !target.startsWith('/')) throw badPayload();
+    if (action === 'read') return `read\n${target}`;
+    if (typeof contentSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(contentSha256)) throw badPayload();
+    return `write\n${target}\n${contentSha256}`;
+  }
+  throw badPayload();
+}
+
 // A watch reason: 1..256 UTF-8 bytes of printable characters with some
 // non-space content; no tab, newline or other control character, and no
 // U+FFFD (the agent refuses all of these as bad_request).
@@ -295,6 +319,7 @@ module.exports = {
   filePayload,
   sysServicePayload,
   sysPackagePayload,
+  sysConfigPayload,
   xferPayload,
   xferMaterial,
   peerAddress,

@@ -1847,6 +1847,71 @@ test('sys:package is an operator scope, gated by the host package allowlist, and
   }
 });
 
+test('sys:config is an operator scope; read/write gated by paths, reload by units, and the body is never audited', async () => {
+  assert.equal(OPERATOR.includes('sys:config'), true);
+  assert.equal(scopesForRole('viewer').has('sys:config'), false);
+
+  const fm = fleet();
+  await seed(fm);
+  await fm.registry.setHostChannelPolicy(HOST_A, { config_policy: { paths: ['/etc/nginx'] }, service_policy: { units: ['nginx.service'] } });
+  await fm.registry.addMember('acme', 'op-1', 'operator', 'op@example');
+  await fm.registry.addMember('acme', 'view-1', 'viewer', 'view@example');
+  const opApp = await listen(appFor(fm, await ssoUser(fm, 'op-1', { email: 'op@example', groups: [] })));
+  const viewApp = await listen(appFor(fm, await ssoUser(fm, 'view-1', { email: 'view@example', groups: [] })));
+  const cfgTicket = (url, config, headers = {}) => call(`${url}/api/v1/ws-ticket`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...headers },
+    body: JSON.stringify({ host_id: HOST_A, purpose: 'sys:config', config })
+  });
+  try {
+    // A viewer cannot mint a sys:config ticket.
+    const viewer = await cfgTicket(viewApp.url, { action: 'read', target: '/etc/nginx/nginx.conf' });
+    assert.equal(viewer.status, 403);
+    assert.equal(viewer.body.error, 'scope_denied');
+
+    // A path off the allowlist is denied; a reload unit off the allowlist too.
+    const deniedPath = await cfgTicket(opApp.url, { action: 'write', target: '/etc/shadow', content: 'x\n' });
+    assert.equal(deniedPath.status, 403);
+    assert.equal(deniedPath.body.error, 'path_denied');
+    const deniedUnit = await cfgTicket(opApp.url, { action: 'reload', target: 'postgresql.service' });
+    assert.equal(deniedUnit.status, 403);
+    assert.equal(deniedUnit.body.error, 'unit_denied');
+    assert.equal(fm.tickets.size, 0);
+
+    // An allowed read mints a ticket bound to { action, target }.
+    const read = await cfgTicket(opApp.url, { action: 'read', target: '/etc/nginx/nginx.conf' });
+    assert.equal(read.status, 200);
+    assert.deepEqual(fm.tickets.get(read.body.ticket).sys, { action: 'read', target: '/etc/nginx/nginx.conf' });
+
+    // A write carries content on the ticket, but the ticket_issued row records
+    // only the content hash and size, never the body.
+    const content = 'server { listen 8080; }\n';
+    const write = await cfgTicket(opApp.url, { action: 'write', target: '/etc/nginx/nginx.conf', content });
+    assert.equal(write.status, 200);
+    assert.equal(fm.tickets.get(write.body.ticket).sys.content, content);
+
+    // A bad verb or a write missing content is 400.
+    const badVerb = await cfgTicket(opApp.url, { action: 'validate', target: '/etc/nginx/nginx.conf' });
+    assert.equal(badVerb.status, 400);
+    assert.equal(badVerb.body.error, 'bad_action');
+    const noContent = await cfgTicket(opApp.url, { action: 'write', target: '/etc/nginx/nginx.conf' });
+    assert.equal(noContent.status, 400);
+    assert.equal(noContent.body.error, 'bad_config');
+
+    const issued = fm.registry.audit.filter((r) => r.action === 'ticket_issued' && r.payload.purpose === 'sys:config');
+    assert.equal(issued.length, 2);
+    assert.deepEqual(issued[0].payload.config, { action: 'read', target: '/etc/nginx/nginx.conf' });
+    assert.equal(issued[1].payload.config.action, 'write');
+    assert.equal(issued[1].payload.config.content_sha256,
+      require('node:crypto').createHash('sha256').update(content, 'utf8').digest('hex'));
+    assert.equal(JSON.stringify(issued).includes('listen 8080'), false);
+    assert.equal((await fm.registry.verifyAudit()).ok, true);
+  } finally {
+    opApp.server.close();
+    viewApp.server.close();
+  }
+});
+
 test('the audit chain covers actor, host, tenant and action; legacy rows still verify', async () => {
   const { GENESIS, chainHash } = require('../controlplane/chain');
   const reg = new MemoryRegistry({ NODE_ENV: 'test' });

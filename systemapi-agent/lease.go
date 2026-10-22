@@ -101,7 +101,7 @@ func knownAction(action string) bool {
 // sysAction reports the SAH OS-management channel lease actions
 // (docs/sah-os-management-design.md).
 func sysAction(action string) bool {
-	return action == "sys_service" || action == "sys_package"
+	return action == "sys_service" || action == "sys_package" || action == "sys_config"
 }
 
 // xferAction reports the sahxfer grant lease actions.
@@ -200,6 +200,40 @@ func sysPackageLeasePayload(name, action string) (string, error) {
 		return "", errors.New("bad_name")
 	}
 	return name + "\n" + action, nil
+}
+
+// sysConfigLeasePayload is the signed payload of a sys_config lease
+// (docs/sah-os-management-design.md), byte-for-byte the server's
+// sysConfigPayload (controlplane/lease.js):
+//
+//	read:   "read\n<path>"
+//	write:  "write\n<path>\n<content_sha256>"
+//	reload: "reload\n<unit>"
+//
+// For a write the agent passes contentSHA = sha256hex(content), so a tampered
+// body yields a different hash and verifyLease refuses it. read/write target
+// an absolute path; reload targets a unit (serviceNameRE).
+func sysConfigLeasePayload(action, target, contentSHA string) (string, error) {
+	switch action {
+	case "reload":
+		if !serviceNameRE.MatchString(target) {
+			return "", errors.New("bad_unit")
+		}
+		return "reload\n" + target, nil
+	case "read", "write":
+		if target == "" || len(target) > 4096 || target == "/" || !strings.HasPrefix(target, "/") || !noControl(target) {
+			return "", errors.New("bad_path")
+		}
+		if action == "read" {
+			return "read\n" + target, nil
+		}
+		if !hashHexRe.MatchString(contentSHA) {
+			return "", errors.New("bad_content")
+		}
+		return "write\n" + target + "\n" + contentSHA, nil
+	default:
+		return "", errors.New("bad_action")
+	}
 }
 
 const (

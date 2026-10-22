@@ -23,6 +23,10 @@ var (
 	errPkgUnsupported = errors.New("package_unsupported")
 	errPkgNameDenied  = errors.New("package_denied")
 	errPkgBadAction   = errors.New("bad_action")
+
+	errCfgUnsupported = errors.New("config_unsupported")
+	errCfgTargetBad   = errors.New("target_denied")
+	errCfgBadAction   = errors.New("bad_action")
 )
 
 // sysServiceActions is the closed set of mutating verbs this channel exposes:
@@ -73,6 +77,38 @@ func checkSysPackagePolicy(name, action string) error {
 	}
 	if !packageNameRE.MatchString(name) {
 		return errPkgNameDenied
+	}
+	return nil
+}
+
+// sysConfigActions is the closed set of sys:config channel verbs. read is a
+// read; write/reload are mutations. Kept byte-for-byte in sync with the
+// server's CONFIG_ACTIONS (controlplane/channels.js).
+var sysConfigActions = map[string]struct{}{
+	"read": {}, "write": {}, "reload": {},
+}
+
+// checkSysConfigPolicy is the agent's own fail-closed gate for sys:config. The
+// per-host path/unit allowlists are enforced by the control plane and the
+// lease binds the exact target (and, for a write, the content hash); the agent
+// refuses unless the host advertises the config capability, the verb is in the
+// closed set, and the target passes its shape guard (an absolute path for
+// read/write, a unit for reload).
+func checkSysConfigPolicy(action, target string) error {
+	if !sysConfig().Available() {
+		return errCfgUnsupported
+	}
+	if _, ok := sysConfigActions[action]; !ok {
+		return errCfgBadAction
+	}
+	if action == "reload" {
+		if !serviceNameRE.MatchString(target) {
+			return errCfgTargetBad
+		}
+		return nil
+	}
+	if target == "" || len(target) > 4096 || target == "/" || target[0] != '/' || !noControl(target) {
+		return errCfgTargetBad
 	}
 	return nil
 }

@@ -22,16 +22,56 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
+	"os"
 	"os/exec"
 	"regexp"
+	"syscall"
 	"time"
 )
 
 // errSysPkgBadArgv is an internal guard: the package manager produced no argv.
 var errSysPkgBadArgv = errors.New("package manager unavailable")
+
+// sysConfigReadMax caps the bytes a sys:config read returns.
+const sysConfigReadMax = 64 * 1024
+
+// sysConfig returns the host's ConfigStore; tests replace it.
+var sysConfig = func() ConfigStore { return currentPlatform().Config }
+
+// sysConfigReadFile reads one config file for a sys:config read. It opens the
+// final component without following a symlink and refuses anything that is not
+// a regular file, so a planted symlink cannot redirect the read out of an
+// allowed prefix. tests replace it. Output is capped at sysConfigReadMax.
+var sysConfigReadFile = func(path string) (string, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", errors.New("not a regular file")
+	}
+	buf, err := io.ReadAll(io.LimitReader(f, sysConfigReadMax))
+	if err != nil {
+		return "", err
+	}
+	return string(buf), nil
+}
+
+func sysSHA256Hex(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
 
 // sysRequestRe matches a server-minted request id (playground/sys.js).
 var sysRequestRe = regexp.MustCompile(`^sys_[A-Za-z0-9_-]{16,64}$`)
@@ -98,6 +138,14 @@ func (c *channelConn) handleSys(typ string, message []byte) bool {
 			return true
 		}
 		c.sysPackage(msg, time.Now())
+		return true
+	case "sys_config":
+		var msg sysConfigMsg
+		if err := json.Unmarshal(message, &msg); err != nil {
+			log.Printf("rejected malformed sys_config")
+			return true
+		}
+		c.sysConfig(msg, time.Now())
 		return true
 	default:
 		return false
@@ -244,4 +292,73 @@ func (c *channelConn) sysPackage(msg sysPackageMsg, now time.Time) {
 	}
 	_ = c.out.WriteJSON(ResponseMessage{Type: "sys_result", RequestID: rid, Payload: result})
 	log.Printf("sys_package %s name=%s action=%s ok=%t", rid, msg.Name, msg.Action, actErr == nil)
+}
+
+// sysConfigMsg is the server's sys_config request frame. Content is present
+// only for a write; its SHA-256 is bound in the lease.
+type sysConfigMsg struct {
+	Type      string `json:"type"`
+	RequestID string `json:"request_id"`
+	Action    string `json:"action"`
+	Target    string `json:"target"`
+	Content   string `json:"content"`
+	Lease     *Lease `json:"lease"`
+}
+
+// sysConfig reads, writes or reloads one config target. read returns the file
+// content (symlink-guarded, capped); write rebuilds the signed payload from
+// the body's hash (so a tampered body is refused) and does an atomic write;
+// reload reloads a unit through the ConfigStore.
+func (c *channelConn) sysConfig(msg sysConfigMsg, now time.Time) {
+	rid := msg.RequestID
+	if !sysRequestRe.MatchString(rid) {
+		log.Printf("sys_config refused: bad request id")
+		sysResultError(c.out, "", "internal")
+		return
+	}
+	// Rebuild the signed payload from the target and verb we are about to act
+	// on. A write binds the content by its SHA-256, so a body swapped in
+	// transit yields a different hash and the lease no longer verifies.
+	contentSHA := ""
+	if msg.Action == "write" {
+		contentSHA = sysSHA256Hex(msg.Content)
+	}
+	payload, err := sysConfigLeasePayload(msg.Action, msg.Target, contentSHA)
+	if err != nil {
+		log.Printf("sys_config refused: %s", err.Error())
+		sysResultError(c.out, rid, "lease_required")
+		return
+	}
+	if err := authorizeCommand(c.hostID, "sys_config", payload, msg.Lease, now); err != nil {
+		log.Printf("sys_config refused: %s", err.Error())
+		sysResultError(c.out, rid, "lease_required")
+		return
+	}
+	if err := checkSysConfigPolicy(msg.Action, msg.Target); err != nil {
+		log.Printf("sys_config refused: %s", err.Error())
+		sysResultError(c.out, rid, err.Error())
+		return
+	}
+	result := map[string]interface{}{"action": msg.Action, "target": msg.Target}
+	var actErr error
+	switch msg.Action {
+	case "read":
+		var out string
+		out, actErr = sysConfigReadFile(msg.Target)
+		if actErr == nil {
+			result["output"] = out
+		}
+	case "write":
+		actErr = sysConfig().AtomicWrite(msg.Target, msg.Content)
+	case "reload":
+		var out string
+		out, actErr = sysConfig().Reload(msg.Target)
+		result["output"] = capSysOutput(out)
+	}
+	result["ok"] = actErr == nil
+	if actErr != nil {
+		result["error"] = "action_failed"
+	}
+	_ = c.out.WriteJSON(ResponseMessage{Type: "sys_result", RequestID: rid, Payload: result})
+	log.Printf("sys_config %s action=%s target=%s ok=%t", rid, msg.Action, msg.Target, actErr == nil)
 }

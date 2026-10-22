@@ -29,10 +29,15 @@
 'use strict';
 
 const WebSocket = require('ws');
+const crypto = require('node:crypto');
 const { ticketFromRequest } = require('../controlplane/httpauth');
 const { consumeTicket } = require('../controlplane/tickets');
-const { issueLease, sysServicePayload, sysPackagePayload } = require('../controlplane/lease');
-const { validateServiceBinding, validatePackageBinding } = require('../controlplane/channels');
+const { issueLease, sysServicePayload, sysPackagePayload, sysConfigPayload } = require('../controlplane/lease');
+const { validateServiceBinding, validatePackageBinding, validateConfigBinding } = require('../controlplane/channels');
+
+function sha256Hex(s) {
+    return crypto.createHash('sha256').update(s, 'utf8').digest('hex');
+}
 const { randomToken } = require('../controlplane/token');
 const { envInt, unref, sendJSON, channelUpgradeHost, recheckChannelTicket, appendAuditRetrying } = require('./channel');
 
@@ -42,7 +47,7 @@ const SYS_PER_ACTOR_DEFAULT = 16;
 const SYS_PER_AGENT = 64;
 const SYS_ERRORS = new Set([
     'ticket_invalid', 'scope_denied', 'agent_offline', 'agent_unsupported', 'lease_required', 'unit_denied',
-    'package_denied', 'cap_reached', 'protocol_error', 'timeout', 'agent_disconnected', 'internal'
+    'package_denied', 'path_denied', 'cap_reached', 'protocol_error', 'timeout', 'agent_disconnected', 'internal'
 ]);
 
 // Per-purpose description of one sys resource. Each binds one capability, one
@@ -84,6 +89,35 @@ const SYS_RESOURCES = {
         resultAction: 'sys_package_result',
         resourceFields: (b) => ({ name: b.name, action: b.action }),
         resultFields: (r) => ({ output: typeof r.output === 'string' ? r.output : null })
+    },
+    'sys:config': {
+        capability: 'config',
+        leaseAction: 'sys_config',
+        frameType: 'sys_config',
+        // Returns { ok, binding } where binding is { action, target, content? }.
+        validate: (cfg) => {
+            const c = validateConfigBinding(cfg);
+            return c.ok ? { ok: true, binding: c.config } : { ok: false };
+        },
+        // write binds the content by its SHA-256; read/reload bind no body.
+        leasePayload: (b) => (b.action === 'write'
+            ? sysConfigPayload('write', b.target, sha256Hex(b.content))
+            : sysConfigPayload(b.action, b.target)),
+        // write carries the content to the agent; the lease already binds its
+        // hash, so a tampered body fails verifyLease on the agent.
+        agentFields: (b) => (b.action === 'write'
+            ? { action: b.action, target: b.target, content: b.content }
+            : { action: b.action, target: b.target }),
+        intentAction: 'sys_config_intent',
+        resultAction: 'sys_config_result',
+        // The audit never stores config bodies: a write records the content
+        // hash and size, a read records the hash/size of what was returned.
+        resourceFields: (b) => (b.action === 'write'
+            ? { action: b.action, target: b.target, content_sha256: sha256Hex(b.content), content_bytes: Buffer.byteLength(b.content, 'utf8') }
+            : { action: b.action, target: b.target }),
+        resultFields: (r) => (typeof r.output === 'string'
+            ? { content_sha256: sha256Hex(r.output), content_bytes: Buffer.byteLength(r.output, 'utf8') }
+            : {})
     }
 };
 
