@@ -1,6 +1,6 @@
 # SAH suite contract
 
-Status: 2026-10-17, as of systemapi.io branch `feat/channel-policy-cli` (a8dc200) plus the sahxfer grant route on `feat/suite-contract-xfer`. This file is the contract for how the SAH names join. Tool commands live in each tool's `docs/usage.md`. If a tool README and this file disagree about what is wired, this file wins.
+Status: 2026-10-22, as of systemapi.io branch `feat/channel-policy-cli` (a8dc200) plus the sahxfer grant route on `feat/suite-contract-xfer` and the mesh channel in the `main` working tree (uncommitted). This file is the contract for how the SAH names join. Tool commands live in each tool's `docs/usage.md`. If a tool README and this file disagree about what is wired, this file wins.
 
 **sah** means Service Automation Hub. The hub encompasses the platform and the suite of utilities. `adssh` is the development name of the execution shell. The binary, the module `github.com/afterdarksys/adssh`, `adssh-mcp`, `~/.adssh`, and the GitHub repo `afterdarksys/adssh` stay on that name until a rename is explicit.
 
@@ -28,7 +28,7 @@ These domains do not rename a repository, a binary, or a Go module. `adssh` stay
 | sahconnect | `~/development/sahconnect` | HTTP client for systemapi. `ssh` execs the `adssh` binary. |
 | sahapi | `~/development/sahapi` | Loopback HTTP service. Three GET proxies. |
 | sah2grpc | `~/development/sah2grpc` | Library. Go packages and protobuf only. No command. Nothing wired. |
-| sahmesh | `~/development/sahmesh` | Idea only. `IDEA.md`. No code. |
+| sahmesh | `~/development/sahmesh` | Code. Loopback SOCKS5 proxy over the SystemAPI mesh channel: one multiplexed WebSocket per host, `NAME.sah:PORT` reaches a host, routes map CIDRs to a `--via` agent. |
 | sahcore | `~/development/sahcore` | Unassigned. Docs only. No binary. |
 | adssh | `~/development/adssh` | Execution shell: policy, HMAC chain, four-eyes, break-glass, native SSH when policy allows, local `admin serve`. |
 | systemapi | `~/development/systemapi.io` | Linux control plane, outbound agent, CLI, dashboard. |
@@ -53,7 +53,9 @@ These calls exist in code. Nothing else in the suite calls across repositories.
 8. `sahlink HOST:PORT`, `sahlink -L PORT HOST:PORT`, `sahlink --via AGENT ADDR:PORT`, and `sahlink rdp HOST` call systemapi as `docs/sah-tcp-protocol.md` fixes it: `GET /api/v1/hosts/resolve?name=`, then `POST /api/v1/ws-ticket` with purpose `tcp:open` and `target` (`{"host":"local"}` or an IP literal, and a port), then one WebSocket `/api/v1/systems/tcp/<host_id>?ticket=&purpose=tcp:open` per accepted connection. The listener is `127.0.0.1` only. `-R` is `reverse_unsupported`. The server refuses a target unless the host's `tcp_policy`, else the tenant default, allows it. No policy is deny. The agent advertises `tcp`, checks its own `--tcp-allow` list, and dials only the target in the signed `tcp` lease. TCP bytes are not recorded. `tcp_start` and `tcp_end` rows go into the audit chain.
 9. `sahsync ls`, `put`, `get`, and `sync` call systemapi as `docs/sah-file-protocol.md` fixes it: resolve, then `POST /api/v1/ws-ticket` with purpose `file:read`, `file:write`, or `file:root` (admin only) and `root`, then the WebSocket `/api/v1/systems/file/<host_id>?ticket=&purpose=`. One session carries sequential ops: `stat`, `list`, `read`, `hash`, `write_open`, `write_chunk`, `write_commit`, `write_abort`, `mkdir`, and `remove`. `sync` sends `mkdir`, and `remove` only with `--delete --yes`. The server refuses a root unless the host's `file_policy`, else the tenant default, allows it with the flag the purpose needs. An intent row is written before every `write_commit`, `mkdir`, and `remove` is forwarded. `file_session_start`, `file_op`, `file_read`, and `file_session_end` rows follow. On the host, the file helper is Linux only: a child process dropped to `pty_user` (root for `file:root`) that opens the root with `openat2` and `RESOLVE_NO_SYMLINKS`, and every path beneath it with `RESOLVE_BENEATH`. The agent advertises `file` only when `openat2` works. A macOS or other non-Linux agent, and a Linux kernel without `openat2`, get `agent_unsupported`. There is no fallback.
 
-Two server-side steps sit under items 8 and 9. They are not cross-repo calls.
+10. `sahmesh up` calls systemapi as `docs/sah-mesh-protocol.md` fixes it: `GET /api/v1/hosts/resolve?name=` once per agent name, then `POST /api/v1/ws-ticket` with purpose `mesh:open` and no target, then one WebSocket `/api/v1/systems/mesh/<host_id>?ticket=&purpose=mesh:open` per host that carries many streams. Each stream is opened with a `mesh_open` frame naming `{"host":"local"}` or an IP literal and a port, and is a TCP session on the server: the same target validation, `tcp_policy`, signed `tcp` lease, limits, and shared per-actor and per-agent caps as item 8, with `tcp_start` and `tcp_end` rows that also name the `msh_` session and the stream id. `mesh:open` is its own operator scope; it does not open `tcp:open` channels and the reverse. Credit runs per stream in both directions on the client hop. The agent is unchanged: it sees ordinary `tcp_open` frames. The SOCKS5 listener is loopback only; `NAME.sah` is agent `NAME` with target `local`; an IP literal needs a route (`--route CIDR=AGENT` or `~/.config/sahmesh/routes.toml`); no DNS is resolved; UDP, BIND, and reverse listeners are refused.
+
+Two server-side steps sit under items 8, 9, and 10. They are not cross-repo calls.
 
 - Channel policy is set on the server with `scripts/channel-policy.js` (`show`, `set`, `clear`, `inherit`, with `--tenant`, `--host`, and a required `--reason`). There is no HTTP route that writes a host policy. `set` accepts only `--tcp-local PORT`, `--file-read DIR`, and `--file-write DIR`. It never grants `file:root` and refuses system roots. Every change appends an audit-chain row in the same transaction as the write.
 - The first admin of a fresh database is created on the server with `scripts/bootstrap-admin.js` (`docs/bootstrap.md`). No HTTP route creates the first credential.
@@ -65,6 +67,12 @@ No SAH module imports `github.com/afterdarksys/adssh`. The systemapi agent does 
 Device login stays in `controlplane/oauth.js`. `adssh identity device login` is a client of that server. It stores an opaque bearer and sets the session user with no groups. It does not import OIDC groups. Dashboard login stays Authentik at `https://auth.afterdarksys.com`, client `systemapi-io-client`. An Authentik access token is not the CLI bearer. sahapi does not serve OAuth.
 
 `adssh admin serve` is the local admin API. It is not a second public API.
+
+## Enrolled hosts
+
+miniapps1 (Debian 12, 108.165.123.119) is the first enrolled agent, live since 2026-10-22, tenant afterdark. The deployed control plane and agent are systemapi.io `main` at 2643d56. Proven end to end on it: the agent PTY terminal (`sahconnect`), a channel policy set with `scripts/channel-policy.js`, a TCP forward (`sahlink -L`), and the file channel (`sahsync put/get/compare`, checksums matched both ways).
+
+The file channel needs `openat2`. systemd 252 denies it with ENOSYS while `RestrictSUIDSGID` is on, so the hardened unit must turn `RestrictSUIDSGID` off (a drop-in and the `install-agent.sh` template do; NoNewPrivileges and the capability bounding set stay). Until it is off the agent withholds `file` and every `sahsync` op answers `agent_unsupported`.
 
 ## Partially wired
 
