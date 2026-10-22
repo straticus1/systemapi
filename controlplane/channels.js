@@ -15,16 +15,27 @@
 const TCP_PURPOSES = new Set(['tcp:open']);
 const FILE_PURPOSES = new Set(['file:read', 'file:write', 'file:root']);
 const CHANNEL_PURPOSES = new Set([...TCP_PURPOSES, ...FILE_PURPOSES]);
+// SAH OS-management channel (docs/sah-os-management-design.md Phase 1). Kept
+// out of CHANNEL_PURPOSES: it carries a service binding, not a target or root.
+const SYS_PURPOSES = new Set(['sys:service']);
 const ROOT_MAX_BYTES = 4096;
 const POLICY_MAX_ENTRIES = 256;
 const POLICY_MAX_PORTS = 256;
+// Service/unit name guard; mirrors systemapi-agent/platform.go serviceNameRE
+// and controlplane/lease.js SERVICE_UNIT_RE.
+const SERVICE_UNIT_RE = /^[a-zA-Z0-9][a-zA-Z0-9@._:-]{0,127}$/;
+// Phase 1 exposes restart only; status is the agent's confirm read.
+const SERVICE_ACTIONS = new Set(['restart']);
 
-// Scopes each purpose needs. file:write needs file:read too (FILE §2).
+// Scopes each purpose needs. file:write needs file:read too (FILE §2). A
+// service restart is root-equivalent but bounded by the per-host unit
+// allowlist (deny by default); it is an operator scope like tcp:open.
 const PURPOSE_SCOPES = Object.freeze({
   'tcp:open': ['tcp:open'],
   'file:read': ['file:read'],
   'file:write': ['file:read', 'file:write'],
-  'file:root': ['file:root']
+  'file:root': ['file:root'],
+  'sys:service': ['sys:service']
 });
 
 const IPV4_OCTET = '(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])';
@@ -304,6 +315,39 @@ function filePolicyAllows(policy, purpose, root) {
   return false;
 }
 
+// validateServiceBinding checks a ws-ticket `service` object (the sys:service
+// binding): { unit, action }. Phase 1 action is restart only.
+function validateServiceBinding(service) {
+  if (!service || typeof service !== 'object' || Array.isArray(service)) return { ok: false, error: 'bad_unit' };
+  const { unit, action } = service;
+  if (typeof unit !== 'string' || !SERVICE_UNIT_RE.test(unit)) return { ok: false, error: 'bad_unit' };
+  if (!SERVICE_ACTIONS.has(action)) return { ok: false, error: 'bad_action' };
+  return { ok: true, service: { unit, action } };
+}
+
+// parseServicePolicy returns the normalized unit allowlist, or null when the
+// policy is malformed (callers treat null as deny-all). The allowlist is the
+// tight gate: a unit not listed is denied (the --service grant of
+// scripts/channel-policy.js).
+function parseServicePolicy(raw) {
+  if (raw === null || raw === undefined) return { units: [] };
+  if (typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const units = raw.units;
+  if (!Array.isArray(units) || units.length > POLICY_MAX_ENTRIES) return null;
+  const out = [];
+  for (const unit of units) {
+    if (typeof unit !== 'string' || !SERVICE_UNIT_RE.test(unit)) return null;
+    out.push(unit);
+  }
+  return { units: out };
+}
+
+// servicePolicyAllows: the requested unit is listed exactly. Deny by default.
+function servicePolicyAllows(policy, unit) {
+  if (!policy || !Array.isArray(policy.units)) return false;
+  return policy.units.includes(unit);
+}
+
 // validateBinding parses the purpose-specific part of a ws-ticket body.
 // Returns { ok, binding } where binding is { target } or { root }, or
 // { ok:false, error }. target_forbidden is reported separately in
@@ -320,6 +364,11 @@ function validateBinding(purpose, body) {
     if (!checked.ok) return { ok: false, error: 'bad_root' };
     return { ok: true, forbidden: false, binding: { root: checked.root }, checked };
   }
+  if (SYS_PURPOSES.has(purpose)) {
+    const checked = validateServiceBinding(body && body.service);
+    if (!checked.ok) return { ok: false, error: checked.error };
+    return { ok: true, forbidden: false, binding: { sys: checked.service }, checked };
+  }
   return { ok: true, forbidden: false, binding: null, checked: null };
 }
 
@@ -327,12 +376,13 @@ function validateBinding(purpose, body) {
 // else the tenant default, else deny-all. A registry without channel policy
 // support denies everything.
 async function effectivePolicies(registry, hostId) {
-  if (!registry || typeof registry.channelPolicies !== 'function') return { tcp: { allow: [] }, file: { roots: [] } };
+  if (!registry || typeof registry.channelPolicies !== 'function') return { tcp: { allow: [] }, file: { roots: [] }, service: { units: [] } };
   const raw = await registry.channelPolicies(hostId);
   const pick = (hostVal, tenantVal) => (hostVal !== null && hostVal !== undefined ? hostVal : tenantVal);
   return {
     tcp: parseTcpPolicy(pick(raw && raw.host_tcp_policy, raw && raw.tenant_tcp_policy)),
-    file: parseFilePolicy(pick(raw && raw.host_file_policy, raw && raw.tenant_file_policy))
+    file: parseFilePolicy(pick(raw && raw.host_file_policy, raw && raw.tenant_file_policy)),
+    service: parseServicePolicy(pick(raw && raw.host_service_policy, raw && raw.tenant_service_policy))
   };
 }
 
@@ -351,6 +401,12 @@ async function policyDecision(registry, hostId, purpose, binding) {
     const { file } = await effectivePolicies(registry, hostId);
     return filePolicyAllows(file, purpose, checked.root) ? null : 'root_denied';
   }
+  if (SYS_PURPOSES.has(purpose)) {
+    const checked = validateServiceBinding(binding && binding.sys);
+    if (!checked.ok) return checked.error;
+    const { service } = await effectivePolicies(registry, hostId);
+    return servicePolicyAllows(service, checked.service.unit) ? null : 'unit_denied';
+  }
   return null;
 }
 
@@ -358,7 +414,7 @@ async function policyDecision(registry, hostId, purpose, binding) {
 // store; null clears the column.
 function assertPolicyShape(kind, raw) {
   if (raw === null) return;
-  const parsed = kind === 'tcp' ? parseTcpPolicy(raw) : parseFilePolicy(raw);
+  const parsed = kind === 'tcp' ? parseTcpPolicy(raw) : kind === 'service' ? parseServicePolicy(raw) : parseFilePolicy(raw);
   if (!parsed || raw === undefined) {
     const err = new Error('bad_policy');
     err.status = 400;
@@ -385,7 +441,9 @@ module.exports = {
   TCP_PURPOSES,
   FILE_PURPOSES,
   CHANNEL_PURPOSES,
+  SYS_PURPOSES,
   PURPOSE_SCOPES,
+  SERVICE_UNIT_RE,
   parseIP,
   formatIP,
   parseCIDR,
@@ -396,6 +454,9 @@ module.exports = {
   validateFileRoot,
   parseFilePolicy,
   filePolicyAllows,
+  validateServiceBinding,
+  parseServicePolicy,
+  servicePolicyAllows,
   validateBinding,
   effectivePolicies,
   policyDecision,

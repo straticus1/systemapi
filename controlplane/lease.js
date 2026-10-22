@@ -35,12 +35,16 @@ const crypto = require('node:crypto');
 const { validateFileRoot } = require('./channels');
 const { randomBytes, timingSafeEqual } = crypto;
 
-const ACTIONS = new Set(['sysscript', 'pty', 'pty_root', 'breakglass', 'tcp', 'file', 'file_root', 'xfer', 'xfer_root']);
+const ACTIONS = new Set(['sysscript', 'pty', 'pty_root', 'breakglass', 'tcp', 'file', 'file_root', 'xfer', 'xfer_root', 'sys_service']);
 const TERMINAL_ACTIONS = new Set(['pty', 'pty_root', 'breakglass']);
 const CHANNEL_ACTIONS = new Set(['tcp', 'file', 'file_root']);
 const XFER_ACTIONS = new Set(['xfer', 'xfer_root']);
+// SAH OS-management channel actions (docs/sah-os-management-design.md Phase 1).
+const SYS_ACTIONS = new Set(['sys_service']);
 // Actions whose hash covers "<action>\n<payload>".
-const SESSION_ACTIONS = new Set([...TERMINAL_ACTIONS, ...CHANNEL_ACTIONS, ...XFER_ACTIONS]);
+const SESSION_ACTIONS = new Set([...TERMINAL_ACTIONS, ...CHANNEL_ACTIONS, ...XFER_ACTIONS, ...SYS_ACTIONS]);
+// Service/unit name guard; mirrors systemapi-agent/platform.go serviceNameRE.
+const SERVICE_UNIT_RE = /^[a-zA-Z0-9][a-zA-Z0-9@._:-]{0,127}$/;
 const TCP_SESSION_RE = /^tcs_[A-Za-z0-9_-]{16,64}$/;
 const FILE_SESSION_RE = /^fls_[A-Za-z0-9_-]{16,64}$/;
 const XFER_GRANT_RE = /^xfr_[A-Za-z0-9_-]{8,64}$/;
@@ -167,6 +171,16 @@ function filePayload(sessionId, deadlineUnix, phase, mode, root) {
   return `${sessionId}\n${deadlineUnix}\n${phase}\n${mode}\n${root}`;
 }
 
+// sys_service lease payload (docs/sah-os-management-design.md Phase 1):
+// "<unit>\n<action>". Phase 1 signs restart only; the agent rebuilds this from
+// the unit it is about to act on (systemapi-agent/lease.go
+// sysServiceLeasePayload), so a lease for one unit never acts on another.
+function sysServicePayload(unit, action) {
+  if (typeof unit !== 'string' || !SERVICE_UNIT_RE.test(unit)) throw badPayload();
+  if (action !== 'restart') throw badPayload();
+  return `${unit}\n${action}`;
+}
+
 // A watch reason: 1..256 UTF-8 bytes of printable characters with some
 // non-space content; no tab, newline or other control character, and no
 // U+FFFD (the agent refuses all of these as bad_request).
@@ -252,6 +266,7 @@ function xferPayload({
 module.exports = {
   TERMINAL_ACTIONS,
   CHANNEL_ACTIONS,
+  SYS_ACTIONS,
   TCP_SESSION_RE,
   FILE_SESSION_RE,
   XFER_ACTIONS,
@@ -263,6 +278,7 @@ module.exports = {
   terminalPayload,
   tcpPayload,
   filePayload,
+  sysServicePayload,
   xferPayload,
   xferMaterial,
   peerAddress,

@@ -1,7 +1,8 @@
 // Threats: a long-lived API key in a browser WebSocket URL. Tickets are
 // single-use, 60s, and bound to a host and purpose. Consume deletes the
 // ticket even when the host or purpose does not match. Channel tickets
-// (tcp:open, file:*) are also bound to their target or root: the binding is
+// (tcp:open, file:*) are also bound to their target or root, and a sys:service
+// ticket to its { unit, action }: the binding is
 // stored on the ticket, a channel ticket without one is refused at consume,
 // and a caller that passes an expected binding must match it exactly. A watch
 // ticket (terminal:watch, terminal:watch_rw) is bound to one granted watch
@@ -19,9 +20,14 @@ function frozenTarget(target) {
   return Object.freeze({ host: target.host, port: target.port });
 }
 
+function frozenSys(sys) {
+  if (!sys) return null;
+  return Object.freeze({ unit: sys.unit, action: sys.action });
+}
+
 // auth ({ kind, keyId, groupRole }) is what the upgrade needs to re-check the
 // actor's scopes (authz.ticketScopesHeld); it is never sent anywhere.
-function issueTicket(store, { hostId, purpose, tenantId, actor = null, auth = null, target = null, root = null, watch = null }) {
+function issueTicket(store, { hostId, purpose, tenantId, actor = null, auth = null, target = null, root = null, watch = null, sys = null }) {
   const ticket = `stk_${randomToken(32)}`;
   store.set(ticket, {
     hostId,
@@ -32,6 +38,7 @@ function issueTicket(store, { hostId, purpose, tenantId, actor = null, auth = nu
     target: frozenTarget(target),
     root: typeof root === 'string' ? root : null,
     watch: watch ? Object.freeze({ sessionId: watch.sessionId, watchId: watch.watchId, mode: watch.mode }) : null,
+    sys: frozenSys(sys),
     exp: Date.now() + TTL_MS
   });
   return ticket;
@@ -53,6 +60,14 @@ function bindingOk(row, expect) {
   }
   if (row.purpose === 'terminal:watch' || row.purpose === 'terminal:watch_rw') {
     return !!(row.watch && typeof row.watch.watchId === 'string' && row.watch.mode === (row.purpose === 'terminal:watch' ? 'ro' : 'rw'));
+  }
+  if (row.purpose === 'sys:service') {
+    if (!row.sys || typeof row.sys.unit !== 'string' || row.sys.action !== 'restart') return false;
+    if (expect && expect.sys !== undefined) {
+      const s = expect.sys;
+      if (!s || s.unit !== row.sys.unit || s.action !== row.sys.action) return false;
+    }
+    return true;
   }
   return true;
 }
