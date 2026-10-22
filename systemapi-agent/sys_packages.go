@@ -3,9 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"time"
 
 	"go.starlark.net/starlark"
@@ -23,34 +21,6 @@ const packagePATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 
 var lookupPackageManager = lookupFixedPackageManager
 var runPackageInstall = runFixedPackageInstall
-
-func packageArgv(mgr, name string) ([]string, error) {
-	if !packageNameRE.MatchString(name) {
-		return nil, fmt.Errorf("package not allowed")
-	}
-	switch mgr {
-	case "apt-get":
-		return []string{"apt-get", "install", "-y", "--no-install-recommends", "--", name}, nil
-	case "dnf":
-		return []string{"dnf", "install", "-y", "--", name}, nil
-	default:
-		return nil, fmt.Errorf("package manager unavailable")
-	}
-}
-
-func lookupFixedPackageManager() (string, error) {
-	for _, name := range []string{"apt-get", "dnf"} {
-		for _, dir := range []string{"/usr/sbin", "/usr/bin", "/sbin", "/bin"} {
-			path := filepath.Join(dir, name)
-			info, err := os.Stat(path)
-			if err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
-				continue
-			}
-			return name, nil
-		}
-	}
-	return "", fmt.Errorf("package manager unavailable")
-}
 
 func runFixedPackageInstall(ctx context.Context, argv []string) error {
 	if len(argv) < 2 {

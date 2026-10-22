@@ -81,7 +81,19 @@ func TestPackageArgv(t *testing.T) {
 	if _, err := packageArgv("apt-get", "*"); err == nil || !strings.Contains(err.Error(), "package not allowed") {
 		t.Fatal(err)
 	}
-	if _, err := packageArgv("yum", "nginx"); err == nil || !strings.Contains(err.Error(), "package manager unavailable") {
+	yum, err := packageArgv("yum", "nginx")
+	if err != nil || strings.Join(yum, " ") != "yum install -y -- nginx" {
+		t.Fatalf("%v %v", yum, err)
+	}
+	zypper, err := packageArgv("zypper", "nginx")
+	if err != nil || strings.Join(zypper, " ") != "zypper --non-interactive install -- nginx" {
+		t.Fatalf("%v %v", zypper, err)
+	}
+	brew, err := packageArgv("brew", "nginx")
+	if err != nil || strings.Join(brew, " ") != "brew install nginx" {
+		t.Fatalf("%v %v", brew, err)
+	}
+	if _, err := packageArgv("pacman", "nginx"); err == nil || !strings.Contains(err.Error(), "package manager unavailable") {
 		t.Fatal(err)
 	}
 }
