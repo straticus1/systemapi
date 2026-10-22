@@ -90,3 +90,22 @@ The precondition for ever disabling sshd. With ssh off the agent is the only doo
 2. Out-of-band console (provider KVM / IPMI / serial): the true last resort, survives total software failure; depends on what the VPS provider offers, and is manual and slow. NEED TO KNOW: what console does the provider give these hosts.
 3. Signed, time-boxed sshd break-glass: the agent (or the watchdog) accepts a signed, expiring command that turns sshd back on for a window. Reuses the lease model; useless if the agent itself is the wedged thing.
 Recommendation: build 1 (watchdog) + 3 (signed sshd break-glass) as the in-band pair, and document 2 (provider console) as the true last resort. Do not disable sshd anywhere until this is built and drilled (the acceptance test includes a simulated wedge + recovery).
+
+## Decisions 2026-10-22 (night): exec model and recovery
+
+- Phase 2 exec: option (b). Structured verbs cover `--connect=api`; a narrow, deny-by-default `sys:exec` is bound to the exact committed runbook commands that cannot be expressed as a structured verb, decided per command. No blanket shell over the API.
+- Phase 3 recovery: option 1, realized as a dedicated **sah-service**. This replaces the dependency on a provider console (option 2); option 2 (provider KVM/IPMI/serial) stays documented only as the absolute last resort for when both the agent AND sah-service are dead. Option 3 (signed sshd break-glass) becomes a capability sah-service exposes, not a separate thing.
+
+## sah-service — the recovery daemon (Phase 3)
+
+A second, minimal daemon on each host, independent of the main `systemapi-agent`, whose only job is to keep a way in when the agent is wedged and ssh is off. Ryan's idea, 2026-10-22.
+
+Properties (all load-bearing — this is the thing that must not fail when everything else does):
+- Its own systemd unit, its own enrollment key, and the fewest dependencies possible (prefer a static binary with no shared surface with the agent, so a bad agent build or a hardening-flag regression like the openat2 one cannot take it down too).
+- More conservative than the agent it guards: it does not self-update in any way that can brick it, and it never applies a config that could remove its own reachability.
+- Watchdog role: detect the main agent crashed, wedged, or un-enrolled, and restart or re-enroll it.
+- Recovery role, each a narrow signed capability (not a general runner): roll the agent back to its `.prev` binary; pull and install a fresh agent build; re-enable sshd for a signed, time-boxed window (the former option 3); report its own and the agent's health.
+- Security: its own scopes (e.g. `recovery:*`), signed grants, audit rows, deny by default. It must be strictly less capable than a shell — recovery verbs only, no arbitrary exec — so it is a smaller attack surface than the agent, not a bigger one. SECURITY-RULES.md binds it.
+- It is SAH's own out-of-band lifeline, so the fleet does not depend on a provider console. The provider console is the last resort only if both the agent and sah-service are dead.
+
+Open for Ryan to shape: the name (`sah-service`), whether it rides the existing control plane on its own channel or a separate minimal endpoint, and how its key is provisioned so it survives an agent re-key.
