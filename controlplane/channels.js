@@ -15,9 +15,9 @@
 const TCP_PURPOSES = new Set(['tcp:open']);
 const FILE_PURPOSES = new Set(['file:read', 'file:write', 'file:root']);
 const CHANNEL_PURPOSES = new Set([...TCP_PURPOSES, ...FILE_PURPOSES]);
-// SAH OS-management channel (docs/sah-os-management-design.md Phase 1). Kept
-// out of CHANNEL_PURPOSES: it carries a service binding, not a target or root.
-const SYS_PURPOSES = new Set(['sys:service']);
+// SAH OS-management channels (docs/sah-os-management-design.md). Kept out of
+// CHANNEL_PURPOSES: each carries a resource binding, not a target or root.
+const SYS_PURPOSES = new Set(['sys:service', 'sys:package']);
 const ROOT_MAX_BYTES = 4096;
 const POLICY_MAX_ENTRIES = 256;
 const POLICY_MAX_PORTS = 256;
@@ -28,6 +28,10 @@ const SERVICE_UNIT_RE = /^[a-zA-Z0-9][a-zA-Z0-9@._:-]{0,127}$/;
 // the agent's confirm read, not a channel verb. The lease binds the exact
 // { unit, action } so a lease for one verb can never perform another.
 const SERVICE_ACTIONS = new Set(['start', 'stop', 'restart', 'enable', 'disable']);
+// Package name guard; mirrors systemapi-agent/grant.go packageNameRE.
+const PACKAGE_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9.+_-]{0,127}$/;
+// The sys:package channel verbs. query is a read; the rest are mutations.
+const PACKAGE_ACTIONS = new Set(['query', 'install', 'remove', 'upgrade']);
 
 // Scopes each purpose needs. file:write needs file:read too (FILE §2). A
 // service restart is root-equivalent but bounded by the per-host unit
@@ -37,7 +41,8 @@ const PURPOSE_SCOPES = Object.freeze({
   'file:read': ['file:read'],
   'file:write': ['file:read', 'file:write'],
   'file:root': ['file:root'],
-  'sys:service': ['sys:service']
+  'sys:service': ['sys:service'],
+  'sys:package': ['sys:package']
 });
 
 const IPV4_OCTET = '(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])';
@@ -350,6 +355,40 @@ function servicePolicyAllows(policy, unit) {
   return policy.units.includes(unit);
 }
 
+// validateServiceBinding's package counterpart: { name, action }. name
+// mirrors the agent's packageNameRE (grant.go); action is a channel verb.
+function validatePackageBinding(pkg) {
+  if (!pkg || typeof pkg !== 'object' || Array.isArray(pkg)) return { ok: false, error: 'bad_package' };
+  const { name, action } = pkg;
+  if (typeof name !== 'string' || !PACKAGE_NAME_RE.test(name)) return { ok: false, error: 'bad_package' };
+  if (!PACKAGE_ACTIONS.has(action)) return { ok: false, error: 'bad_action' };
+  return { ok: true, package: { name, action } };
+}
+
+// parsePackagePolicy returns the normalized package-name allowlist, or null
+// when malformed (callers treat null as deny-all). Each name must match
+// PACKAGE_NAME_RE, so "*" is never a name and the list is never allow-all:
+// this mirrors the agent's exactGrant semantics (grant.go). The allowlist is
+// the tight gate (the --package grant of scripts/channel-policy.js).
+function parsePackagePolicy(raw) {
+  if (raw === null || raw === undefined) return { names: [] };
+  if (typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const names = raw.names;
+  if (!Array.isArray(names) || names.length > POLICY_MAX_ENTRIES) return null;
+  const out = [];
+  for (const name of names) {
+    if (typeof name !== 'string' || !PACKAGE_NAME_RE.test(name)) return null;
+    out.push(name);
+  }
+  return { names: out };
+}
+
+// packagePolicyAllows: the requested name is listed exactly. Deny by default.
+function packagePolicyAllows(policy, name) {
+  if (!policy || !Array.isArray(policy.names)) return false;
+  return policy.names.includes(name);
+}
+
 // validateBinding parses the purpose-specific part of a ws-ticket body.
 // Returns { ok, binding } where binding is { target } or { root }, or
 // { ok:false, error }. target_forbidden is reported separately in
@@ -366,10 +405,15 @@ function validateBinding(purpose, body) {
     if (!checked.ok) return { ok: false, error: 'bad_root' };
     return { ok: true, forbidden: false, binding: { root: checked.root }, checked };
   }
-  if (SYS_PURPOSES.has(purpose)) {
+  if (purpose === 'sys:service') {
     const checked = validateServiceBinding(body && body.service);
     if (!checked.ok) return { ok: false, error: checked.error };
     return { ok: true, forbidden: false, binding: { sys: checked.service }, checked };
+  }
+  if (purpose === 'sys:package') {
+    const checked = validatePackageBinding(body && body.package);
+    if (!checked.ok) return { ok: false, error: checked.error };
+    return { ok: true, forbidden: false, binding: { sys: checked.package }, checked };
   }
   return { ok: true, forbidden: false, binding: null, checked: null };
 }
@@ -378,13 +422,16 @@ function validateBinding(purpose, body) {
 // else the tenant default, else deny-all. A registry without channel policy
 // support denies everything.
 async function effectivePolicies(registry, hostId) {
-  if (!registry || typeof registry.channelPolicies !== 'function') return { tcp: { allow: [] }, file: { roots: [] }, service: { units: [] } };
+  if (!registry || typeof registry.channelPolicies !== 'function') {
+    return { tcp: { allow: [] }, file: { roots: [] }, service: { units: [] }, package: { names: [] } };
+  }
   const raw = await registry.channelPolicies(hostId);
   const pick = (hostVal, tenantVal) => (hostVal !== null && hostVal !== undefined ? hostVal : tenantVal);
   return {
     tcp: parseTcpPolicy(pick(raw && raw.host_tcp_policy, raw && raw.tenant_tcp_policy)),
     file: parseFilePolicy(pick(raw && raw.host_file_policy, raw && raw.tenant_file_policy)),
-    service: parseServicePolicy(pick(raw && raw.host_service_policy, raw && raw.tenant_service_policy))
+    service: parseServicePolicy(pick(raw && raw.host_service_policy, raw && raw.tenant_service_policy)),
+    package: parsePackagePolicy(pick(raw && raw.host_package_policy, raw && raw.tenant_package_policy))
   };
 }
 
@@ -403,11 +450,17 @@ async function policyDecision(registry, hostId, purpose, binding) {
     const { file } = await effectivePolicies(registry, hostId);
     return filePolicyAllows(file, purpose, checked.root) ? null : 'root_denied';
   }
-  if (SYS_PURPOSES.has(purpose)) {
+  if (purpose === 'sys:service') {
     const checked = validateServiceBinding(binding && binding.sys);
     if (!checked.ok) return checked.error;
     const { service } = await effectivePolicies(registry, hostId);
     return servicePolicyAllows(service, checked.service.unit) ? null : 'unit_denied';
+  }
+  if (purpose === 'sys:package') {
+    const checked = validatePackageBinding(binding && binding.sys);
+    if (!checked.ok) return checked.error;
+    const { package: pkg } = await effectivePolicies(registry, hostId);
+    return packagePolicyAllows(pkg, checked.package.name) ? null : 'package_denied';
   }
   return null;
 }
@@ -416,7 +469,10 @@ async function policyDecision(registry, hostId, purpose, binding) {
 // store; null clears the column.
 function assertPolicyShape(kind, raw) {
   if (raw === null) return;
-  const parsed = kind === 'tcp' ? parseTcpPolicy(raw) : kind === 'service' ? parseServicePolicy(raw) : parseFilePolicy(raw);
+  const parsed = kind === 'tcp' ? parseTcpPolicy(raw)
+    : kind === 'service' ? parseServicePolicy(raw)
+      : kind === 'package' ? parsePackagePolicy(raw)
+        : parseFilePolicy(raw);
   if (!parsed || raw === undefined) {
     const err = new Error('bad_policy');
     err.status = 400;
@@ -459,6 +515,10 @@ module.exports = {
   validateServiceBinding,
   parseServicePolicy,
   servicePolicyAllows,
+  PACKAGE_NAME_RE,
+  validatePackageBinding,
+  parsePackagePolicy,
+  packagePolicyAllows,
   validateBinding,
   effectivePolicies,
   policyDecision,

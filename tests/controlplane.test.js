@@ -1787,6 +1787,66 @@ test('sys:service is an operator scope, gated by the host service allowlist, and
   }
 });
 
+test('sys:package is an operator scope, gated by the host package allowlist, and binds the ticket', async () => {
+  assert.equal(OPERATOR.includes('sys:package'), true);
+  assert.equal(scopesForRole('viewer').has('sys:package'), false);
+  assert.equal(scopesForRole('operator').has('sys:package'), true);
+
+  const fm = fleet();
+  await seed(fm);
+  // The host may act only on the nginx package.
+  await fm.registry.setHostChannelPolicy(HOST_A, { package_policy: { names: ['nginx'] } });
+  await fm.registry.addMember('acme', 'op-1', 'operator', 'op@example');
+  await fm.registry.addMember('acme', 'view-1', 'viewer', 'view@example');
+  const opApp = await listen(appFor(fm, await ssoUser(fm, 'op-1', { email: 'op@example', groups: [] })));
+  const viewApp = await listen(appFor(fm, await ssoUser(fm, 'view-1', { email: 'view@example', groups: [] })));
+  const pkgTicket = (url, pkg, headers = {}) => call(`${url}/api/v1/ws-ticket`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...headers },
+    body: JSON.stringify({ host_id: HOST_A, purpose: 'sys:package', package: pkg })
+  });
+  try {
+    // A viewer cannot mint a sys:package ticket.
+    const viewer = await pkgTicket(viewApp.url, { name: 'nginx', action: 'install' });
+    assert.equal(viewer.status, 403);
+    assert.equal(viewer.body.error, 'scope_denied');
+
+    // A package not on the host allowlist is denied (deny by default).
+    const denied = await pkgTicket(opApp.url, { name: 'curl', action: 'install' });
+    assert.equal(denied.status, 403);
+    assert.equal(denied.body.error, 'package_denied');
+    assert.equal(fm.tickets.size, 0);
+
+    // A listed package mints a single-use ticket bound to { name, action }.
+    const ok = await pkgTicket(opApp.url, { name: 'nginx', action: 'install' });
+    assert.equal(ok.status, 200);
+    assert.deepEqual(fm.tickets.get(ok.body.ticket).sys, { name: 'nginx', action: 'install' });
+
+    // query (a read) is also an operator verb on an allowed name.
+    const query = await pkgTicket(opApp.url, { name: 'nginx', action: 'query' });
+    assert.equal(query.status, 200);
+    assert.deepEqual(fm.tickets.get(query.body.ticket).sys, { name: 'nginx', action: 'query' });
+
+    // A verb outside the set or a bad name is 400.
+    const badVerb = await pkgTicket(opApp.url, { name: 'nginx', action: 'search' });
+    assert.equal(badVerb.status, 400);
+    assert.equal(badVerb.body.error, 'bad_action');
+    const badName = await pkgTicket(opApp.url, { name: 'ng*nx', action: 'install' });
+    assert.equal(badName.status, 400);
+    assert.equal(badName.body.error, 'bad_package');
+
+    // Each successful ticket_issued row records its package binding.
+    const issued = fm.registry.audit.filter((r) => r.action === 'ticket_issued' && r.payload.purpose === 'sys:package');
+    assert.equal(issued.length, 2);
+    assert.deepEqual(issued[0].payload.package, { name: 'nginx', action: 'install' });
+    assert.deepEqual(issued[1].payload.package, { name: 'nginx', action: 'query' });
+    assert.equal((await fm.registry.verifyAudit()).ok, true);
+  } finally {
+    opApp.server.close();
+    viewApp.server.close();
+  }
+});
+
 test('the audit chain covers actor, host, tenant and action; legacy rows still verify', async () => {
   const { GENESIS, chainHash } = require('../controlplane/chain');
   const reg = new MemoryRegistry({ NODE_ENV: 'test' });

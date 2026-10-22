@@ -19,6 +19,10 @@ var (
 	errSysUnsupported = errors.New("service_unsupported")
 	errSysUnitDenied  = errors.New("unit_denied")
 	errSysBadAction   = errors.New("bad_action")
+
+	errPkgUnsupported = errors.New("package_unsupported")
+	errPkgNameDenied  = errors.New("package_denied")
+	errPkgBadAction   = errors.New("bad_action")
 )
 
 // sysServiceActions is the closed set of mutating verbs this channel exposes:
@@ -42,6 +46,33 @@ func checkSysServicePolicy(unit, action string) error {
 	}
 	if !serviceNameRE.MatchString(unit) {
 		return errSysUnitDenied
+	}
+	return nil
+}
+
+// sysPackageActions is the closed set of sys:package channel verbs: query
+// (a read) plus the mutations. Kept byte-for-byte in sync with the server's
+// PACKAGE_LEASE_ACTIONS (controlplane/lease.js) and PACKAGE_ACTIONS
+// (controlplane/channels.js, controlplane/tickets.js).
+var sysPackageActions = map[string]struct{}{
+	"query": {}, "install": {}, "remove": {}, "upgrade": {},
+}
+
+// checkSysPackagePolicy is the agent's own fail-closed gate for sys:package,
+// run after the lease verifies and independent of it. The per-host name
+// allowlist is enforced by the control plane (package_policy) and the lease
+// binds the exact name; the agent refuses unless the host advertises the
+// package capability, the verb is in the closed set, and the name passes the
+// shape guard (grant.go packageNameRE; "*" never matches).
+func checkSysPackagePolicy(name, action string) error {
+	if !sysPackages().Available() {
+		return errPkgUnsupported
+	}
+	if _, ok := sysPackageActions[action]; !ok {
+		return errPkgBadAction
+	}
+	if !packageNameRE.MatchString(name) {
+		return errPkgNameDenied
 	}
 	return nil
 }

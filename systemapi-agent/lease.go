@@ -99,9 +99,9 @@ func knownAction(action string) bool {
 }
 
 // sysAction reports the SAH OS-management channel lease actions
-// (docs/sah-os-management-design.md Phase 1).
+// (docs/sah-os-management-design.md).
 func sysAction(action string) bool {
-	return action == "sys_service"
+	return action == "sys_service" || action == "sys_package"
 }
 
 // xferAction reports the sahxfer grant lease actions.
@@ -183,6 +183,23 @@ func sysServiceLeasePayload(unit, action string) (string, error) {
 		return "", errors.New("bad_unit")
 	}
 	return unit + "\n" + action, nil
+}
+
+// sysPackageLeasePayload is the signed payload of a sys_package lease
+// (docs/sah-os-management-design.md): "<name>\n<action>". The agent rebuilds
+// it from the name and verb it is about to act on, so a lease for one package
+// or verb never authorizes another. action is one of sysPackageActions
+// (sys_policy.go), byte-for-byte the server's PACKAGE_LEASE_ACTIONS
+// (controlplane/lease.js). The name shape mirrors the server's
+// PACKAGE_NAME_RE and the agent's packageNameRE (grant.go).
+func sysPackageLeasePayload(name, action string) (string, error) {
+	if _, ok := sysPackageActions[action]; !ok {
+		return "", errors.New("bad_action")
+	}
+	if !packageNameRE.MatchString(name) {
+		return "", errors.New("bad_name")
+	}
+	return name + "\n" + action, nil
 }
 
 const (

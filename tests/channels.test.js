@@ -455,3 +455,54 @@ test('service policy: binding, allowlist, decision, and the sys_service lease', 
   assert.throws(() => lease.sysServicePayload('nginx.service', 'reload'), /bad_payload/);
   assert.throws(() => lease.sysServicePayload('nginx\n.service', 'restart'), /bad_payload/);
 });
+
+test('package policy: binding, allowlist, decision, and the sys_package lease', async () => {
+  const lease = require('../controlplane/lease');
+  // Binding: the four package verbs; a bad name or verb is refused.
+  for (const action of ['query', 'install', 'remove', 'upgrade']) {
+    assert.deepEqual(ch.validatePackageBinding({ name: 'nginx', action }),
+      { ok: true, package: { name: 'nginx', action } });
+  }
+  assert.equal(ch.validatePackageBinding({ name: 'ng*nx', action: 'install' }).error, 'bad_package');
+  assert.equal(ch.validatePackageBinding({ name: 'nginx', action: 'search' }).error, 'bad_action');
+  assert.equal(ch.validatePackageBinding(null).error, 'bad_package');
+
+  // Policy parse: a well-formed name list, else null (deny-all). "*" is never
+  // a valid name, so the list is never allow-all.
+  assert.deepEqual(ch.parsePackagePolicy({ names: ['nginx', 'curl'] }), { names: ['nginx', 'curl'] });
+  assert.deepEqual(ch.parsePackagePolicy(null), { names: [] });
+  assert.equal(ch.parsePackagePolicy({ names: 'all' }), null);
+  assert.equal(ch.parsePackagePolicy({ names: ['*'] }), null);
+  assert.equal(ch.parsePackagePolicy({ names: ['bad name'] }), null);
+  assert.equal(ch.parsePackagePolicy([]), null);
+
+  // Allowlist membership (deny by default).
+  assert.equal(ch.packagePolicyAllows({ names: ['nginx'] }, 'nginx'), true);
+  assert.equal(ch.packagePolicyAllows({ names: ['nginx'] }, 'curl'), false);
+  assert.equal(ch.packagePolicyAllows(null, 'nginx'), false);
+
+  // policyDecision against a registry: listed name allowed, others denied, and
+  // a host with no policy denies everything.
+  const reg = new MemoryRegistry({ NODE_ENV: 'test' });
+  const pub2 = opensshEd25519(Buffer.alloc(32, 8));
+  await reg.enroll({ tenantId: 'acme', userId: 'u', keyId: 'k', hostId: HOST_A, hostname: 'a.example', os: 'linux', platform: 'amd64', sshPubkey: pub2 });
+  assert.equal(await ch.policyDecision(reg, HOST_A, 'sys:package', { sys: { name: 'nginx', action: 'install' } }), 'package_denied');
+  await reg.setHostChannelPolicy(HOST_A, { package_policy: { names: ['nginx'] } });
+  assert.equal(await ch.policyDecision(reg, HOST_A, 'sys:package', { sys: { name: 'nginx', action: 'install' } }), null);
+  assert.equal(await ch.policyDecision(reg, HOST_A, 'sys:package', { sys: { name: 'curl', action: 'install' } }), 'package_denied');
+  await assert.rejects(reg.setHostChannelPolicy(HOST_A, { package_policy: { names: ['*'] } }), /bad_policy/);
+
+  // The sys_package lease signs "<name>\n<action>"; a tampered name or verb
+  // fails verification, and the verb must be a package verb.
+  const svcSigner = buildSigner(privateKeyFromSeed(TEST_SEED), rawPublicKey(privateKeyFromSeed(TEST_SEED)));
+  const svcPub = require('node:crypto').createPublicKey(privateKeyFromSeed(TEST_SEED));
+  const now = Date.now();
+  const payload = lease.sysPackagePayload('nginx', 'install');
+  assert.equal(payload, 'nginx\ninstall');
+  const pl = lease.issueLease(svcSigner, { hostId: HOST_A, action: 'sys_package', payload, now });
+  assert.equal(lease.verifyLease(svcPub, pl, payload, now).ok, true);
+  assert.equal(lease.verifyLease(svcPub, pl, lease.sysPackagePayload('nginx', 'remove'), now).error, 'payload_mismatch');
+  assert.equal(lease.verifyLease(svcPub, pl, lease.sysPackagePayload('curl', 'install'), now).error, 'payload_mismatch');
+  assert.throws(() => lease.sysPackagePayload('nginx', 'search'), /bad_payload/);
+  assert.throws(() => lease.sysPackagePayload('ng*nx', 'install'), /bad_payload/);
+});

@@ -13,10 +13,14 @@
 // server's own state and config, PostgreSQL's data), beneath one, nor a
 // parent of one (so /var/lib is refused too), and --service entries are unit
 // names on a per-host allowlist (deny by default; the sys:service channel may
-// act only on a listed unit), and the host must resolve to exactly one host of the
-// named tenant. `set` replaces ALL THREE host columns, so nothing from an earlier
+// act only on a listed unit), and --package entries are package names on a
+// per-host allowlist (deny by default; each must match the package-name shape
+// so "*" is never allow-all; the sys:package channel may act only on a listed
+// name), and the host must resolve to exactly one host of the
+// named tenant. `set` replaces ALL host policy columns, so nothing from an earlier
 // policy lingers; `clear` is an explicit deny on the host (tcp_policy
-// {allow:[]}, file_policy {roots:[]}, service_policy {units:[]}), which a tenant default does not
+// {allow:[]}, file_policy {roots:[]}, service_policy {units:[]}, package_policy {names:[]}),
+// which a tenant default does not
 // override; `inherit` sets all three to null (back to the tenant default, else
 // deny). Every set, clear and inherit appends an audit-chain row (actor
 // "cli:channel-policy", the operator's required --reason, the old and new
@@ -31,7 +35,7 @@
 //
 // Usage: node scripts/channel-policy.js show  --tenant <t> --host <hostname|host_id>
 //        node scripts/channel-policy.js set   --tenant <t> --host <hostname|host_id> --reason <text>
-//               [--tcp-local <port>]... [--file-read <dir>]... [--file-write <dir>]... [--service <unit>]...
+//               [--tcp-local <port>]... [--file-read <dir>]... [--file-write <dir>]... [--service <unit>]... [--package <name>]...
 //        node scripts/channel-policy.js clear --tenant <t> --host <hostname|host_id> --reason <text>
 //        node scripts/channel-policy.js inherit --tenant <t> --host <hostname|host_id> --reason <text>
 // Database and env file: as scripts/sso-bind.js (ENV_FILE, else
@@ -40,7 +44,7 @@
 
 const path = require('node:path');
 const { validateTenant } = require('../controlplane/sshkey');
-const { validateFileRoot, effectivePolicies, SERVICE_UNIT_RE } = require('../controlplane/channels');
+const { validateFileRoot, effectivePolicies, SERVICE_UNIT_RE, PACKAGE_NAME_RE } = require('../controlplane/channels');
 
 const ACTOR = 'cli:channel-policy';
 const MAX_ENTRIES = 16;
@@ -48,17 +52,17 @@ const HOST_RE = /^[A-Za-z0-9._-]{1,253}$/;
 const SYSTEM_ROOTS = ['/proc', '/sys', '/dev', '/boot', '/etc', '/root', '/var/lib/systemapi-agent',
   '/etc/systemapi-agent', '/var/lib/postgresql', '/etc/sahcore'];
 const USAGE = 'usage: node scripts/channel-policy.js show|set|clear|inherit --tenant <t> --host <hostname|host_id> '
-  + '[--reason <text>, required except for show] [--tcp-local <port>]... [--file-read <dir>]... [--file-write <dir>]... [--service <unit>]...';
+  + '[--reason <text>, required except for show] [--tcp-local <port>]... [--file-read <dir>]... [--file-write <dir>]... [--service <unit>]... [--package <name>]...';
 const REASON_MAX = 256;
 const COMMANDS = new Set(['show', 'set', 'clear', 'inherit']);
 // What each writing command stores in the two host columns and its audit
 // action. clear is an explicit deny; inherit (null) defers to the tenant.
 const WRITES = {
-  clear: { action: 'channel_policy_clear', policy: () => ({ tcp_policy: { allow: [] }, file_policy: { roots: [] }, service_policy: { units: [] } }) },
-  inherit: { action: 'channel_policy_inherit', policy: () => ({ tcp_policy: null, file_policy: null, service_policy: null }) }
+  clear: { action: 'channel_policy_clear', policy: () => ({ tcp_policy: { allow: [] }, file_policy: { roots: [] }, service_policy: { units: [] }, package_policy: { names: [] } }) },
+  inherit: { action: 'channel_policy_inherit', policy: () => ({ tcp_policy: null, file_policy: null, service_policy: null, package_policy: null }) }
 };
 const ONCE_FLAGS = new Set(['--tenant', '--host', '--reason']);
-const LIST_FLAGS = new Set(['--tcp-local', '--file-read', '--file-write', '--service']);
+const LIST_FLAGS = new Set(['--tcp-local', '--file-read', '--file-write', '--service', '--package']);
 
 function fail(code, message = code) {
   const err = new Error(message);
@@ -84,6 +88,13 @@ function parseUnit(text) {
   return text;
 }
 
+function parsePackage(text) {
+  if (typeof text !== 'string' || !PACKAGE_NAME_RE.test(text)) {
+    throw usage(`bad --package: ${JSON.stringify(text)} is not a package name (letters, digits, ".+_-", at most 128; no "*")`);
+  }
+  return text;
+}
+
 function parseDir(flag, text) {
   if (text === '/' || text === '~') throw usage(`bad ${flag}: "${text}" is too wide; name one directory`);
   const checked = validateFileRoot(text, 'file:write');
@@ -99,7 +110,7 @@ function parseArgs(argv) {
   if (!Array.isArray(argv) || argv.length === 0 || !COMMANDS.has(argv[0])) throw usage();
   const command = argv[0];
   const once = {};
-  const lists = { '--tcp-local': [], '--file-read': [], '--file-write': [], '--service': [] };
+  const lists = { '--tcp-local': [], '--file-read': [], '--file-write': [], '--service': [], '--package': [] };
   for (let i = 1; i < argv.length; i += 1) {
     const flag = argv[i];
     if (i + 1 >= argv.length) throw usage();
@@ -138,11 +149,12 @@ function parseArgs(argv) {
   const reads = [...new Set(lists['--file-read'].map((d) => parseDir('--file-read', d)))]
     .filter((d) => !writes.includes(d));
   const units = [...new Set(lists['--service'].map(parseUnit))].sort();
-  if (ports.length === 0 && reads.length === 0 && writes.length === 0 && units.length === 0) {
-    throw usage('set needs at least one --tcp-local, --file-read, --file-write or --service; use clear to deny all, inherit for the tenant default');
+  const names = [...new Set(lists['--package'].map(parsePackage))].sort();
+  if (ports.length === 0 && reads.length === 0 && writes.length === 0 && units.length === 0 && names.length === 0) {
+    throw usage('set needs at least one --tcp-local, --file-read, --file-write, --service or --package; use clear to deny all, inherit for the tenant default');
   }
-  if (ports.length > MAX_ENTRIES || reads.length + writes.length > MAX_ENTRIES || units.length > MAX_ENTRIES) {
-    throw usage(`at most ${MAX_ENTRIES} ports, ${MAX_ENTRIES} directories and ${MAX_ENTRIES} units`);
+  if (ports.length > MAX_ENTRIES || reads.length + writes.length > MAX_ENTRIES || units.length > MAX_ENTRIES || names.length > MAX_ENTRIES) {
+    throw usage(`at most ${MAX_ENTRIES} ports, ${MAX_ENTRIES} directories, ${MAX_ENTRIES} units and ${MAX_ENTRIES} packages`);
   }
   out.tcpPolicy = { allow: ports.length ? [{ local: true, ports }] : [] };
   out.filePolicy = {
@@ -152,6 +164,7 @@ function parseArgs(argv) {
     ]
   };
   out.servicePolicy = { units };
+  out.packagePolicy = { names };
   return out;
 }
 
@@ -174,9 +187,11 @@ async function summary(registry, host) {
     host_tcp_policy: raw.host_tcp_policy ?? null,
     host_file_policy: raw.host_file_policy ?? null,
     host_service_policy: raw.host_service_policy ?? null,
+    host_package_policy: raw.host_package_policy ?? null,
     effective_tcp_policy: effective.tcp,
     effective_file_policy: effective.file,
-    effective_service_policy: effective.service
+    effective_service_policy: effective.service,
+    effective_package_policy: effective.package
   };
 }
 
@@ -191,7 +206,7 @@ async function run(argv, { registry }) {
   if (args.command === 'show') return summary(registry, host);
 
   const next = args.command === 'set'
-    ? { tcp_policy: args.tcpPolicy, file_policy: args.filePolicy, service_policy: args.servicePolicy }
+    ? { tcp_policy: args.tcpPolicy, file_policy: args.filePolicy, service_policy: args.servicePolicy, package_policy: args.packagePolicy }
     : WRITES[args.command].policy();
   const action = args.command === 'set' ? 'channel_policy_set' : WRITES[args.command].action;
   try {
@@ -201,6 +216,7 @@ async function run(argv, { registry }) {
       tcpPolicy: next.tcp_policy,
       filePolicy: next.file_policy,
       servicePolicy: next.service_policy,
+      packagePolicy: next.package_policy,
       actor: ACTOR,
       action,
       reason: args.reason

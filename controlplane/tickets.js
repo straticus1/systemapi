@@ -16,15 +16,20 @@ const { randomToken } = require('./token');
 const TTL_MS = 60_000;
 // The sys:service channel verbs; the lease binds the exact { unit, action }.
 const SERVICE_ACTIONS = new Set(['start', 'stop', 'restart', 'enable', 'disable']);
+// The sys:package channel verbs; the lease binds the exact { name, action }.
+const PACKAGE_ACTIONS = new Set(['query', 'install', 'remove', 'upgrade']);
 
 function frozenTarget(target) {
   if (!target) return null;
   return Object.freeze({ host: target.host, port: target.port });
 }
 
+// The sys:* binding ({ unit, action } for service, { name, action } for
+// package, ...). Frozen as a shallow copy so the stored binding cannot be
+// mutated after issue; bindingOk validates its shape per purpose at consume.
 function frozenSys(sys) {
-  if (!sys) return null;
-  return Object.freeze({ unit: sys.unit, action: sys.action });
+  if (!sys || typeof sys !== 'object') return null;
+  return Object.freeze({ ...sys });
 }
 
 // auth ({ kind, keyId, groupRole }) is what the upgrade needs to re-check the
@@ -68,6 +73,14 @@ function bindingOk(row, expect) {
     if (expect && expect.sys !== undefined) {
       const s = expect.sys;
       if (!s || s.unit !== row.sys.unit || s.action !== row.sys.action) return false;
+    }
+    return true;
+  }
+  if (row.purpose === 'sys:package') {
+    if (!row.sys || typeof row.sys.name !== 'string' || !PACKAGE_ACTIONS.has(row.sys.action)) return false;
+    if (expect && expect.sys !== undefined) {
+      const s = expect.sys;
+      if (!s || s.name !== row.sys.name || s.action !== row.sys.action) return false;
     }
     return true;
   }

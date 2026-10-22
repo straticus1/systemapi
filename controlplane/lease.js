@@ -35,12 +35,12 @@ const crypto = require('node:crypto');
 const { validateFileRoot } = require('./channels');
 const { randomBytes, timingSafeEqual } = crypto;
 
-const ACTIONS = new Set(['sysscript', 'pty', 'pty_root', 'breakglass', 'tcp', 'file', 'file_root', 'xfer', 'xfer_root', 'sys_service']);
+const ACTIONS = new Set(['sysscript', 'pty', 'pty_root', 'breakglass', 'tcp', 'file', 'file_root', 'xfer', 'xfer_root', 'sys_service', 'sys_package']);
 const TERMINAL_ACTIONS = new Set(['pty', 'pty_root', 'breakglass']);
 const CHANNEL_ACTIONS = new Set(['tcp', 'file', 'file_root']);
 const XFER_ACTIONS = new Set(['xfer', 'xfer_root']);
-// SAH OS-management channel actions (docs/sah-os-management-design.md Phase 1).
-const SYS_ACTIONS = new Set(['sys_service']);
+// SAH OS-management channel actions (docs/sah-os-management-design.md).
+const SYS_ACTIONS = new Set(['sys_service', 'sys_package']);
 // Actions whose hash covers "<action>\n<payload>".
 const SESSION_ACTIONS = new Set([...TERMINAL_ACTIONS, ...CHANNEL_ACTIONS, ...XFER_ACTIONS, ...SYS_ACTIONS]);
 // Service/unit name guard; mirrors systemapi-agent/platform.go serviceNameRE.
@@ -183,6 +183,19 @@ function sysServicePayload(unit, action) {
   return `${unit}\n${action}`;
 }
 
+// sys_package lease payload (docs/sah-os-management-design.md): "<name>\n
+// <action>". action is one of PACKAGE_LEASE_ACTIONS; the agent rebuilds this
+// from the name and verb it is about to act on (systemapi-agent/lease.go
+// sysPackageLeasePayload), so a lease for one package or verb never acts on
+// another. name mirrors the agent's packageNameRE (grant.go).
+const PACKAGE_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9.+_-]{0,127}$/;
+const PACKAGE_LEASE_ACTIONS = new Set(['query', 'install', 'remove', 'upgrade']);
+function sysPackagePayload(name, action) {
+  if (typeof name !== 'string' || !PACKAGE_NAME_RE.test(name)) throw badPayload();
+  if (!PACKAGE_LEASE_ACTIONS.has(action)) throw badPayload();
+  return `${name}\n${action}`;
+}
+
 // A watch reason: 1..256 UTF-8 bytes of printable characters with some
 // non-space content; no tab, newline or other control character, and no
 // U+FFFD (the agent refuses all of these as bad_request).
@@ -281,6 +294,7 @@ module.exports = {
   tcpPayload,
   filePayload,
   sysServicePayload,
+  sysPackagePayload,
   xferPayload,
   xferMaterial,
   peerAddress,

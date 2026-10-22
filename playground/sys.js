@@ -1,45 +1,91 @@
 /**
- * Service-management channel, server side (docs/sah-os-management-design.md
- * Phase 1), modelled on playground/tcp.js. One WebSocket carries one service
- * operation: a service lifecycle verb (start/stop/restart/enable/disable),
- * with the agent's status read as the
- * confirm. It is request/response, not a byte stream, so there is no credit
- * mux: the client opens the socket, the server mints a signed sys_service
- * lease and forwards one frame to the agent, and the agent answers one
- * sys_result.
+ * OS-management channel, server side (docs/sah-os-management-design.md),
+ * modelled on playground/tcp.js. One WebSocket carries one OS-management
+ * operation, selected by the ticket's `purpose`:
+ *   - sys:service  a service lifecycle verb (start/stop/restart/enable/disable),
+ *                  with the agent's status read as the confirm;
+ *   - sys:package  a package verb (query/install/remove/upgrade).
+ * It is request/response, not a byte stream, so there is no credit mux: the
+ * client opens the socket, the server mints a signed lease bound to the exact
+ * resource and verb, forwards one frame to the agent, and the agent answers
+ * one sys_result. One SysChannels instance multiplexes every sys purpose over
+ * the one /api/v1/systems/sys/ route; each purpose is described by an entry in
+ * SYS_RESOURCES.
  *
- * Threats: a service restart is root-equivalent. The ticket's bound { unit,
- * action } is re-validated and the actor's scope and the host's service
- * allowlist are re-checked at the upgrade (recheckChannelTicket); the lease
- * signs the exact unit and action so the agent acts only on what was signed; a
- * host that does not advertise the `service` capability is refused
- * agent_unsupported; the ticket is single-use (consumed on first upgrade) so
- * it cannot be replayed; and every operation leaves an intent row before the
- * request is forwarded and a result row after (both auditable, the result row
- * retried like tcp_end). A request without a result in time ends with timeout
- * and still writes its result row. Caps bound how many operations one actor or
- * one agent can have in flight. Does NOT stream or record any content, and
- * does NOT persist a request across a server restart.
+ * Threats: every sys write is root-equivalent. The ticket's bound resource
+ * (unit/action or name/action) is re-validated and the actor's scope and the
+ * host's per-resource allowlist are re-checked at the upgrade
+ * (recheckChannelTicket); the lease signs the exact resource and verb so the
+ * agent acts only on what was signed; a host that does not advertise the
+ * resource's capability is refused agent_unsupported; the ticket is single-use
+ * (consumed on first upgrade) so it cannot be replayed; and every operation
+ * leaves an intent row before the request is forwarded and a result row after
+ * (both auditable, the result row retried like tcp_end). A request without a
+ * result in time ends with timeout and still writes its result row. Caps bound
+ * how many operations one actor or one agent can have in flight. Does NOT
+ * stream or record any content, and does NOT persist a request across a server
+ * restart.
  */
 'use strict';
 
 const WebSocket = require('ws');
 const { ticketFromRequest } = require('../controlplane/httpauth');
 const { consumeTicket } = require('../controlplane/tickets');
-const { issueLease, sysServicePayload } = require('../controlplane/lease');
-const { validateServiceBinding } = require('../controlplane/channels');
+const { issueLease, sysServicePayload, sysPackagePayload } = require('../controlplane/lease');
+const { validateServiceBinding, validatePackageBinding } = require('../controlplane/channels');
 const { randomToken } = require('../controlplane/token');
 const { envInt, unref, sendJSON, channelUpgradeHost, recheckChannelTicket, appendAuditRetrying } = require('./channel');
 
-const SYS_PURPOSE = 'sys:service';
 const SYS_LEASE_TTL_S = 60;
 const SYS_RESULT_TIMEOUT_MS = 30_000;
 const SYS_PER_ACTOR_DEFAULT = 16;
 const SYS_PER_AGENT = 64;
 const SYS_ERRORS = new Set([
     'ticket_invalid', 'scope_denied', 'agent_offline', 'agent_unsupported', 'lease_required', 'unit_denied',
-    'cap_reached', 'protocol_error', 'timeout', 'agent_disconnected', 'internal'
+    'package_denied', 'cap_reached', 'protocol_error', 'timeout', 'agent_disconnected', 'internal'
 ]);
+
+// Per-purpose description of one sys resource. Each binds one capability, one
+// lease action, one agent frame type and one audit resource name; the lease
+// payload and agent frame carry the exact signed resource and verb, and the
+// result payload records the resource-specific fields on the chain.
+const SYS_RESOURCES = {
+    'sys:service': {
+        capability: 'service',
+        leaseAction: 'sys_service',
+        frameType: 'sys_service',
+        // Returns { ok, binding } where binding is the frozen { unit, action }.
+        validate: (sys) => {
+            const c = validateServiceBinding(sys);
+            return c.ok ? { ok: true, binding: c.service } : { ok: false };
+        },
+        leasePayload: (b) => sysServicePayload(b.unit, b.action),
+        agentFields: (b) => ({ unit: b.unit, action: b.action }),
+        intentAction: 'sys_service_intent',
+        resultAction: 'sys_service_result',
+        resourceFields: (b) => ({ unit: b.unit, action: b.action }),
+        resultFields: (r) => ({
+            result_state: typeof r.state === 'string' ? r.state : null,
+            result_active: typeof r.active === 'boolean' ? r.active : null
+        })
+    },
+    'sys:package': {
+        capability: 'package',
+        leaseAction: 'sys_package',
+        frameType: 'sys_package',
+        // Returns { ok, binding } where binding is the frozen { name, action }.
+        validate: (pkg) => {
+            const c = validatePackageBinding(pkg);
+            return c.ok ? { ok: true, binding: c.package } : { ok: false };
+        },
+        leasePayload: (b) => sysPackagePayload(b.name, b.action),
+        agentFields: (b) => ({ name: b.name, action: b.action }),
+        intentAction: 'sys_package_intent',
+        resultAction: 'sys_package_result',
+        resourceFields: (b) => ({ name: b.name, action: b.action }),
+        resultFields: (r) => ({ output: typeof r.output === 'string' ? r.output : null })
+    }
+};
 
 class SysChannels {
     constructor(fm) {
@@ -103,14 +149,16 @@ class SysChannels {
             this.failSocket(ws, 'ticket_invalid');
             return;
         }
-        // Consumed on first upgrade, even when host or purpose do not match.
-        const purpose = parsed.searchParams.get('purpose') || SYS_PURPOSE;
+        // The purpose names the resource; an unknown purpose still consumes the
+        // ticket (consumeTicket deletes it even on a mismatch) before refusing.
+        const purpose = parsed.searchParams.get('purpose') || '';
+        const resource = SYS_RESOURCES[purpose] || null;
         const row = consumeTicket(fm.tickets, ticketRes.ticket, hostId, purpose);
-        if (!row || purpose !== SYS_PURPOSE) {
+        if (!row || !resource) {
             this.failSocket(ws, 'ticket_invalid');
             return;
         }
-        const checked = validateServiceBinding(row.sys);
+        const checked = resource.validate(row.sys);
         if (!checked.ok) {
             this.failSocket(ws, 'ticket_invalid');
             return;
@@ -119,7 +167,7 @@ class SysChannels {
             this.failSocket(ws, 'lease_required');
             return;
         }
-        const denied = await recheckChannelTicket(fm.registry, row, SYS_PURPOSE, { sys: checked.service });
+        const denied = await recheckChannelTicket(fm.registry, row, purpose, { sys: checked.binding });
         if (early.closed || early.failed) return;
         if (denied) {
             this.failSocket(ws, denied);
@@ -130,7 +178,7 @@ class SysChannels {
             this.failSocket(ws, 'agent_offline');
             return;
         }
-        if (!fm.agentSupports(hostId, 'service')) {
+        if (!fm.agentSupports(hostId, resource.capability)) {
             this.failSocket(ws, 'agent_unsupported');
             return;
         }
@@ -143,13 +191,13 @@ class SysChannels {
         }
 
         const requestId = `sys_${randomToken(16)}`;
-        const service = checked.service;
+        const binding = checked.binding;
         let lease;
         try {
             lease = issueLease(fm.signer, {
                 hostId,
-                action: 'sys_service',
-                payload: sysServicePayload(service.unit, service.action),
+                action: resource.leaseAction,
+                payload: resource.leasePayload(binding),
                 ttl: SYS_LEASE_TTL_S
             });
         } catch (err) {
@@ -162,7 +210,8 @@ class SysChannels {
             tenantId: row.tenantId,
             actor,
             auth: row.auth || null,
-            service,
+            resource,
+            binding,
             client: ws,
             agent: agentWs,
             ended: false,
@@ -182,8 +231,8 @@ class SysChannels {
                 tenant_id: s.tenantId,
                 host_id: s.hostId,
                 actor: s.actor,
-                action: 'sys_service_intent',
-                payload: { request_id: s.id, unit: service.unit, action: service.action }
+                action: resource.intentAction,
+                payload: { request_id: s.id, ...resource.resourceFields(binding) }
             });
         } catch (err) {
             console.error('[Fleet] sys intent audit failed:', err.message);
@@ -192,7 +241,7 @@ class SysChannels {
         }
         if (s.ended) return;
         sendJSON(ws, { type: 'sys_status', payload: { status: 'forwarded', request_id: s.id } });
-        sendJSON(agentWs, { type: 'sys_service', request_id: s.id, unit: service.unit, action: service.action, lease });
+        sendJSON(agentWs, { type: resource.frameType, request_id: s.id, ...resource.agentFields(binding), lease });
         s.resultTimer = unref(setTimeout(() => this.end(s, 'timeout', { error: 'timeout' }), this.resultWaitMs));
     }
 
@@ -249,19 +298,18 @@ class SysChannels {
         this.finalize(s);
     }
 
-    // Writes the sys_service_result row once, retried like tcp_end.
+    // Writes the resource's result row once, retried like tcp_end.
     finalize(s) {
         if (s.finalized) return;
         s.finalized = true;
         const r = s.result || {};
+        const resource = s.resource;
         const payload = {
             request_id: s.id,
-            unit: s.service.unit,
-            action: s.service.action,
+            ...resource.resourceFields(s.binding),
             reason: s.endReason,
             ok: r.ok === true,
-            result_state: typeof r.state === 'string' ? r.state : null,
-            result_active: typeof r.active === 'boolean' ? r.active : null,
+            ...resource.resultFields(r),
             error: typeof r.error === 'string' ? r.error : null,
             duration_s: Math.round((Date.now() - s.startedMs) / 1000)
         };
@@ -270,7 +318,7 @@ class SysChannels {
             tenant_id: s.tenantId,
             host_id: s.hostId,
             actor: s.actor,
-            action: 'sys_service_result',
+            action: resource.resultAction,
             payload
         }, fm.auditRetryDelaysMs, (err) => {
             console.error('[Fleet] sys result audit failed:', err && err.message);
@@ -280,4 +328,4 @@ class SysChannels {
     }
 }
 
-module.exports = { SysChannels, SYS_ERRORS, SYS_PER_AGENT };
+module.exports = { SysChannels, SYS_ERRORS, SYS_PER_AGENT, SYS_RESOURCES };

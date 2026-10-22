@@ -65,6 +65,13 @@ ALTER TABLE cp_tenants ADD COLUMN IF NOT EXISTS file_policy JSONB;
 -- and malformed-is-deny-all rules as the tcp/file policies above.
 ALTER TABLE cp_hosts ADD COLUMN IF NOT EXISTS service_policy JSONB;
 ALTER TABLE cp_tenants ADD COLUMN IF NOT EXISTS service_policy JSONB;
+-- SAH OS-management package policy (docs/sah-os-management-design.md):
+-- { "names": ["nginx", ...] }, the per-host/tenant allowlist of package names
+-- the sys:package channel may query/install/remove/upgrade. Same host-replaces-
+-- tenant, deny-by-default and malformed-is-deny-all rules as the policies above;
+-- each name must match the package-name shape, so "*" is never allow-all.
+ALTER TABLE cp_hosts ADD COLUMN IF NOT EXISTS package_policy JSONB;
+ALTER TABLE cp_tenants ADD COLUMN IF NOT EXISTS package_policy JSONB;
 
 -- Host retirement (POST /api/v1/hosts/:host_id/retire). A retired row is
 -- kept for audit but never resolves, is left out of the fleet listing by

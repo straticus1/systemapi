@@ -16,12 +16,14 @@ const FleetManager = require('../playground/fleet');
 const { MemoryRegistry } = require('../controlplane/registry');
 const { TEST_SEED, privateKeyFromSeed, rawPublicKey, buildSigner } = require('../controlplane/keys');
 const { issueTicket } = require('../controlplane/tickets');
-const { verifyLease, sysServicePayload } = require('../controlplane/lease');
+const { verifyLease, sysServicePayload, sysPackagePayload } = require('../controlplane/lease');
 
 const HOST_A = '11111111-1111-4111-8111-111111111111';
 const PUBLIC_KEY = crypto.createPublicKey(privateKeyFromSeed(TEST_SEED));
 const UNIT = 'nginx.service';
 const POLICY = { units: [UNIT] };
+const PKG = 'nginx';
+const PKG_POLICY = { names: [PKG] };
 
 function signer() {
   const key = privateKeyFromSeed(TEST_SEED);
@@ -278,6 +280,150 @@ test('the agent going away ends an in-flight request and writes its result row',
     await failsWith(client, 'agent_disconnected');
     await waitUntil('result row', () => auditRows(r, 'sys_service_result').length === 1);
     assert.equal(auditRows(r, 'sys_service_result')[0].payload.reason, 'agent_disconnected');
+  } finally {
+    await r.close();
+  }
+});
+
+// --- sys:package ---
+
+// Connects a fake package-capable agent that answers every sys_package with a
+// sys_result (ok unless opts.fail).
+async function connectPackageAgent(r, { caps = 'pty,package', policy = PKG_POLICY, autoAnswer = true, fail = false } = {}) {
+  const ws = r.track(new WebSocket(`${r.base}/api/v1/systems/stream`, {
+    headers: {
+      authorization: 'Bearer agent-key',
+      'x-systemapi-tenant': 'acme',
+      'x-systemapi-host-id': HOST_A,
+      'x-systemapi-hostname': 'a.example',
+      'x-systemapi-ssh-pubkey': opensshEd25519(r.fm.signer.publicKeyRaw),
+      ...(caps === null ? {} : { 'x-systemapi-capabilities': caps })
+    }
+  }));
+  const box = collect(ws);
+  await waitUntil('enrolled', () => box.frames.find((f) => f.type === 'enrolled'));
+  if (policy) await r.fm.registry.setHostChannelPolicy(HOST_A, { package_policy: policy });
+  const agent = { ws, box, requests: [] };
+  ws.on('message', (data, isBinary) => {
+    if (isBinary) return;
+    const msg = JSON.parse(data.toString());
+    if (msg.type !== 'sys_package') return;
+    agent.requests.push(msg);
+    if (!autoAnswer) return;
+    ws.send(JSON.stringify({
+      type: 'sys_result',
+      request_id: msg.request_id,
+      payload: fail
+        ? { ok: false, name: msg.name, action: msg.action, error: 'action_failed' }
+        : { ok: true, name: msg.name, action: msg.action, output: `ran ${msg.action} ${msg.name}` }
+    }));
+  });
+  return agent;
+}
+
+function pkgTicketFor(r, { name = PKG, action = 'install', actor = 'user-1', auth = null } = {}) {
+  return issueTicket(r.fm.tickets, { hostId: HOST_A, purpose: 'sys:package', tenantId: 'acme', actor, auth, sys: { name, action } });
+}
+
+function openPkg(r, { ticket, name, action } = {}) {
+  const t = ticket || pkgTicketFor(r, { name, action });
+  const ws = r.track(new WebSocket(`${r.base}/api/v1/systems/sys/${HOST_A}?ticket=${t}&purpose=sys:package`));
+  return { ws, box: collect(ws), ticket: t };
+}
+
+test('package install runs end to end: signed lease, agent result, intent and result audit rows', async () => {
+  const r = await rig();
+  try {
+    const agent = await connectPackageAgent(r);
+    const client = openPkg(r, { action: 'install' });
+    const req = await waitUntil('sys_package frame', () => agent.requests[0]);
+    assert.equal(req.name, PKG);
+    assert.equal(req.action, 'install');
+    // The lease signs the exact name and verb.
+    assert.equal(verifyLease(PUBLIC_KEY, req.lease, sysPackagePayload(PKG, 'install')).ok, true);
+    assert.equal(req.lease.action, 'sys_package');
+    assert.equal(verifyLease(PUBLIC_KEY, req.lease, sysPackagePayload(PKG, 'remove')).ok, false);
+
+    const result = await waitUntil('sys_result', () => okResult(client.box));
+    assert.equal(result.payload.name, PKG);
+
+    await waitUntil('audit rows', () => auditRows(r, 'sys_package_result').length === 1);
+    const intent = auditRows(r, 'sys_package_intent');
+    const done = auditRows(r, 'sys_package_result');
+    assert.equal(intent.length, 1);
+    assert.deepEqual([intent[0].payload.name, intent[0].payload.action], [PKG, 'install']);
+    assert.equal(done.length, 1);
+    assert.equal(done[0].payload.ok, true);
+    assert.equal(done[0].payload.request_id, intent[0].payload.request_id);
+    assert.equal((await r.fm.registry.verifyAudit()).ok, true);
+  } finally {
+    await r.close();
+  }
+});
+
+test('package query (a read) still rides the lease and writes both audit rows', async () => {
+  const r = await rig();
+  try {
+    const agent = await connectPackageAgent(r);
+    const client = openPkg(r, { action: 'query' });
+    const req = await waitUntil('sys_package frame', () => agent.requests[0]);
+    assert.equal(req.action, 'query');
+    await waitUntil('sys_result', () => okResult(client.box));
+    await waitUntil('result row', () => auditRows(r, 'sys_package_result').length === 1);
+    assert.equal(auditRows(r, 'sys_package_intent')[0].payload.action, 'query');
+  } finally {
+    await r.close();
+  }
+});
+
+test('a package the host policy does not allow is refused at the upgrade', async () => {
+  const r = await rig();
+  try {
+    await connectPackageAgent(r); // policy allows only nginx
+    const client = openPkg(r, { ticket: pkgTicketFor(r, { name: 'curl' }) });
+    await failsWith(client, 'package_denied');
+    assert.equal(auditRows(r, 'sys_package_intent').length, 0);
+  } finally {
+    await r.close();
+  }
+});
+
+test('a host that does not advertise the package capability is refused', async () => {
+  const r = await rig();
+  try {
+    await connectPackageAgent(r, { caps: 'pty,service' }); // no package capability
+    const client = openPkg(r);
+    await failsWith(client, 'agent_unsupported');
+    assert.equal(auditRows(r, 'sys_package_intent').length, 0);
+  } finally {
+    await r.close();
+  }
+});
+
+test('a single-use package ticket cannot be replayed', async () => {
+  const r = await rig();
+  try {
+    await connectPackageAgent(r);
+    const first = openPkg(r);
+    await waitUntil('first result', () => first.box.frames.find((f) => f.type === 'sys_result'));
+    const replay = openPkg(r, { ticket: first.ticket });
+    await failsWith(replay, 'ticket_invalid');
+  } finally {
+    await r.close();
+  }
+});
+
+test('a failed package op records ok:false and a result row', async () => {
+  const r = await rig();
+  try {
+    await connectPackageAgent(r, { fail: true });
+    const client = openPkg(r);
+    await waitUntil('sys_result', () => client.box.frames.find((f) => f.type === 'sys_result'));
+    const f = client.box.frames.find((x) => x.type === 'sys_result');
+    assert.equal(f.payload.ok, false);
+    assert.equal(f.payload.error, 'action_failed');
+    await waitUntil('result row', () => auditRows(r, 'sys_package_result').length === 1);
+    assert.equal(auditRows(r, 'sys_package_result')[0].payload.ok, false);
   } finally {
     await r.close();
   }
