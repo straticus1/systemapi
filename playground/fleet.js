@@ -57,6 +57,7 @@ const { CreditLedger } = require('../controlplane/credit');
 const { deliverWebhooks, COOLDOWN_MS } = require('../controlplane/router');
 const { TcpChannels } = require('./tcp');
 const { FileChannels } = require('./file');
+const { SysChannels } = require('./sys');
 const { XferGrants } = require('./xfer');
 const { TerminalWatches } = require('./watch');
 const { rejectUpgrade } = require('./channel');
@@ -184,6 +185,8 @@ class FleetManager {
         this.tcp = new TcpChannels(this);
         // File channel sessions (playground/file.js).
         this.file = new FileChannels(this);
+        // Service-management channel sessions (playground/sys.js).
+        this.sys = new SysChannels(this);
         // sahxfer grants (playground/xfer.js).
         this.xfer = new XferGrants(this);
         // Terminal session watches (playground/watch.js).
@@ -232,6 +235,10 @@ class FleetManager {
         }
         if (parsed.pathname.startsWith('/api/v1/systems/file/')) {
             this.file.upgrade(request, socket, head, parsed);
+            return;
+        }
+        if (parsed.pathname.startsWith('/api/v1/systems/sys/')) {
+            this.sys.upgrade(request, socket, head, parsed);
             return;
         }
         this.rejectUpgrade(socket, 404, 'Not Found');
@@ -835,6 +842,9 @@ class FleetManager {
                 } else if (msg.type === 'xfer_status' || msg.type === 'xfer_result') {
                     const id = hostId;
                     if (id) inOrder(() => this.xfer.onAgentFrame(ws, id, msg));
+                } else if (msg.type === 'sys_result' || msg.type === 'sys_status') {
+                    const id = hostId;
+                    if (id) inOrder(() => this.sys.onAgentFrame(ws, id, msg));
                 }
             } catch (err) {
                 console.error('[Fleet] message error:', err.message);
@@ -853,6 +863,7 @@ class FleetManager {
                 this.tcp.onAgentGone(ws);
                 this.file.onAgentGone(ws);
                 this.xfer.onAgentGone(ws);
+                this.sys.onAgentGone(ws);
             }, 0, true);
             // A connection that a newer one for the same host already
             // replaced does not mark the host offline.
