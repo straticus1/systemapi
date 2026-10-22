@@ -59,6 +59,12 @@ ALTER TABLE cp_hosts ADD COLUMN IF NOT EXISTS tcp_policy JSONB;
 ALTER TABLE cp_hosts ADD COLUMN IF NOT EXISTS file_policy JSONB;
 ALTER TABLE cp_tenants ADD COLUMN IF NOT EXISTS tcp_policy JSONB;
 ALTER TABLE cp_tenants ADD COLUMN IF NOT EXISTS file_policy JSONB;
+-- SAH OS-management service policy (docs/sah-os-management-design.md Phase 1):
+-- { "units": ["nginx.service", ...] }, the per-host/tenant allowlist of units
+-- the sys:service channel may act on. Same host-replaces-tenant, deny-by-default
+-- and malformed-is-deny-all rules as the tcp/file policies above.
+ALTER TABLE cp_hosts ADD COLUMN IF NOT EXISTS service_policy JSONB;
+ALTER TABLE cp_tenants ADD COLUMN IF NOT EXISTS service_policy JSONB;
 
 -- Host retirement (POST /api/v1/hosts/:host_id/retire). A retired row is
 -- kept for audit but never resolves, is left out of the fleet listing by
