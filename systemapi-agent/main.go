@@ -199,7 +199,9 @@ func main() {
 	header.Set("X-SystemAPI-Host-ID", st.HostID)
 	header.Set("X-SystemAPI-Hostname", hostname)
 	header.Set("X-SystemAPI-SSH-PubKey", pubLine)
-	if caps := capabilitiesHeaderValue(); caps != "" {
+	caps := capabilitiesHeaderValue()
+	log.Printf("advertised capabilities=%q", caps)
+	if caps != "" {
 		header.Set(capabilitiesHeader, caps)
 	}
 

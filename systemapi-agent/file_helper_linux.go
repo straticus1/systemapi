@@ -31,6 +31,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"os"
 	"sort"
 	"strings"
@@ -67,6 +68,8 @@ func openat2Available() bool {
 		if err == nil {
 			_ = unix.Close(fd)
 			openat2OK = true
+		} else {
+			log.Printf("file capability: openat2 probe failed, file channel not advertised: %v", err)
 		}
 	})
 	return openat2OK
