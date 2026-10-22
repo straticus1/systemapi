@@ -404,3 +404,50 @@ test('channel leases: payload builders, vectors, and negative cases', () => {
   assert.equal(lease.verifyLease(pub, fl, fileStart, now + 200_000).error, 'expired');
   assert.equal(lease.verifyLease(otherPub, fl, fileStart, now).error, 'bad_signature');
 });
+
+test('service policy: binding, allowlist, decision, and the sys_service lease', async () => {
+  const lease = require('../controlplane/lease');
+  // Binding: Phase 1 is restart only.
+  assert.deepEqual(ch.validateServiceBinding({ unit: 'nginx.service', action: 'restart' }),
+    { ok: true, service: { unit: 'nginx.service', action: 'restart' } });
+  assert.equal(ch.validateServiceBinding({ unit: 'nginx\n.service', action: 'restart' }).error, 'bad_unit');
+  assert.equal(ch.validateServiceBinding({ unit: 'nginx.service', action: 'stop' }).error, 'bad_action');
+  assert.equal(ch.validateServiceBinding(null).error, 'bad_unit');
+
+  // Policy parse: a well-formed unit list, else null (deny-all).
+  assert.deepEqual(ch.parseServicePolicy({ units: ['a.service', 'b'] }), { units: ['a.service', 'b'] });
+  assert.deepEqual(ch.parseServicePolicy(null), { units: [] });
+  assert.equal(ch.parseServicePolicy({ units: 'all' }), null);
+  assert.equal(ch.parseServicePolicy({ units: ['bad unit'] }), null);
+  assert.equal(ch.parseServicePolicy([]), null);
+
+  // Allowlist membership (deny by default).
+  assert.equal(ch.servicePolicyAllows({ units: ['nginx.service'] }, 'nginx.service'), true);
+  assert.equal(ch.servicePolicyAllows({ units: ['nginx.service'] }, 'postgresql.service'), false);
+  assert.equal(ch.servicePolicyAllows(null, 'nginx.service'), false);
+
+  // policyDecision against a registry: listed unit allowed, others denied, and
+  // a host with no policy denies everything.
+  const reg = new MemoryRegistry({ NODE_ENV: 'test' });
+  const pub2 = opensshEd25519(Buffer.alloc(32, 7));
+  await reg.enroll({ tenantId: 'acme', userId: 'u', keyId: 'k', hostId: HOST_A, hostname: 'a.example', os: 'linux', platform: 'amd64', sshPubkey: pub2 });
+  assert.equal(await ch.policyDecision(reg, HOST_A, 'sys:service', { sys: { unit: 'nginx.service', action: 'restart' } }), 'unit_denied');
+  await reg.setHostChannelPolicy(HOST_A, { service_policy: { units: ['nginx.service'] } });
+  assert.equal(await ch.policyDecision(reg, HOST_A, 'sys:service', { sys: { unit: 'nginx.service', action: 'restart' } }), null);
+  assert.equal(await ch.policyDecision(reg, HOST_A, 'sys:service', { sys: { unit: 'postgresql.service', action: 'restart' } }), 'unit_denied');
+  // A malformed stored policy is refused on write (fail closed).
+  await assert.rejects(reg.setHostChannelPolicy(HOST_A, { service_policy: { units: 'all' } }), /bad_policy/);
+
+  // The sys_service lease signs "<unit>\n<action>"; a tampered unit or action
+  // fails verification, and only restart is a valid payload.
+  const svcSigner = buildSigner(privateKeyFromSeed(TEST_SEED), rawPublicKey(privateKeyFromSeed(TEST_SEED)));
+  const svcPub = require('node:crypto').createPublicKey(privateKeyFromSeed(TEST_SEED));
+  const svcNow = Date.now();
+  const svcPayload = lease.sysServicePayload('nginx.service', 'restart');
+  assert.equal(svcPayload, 'nginx.service\nrestart');
+  const sl = lease.issueLease(svcSigner, { hostId: HOST_A, action: 'sys_service', payload: svcPayload, now: svcNow });
+  assert.equal(lease.verifyLease(svcPub, sl, svcPayload, svcNow).ok, true);
+  assert.equal(lease.verifyLease(svcPub, sl, lease.sysServicePayload('postgresql.service', 'restart'), svcNow).error, 'payload_mismatch');
+  assert.throws(() => lease.sysServicePayload('nginx.service', 'stop'), /bad_payload/);
+  assert.throws(() => lease.sysServicePayload('nginx\n.service', 'restart'), /bad_payload/);
+});

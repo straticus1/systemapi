@@ -1721,6 +1721,66 @@ test('terminal:root is admin only and every ticket is audited', async () => {
   }
 });
 
+test('sys:service is an operator scope, gated by the host service allowlist, and binds the ticket', async () => {
+  // sys:service is an operator scope (root-equivalent, bounded by the per-host
+  // unit allowlist), not a viewer one.
+  assert.equal(OPERATOR.includes('sys:service'), true);
+  assert.equal(scopesForRole('viewer').has('sys:service'), false);
+  assert.equal(scopesForRole('operator').has('sys:service'), true);
+
+  const fm = fleet();
+  await seed(fm);
+  // The host may act only on nginx.service.
+  await fm.registry.setHostChannelPolicy(HOST_A, { service_policy: { units: ['nginx.service'] } });
+  await fm.registry.addMember('acme', 'op-1', 'operator', 'op@example');
+  await fm.registry.addMember('acme', 'view-1', 'viewer', 'view@example');
+  const opApp = await listen(appFor(fm, await ssoUser(fm, 'op-1', { email: 'op@example', groups: [] })));
+  const viewApp = await listen(appFor(fm, await ssoUser(fm, 'view-1', { email: 'view@example', groups: [] })));
+  const svcTicket = (url, service, headers = {}) => call(`${url}/api/v1/ws-ticket`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...headers },
+    body: JSON.stringify({ host_id: HOST_A, purpose: 'sys:service', service })
+  });
+  try {
+    // A viewer cannot mint a sys:service ticket.
+    const viewer = await svcTicket(viewApp.url, { unit: 'nginx.service', action: 'restart' });
+    assert.equal(viewer.status, 403);
+    assert.equal(viewer.body.error, 'scope_denied');
+
+    // A unit not on the host allowlist is denied (deny by default).
+    const denied = await svcTicket(opApp.url, { unit: 'postgresql.service', action: 'restart' });
+    assert.equal(denied.status, 403);
+    assert.equal(denied.body.error, 'unit_denied');
+    assert.equal(fm.tickets.size, 0);
+
+    // A listed unit mints a single-use ticket bound to { unit, action }.
+    const ok = await svcTicket(opApp.url, { unit: 'nginx.service', action: 'restart' });
+    assert.equal(ok.status, 200);
+    assert.match(ok.body.ticket, /^stk_/);
+    const row = fm.tickets.get(ok.body.ticket);
+    assert.equal(row.purpose, 'sys:service');
+    assert.equal(row.actor, 'op-1');
+    assert.deepEqual(row.sys, { unit: 'nginx.service', action: 'restart' });
+
+    // Only restart is a valid Phase 1 action; a bad unit or verb is 400.
+    const stop = await svcTicket(opApp.url, { unit: 'nginx.service', action: 'stop' });
+    assert.equal(stop.status, 400);
+    assert.equal(stop.body.error, 'bad_action');
+    const badUnit = await svcTicket(opApp.url, { unit: 'nginx\n.service', action: 'restart' });
+    assert.equal(badUnit.status, 400);
+    assert.equal(badUnit.body.error, 'bad_unit');
+
+    // The ticket_issued row records the service binding.
+    const issued = fm.registry.audit.filter((r) => r.action === 'ticket_issued' && r.payload.purpose === 'sys:service');
+    assert.equal(issued.length, 1);
+    assert.deepEqual(issued[0].payload.service, { unit: 'nginx.service', action: 'restart' });
+    assert.equal((await fm.registry.verifyAudit()).ok, true);
+  } finally {
+    opApp.server.close();
+    viewApp.server.close();
+  }
+});
+
 test('the audit chain covers actor, host, tenant and action; legacy rows still verify', async () => {
   const { GENESIS, chainHash } = require('../controlplane/chain');
   const reg = new MemoryRegistry({ NODE_ENV: 'test' });

@@ -196,8 +196,8 @@ function fakePool(failOn) {
           const q = sql.replace(/\s+/g, ' ').trim();
           log.push({ client: id, q, params });
           if (failOn && q.startsWith(failOn)) throw new Error('boom');
-          if (q.startsWith('SELECT tcp_policy, file_policy FROM cp_hosts')) {
-            return { rowCount: 1, rows: [{ tcp_policy: { allow: [{ local: true, ports: [3003] }] }, file_policy: null }] };
+          if (q.startsWith('SELECT tcp_policy, file_policy, service_policy FROM cp_hosts')) {
+            return { rowCount: 1, rows: [{ tcp_policy: { allow: [{ local: true, ports: [3003] }] }, file_policy: null, service_policy: { units: ['nginx.service'] } }] };
           }
           if (q.startsWith('SELECT row_hash FROM cp_audit')) return { rowCount: 0, rows: [] };
           return { rowCount: 1, rows: [{}] };
@@ -213,19 +213,21 @@ test('PgRegistry writes the policy and its audit row in one transaction on one c
   const pool = fakePool(null);
   const pg = new PgRegistry(pool, { NODE_ENV: 'production' });
   await pg.setHostChannelPolicyAudited({
-    tenantId: 'afterdark', hostId: HOST_A, tcpPolicy: { allow: [] }, filePolicy: { roots: [] }, actor: ACTOR, action: 'channel_policy_clear', reason: 'why'
+    tenantId: 'afterdark', hostId: HOST_A, tcpPolicy: { allow: [] }, filePolicy: { roots: [] }, servicePolicy: { units: [] }, actor: ACTOR, action: 'channel_policy_clear', reason: 'why'
   });
   assert.equal(pool.clients, 1);
   const qs = pool.log.map((e) => e.q);
   assert.equal(qs[0], 'BEGIN');
-  assert.match(qs[1], /^SELECT tcp_policy, file_policy FROM cp_hosts WHERE host_id = \$1 AND tenant_id = \$2 FOR UPDATE$/);
+  assert.match(qs[1], /^SELECT tcp_policy, file_policy, service_policy FROM cp_hosts WHERE host_id = \$1 AND tenant_id = \$2 FOR UPDATE$/);
   assert.deepEqual(pool.log[1].params, [HOST_A, 'afterdark']);
-  assert.match(qs[2], /^UPDATE cp_hosts SET tcp_policy = \$2::jsonb, file_policy = \$3::jsonb WHERE host_id = \$1$/);
+  assert.match(qs[2], /^UPDATE cp_hosts SET tcp_policy = \$2::jsonb, file_policy = \$3::jsonb, service_policy = \$4::jsonb WHERE host_id = \$1$/);
   assert.match(qs[3], /^SELECT row_hash FROM cp_audit .*FOR UPDATE$/);
   assert.match(qs[4], /^INSERT INTO cp_audit/);
   const audit = JSON.parse(pool.log[4].params[6]);
   assert.deepEqual(audit.previous_tcp_policy, { allow: [{ local: true, ports: [3003] }] });
   assert.deepEqual(audit.tcp_policy, { allow: [] });
+  assert.deepEqual(audit.previous_service_policy, { units: ['nginx.service'] });
+  assert.deepEqual(audit.service_policy, { units: [] });
   assert.equal(audit.reason, 'why');
   assert.equal(pool.log[4].params[4], ACTOR);
   assert.deepEqual(qs.slice(5), ['COMMIT', 'RELEASE']);
@@ -365,6 +367,32 @@ test('main: env and argument errors exit 2 with a short message and print no sec
     assert.equal(r.out, '');
     assert.equal(r.err.includes(SECRET), false);
   }
+});
+
+test('--service writes a per-host unit allowlist the sys:service route then enforces', async () => {
+  const reg = await fixture();
+  const out = await run(['set', '--tenant', 'afterdark', '--host', 'miniapps1', '--reason', 'ticket 42',
+    '--service', 'postgresql.service', '--service', 'nginx.service'], { registry: reg });
+  assert.deepEqual(out.host_service_policy, { units: ['nginx.service', 'postgresql.service'] });
+  // The sys:service route then allows exactly those units and denies the rest.
+  assert.equal(await policyDecision(reg, HOST_A, 'sys:service', { sys: { unit: 'nginx.service', action: 'restart' } }), null);
+  assert.equal(await policyDecision(reg, HOST_A, 'sys:service', { sys: { unit: 'redis.service', action: 'restart' } }), 'unit_denied');
+  // The other tenant's host is untouched: deny by default.
+  assert.equal(await policyDecision(reg, HOST_B, 'sys:service', { sys: { unit: 'nginx.service', action: 'restart' } }), 'unit_denied');
+});
+
+test('clear denies all services; inherit defers to the tenant; a bad unit is refused', async () => {
+  const reg = await fixture();
+  await run(['set', '--tenant', 'afterdark', '--host', 'miniapps1', '--reason', 'r', '--service', 'nginx.service'], { registry: reg });
+  // clear is an explicit deny on all three columns.
+  const cleared = await run(['clear', '--tenant', 'afterdark', '--host', 'miniapps1', '--reason', 'done'], { registry: reg });
+  assert.deepEqual(cleared.host_service_policy, { units: [] });
+  assert.equal(await policyDecision(reg, HOST_A, 'sys:service', { sys: { unit: 'nginx.service', action: 'restart' } }), 'unit_denied');
+  // inherit clears the host columns (back to the tenant default, else deny).
+  const inherited = await run(['inherit', '--tenant', 'afterdark', '--host', 'miniapps1', '--reason', 'reset'], { registry: reg });
+  assert.equal(inherited.host_service_policy, null);
+  // A malformed unit name is refused by parseArgs.
+  assert.throws(() => parseArgs(['set', '--tenant', 'afterdark', '--host', 'miniapps1', '--reason', 'r', '--service', 'bad unit']), /bad --service/);
 });
 
 test('main: a database that cannot be reached or configured fails with a code, never the credentials', async () => {
