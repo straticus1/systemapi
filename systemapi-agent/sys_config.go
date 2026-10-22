@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"os/exec"
 	"strings"
 	"time"
 
@@ -32,7 +31,7 @@ func (engine *SysscriptEngine) configWrite(thread *starlark.Thread, b *starlark.
 		return result, nil
 	}
 
-	err := engine.cm.AtomicWrite(path, content)
+	err := currentPlatform().Config.AtomicWrite(path, content)
 	result := starlark.NewDict(2)
 	if err != nil {
 		result.SetKey(starlark.String("success"), starlark.False)
@@ -85,33 +84,15 @@ func (engine *SysscriptEngine) configValidate(thread *starlark.Thread, b *starla
 		return starlark.None, err
 	}
 
-	var cmd *exec.Cmd
-	switch strings.ToLower(service) {
-	case "postfix":
-		cmd = exec.Command("postfix", "check")
-	case "bind", "named":
-		cmd = exec.Command("named", "-checkconf", path)
-	case "nsd":
-		cmd = exec.Command("nsd-checkconf", path)
-	case "unbound":
-		cmd = exec.Command("unbound-checkconf", path)
-	default:
-		result := starlark.NewDict(3)
-		result.SetKey(starlark.String("success"), starlark.True)
-		result.SetKey(starlark.String("output"), starlark.String("no validator for service"))
-		result.SetKey(starlark.String("error"), starlark.String(""))
-		return result, nil
-	}
-
-	out, err := cmd.CombinedOutput()
+	out, err := currentPlatform().Config.Validate(service, path)
 	result := starlark.NewDict(3)
 	if err != nil {
 		result.SetKey(starlark.String("success"), starlark.False)
-		result.SetKey(starlark.String("output"), starlark.String(string(out)))
+		result.SetKey(starlark.String("output"), starlark.String(out))
 		result.SetKey(starlark.String("error"), starlark.String(err.Error()))
 	} else {
 		result.SetKey(starlark.String("success"), starlark.True)
-		result.SetKey(starlark.String("output"), starlark.String(string(out)))
+		result.SetKey(starlark.String("output"), starlark.String(out))
 		result.SetKey(starlark.String("error"), starlark.String(""))
 	}
 	return result, nil
@@ -140,15 +121,15 @@ func (engine *SysscriptEngine) configReload(thread *starlark.Thread, b *starlark
 		return result, nil
 	}
 
-	out, err := exec.Command("systemctl", "reload", service).CombinedOutput()
+	out, err := currentPlatform().Config.Reload(service)
 	result := starlark.NewDict(3)
 	if err != nil {
 		result.SetKey(starlark.String("success"), starlark.False)
-		result.SetKey(starlark.String("output"), starlark.String(string(out)))
+		result.SetKey(starlark.String("output"), starlark.String(out))
 		result.SetKey(starlark.String("error"), starlark.String(err.Error()))
 	} else {
 		result.SetKey(starlark.String("success"), starlark.True)
-		result.SetKey(starlark.String("output"), starlark.String(string(out)))
+		result.SetKey(starlark.String("output"), starlark.String(out))
 		result.SetKey(starlark.String("error"), starlark.String(""))
 	}
 	return result, nil

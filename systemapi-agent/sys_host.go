@@ -212,13 +212,7 @@ func (engine *SysscriptEngine) procfsSysctlGet(thread *starlark.Thread, b *starl
 	if err := starlark.UnpackArgs("sysctl_get", args, kwargs, "key", &key); err != nil {
 		return starlark.None, err
 	}
-	if !sysctlGranted(engine.ents().AllowSysctl, key) {
-		return starlark.None, fmt.Errorf("sysctl not allowed")
-	}
-	if _, err := sysctlProcPath(key); err != nil {
-		return starlark.None, err
-	}
-	text, err := hostSysctlGet(key, engine.ents().AllowSysctl)
+	text, err := currentPlatform().Tweaks.SysctlGet(key, engine.ents().AllowSysctl)
 	if err != nil {
 		return starlark.None, err
 	}
@@ -230,13 +224,7 @@ func (engine *SysscriptEngine) procfsSysctlSet(thread *starlark.Thread, b *starl
 	if err := starlark.UnpackArgs("sysctl_set", args, kwargs, "key", &key, "value", &value); err != nil {
 		return starlark.None, err
 	}
-	if !sysctlGranted(engine.ents().AllowSysctl, key) || !sysctlValueOK(value) {
-		return starlark.None, fmt.Errorf("sysctl not allowed")
-	}
-	if _, err := sysctlProcPath(key); err != nil {
-		return starlark.None, err
-	}
-	if err := hostSysctlSet(key, value, engine.ents().AllowSysctl); err != nil {
+	if err := currentPlatform().Tweaks.SysctlSet(key, value, engine.ents().AllowSysctl); err != nil {
 		return starlark.None, err
 	}
 	return starlark.True, nil

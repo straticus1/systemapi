@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -329,10 +328,10 @@ func (engine *SysscriptEngine) svcAction(action, service string) (starlark.Value
 	if !allowed {
 		return starlark.None, fmt.Errorf("security exception: service %q not in allow_service_reload", service)
 	}
-	out, err := exec.Command("systemctl", action, service).CombinedOutput()
+	out, err := currentPlatform().Services.Action(action, service)
 	d := starlark.NewDict(3)
 	d.SetKey(starlark.String("success"), starlark.Bool(err == nil))
-	d.SetKey(starlark.String("output"), starlark.String(strings.TrimSpace(string(out))))
+	d.SetKey(starlark.String("output"), starlark.String(strings.TrimSpace(out)))
 	if err != nil {
 		d.SetKey(starlark.String("error"), starlark.String(err.Error()))
 	} else {
@@ -388,13 +387,10 @@ func (engine *SysscriptEngine) svcStatus(thread *starlark.Thread, b *starlark.Bu
 		return starlark.None, err
 	}
 	// status doesn't modify - no entitlement required
-	out, err := exec.Command("systemctl", "is-active", service).Output()
-	state := strings.TrimSpace(string(out))
+	st, _ := currentPlatform().Services.Status(service)
 	d := starlark.NewDict(3)
-	d.SetKey(starlark.String("active"), starlark.Bool(err == nil && state == "active"))
-	d.SetKey(starlark.String("state"), starlark.String(state))
-	// get full status output
-	full, _ := exec.Command("systemctl", "status", "--no-pager", "-n", "0", service).CombinedOutput()
-	d.SetKey(starlark.String("output"), starlark.String(strings.TrimSpace(string(full))))
+	d.SetKey(starlark.String("active"), starlark.Bool(st.Active))
+	d.SetKey(starlark.String("state"), starlark.String(st.State))
+	d.SetKey(starlark.String("output"), starlark.String(st.Output))
 	return d, nil
 }
