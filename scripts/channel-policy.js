@@ -11,11 +11,13 @@
 // read, or read and write (never file:root), that are neither a system root
 // (SYSTEM_ROOTS: /proc /sys /dev /boot /etc /root, the agent's and the
 // server's own state and config, PostgreSQL's data), beneath one, nor a
-// parent of one (so /var/lib is refused too), and the host must resolve to exactly one host of the
-// named tenant. `set` replaces BOTH host columns, so nothing from an earlier
+// parent of one (so /var/lib is refused too), and --service entries are unit
+// names on a per-host allowlist (deny by default; the sys:service channel may
+// act only on a listed unit), and the host must resolve to exactly one host of the
+// named tenant. `set` replaces ALL THREE host columns, so nothing from an earlier
 // policy lingers; `clear` is an explicit deny on the host (tcp_policy
-// {allow:[]}, file_policy {roots:[]}), which a tenant default does not
-// override; `inherit` sets both to null (back to the tenant default, else
+// {allow:[]}, file_policy {roots:[]}, service_policy {units:[]}), which a tenant default does not
+// override; `inherit` sets all three to null (back to the tenant default, else
 // deny). Every set, clear and inherit appends an audit-chain row (actor
 // "cli:channel-policy", the operator's required --reason, the old and new
 // policies) in the same transaction as
@@ -29,7 +31,7 @@
 //
 // Usage: node scripts/channel-policy.js show  --tenant <t> --host <hostname|host_id>
 //        node scripts/channel-policy.js set   --tenant <t> --host <hostname|host_id> --reason <text>
-//               [--tcp-local <port>]... [--file-read <dir>]... [--file-write <dir>]...
+//               [--tcp-local <port>]... [--file-read <dir>]... [--file-write <dir>]... [--service <unit>]...
 //        node scripts/channel-policy.js clear --tenant <t> --host <hostname|host_id> --reason <text>
 //        node scripts/channel-policy.js inherit --tenant <t> --host <hostname|host_id> --reason <text>
 // Database and env file: as scripts/sso-bind.js (ENV_FILE, else
@@ -38,7 +40,7 @@
 
 const path = require('node:path');
 const { validateTenant } = require('../controlplane/sshkey');
-const { validateFileRoot, effectivePolicies } = require('../controlplane/channels');
+const { validateFileRoot, effectivePolicies, SERVICE_UNIT_RE } = require('../controlplane/channels');
 
 const ACTOR = 'cli:channel-policy';
 const MAX_ENTRIES = 16;
@@ -46,17 +48,17 @@ const HOST_RE = /^[A-Za-z0-9._-]{1,253}$/;
 const SYSTEM_ROOTS = ['/proc', '/sys', '/dev', '/boot', '/etc', '/root', '/var/lib/systemapi-agent',
   '/etc/systemapi-agent', '/var/lib/postgresql', '/etc/sahcore'];
 const USAGE = 'usage: node scripts/channel-policy.js show|set|clear|inherit --tenant <t> --host <hostname|host_id> '
-  + '[--reason <text>, required except for show] [--tcp-local <port>]... [--file-read <dir>]... [--file-write <dir>]...';
+  + '[--reason <text>, required except for show] [--tcp-local <port>]... [--file-read <dir>]... [--file-write <dir>]... [--service <unit>]...';
 const REASON_MAX = 256;
 const COMMANDS = new Set(['show', 'set', 'clear', 'inherit']);
 // What each writing command stores in the two host columns and its audit
 // action. clear is an explicit deny; inherit (null) defers to the tenant.
 const WRITES = {
-  clear: { action: 'channel_policy_clear', policy: () => ({ tcp_policy: { allow: [] }, file_policy: { roots: [] } }) },
-  inherit: { action: 'channel_policy_inherit', policy: () => ({ tcp_policy: null, file_policy: null }) }
+  clear: { action: 'channel_policy_clear', policy: () => ({ tcp_policy: { allow: [] }, file_policy: { roots: [] }, service_policy: { units: [] } }) },
+  inherit: { action: 'channel_policy_inherit', policy: () => ({ tcp_policy: null, file_policy: null, service_policy: null }) }
 };
 const ONCE_FLAGS = new Set(['--tenant', '--host', '--reason']);
-const LIST_FLAGS = new Set(['--tcp-local', '--file-read', '--file-write']);
+const LIST_FLAGS = new Set(['--tcp-local', '--file-read', '--file-write', '--service']);
 
 function fail(code, message = code) {
   const err = new Error(message);
@@ -75,6 +77,13 @@ function parsePort(text) {
   return port;
 }
 
+function parseUnit(text) {
+  if (typeof text !== 'string' || !SERVICE_UNIT_RE.test(text)) {
+    throw usage(`bad --service: ${JSON.stringify(text)} is not a unit name (letters, digits, "@._:-", at most 128)`);
+  }
+  return text;
+}
+
 function parseDir(flag, text) {
   if (text === '/' || text === '~') throw usage(`bad ${flag}: "${text}" is too wide; name one directory`);
   const checked = validateFileRoot(text, 'file:write');
@@ -90,7 +99,7 @@ function parseArgs(argv) {
   if (!Array.isArray(argv) || argv.length === 0 || !COMMANDS.has(argv[0])) throw usage();
   const command = argv[0];
   const once = {};
-  const lists = { '--tcp-local': [], '--file-read': [], '--file-write': [] };
+  const lists = { '--tcp-local': [], '--file-read': [], '--file-write': [], '--service': [] };
   for (let i = 1; i < argv.length; i += 1) {
     const flag = argv[i];
     if (i + 1 >= argv.length) throw usage();
@@ -128,11 +137,12 @@ function parseArgs(argv) {
   const writes = [...new Set(lists['--file-write'].map((d) => parseDir('--file-write', d)))];
   const reads = [...new Set(lists['--file-read'].map((d) => parseDir('--file-read', d)))]
     .filter((d) => !writes.includes(d));
-  if (ports.length === 0 && reads.length === 0 && writes.length === 0) {
-    throw usage('set needs at least one --tcp-local, --file-read or --file-write; use clear to deny all, inherit for the tenant default');
+  const units = [...new Set(lists['--service'].map(parseUnit))].sort();
+  if (ports.length === 0 && reads.length === 0 && writes.length === 0 && units.length === 0) {
+    throw usage('set needs at least one --tcp-local, --file-read, --file-write or --service; use clear to deny all, inherit for the tenant default');
   }
-  if (ports.length > MAX_ENTRIES || reads.length + writes.length > MAX_ENTRIES) {
-    throw usage(`at most ${MAX_ENTRIES} ports and ${MAX_ENTRIES} directories`);
+  if (ports.length > MAX_ENTRIES || reads.length + writes.length > MAX_ENTRIES || units.length > MAX_ENTRIES) {
+    throw usage(`at most ${MAX_ENTRIES} ports, ${MAX_ENTRIES} directories and ${MAX_ENTRIES} units`);
   }
   out.tcpPolicy = { allow: ports.length ? [{ local: true, ports }] : [] };
   out.filePolicy = {
@@ -141,6 +151,7 @@ function parseArgs(argv) {
       ...reads.map((p) => ({ path: p, read: true, write: false }))
     ]
   };
+  out.servicePolicy = { units };
   return out;
 }
 
@@ -162,8 +173,10 @@ async function summary(registry, host) {
     hostname: host.hostname,
     host_tcp_policy: raw.host_tcp_policy ?? null,
     host_file_policy: raw.host_file_policy ?? null,
+    host_service_policy: raw.host_service_policy ?? null,
     effective_tcp_policy: effective.tcp,
-    effective_file_policy: effective.file
+    effective_file_policy: effective.file,
+    effective_service_policy: effective.service
   };
 }
 
@@ -178,7 +191,7 @@ async function run(argv, { registry }) {
   if (args.command === 'show') return summary(registry, host);
 
   const next = args.command === 'set'
-    ? { tcp_policy: args.tcpPolicy, file_policy: args.filePolicy }
+    ? { tcp_policy: args.tcpPolicy, file_policy: args.filePolicy, service_policy: args.servicePolicy }
     : WRITES[args.command].policy();
   const action = args.command === 'set' ? 'channel_policy_set' : WRITES[args.command].action;
   try {
@@ -187,6 +200,7 @@ async function run(argv, { registry }) {
       hostId: host.host_id,
       tcpPolicy: next.tcp_policy,
       filePolicy: next.file_policy,
+      servicePolicy: next.service_policy,
       actor: ACTOR,
       action,
       reason: args.reason
