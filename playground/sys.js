@@ -32,8 +32,8 @@ const WebSocket = require('ws');
 const crypto = require('node:crypto');
 const { ticketFromRequest } = require('../controlplane/httpauth');
 const { consumeTicket } = require('../controlplane/tickets');
-const { issueLease, sysServicePayload, sysPackagePayload, sysConfigPayload } = require('../controlplane/lease');
-const { validateServiceBinding, validatePackageBinding, validateConfigBinding } = require('../controlplane/channels');
+const { issueLease, sysServicePayload, sysPackagePayload, sysConfigPayload, sysTweakPayload } = require('../controlplane/lease');
+const { validateServiceBinding, validatePackageBinding, validateConfigBinding, validateTweakBinding } = require('../controlplane/channels');
 
 function sha256Hex(s) {
     return crypto.createHash('sha256').update(s, 'utf8').digest('hex');
@@ -47,7 +47,7 @@ const SYS_PER_ACTOR_DEFAULT = 16;
 const SYS_PER_AGENT = 64;
 const SYS_ERRORS = new Set([
     'ticket_invalid', 'scope_denied', 'agent_offline', 'agent_unsupported', 'lease_required', 'unit_denied',
-    'package_denied', 'path_denied', 'cap_reached', 'protocol_error', 'timeout', 'agent_disconnected', 'internal'
+    'package_denied', 'path_denied', 'sysctl_denied', 'tweak_denied', 'cap_reached', 'protocol_error', 'timeout', 'agent_disconnected', 'internal'
 ]);
 
 // Per-purpose description of one sys resource. Each binds one capability, one
@@ -118,6 +118,32 @@ const SYS_RESOURCES = {
         resultFields: (r) => (typeof r.output === 'string'
             ? { content_sha256: sha256Hex(r.output), content_bytes: Buffer.byteLength(r.output, 'utf8') }
             : {})
+    },
+    'sys:tweak': {
+        capability: 'tweak',
+        leaseAction: 'sys_tweak',
+        frameType: 'sys_tweak',
+        // Returns { ok, binding } where binding is the flat { verb, ... }.
+        validate: (tw) => {
+            const c = validateTweakBinding(tw);
+            return c.ok ? { ok: true, binding: c.tweak } : { ok: false };
+        },
+        // A unit-override body is bound by its SHA-256; other verbs' short
+        // values ride the payload directly.
+        leasePayload: (b) => sysTweakPayload(b, b.verb === 'unit-override-set' ? sha256Hex(b.content) : undefined),
+        // The frame carries every bound field (the override body included);
+        // the agent rebuilds the signed payload from them.
+        agentFields: (b) => ({ ...b }),
+        intentAction: 'sys_tweak_intent',
+        resultAction: 'sys_tweak_result',
+        // A unit-override body is never audited: record its hash and size.
+        resourceFields: (b) => {
+            const { content, ...rest } = b;
+            return typeof content === 'string'
+                ? { ...rest, content_sha256: sha256Hex(content), content_bytes: Buffer.byteLength(content, 'utf8') }
+                : { ...rest };
+        },
+        resultFields: () => ({})
     }
 };
 

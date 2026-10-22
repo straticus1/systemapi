@@ -35,12 +35,12 @@ const crypto = require('node:crypto');
 const { validateFileRoot } = require('./channels');
 const { randomBytes, timingSafeEqual } = crypto;
 
-const ACTIONS = new Set(['sysscript', 'pty', 'pty_root', 'breakglass', 'tcp', 'file', 'file_root', 'xfer', 'xfer_root', 'sys_service', 'sys_package', 'sys_config']);
+const ACTIONS = new Set(['sysscript', 'pty', 'pty_root', 'breakglass', 'tcp', 'file', 'file_root', 'xfer', 'xfer_root', 'sys_service', 'sys_package', 'sys_config', 'sys_tweak']);
 const TERMINAL_ACTIONS = new Set(['pty', 'pty_root', 'breakglass']);
 const CHANNEL_ACTIONS = new Set(['tcp', 'file', 'file_root']);
 const XFER_ACTIONS = new Set(['xfer', 'xfer_root']);
 // SAH OS-management channel actions (docs/sah-os-management-design.md).
-const SYS_ACTIONS = new Set(['sys_service', 'sys_package', 'sys_config']);
+const SYS_ACTIONS = new Set(['sys_service', 'sys_package', 'sys_config', 'sys_tweak']);
 // Actions whose hash covers "<action>\n<payload>".
 const SESSION_ACTIONS = new Set([...TERMINAL_ACTIONS, ...CHANNEL_ACTIONS, ...XFER_ACTIONS, ...SYS_ACTIONS]);
 // Service/unit name guard; mirrors systemapi-agent/platform.go serviceNameRE.
@@ -220,6 +220,46 @@ function sysConfigPayload(action, target, contentSha256) {
   throw badPayload();
 }
 
+// sys_tweak lease payload (docs/sah-os-management-design.md):
+//   sysctl-get:         "sysctl-get\n<key>"
+//   sysctl-set:         "sysctl-set\n<key>\n<value>"
+//   resource-limit-set: "resource-limit-set\n<unit>\n<limit>\n<value>"
+//   unit-override-set:  "unit-override-set\n<unit>\n<name>\n<content_sha256>"
+// Short values (sysctl, resource limit) ride the payload directly; a unit-
+// override body rides the agent frame bound by its SHA-256. The agent rebuilds
+// this from the frame, so a lease for one key/unit/verb/value never acts on
+// another. Shapes mirror systemapi-agent/grant.go and platform_tweak.go.
+const TWEAK_SYSCTL_KEY_RE = /^[a-z][a-z0-9_.]{0,127}$/;
+const TWEAK_OVERRIDE_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
+const TWEAK_LIMIT_VALUE_RE = /^[a-zA-Z0-9:._]{1,64}$/;
+const TWEAK_RESOURCE_LIMITS = new Set(['LimitCPU', 'LimitFSIZE', 'LimitDATA', 'LimitSTACK', 'LimitCORE', 'LimitRSS',
+  'LimitNOFILE', 'LimitAS', 'LimitNPROC', 'LimitMEMLOCK', 'LimitLOCKS', 'LimitSIGPENDING', 'LimitMSGQUEUE',
+  'LimitNICE', 'LimitRTPRIO', 'LimitRTTIME']);
+const TWEAK_DENIED_SYSCTL = new Set(['kernel.core_pattern', 'kernel.modprobe', 'kernel.hotplug']);
+function sysTweakPayload(tw, contentSha256) {
+  if (!tw || typeof tw !== 'object') throw badPayload();
+  const sysctlKeyOk = (k) => typeof k === 'string' && TWEAK_SYSCTL_KEY_RE.test(k) && !TWEAK_DENIED_SYSCTL.has(k);
+  const unitOk = (u) => typeof u === 'string' && SERVICE_UNIT_RE.test(u);
+  switch (tw.verb) {
+    case 'sysctl-get':
+      if (!sysctlKeyOk(tw.key)) throw badPayload();
+      return `sysctl-get\n${tw.key}`;
+    case 'sysctl-set':
+      if (!sysctlKeyOk(tw.key)) throw badPayload();
+      if (typeof tw.value !== 'string' || tw.value.length === 0 || tw.value.length > 256 || /[\n\r\u0000]/.test(tw.value)) throw badPayload();
+      return `sysctl-set\n${tw.key}\n${tw.value}`;
+    case 'resource-limit-set':
+      if (!unitOk(tw.unit) || !TWEAK_RESOURCE_LIMITS.has(tw.limit) || typeof tw.value !== 'string' || !TWEAK_LIMIT_VALUE_RE.test(tw.value)) throw badPayload();
+      return `resource-limit-set\n${tw.unit}\n${tw.limit}\n${tw.value}`;
+    case 'unit-override-set':
+      if (!unitOk(tw.unit) || typeof tw.name !== 'string' || !TWEAK_OVERRIDE_NAME_RE.test(tw.name)) throw badPayload();
+      if (typeof contentSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(contentSha256)) throw badPayload();
+      return `unit-override-set\n${tw.unit}\n${tw.name}\n${contentSha256}`;
+    default:
+      throw badPayload();
+  }
+}
+
 // A watch reason: 1..256 UTF-8 bytes of printable characters with some
 // non-space content; no tab, newline or other control character, and no
 // U+FFFD (the agent refuses all of these as bad_request).
@@ -320,6 +360,7 @@ module.exports = {
   sysServicePayload,
   sysPackagePayload,
   sysConfigPayload,
+  sysTweakPayload,
   xferPayload,
   xferMaterial,
   peerAddress,

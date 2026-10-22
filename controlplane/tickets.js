@@ -20,6 +20,8 @@ const SERVICE_ACTIONS = new Set(['start', 'stop', 'restart', 'enable', 'disable'
 const PACKAGE_ACTIONS = new Set(['query', 'install', 'remove', 'upgrade']);
 // The sys:config channel verbs; the binding is { action, target, content? }.
 const CONFIG_ACTIONS = new Set(['read', 'write', 'reload']);
+// The sys:tweak channel verbs; the binding is a flat { verb, ... }.
+const TWEAK_VERBS = new Set(['sysctl-get', 'sysctl-set', 'resource-limit-set', 'unit-override-set']);
 
 function frozenTarget(target) {
   if (!target) return null;
@@ -93,6 +95,12 @@ function bindingOk(row, expect) {
       const s = expect.sys;
       if (!s || s.action !== row.sys.action || s.target !== row.sys.target) return false;
     }
+    return true;
+  }
+  if (row.purpose === 'sys:tweak') {
+    if (!row.sys || !TWEAK_VERBS.has(row.sys.verb)) return false;
+    if ((row.sys.verb === 'sysctl-get' || row.sys.verb === 'sysctl-set') && typeof row.sys.key !== 'string') return false;
+    if ((row.sys.verb === 'resource-limit-set' || row.sys.verb === 'unit-override-set') && typeof row.sys.unit !== 'string') return false;
     return true;
   }
   return true;

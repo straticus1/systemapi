@@ -565,3 +565,56 @@ test('config policy: binding, allowlist, decision, and the sys_config lease', as
   assert.throws(() => lease.sysConfigPayload('reload', '/etc/x'), /bad_payload/);
   assert.throws(() => lease.sysConfigPayload('write', '/etc/x', 'nothex'), /bad_payload/);
 });
+
+test('tweak policy: binding, allowlists, decision, and the sys_tweak lease', async () => {
+  const lease = require('../controlplane/lease');
+  // Binding per verb, idempotent and flat.
+  assert.deepEqual(ch.validateTweakBinding({ verb: 'sysctl-get', key: 'net.ipv4.ip_forward' }),
+    { ok: true, tweak: { verb: 'sysctl-get', key: 'net.ipv4.ip_forward' } });
+  assert.deepEqual(ch.validateTweakBinding({ verb: 'sysctl-set', key: 'net.ipv4.ip_forward', value: '1' }),
+    { ok: true, tweak: { verb: 'sysctl-set', key: 'net.ipv4.ip_forward', value: '1' } });
+  assert.deepEqual(ch.validateTweakBinding({ verb: 'resource-limit-set', unit: 'nginx.service', limit: 'LimitNOFILE', value: '65536' }),
+    { ok: true, tweak: { verb: 'resource-limit-set', unit: 'nginx.service', limit: 'LimitNOFILE', value: '65536' } });
+  assert.deepEqual(ch.validateTweakBinding({ verb: 'unit-override-set', unit: 'nginx.service', name: 'limit', content: 'x\n' }),
+    { ok: true, tweak: { verb: 'unit-override-set', unit: 'nginx.service', name: 'limit', content: 'x\n' } });
+  // Hard-denied sysctl, bad value, unknown limit, bad verb are refused.
+  assert.equal(ch.validateTweakBinding({ verb: 'sysctl-set', key: 'kernel.core_pattern', value: 'x' }).error, 'bad_tweak');
+  assert.equal(ch.validateTweakBinding({ verb: 'sysctl-set', key: 'net.ipv4.ip_forward', value: 'a\nb' }).error, 'bad_tweak');
+  assert.equal(ch.validateTweakBinding({ verb: 'resource-limit-set', unit: 'nginx.service', limit: 'LimitNope', value: '1' }).error, 'bad_tweak');
+  assert.equal(ch.validateTweakBinding({ verb: 'poke', key: 'x' }).error, 'bad_action');
+
+  // Policy parse: two allowlists, else null; a hard-denied key is never valid.
+  assert.deepEqual(ch.parseTweakPolicy({ sysctls: ['net.ipv4.ip_forward'], units: ['nginx.service'] }), { sysctls: ['net.ipv4.ip_forward'], units: ['nginx.service'] });
+  assert.deepEqual(ch.parseTweakPolicy(null), { sysctls: [], units: [] });
+  assert.equal(ch.parseTweakPolicy({ sysctls: ['kernel.modprobe'] }), null);
+  assert.equal(ch.parseTweakPolicy({ sysctls: 'all' }), null);
+
+  // Allowlist: sysctl verbs gated by sysctls, override verbs by units.
+  assert.equal(ch.tweakPolicyAllows({ sysctls: ['net.ipv4.ip_forward'], units: [] }, { verb: 'sysctl-get', key: 'net.ipv4.ip_forward' }), null);
+  assert.equal(ch.tweakPolicyAllows({ sysctls: ['net.ipv4.ip_forward'], units: [] }, { verb: 'sysctl-get', key: 'vm.swappiness' }), 'sysctl_denied');
+  assert.equal(ch.tweakPolicyAllows({ sysctls: [], units: ['nginx.service'] }, { verb: 'unit-override-set', unit: 'nginx.service' }), null);
+  assert.equal(ch.tweakPolicyAllows({ sysctls: [], units: ['nginx.service'] }, { verb: 'unit-override-set', unit: 'redis.service' }), 'unit_denied');
+
+  // policyDecision against a registry.
+  const reg = new MemoryRegistry({ NODE_ENV: 'test' });
+  const pub2 = opensshEd25519(Buffer.alloc(32, 10));
+  await reg.enroll({ tenantId: 'acme', userId: 'u', keyId: 'k', hostId: HOST_A, hostname: 'a.example', os: 'linux', platform: 'amd64', sshPubkey: pub2 });
+  assert.equal(await ch.policyDecision(reg, HOST_A, 'sys:tweak', { sys: { verb: 'sysctl-set', key: 'net.ipv4.ip_forward', value: '1' } }), 'sysctl_denied');
+  await reg.setHostChannelPolicy(HOST_A, { tweak_policy: { sysctls: ['net.ipv4.ip_forward'], units: ['nginx.service'] } });
+  assert.equal(await ch.policyDecision(reg, HOST_A, 'sys:tweak', { sys: { verb: 'sysctl-set', key: 'net.ipv4.ip_forward', value: '1' } }), null);
+  assert.equal(await ch.policyDecision(reg, HOST_A, 'sys:tweak', { sys: { verb: 'resource-limit-set', unit: 'nginx.service', limit: 'LimitNOFILE', value: '1' } }), null);
+  assert.equal(await ch.policyDecision(reg, HOST_A, 'sys:tweak', { sys: { verb: 'resource-limit-set', unit: 'redis.service', limit: 'LimitNOFILE', value: '1' } }), 'unit_denied');
+
+  // The sys_tweak lease binds verb + key/unit + value; the unit-override body
+  // is bound by hash.
+  const svcSigner = buildSigner(privateKeyFromSeed(TEST_SEED), rawPublicKey(privateKeyFromSeed(TEST_SEED)));
+  const svcPub = require('node:crypto').createPublicKey(privateKeyFromSeed(TEST_SEED));
+  const now = Date.now();
+  const payload = lease.sysTweakPayload({ verb: 'sysctl-set', key: 'net.ipv4.ip_forward', value: '1' });
+  assert.equal(payload, 'sysctl-set\nnet.ipv4.ip_forward\n1');
+  const tl = lease.issueLease(svcSigner, { hostId: HOST_A, action: 'sys_tweak', payload, now });
+  assert.equal(lease.verifyLease(svcPub, tl, payload, now).ok, true);
+  assert.equal(lease.verifyLease(svcPub, tl, lease.sysTweakPayload({ verb: 'sysctl-set', key: 'net.ipv4.ip_forward', value: '0' }), now).error, 'payload_mismatch');
+  assert.throws(() => lease.sysTweakPayload({ verb: 'sysctl-set', key: 'kernel.modprobe', value: '1' }), /bad_payload/);
+  assert.throws(() => lease.sysTweakPayload({ verb: 'unit-override-set', unit: 'nginx.service', name: 'x' }, 'nothex'), /bad_payload/);
+});

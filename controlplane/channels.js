@@ -17,7 +17,7 @@ const FILE_PURPOSES = new Set(['file:read', 'file:write', 'file:root']);
 const CHANNEL_PURPOSES = new Set([...TCP_PURPOSES, ...FILE_PURPOSES]);
 // SAH OS-management channels (docs/sah-os-management-design.md). Kept out of
 // CHANNEL_PURPOSES: each carries a resource binding, not a target or root.
-const SYS_PURPOSES = new Set(['sys:service', 'sys:package', 'sys:config']);
+const SYS_PURPOSES = new Set(['sys:service', 'sys:package', 'sys:config', 'sys:tweak']);
 const ROOT_MAX_BYTES = 4096;
 const POLICY_MAX_ENTRIES = 256;
 const POLICY_MAX_PORTS = 256;
@@ -39,6 +39,21 @@ const PACKAGE_ACTIONS = new Set(['query', 'install', 'remove', 'upgrade']);
 // the lease (the file/xfer content-by-hash pattern).
 const CONFIG_ACTIONS = new Set(['read', 'write', 'reload']);
 const CONFIG_CONTENT_MAX = 64 * 1024;
+// The sys:tweak channel verbs. sysctl-get is a read; the rest are mutations.
+// Kernel modules and firewall rules are out of v1 (design Decision 2).
+const TWEAK_VERBS = new Set(['sysctl-get', 'sysctl-set', 'resource-limit-set', 'unit-override-set']);
+// Mirrors systemapi-agent/grant.go sysctlKeyRE, deniedSysctl, sysctlValueCap
+// and platform_tweak.go resourceLimits, overrideNameRE, limitValueRE,
+// overrideContentCap.
+const SYSCTL_KEY_RE = /^[a-z][a-z0-9_.]{0,127}$/;
+const SYSCTL_VALUE_MAX = 256;
+const DENIED_SYSCTL = new Set(['kernel.core_pattern', 'kernel.modprobe', 'kernel.hotplug']);
+const OVERRIDE_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
+const LIMIT_VALUE_RE = /^[a-zA-Z0-9:._]{1,64}$/;
+const OVERRIDE_CONTENT_MAX = 64 * 1024;
+const RESOURCE_LIMITS = new Set(['LimitCPU', 'LimitFSIZE', 'LimitDATA', 'LimitSTACK', 'LimitCORE', 'LimitRSS',
+  'LimitNOFILE', 'LimitAS', 'LimitNPROC', 'LimitMEMLOCK', 'LimitLOCKS', 'LimitSIGPENDING', 'LimitMSGQUEUE',
+  'LimitNICE', 'LimitRTPRIO', 'LimitRTTIME']);
 
 // Scopes each purpose needs. file:write needs file:read too (FILE §2). A
 // service restart is root-equivalent but bounded by the per-host unit
@@ -50,7 +65,8 @@ const PURPOSE_SCOPES = Object.freeze({
   'file:root': ['file:root'],
   'sys:service': ['sys:service'],
   'sys:package': ['sys:package'],
-  'sys:config': ['sys:config']
+  'sys:config': ['sys:config'],
+  'sys:tweak': ['sys:tweak']
 });
 
 const IPV4_OCTET = '(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])';
@@ -443,6 +459,73 @@ function configPolicyAllows(policy, path) {
   return policy.paths.some((base) => beneath(path, base));
 }
 
+// validateTweakBinding checks a sys:tweak binding. The canonical shape is a
+// flat { verb, ... } with only the fields that verb uses; it is idempotent, so
+// the same function guards the ticket body and the stored binding. sysctl
+// values and resource-limit values ride the lease directly (short, newline-
+// free); a unit-override body rides the agent frame bound by SHA-256 in the
+// lease (sys.js). A hard-denied sysctl key is refused here as well as on the
+// agent. Mirrors systemapi-agent/sys_policy.go checkSysTweakPolicy and
+// platform_tweak.go.
+function validateTweakBinding(tw) {
+  if (!tw || typeof tw !== 'object' || Array.isArray(tw)) return { ok: false, error: 'bad_tweak' };
+  const { verb } = tw;
+  if (!TWEAK_VERBS.has(verb)) return { ok: false, error: 'bad_action' };
+  if (verb === 'sysctl-get' || verb === 'sysctl-set') {
+    if (typeof tw.key !== 'string' || !SYSCTL_KEY_RE.test(tw.key) || DENIED_SYSCTL.has(tw.key)) return { ok: false, error: 'bad_tweak' };
+    if (verb === 'sysctl-get') return { ok: true, tweak: { verb, key: tw.key } };
+    if (typeof tw.value !== 'string' || tw.value.length === 0 || tw.value.length > SYSCTL_VALUE_MAX
+      || /[\n\r\u0000]/.test(tw.value)) return { ok: false, error: 'bad_tweak' };
+    return { ok: true, tweak: { verb, key: tw.key, value: tw.value } };
+  }
+  if (verb === 'resource-limit-set') {
+    if (typeof tw.unit !== 'string' || !SERVICE_UNIT_RE.test(tw.unit)) return { ok: false, error: 'bad_tweak' };
+    if (typeof tw.limit !== 'string' || !RESOURCE_LIMITS.has(tw.limit)) return { ok: false, error: 'bad_tweak' };
+    if (typeof tw.value !== 'string' || !LIMIT_VALUE_RE.test(tw.value)) return { ok: false, error: 'bad_tweak' };
+    return { ok: true, tweak: { verb, unit: tw.unit, limit: tw.limit, value: tw.value } };
+  }
+  // unit-override-set
+  if (typeof tw.unit !== 'string' || !SERVICE_UNIT_RE.test(tw.unit)) return { ok: false, error: 'bad_tweak' };
+  if (typeof tw.name !== 'string' || !OVERRIDE_NAME_RE.test(tw.name)) return { ok: false, error: 'bad_tweak' };
+  if (typeof tw.content !== 'string' || !tw.content.isWellFormed() || tw.content.length === 0
+    || Buffer.byteLength(tw.content, 'utf8') > OVERRIDE_CONTENT_MAX || tw.content.includes('\u0000')) return { ok: false, error: 'bad_tweak' };
+  return { ok: true, tweak: { verb, unit: tw.unit, name: tw.name, content: tw.content } };
+}
+
+// parseTweakPolicy returns the normalized allowlists, or null when malformed
+// (deny-all): { sysctls: [keys], units: [units] }. sysctl get/set are gated by
+// sysctls; resource-limit/unit-override by units. A hard-denied sysctl can
+// never be listed. Deny by default.
+function parseTweakPolicy(raw) {
+  if (raw === null || raw === undefined) return { sysctls: [], units: [] };
+  if (typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const sysctls = raw.sysctls === undefined ? [] : raw.sysctls;
+  const units = raw.units === undefined ? [] : raw.units;
+  if (!Array.isArray(sysctls) || !Array.isArray(units) || sysctls.length > POLICY_MAX_ENTRIES || units.length > POLICY_MAX_ENTRIES) return null;
+  const outKeys = [];
+  for (const k of sysctls) {
+    if (typeof k !== 'string' || !SYSCTL_KEY_RE.test(k) || DENIED_SYSCTL.has(k)) return null;
+    outKeys.push(k);
+  }
+  const outUnits = [];
+  for (const u of units) {
+    if (typeof u !== 'string' || !SERVICE_UNIT_RE.test(u)) return null;
+    outUnits.push(u);
+  }
+  return { sysctls: outKeys, units: outUnits };
+}
+
+// tweakPolicyAllows returns null when allowed, else the deny code. Deny by
+// default. sysctl verbs are gated by the sysctl allowlist, the override verbs
+// by the unit allowlist.
+function tweakPolicyAllows(policy, tweak) {
+  if (!policy || !Array.isArray(policy.sysctls) || !Array.isArray(policy.units) || !tweak) return 'tweak_denied';
+  if (tweak.verb === 'sysctl-get' || tweak.verb === 'sysctl-set') {
+    return policy.sysctls.includes(tweak.key) ? null : 'sysctl_denied';
+  }
+  return policy.units.includes(tweak.unit) ? null : 'unit_denied';
+}
+
 // validateBinding parses the purpose-specific part of a ws-ticket body.
 // Returns { ok, binding } where binding is { target } or { root }, or
 // { ok:false, error }. target_forbidden is reported separately in
@@ -474,6 +557,11 @@ function validateBinding(purpose, body) {
     if (!checked.ok) return { ok: false, error: checked.error };
     return { ok: true, forbidden: false, binding: { sys: checked.config }, checked };
   }
+  if (purpose === 'sys:tweak') {
+    const checked = validateTweakBinding(body && body.tweak);
+    if (!checked.ok) return { ok: false, error: checked.error };
+    return { ok: true, forbidden: false, binding: { sys: checked.tweak }, checked };
+  }
   return { ok: true, forbidden: false, binding: null, checked: null };
 }
 
@@ -482,7 +570,7 @@ function validateBinding(purpose, body) {
 // support denies everything.
 async function effectivePolicies(registry, hostId) {
   if (!registry || typeof registry.channelPolicies !== 'function') {
-    return { tcp: { allow: [] }, file: { roots: [] }, service: { units: [] }, package: { names: [] }, config: { paths: [] } };
+    return { tcp: { allow: [] }, file: { roots: [] }, service: { units: [] }, package: { names: [] }, config: { paths: [] }, tweak: { sysctls: [], units: [] } };
   }
   const raw = await registry.channelPolicies(hostId);
   const pick = (hostVal, tenantVal) => (hostVal !== null && hostVal !== undefined ? hostVal : tenantVal);
@@ -491,7 +579,8 @@ async function effectivePolicies(registry, hostId) {
     file: parseFilePolicy(pick(raw && raw.host_file_policy, raw && raw.tenant_file_policy)),
     service: parseServicePolicy(pick(raw && raw.host_service_policy, raw && raw.tenant_service_policy)),
     package: parsePackagePolicy(pick(raw && raw.host_package_policy, raw && raw.tenant_package_policy)),
-    config: parseConfigPolicy(pick(raw && raw.host_config_policy, raw && raw.tenant_config_policy))
+    config: parseConfigPolicy(pick(raw && raw.host_config_policy, raw && raw.tenant_config_policy)),
+    tweak: parseTweakPolicy(pick(raw && raw.host_tweak_policy, raw && raw.tenant_tweak_policy))
   };
 }
 
@@ -533,6 +622,12 @@ async function policyDecision(registry, hostId, purpose, binding) {
     }
     return configPolicyAllows(pols.config, checked.config.target) ? null : 'path_denied';
   }
+  if (purpose === 'sys:tweak') {
+    const checked = validateTweakBinding(binding && binding.sys);
+    if (!checked.ok) return checked.error;
+    const { tweak } = await effectivePolicies(registry, hostId);
+    return tweakPolicyAllows(tweak, checked.tweak);
+  }
   return null;
 }
 
@@ -544,7 +639,8 @@ function assertPolicyShape(kind, raw) {
     : kind === 'service' ? parseServicePolicy(raw)
       : kind === 'package' ? parsePackagePolicy(raw)
         : kind === 'config' ? parseConfigPolicy(raw)
-          : parseFilePolicy(raw);
+          : kind === 'tweak' ? parseTweakPolicy(raw)
+            : parseFilePolicy(raw);
   if (!parsed || raw === undefined) {
     const err = new Error('bad_policy');
     err.status = 400;
@@ -595,6 +691,12 @@ module.exports = {
   validateConfigBinding,
   parseConfigPolicy,
   configPolicyAllows,
+  OVERRIDE_CONTENT_MAX,
+  SYSCTL_KEY_RE,
+  DENIED_SYSCTL,
+  validateTweakBinding,
+  parseTweakPolicy,
+  tweakPolicyAllows,
   validateBinding,
   effectivePolicies,
   policyDecision,

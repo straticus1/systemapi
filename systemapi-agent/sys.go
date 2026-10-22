@@ -44,6 +44,14 @@ const sysConfigReadMax = 64 * 1024
 // sysConfig returns the host's ConfigStore; tests replace it.
 var sysConfig = func() ConfigStore { return currentPlatform().Config }
 
+// sysTweaks returns the host's Tweaks backend; tests replace it.
+var sysTweaks = func() Tweaks { return currentPlatform().Tweaks }
+
+// sysTweakOverrideRoot is the fixed prefix a resource-limit or unit-override
+// write lands under; the Phase 0 Tweaks backend pins the full path beneath it.
+// The real allowlist is the per-host tweak unit policy plus the lease.
+var sysTweakOverrideRoot = []string{"/etc/systemd/system"}
+
 // sysConfigReadFile reads one config file for a sys:config read. It opens the
 // final component without following a symlink and refuses anything that is not
 // a regular file, so a planted symlink cannot redirect the read out of an
@@ -146,6 +154,14 @@ func (c *channelConn) handleSys(typ string, message []byte) bool {
 			return true
 		}
 		c.sysConfig(msg, time.Now())
+		return true
+	case "sys_tweak":
+		var msg sysTweakMsg
+		if err := json.Unmarshal(message, &msg); err != nil {
+			log.Printf("rejected malformed sys_tweak")
+			return true
+		}
+		c.sysTweak(msg, time.Now())
 		return true
 	default:
 		return false
@@ -361,4 +377,83 @@ func (c *channelConn) sysConfig(msg sysConfigMsg, now time.Time) {
 	}
 	_ = c.out.WriteJSON(ResponseMessage{Type: "sys_result", RequestID: rid, Payload: result})
 	log.Printf("sys_config %s action=%s target=%s ok=%t", rid, msg.Action, msg.Target, actErr == nil)
+}
+
+// sysTweakMsg is the server's sys_tweak request frame. Only the fields the
+// verb uses are set; content is present only for a unit-override, bound by its
+// SHA-256 in the lease.
+type sysTweakMsg struct {
+	Type      string `json:"type"`
+	RequestID string `json:"request_id"`
+	Verb      string `json:"verb"`
+	Key       string `json:"key"`
+	Value     string `json:"value"`
+	Unit      string `json:"unit"`
+	Limit     string `json:"limit"`
+	Name      string `json:"name"`
+	Content   string `json:"content"`
+	Lease     *Lease `json:"lease"`
+}
+
+// sysTweak applies one kernel/service knob: sysctl get/set, a resource limit,
+// or a unit override. It rebuilds the signed payload from the frame (hashing a
+// unit-override body), verifies the lease, applies its own gate, then calls
+// the Phase 0 Tweaks backend, which re-checks the hard-denied sysctl keys, the
+// value shapes and the AllowConfigWrite prefix.
+func (c *channelConn) sysTweak(msg sysTweakMsg, now time.Time) {
+	rid := msg.RequestID
+	if !sysRequestRe.MatchString(rid) {
+		log.Printf("sys_tweak refused: bad request id")
+		sysResultError(c.out, "", "internal")
+		return
+	}
+	contentSHA := ""
+	if msg.Verb == "unit-override-set" {
+		contentSHA = sysSHA256Hex(msg.Content)
+	}
+	payload, err := sysTweakLeasePayload(msg.Verb, msg.Key, msg.Value, msg.Unit, msg.Limit, msg.Name, contentSHA)
+	if err != nil {
+		log.Printf("sys_tweak refused: %s", err.Error())
+		sysResultError(c.out, rid, "lease_required")
+		return
+	}
+	if err := authorizeCommand(c.hostID, "sys_tweak", payload, msg.Lease, now); err != nil {
+		log.Printf("sys_tweak refused: %s", err.Error())
+		sysResultError(c.out, rid, "lease_required")
+		return
+	}
+	if err := checkSysTweakPolicy(msg.Verb, msg.Key, msg.Unit); err != nil {
+		log.Printf("sys_tweak refused: %s", err.Error())
+		sysResultError(c.out, rid, err.Error())
+		return
+	}
+	tw := sysTweaks()
+	result := map[string]interface{}{"verb": msg.Verb}
+	var actErr error
+	switch msg.Verb {
+	case "sysctl-get":
+		var out string
+		out, actErr = tw.SysctlGet(msg.Key, []string{msg.Key})
+		result["key"] = msg.Key
+		if actErr == nil {
+			result["output"] = capSysOutput(out)
+		}
+	case "sysctl-set":
+		actErr = tw.SysctlSet(msg.Key, msg.Value, []string{msg.Key})
+		result["key"] = msg.Key
+	case "resource-limit-set":
+		actErr = tw.SetResourceLimit(msg.Unit, msg.Limit, msg.Value, sysTweakOverrideRoot)
+		result["unit"] = msg.Unit
+		result["limit"] = msg.Limit
+	case "unit-override-set":
+		actErr = tw.SetUnitOverride(msg.Unit, msg.Name, msg.Content, sysTweakOverrideRoot)
+		result["unit"] = msg.Unit
+		result["name"] = msg.Name
+	}
+	result["ok"] = actErr == nil
+	if actErr != nil {
+		result["error"] = "action_failed"
+	}
+	_ = c.out.WriteJSON(ResponseMessage{Type: "sys_result", RequestID: rid, Payload: result})
+	log.Printf("sys_tweak %s verb=%s ok=%t", rid, msg.Verb, actErr == nil)
 }

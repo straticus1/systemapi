@@ -1912,6 +1912,62 @@ test('sys:config is an operator scope; read/write gated by paths, reload by unit
   }
 });
 
+test('sys:tweak is an operator scope; sysctl gated by keys, overrides by units, override body never audited', async () => {
+  assert.equal(OPERATOR.includes('sys:tweak'), true);
+  assert.equal(scopesForRole('viewer').has('sys:tweak'), false);
+
+  const fm = fleet();
+  await seed(fm);
+  await fm.registry.setHostChannelPolicy(HOST_A, { tweak_policy: { sysctls: ['net.ipv4.ip_forward'], units: ['nginx.service'] } });
+  await fm.registry.addMember('acme', 'op-1', 'operator', 'op@example');
+  await fm.registry.addMember('acme', 'view-1', 'viewer', 'view@example');
+  const opApp = await listen(appFor(fm, await ssoUser(fm, 'op-1', { email: 'op@example', groups: [] })));
+  const viewApp = await listen(appFor(fm, await ssoUser(fm, 'view-1', { email: 'view@example', groups: [] })));
+  const twkTicket = (url, tweak, headers = {}) => call(`${url}/api/v1/ws-ticket`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...headers },
+    body: JSON.stringify({ host_id: HOST_A, purpose: 'sys:tweak', tweak })
+  });
+  try {
+    const viewer = await twkTicket(viewApp.url, { verb: 'sysctl-get', key: 'net.ipv4.ip_forward' });
+    assert.equal(viewer.status, 403);
+    assert.equal(viewer.body.error, 'scope_denied');
+
+    const deniedKey = await twkTicket(opApp.url, { verb: 'sysctl-set', key: 'vm.swappiness', value: '10' });
+    assert.equal(deniedKey.status, 403);
+    assert.equal(deniedKey.body.error, 'sysctl_denied');
+    const deniedUnit = await twkTicket(opApp.url, { verb: 'resource-limit-set', unit: 'redis.service', limit: 'LimitNOFILE', value: '65536' });
+    assert.equal(deniedUnit.status, 403);
+    assert.equal(deniedUnit.body.error, 'unit_denied');
+    assert.equal(fm.tickets.size, 0);
+
+    const get = await twkTicket(opApp.url, { verb: 'sysctl-get', key: 'net.ipv4.ip_forward' });
+    assert.equal(get.status, 200);
+    assert.deepEqual(fm.tickets.get(get.body.ticket).sys, { verb: 'sysctl-get', key: 'net.ipv4.ip_forward' });
+
+    const content = '[Service]\nLimitNOFILE=65536\n';
+    const override = await twkTicket(opApp.url, { verb: 'unit-override-set', unit: 'nginx.service', name: 'limit-nofile', content });
+    assert.equal(override.status, 200);
+    assert.equal(fm.tickets.get(override.body.ticket).sys.content, content);
+
+    const hardDenied = await twkTicket(opApp.url, { verb: 'sysctl-set', key: 'kernel.core_pattern', value: 'x' });
+    assert.equal(hardDenied.status, 400);
+    assert.equal(hardDenied.body.error, 'bad_tweak');
+
+    const issued = fm.registry.audit.filter((r) => r.action === 'ticket_issued' && r.payload.purpose === 'sys:tweak');
+    assert.equal(issued.length, 2);
+    assert.deepEqual(issued[0].payload.tweak, { verb: 'sysctl-get', key: 'net.ipv4.ip_forward' });
+    assert.equal(issued[1].payload.tweak.verb, 'unit-override-set');
+    assert.equal(issued[1].payload.tweak.content_sha256,
+      require('node:crypto').createHash('sha256').update(content, 'utf8').digest('hex'));
+    assert.equal(JSON.stringify(issued).includes('LimitNOFILE'), false);
+    assert.equal((await fm.registry.verifyAudit()).ok, true);
+  } finally {
+    opApp.server.close();
+    viewApp.server.close();
+  }
+});
+
 test('the audit chain covers actor, host, tenant and action; legacy rows still verify', async () => {
   const { GENESIS, chainHash } = require('../controlplane/chain');
   const reg = new MemoryRegistry({ NODE_ENV: 'test' });

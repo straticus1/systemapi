@@ -27,7 +27,7 @@ const { sshKeyMaterial } = require('./sshkey');
 const METRICS = new Set(['cpu.usage_percent', 'memory.used_percent', 'disk.used_percent']);
 const ROLES = new Set(['admin', 'operator', 'viewer']);
 // Maps a channel-policy column to its assertPolicyShape kind.
-const POLICY_KIND = { tcp_policy: 'tcp', file_policy: 'file', service_policy: 'service', package_policy: 'package', config_policy: 'config' };
+const POLICY_KIND = { tcp_policy: 'tcp', file_policy: 'file', service_policy: 'service', package_policy: 'package', config_policy: 'config', tweak_policy: 'tweak' };
 // The channel-policy columns, in the order the policy setters write them.
 const POLICY_COLUMNS = Object.keys(POLICY_KIND);
 const SCHEMA_SQL = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
@@ -146,7 +146,7 @@ async function ssoBindInTx(client, { tenantId, userId, sub, actor }) {
 
 // The audit row for a host channel policy write: why, and the new and the
 // previous policies of both columns.
-function channelPolicyAuditEntry(tenantId, hostId, actor, action, reason, tcpPolicy, filePolicy, prevTcp, prevFile, servicePolicy = null, prevService = null, packagePolicy = null, prevPackage = null, configPolicy = null, prevConfig = null) {
+function channelPolicyAuditEntry(tenantId, hostId, actor, action, reason, tcpPolicy, filePolicy, prevTcp, prevFile, servicePolicy = null, prevService = null, packagePolicy = null, prevPackage = null, configPolicy = null, prevConfig = null, tweakPolicy = null, prevTweak = null) {
   return {
     tenant_id: tenantId,
     host_id: hostId,
@@ -159,11 +159,13 @@ function channelPolicyAuditEntry(tenantId, hostId, actor, action, reason, tcpPol
       service_policy: servicePolicy ?? null,
       package_policy: packagePolicy ?? null,
       config_policy: configPolicy ?? null,
+      tweak_policy: tweakPolicy ?? null,
       previous_tcp_policy: prevTcp ?? null,
       previous_file_policy: prevFile ?? null,
       previous_service_policy: prevService ?? null,
       previous_package_policy: prevPackage ?? null,
-      previous_config_policy: prevConfig ?? null
+      previous_config_policy: prevConfig ?? null,
+      previous_tweak_policy: prevTweak ?? null
     }
   };
 }
@@ -373,11 +375,13 @@ class MemoryRegistry {
       host_service_policy: h.service_policy ?? null,
       host_package_policy: h.package_policy ?? null,
       host_config_policy: h.config_policy ?? null,
+      host_tweak_policy: h.tweak_policy ?? null,
       tenant_tcp_policy: t.tcp_policy ?? null,
       tenant_file_policy: t.file_policy ?? null,
       tenant_service_policy: t.service_policy ?? null,
       tenant_package_policy: t.package_policy ?? null,
-      tenant_config_policy: t.config_policy ?? null
+      tenant_config_policy: t.config_policy ?? null,
+      tenant_tweak_policy: t.tweak_policy ?? null
     };
   }
 
@@ -395,7 +399,7 @@ class MemoryRegistry {
 
   // All three host columns and their audit row together: the row is written
   // first and the policy changes only once it is in (see PgRegistry).
-  async setHostChannelPolicyAudited({ tenantId, hostId, tcpPolicy, filePolicy, servicePolicy = null, packagePolicy = null, configPolicy = null, actor, action, reason }) {
+  async setHostChannelPolicyAudited({ tenantId, hostId, tcpPolicy, filePolicy, servicePolicy = null, packagePolicy = null, configPolicy = null, tweakPolicy = null, actor, action, reason }) {
     const row = this.hosts.get(hostId);
     if (!row || row.tenant_id !== tenantId) throw http(404, 'not_found');
     assertPolicyShape('tcp', tcpPolicy);
@@ -403,14 +407,16 @@ class MemoryRegistry {
     assertPolicyShape('service', servicePolicy);
     assertPolicyShape('package', packagePolicy);
     assertPolicyShape('config', configPolicy);
+    assertPolicyShape('tweak', tweakPolicy);
     const cur = this.hostPolicies.get(hostId) || {};
-    await this.appendAudit(channelPolicyAuditEntry(tenantId, hostId, actor, action, reason, tcpPolicy, filePolicy, cur.tcp_policy, cur.file_policy, servicePolicy, cur.service_policy, packagePolicy, cur.package_policy, configPolicy, cur.config_policy));
+    await this.appendAudit(channelPolicyAuditEntry(tenantId, hostId, actor, action, reason, tcpPolicy, filePolicy, cur.tcp_policy, cur.file_policy, servicePolicy, cur.service_policy, packagePolicy, cur.package_policy, configPolicy, cur.config_policy, tweakPolicy, cur.tweak_policy));
     this.hostPolicies.set(hostId, {
       tcp_policy: tcpPolicy === null ? null : JSON.parse(JSON.stringify(tcpPolicy)),
       file_policy: filePolicy === null ? null : JSON.parse(JSON.stringify(filePolicy)),
       service_policy: servicePolicy === null ? null : JSON.parse(JSON.stringify(servicePolicy)),
       package_policy: packagePolicy === null ? null : JSON.parse(JSON.stringify(packagePolicy)),
-      config_policy: configPolicy === null ? null : JSON.parse(JSON.stringify(configPolicy))
+      config_policy: configPolicy === null ? null : JSON.parse(JSON.stringify(configPolicy)),
+      tweak_policy: tweakPolicy === null ? null : JSON.parse(JSON.stringify(tweakPolicy))
     });
   }
 
@@ -1000,8 +1006,8 @@ class PgRegistry {
 
   async channelPolicies(hostId) {
     const res = await this.pool.query(
-      `SELECT h.tcp_policy AS host_tcp_policy, h.file_policy AS host_file_policy, h.service_policy AS host_service_policy, h.package_policy AS host_package_policy, h.config_policy AS host_config_policy,
-              t.tcp_policy AS tenant_tcp_policy, t.file_policy AS tenant_file_policy, t.service_policy AS tenant_service_policy, t.package_policy AS tenant_package_policy, t.config_policy AS tenant_config_policy
+      `SELECT h.tcp_policy AS host_tcp_policy, h.file_policy AS host_file_policy, h.service_policy AS host_service_policy, h.package_policy AS host_package_policy, h.config_policy AS host_config_policy, h.tweak_policy AS host_tweak_policy,
+              t.tcp_policy AS tenant_tcp_policy, t.file_policy AS tenant_file_policy, t.service_policy AS tenant_service_policy, t.package_policy AS tenant_package_policy, t.config_policy AS tenant_config_policy, t.tweak_policy AS tenant_tweak_policy
        FROM cp_hosts h JOIN cp_tenants t ON t.tenant_id = h.tenant_id
        WHERE h.host_id = $1 AND h.retired_at IS NULL`,
       [hostId]
@@ -1020,28 +1026,29 @@ class PgRegistry {
   // One transaction on one client: lock the host row (it must belong to
   // tenantId), replace the three policy columns, append the audit row with the
   // old and new policies. Any failure rolls all of it back.
-  async setHostChannelPolicyAudited({ tenantId, hostId, tcpPolicy, filePolicy, servicePolicy = null, packagePolicy = null, configPolicy = null, actor, action, reason }) {
+  async setHostChannelPolicyAudited({ tenantId, hostId, tcpPolicy, filePolicy, servicePolicy = null, packagePolicy = null, configPolicy = null, tweakPolicy = null, actor, action, reason }) {
     assertPolicyShape('tcp', tcpPolicy);
     assertPolicyShape('file', filePolicy);
     assertPolicyShape('service', servicePolicy);
     assertPolicyShape('package', packagePolicy);
     assertPolicyShape('config', configPolicy);
+    assertPolicyShape('tweak', tweakPolicy);
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
       const cur = await client.query(
-        'SELECT tcp_policy, file_policy, service_policy, package_policy, config_policy FROM cp_hosts WHERE host_id = $1 AND tenant_id = $2 FOR UPDATE',
+        'SELECT tcp_policy, file_policy, service_policy, package_policy, config_policy, tweak_policy FROM cp_hosts WHERE host_id = $1 AND tenant_id = $2 FOR UPDATE',
         [hostId, tenantId]
       );
       if (cur.rowCount === 0) throw http(404, 'not_found');
       const prev = cur.rows[0];
       await client.query(
-        'UPDATE cp_hosts SET tcp_policy = $2::jsonb, file_policy = $3::jsonb, service_policy = $4::jsonb, package_policy = $5::jsonb, config_policy = $6::jsonb WHERE host_id = $1',
+        'UPDATE cp_hosts SET tcp_policy = $2::jsonb, file_policy = $3::jsonb, service_policy = $4::jsonb, package_policy = $5::jsonb, config_policy = $6::jsonb, tweak_policy = $7::jsonb WHERE host_id = $1',
         [hostId, tcpPolicy === null ? null : JSON.stringify(tcpPolicy), filePolicy === null ? null : JSON.stringify(filePolicy),
           servicePolicy === null ? null : JSON.stringify(servicePolicy), packagePolicy === null ? null : JSON.stringify(packagePolicy),
-          configPolicy === null ? null : JSON.stringify(configPolicy)]
+          configPolicy === null ? null : JSON.stringify(configPolicy), tweakPolicy === null ? null : JSON.stringify(tweakPolicy)]
       );
-      await auditInsert(client, channelPolicyAuditEntry(tenantId, hostId, actor, action, reason, tcpPolicy, filePolicy, prev.tcp_policy, prev.file_policy, servicePolicy, prev.service_policy, packagePolicy, prev.package_policy, configPolicy, prev.config_policy));
+      await auditInsert(client, channelPolicyAuditEntry(tenantId, hostId, actor, action, reason, tcpPolicy, filePolicy, prev.tcp_policy, prev.file_policy, servicePolicy, prev.service_policy, packagePolicy, prev.package_policy, configPolicy, prev.config_policy, tweakPolicy, prev.tweak_policy));
       await client.query('COMMIT');
     } catch (err) {
       try { await client.query('ROLLBACK'); } catch { /* connection already failed */ }

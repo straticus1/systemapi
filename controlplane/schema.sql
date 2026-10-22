@@ -79,6 +79,13 @@ ALTER TABLE cp_tenants ADD COLUMN IF NOT EXISTS package_policy JSONB;
 -- and malformed-is-deny-all rules as the policies above.
 ALTER TABLE cp_hosts ADD COLUMN IF NOT EXISTS config_policy JSONB;
 ALTER TABLE cp_tenants ADD COLUMN IF NOT EXISTS config_policy JSONB;
+-- SAH OS-management tweak policy (docs/sah-os-management-design.md):
+-- { "sysctls": ["net.ipv4.ip_forward", ...], "units": ["nginx.service", ...] },
+-- the per-host/tenant allowlists the sys:tweak channel may act on: sysctl keys
+-- for get/set, units for resource-limit and unit-override. Same host-replaces-
+-- tenant, deny-by-default and malformed-is-deny-all rules as the policies above.
+ALTER TABLE cp_hosts ADD COLUMN IF NOT EXISTS tweak_policy JSONB;
+ALTER TABLE cp_tenants ADD COLUMN IF NOT EXISTS tweak_policy JSONB;
 
 -- Host retirement (POST /api/v1/hosts/:host_id/retire). A retired row is
 -- kept for audit but never resolves, is left out of the fleet listing by

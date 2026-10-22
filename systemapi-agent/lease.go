@@ -101,7 +101,7 @@ func knownAction(action string) bool {
 // sysAction reports the SAH OS-management channel lease actions
 // (docs/sah-os-management-design.md).
 func sysAction(action string) bool {
-	return action == "sys_service" || action == "sys_package" || action == "sys_config"
+	return action == "sys_service" || action == "sys_package" || action == "sys_config" || action == "sys_tweak"
 }
 
 // xferAction reports the sahxfer grant lease actions.
@@ -231,6 +231,51 @@ func sysConfigLeasePayload(action, target, contentSHA string) (string, error) {
 			return "", errors.New("bad_content")
 		}
 		return "write\n" + target + "\n" + contentSHA, nil
+	default:
+		return "", errors.New("bad_action")
+	}
+}
+
+// sysTweakLeasePayload is the signed payload of a sys_tweak lease
+// (docs/sah-os-management-design.md), byte-for-byte the server's
+// sysTweakPayload (controlplane/lease.js). A unit-override body is bound by
+// contentSHA; other verbs' short values ride the payload. Field shapes reuse
+// the agent's existing guards (grant.go sysctlKeyRE/deniedSysctl/sysctlValueOK,
+// platform_tweak.go resourceLimits/limitValueRE/overrideNameRE).
+func sysTweakLeasePayload(verb, key, value, unit, limit, name, contentSHA string) (string, error) {
+	sysctlKeyOK := func(k string) bool {
+		if _, denied := deniedSysctl[k]; denied {
+			return false
+		}
+		return sysctlKeyRE.MatchString(k)
+	}
+	switch verb {
+	case "sysctl-get":
+		if !sysctlKeyOK(key) {
+			return "", errors.New("bad_key")
+		}
+		return "sysctl-get\n" + key, nil
+	case "sysctl-set":
+		if !sysctlKeyOK(key) || !sysctlValueOK(value) {
+			return "", errors.New("bad_key")
+		}
+		return "sysctl-set\n" + key + "\n" + value, nil
+	case "resource-limit-set":
+		if !serviceNameRE.MatchString(unit) {
+			return "", errors.New("bad_unit")
+		}
+		if _, ok := resourceLimits[limit]; !ok || !limitValueRE.MatchString(value) {
+			return "", errors.New("bad_limit")
+		}
+		return "resource-limit-set\n" + unit + "\n" + limit + "\n" + value, nil
+	case "unit-override-set":
+		if !serviceNameRE.MatchString(unit) || !overrideNameRE.MatchString(name) {
+			return "", errors.New("bad_unit")
+		}
+		if !hashHexRe.MatchString(contentSHA) {
+			return "", errors.New("bad_content")
+		}
+		return "unit-override-set\n" + unit + "\n" + name + "\n" + contentSHA, nil
 	default:
 		return "", errors.New("bad_action")
 	}

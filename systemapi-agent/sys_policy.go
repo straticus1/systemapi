@@ -27,6 +27,10 @@ var (
 	errCfgUnsupported = errors.New("config_unsupported")
 	errCfgTargetBad   = errors.New("target_denied")
 	errCfgBadAction   = errors.New("bad_action")
+
+	errTweakUnsupported = errors.New("tweak_unsupported")
+	errTweakTargetBad   = errors.New("tweak_denied")
+	errTweakBadAction   = errors.New("bad_action")
 )
 
 // sysServiceActions is the closed set of mutating verbs this channel exposes:
@@ -109,6 +113,38 @@ func checkSysConfigPolicy(action, target string) error {
 	}
 	if target == "" || len(target) > 4096 || target == "/" || target[0] != '/' || !noControl(target) {
 		return errCfgTargetBad
+	}
+	return nil
+}
+
+// sysTweakVerbs is the closed set of sys:tweak channel verbs. Kept in sync
+// with the server's TWEAK_VERBS (controlplane/channels.js).
+var sysTweakVerbs = map[string]struct{}{
+	"sysctl-get": {}, "sysctl-set": {}, "resource-limit-set": {}, "unit-override-set": {},
+}
+
+// checkSysTweakPolicy is the agent's own fail-closed gate for sys:tweak. The
+// per-host sysctl/unit allowlists are enforced by the control plane and the
+// lease binds the exact key/unit, verb and value (or the override body's
+// hash); the agent refuses unless the host advertises the tweak capability,
+// the verb is in the closed set, and the key/unit passes its shape guard. The
+// Phase 0 Tweaks backend re-checks the hard-denied sysctl keys, the value
+// shapes, the closed resource-limit set and the AllowConfigWrite gate.
+func checkSysTweakPolicy(verb, key, unit string) error {
+	if !sysTweaks().Available() {
+		return errTweakUnsupported
+	}
+	if _, ok := sysTweakVerbs[verb]; !ok {
+		return errTweakBadAction
+	}
+	if verb == "sysctl-get" || verb == "sysctl-set" {
+		if _, denied := deniedSysctl[key]; denied || !sysctlKeyRE.MatchString(key) {
+			return errTweakTargetBad
+		}
+		return nil
+	}
+	if !serviceNameRE.MatchString(unit) {
+		return errTweakTargetBad
 	}
 	return nil
 }

@@ -16,7 +16,7 @@ const FleetManager = require('../playground/fleet');
 const { MemoryRegistry } = require('../controlplane/registry');
 const { TEST_SEED, privateKeyFromSeed, rawPublicKey, buildSigner } = require('../controlplane/keys');
 const { issueTicket } = require('../controlplane/tickets');
-const { verifyLease, sysServicePayload, sysPackagePayload, sysConfigPayload } = require('../controlplane/lease');
+const { verifyLease, sysServicePayload, sysPackagePayload, sysConfigPayload, sysTweakPayload } = require('../controlplane/lease');
 
 const HOST_A = '11111111-1111-4111-8111-111111111111';
 const PUBLIC_KEY = crypto.createPublicKey(privateKeyFromSeed(TEST_SEED));
@@ -26,6 +26,8 @@ const PKG = 'nginx';
 const PKG_POLICY = { names: [PKG] };
 const CFG_PATH = '/etc/nginx/nginx.conf';
 const CFG_POLICY = { paths: ['/etc/nginx'] };
+const SYSCTL_KEY = 'net.ipv4.ip_forward';
+const TWEAK_POLICY = { sysctls: [SYSCTL_KEY], units: [UNIT] };
 const sha256Hex = (s) => crypto.createHash('sha256').update(s, 'utf8').digest('hex');
 
 function signer() {
@@ -587,6 +589,136 @@ test('a single-use config ticket cannot be replayed', async () => {
     const first = openCfg(r, { action: 'read' });
     await waitUntil('first result', () => first.box.frames.find((f) => f.type === 'sys_result'));
     const replay = openCfg(r, { ticket: first.ticket });
+    await failsWith(replay, 'ticket_invalid');
+  } finally {
+    await r.close();
+  }
+});
+
+// --- sys:tweak ---
+
+async function connectTweakAgent(r, { caps = 'pty,tweak', tweakPolicy = TWEAK_POLICY, autoAnswer = true, fail = false } = {}) {
+  const ws = r.track(new WebSocket(`${r.base}/api/v1/systems/stream`, {
+    headers: {
+      authorization: 'Bearer agent-key',
+      'x-systemapi-tenant': 'acme',
+      'x-systemapi-host-id': HOST_A,
+      'x-systemapi-hostname': 'a.example',
+      'x-systemapi-ssh-pubkey': opensshEd25519(r.fm.signer.publicKeyRaw),
+      ...(caps === null ? {} : { 'x-systemapi-capabilities': caps })
+    }
+  }));
+  const box = collect(ws);
+  await waitUntil('enrolled', () => box.frames.find((f) => f.type === 'enrolled'));
+  if (tweakPolicy) await r.fm.registry.setHostChannelPolicy(HOST_A, { tweak_policy: tweakPolicy });
+  const agent = { ws, box, requests: [] };
+  ws.on('message', (data, isBinary) => {
+    if (isBinary) return;
+    const msg = JSON.parse(data.toString());
+    if (msg.type !== 'sys_tweak') return;
+    agent.requests.push(msg);
+    if (!autoAnswer) return;
+    const base = { ok: !fail, verb: msg.verb };
+    if (fail) base.error = 'action_failed';
+    else if (msg.verb === 'sysctl-get') base.output = '1\n';
+    ws.send(JSON.stringify({ type: 'sys_result', request_id: msg.request_id, payload: base }));
+  });
+  return agent;
+}
+
+function twkTicketFor(r, tweak, actor = 'user-1') {
+  return issueTicket(r.fm.tickets, { hostId: HOST_A, purpose: 'sys:tweak', tenantId: 'acme', actor, sys: tweak });
+}
+
+function openTwk(r, opts = {}) {
+  const t = opts.ticket || twkTicketFor(r, opts.tweak || { verb: 'sysctl-get', key: SYSCTL_KEY });
+  const ws = r.track(new WebSocket(`${r.base}/api/v1/systems/sys/${HOST_A}?ticket=${t}&purpose=sys:tweak`));
+  return { ws, box: collect(ws), ticket: t };
+}
+
+test('tweak sysctl-set runs end to end and the lease binds key and value', async () => {
+  const r = await rig();
+  try {
+    const agent = await connectTweakAgent(r);
+    const client = openTwk(r, { tweak: { verb: 'sysctl-set', key: SYSCTL_KEY, value: '1' } });
+    const req = await waitUntil('sys_tweak frame', () => agent.requests[0]);
+    assert.equal(req.verb, 'sysctl-set');
+    assert.equal(req.key, SYSCTL_KEY);
+    assert.equal(req.value, '1');
+    assert.equal(verifyLease(PUBLIC_KEY, req.lease, sysTweakPayload({ verb: 'sysctl-set', key: SYSCTL_KEY, value: '1' })).ok, true);
+    // The value is bound: a lease for value 1 does not verify for value 0.
+    assert.equal(verifyLease(PUBLIC_KEY, req.lease, sysTweakPayload({ verb: 'sysctl-set', key: SYSCTL_KEY, value: '0' })).ok, false);
+    await waitUntil('sys_result', () => okResult(client.box));
+    await waitUntil('result row', () => auditRows(r, 'sys_tweak_result').length === 1);
+    assert.equal(auditRows(r, 'sys_tweak_intent')[0].payload.value, '1');
+    assert.equal((await r.fm.registry.verifyAudit()).ok, true);
+  } finally {
+    await r.close();
+  }
+});
+
+test('tweak unit-override binds the body by hash and never audits it', async () => {
+  const r = await rig();
+  try {
+    const agent = await connectTweakAgent(r);
+    const content = '[Service]\nLimitNOFILE=65536\n';
+    const client = openTwk(r, { tweak: { verb: 'unit-override-set', unit: UNIT, name: 'limit-nofile', content } });
+    const req = await waitUntil('sys_tweak frame', () => agent.requests[0]);
+    assert.equal(req.content, content);
+    assert.equal(verifyLease(PUBLIC_KEY, req.lease, sysTweakPayload({ verb: 'unit-override-set', unit: UNIT, name: 'limit-nofile' }, sha256Hex(content))).ok, true);
+    await waitUntil('sys_result', () => okResult(client.box));
+    await waitUntil('result row', () => auditRows(r, 'sys_tweak_result').length === 1);
+    const intent = auditRows(r, 'sys_tweak_intent')[0].payload;
+    assert.equal(intent.content_sha256, sha256Hex(content));
+    assert.equal(JSON.stringify(intent).includes('LimitNOFILE'), false);
+  } finally {
+    await r.close();
+  }
+});
+
+test('a sysctl key the host policy does not allow is refused at the upgrade', async () => {
+  const r = await rig();
+  try {
+    await connectTweakAgent(r); // allows only net.ipv4.ip_forward
+    const client = openTwk(r, { ticket: twkTicketFor(r, { verb: 'sysctl-set', key: 'vm.swappiness', value: '10' }) });
+    await failsWith(client, 'sysctl_denied');
+    assert.equal(auditRows(r, 'sys_tweak_intent').length, 0);
+  } finally {
+    await r.close();
+  }
+});
+
+test('a tweak unit the host policy does not allow is refused at the upgrade', async () => {
+  const r = await rig();
+  try {
+    await connectTweakAgent(r); // units allow only nginx.service
+    const client = openTwk(r, { ticket: twkTicketFor(r, { verb: 'resource-limit-set', unit: 'postgresql.service', limit: 'LimitNOFILE', value: '65536' }) });
+    await failsWith(client, 'unit_denied');
+    assert.equal(auditRows(r, 'sys_tweak_intent').length, 0);
+  } finally {
+    await r.close();
+  }
+});
+
+test('a host that does not advertise the tweak capability is refused', async () => {
+  const r = await rig();
+  try {
+    await connectTweakAgent(r, { caps: 'pty,service' });
+    const client = openTwk(r);
+    await failsWith(client, 'agent_unsupported');
+    assert.equal(auditRows(r, 'sys_tweak_intent').length, 0);
+  } finally {
+    await r.close();
+  }
+});
+
+test('a single-use tweak ticket cannot be replayed', async () => {
+  const r = await rig();
+  try {
+    await connectTweakAgent(r);
+    const first = openTwk(r);
+    await waitUntil('first result', () => first.box.frames.find((f) => f.type === 'sys_result'));
+    const replay = openTwk(r, { ticket: first.ticket });
     await failsWith(replay, 'ticket_invalid');
   } finally {
     await r.close();

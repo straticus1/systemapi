@@ -9,11 +9,12 @@
 // admin can hand a support key only this scope). tcp:open, file:read and file:write are operator scopes; the
 // file:write purpose needs both file:read and file:write (channels.js).
 // sys:service (control a unit), sys:package (query/install/remove/upgrade a
-// package) and sys:config (read/write a config path, reload a unit; their
-// ws-ticket purposes) are also operator scopes, root-equivalent but bounded by
-// the deny-by-default per-host allowlists: units for service, names for
-// package, config paths for config read/write, and the unit allowlist for a
-// config reload (docs/sah-os-management-design.md).
+// package), sys:config (read/write a config path, reload a unit) and sys:tweak
+// (sysctl get/set, resource-limit and unit-override; their ws-ticket purposes)
+// are also operator scopes, root-equivalent but bounded by the deny-by-default
+// per-host allowlists: units for service, names for package, config paths for
+// config read/write (the unit allowlist for a config reload), and sysctl keys
+// or units for tweak (docs/sah-os-management-design.md).
 // ticketScopesHeld re-checks a channel ticket's scopes at the WebSocket
 // upgrade against the actor's CURRENT membership (and, for an API key, its
 // current key scopes), so a role or key downgraded in the ticket's 60 s
@@ -38,6 +39,7 @@ const ALL = Object.freeze([
   'sys:service',
   'sys:package',
   'sys:config',
+  'sys:tweak',
   'alerts:write',
   'audit:read',
   'admin'
@@ -54,6 +56,7 @@ const OPERATOR = Object.freeze([
   'sys:service',
   'sys:package',
   'sys:config',
+  'sys:tweak',
   'alerts:write',
   'hosts:write'
 ]);

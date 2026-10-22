@@ -418,6 +418,15 @@ async function issueAuditedTicket(fleet, principal, host, purpose, binding = nul
         row.content_bytes = Buffer.byteLength(sys.content, 'utf8');
       }
       payload.config = row;
+    } else if (purpose === 'sys:tweak') {
+      const sys = binding.sys;
+      const { content, ...rest } = sys;
+      const row = { ...rest };
+      if (typeof content === 'string') {
+        row.content_sha256 = require('node:crypto').createHash('sha256').update(content, 'utf8').digest('hex');
+        row.content_bytes = Buffer.byteLength(content, 'utf8');
+      }
+      payload.tweak = row;
     } else {
       payload[purpose === 'sys:package' ? 'package' : 'service'] = { ...binding.sys };
     }
@@ -686,7 +695,7 @@ function mount(app, fleet) {
     if (CHANNEL_PURPOSES.has(purpose) || SYS_PURPOSES.has(purpose)) {
       if (parsed.forbidden) throw http(403, 'target_forbidden');
       const denied = await policyDecision(fleet.registry, host.host_id, purpose, parsed.binding);
-      if (denied) throw http(['bad_target', 'bad_root', 'bad_unit', 'bad_action', 'bad_package', 'bad_config'].includes(denied) ? 400 : 403, denied);
+      if (denied) throw http(['bad_target', 'bad_root', 'bad_unit', 'bad_action', 'bad_package', 'bad_config', 'bad_tweak'].includes(denied) ? 400 : 403, denied);
     }
     res.json(await issueAuditedTicket(fleet, principal, host, purpose, parsed.binding));
   }));
