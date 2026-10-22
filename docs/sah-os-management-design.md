@@ -73,3 +73,20 @@ Config, service, package, and tweak writes are root-equivalent. `~/development/a
 - The Phase 3 recovery path (which option, or combination).
 - Whether the `sys` channel is one multiplexed channel or per-resource, mirroring tcp/file/mesh.
 - Team/org RBAC granularity for OS operations (per-resource scopes vs a single `sys:operator` scope).
+
+## Phase 2 — transport seam and the exec decision (recon 2026-10-22)
+
+The ssh transport is a single seam: `vpscfg/executor.py`, `subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, cmd], ...)` at ~line 160 and ~203. `--connect=ssh|api --failback=...` abstracts that into a transport interface with two backends: `ssh` (today) and `api` (a SystemAPI sys-channel client). farmops is an F0 skeleton (catalog loader + journal only; the runner, scheduler and CLI are later workstreams), so the transport belongs in vpscfgfarm's executor, consumed by farmops once its runner exists.
+
+THE DECISION that gates ssh-off: the sys channel exposes structured verbs (service/package/config/tweak), not an arbitrary shell. vpsexec's core use is running an arbitrary, gated command string. So `--connect=api` naturally covers only operations that map to a sys verb. vpsexec's arbitrary-command path has no API equivalent. Two ways to close it:
+  (a) add a general `sys:exec` verb — an arbitrary command run under a signed lease and a per-host command allowlist. Powerful, and the security crux of the whole program: it is the one surface that can do anything, so it must be the most tightly policy-bound.
+  (b) express every door operation as a structured verb or a committed runbook, and keep ssh only for break-glass.
+Recommendation: (b) as the default, plus a narrow, deny-by-default `sys:exec` scoped to the exact committed runbook commands that cannot be expressed as a structured verb — decided per command, never a blanket shell. This keeps the "checking in the door" thesis: the API transport runs only what policy named, the same as the door.
+
+## Phase 3 — recovery without ssh (options for decision 2026-10-22)
+
+The precondition for ever disabling sshd. With ssh off the agent is the only door, so a wedged agent must have a way back that does not need the thing that is wedged. Options:
+1. Watchdog / recovery agent: a second, minimal, independently-supervised process (its own systemd unit and key) that can restart or re-enroll the main agent, and under a signed grant re-enable sshd for a bounded window. In-band, no hardware; cost is another privileged surface, and if both wedge you are stuck.
+2. Out-of-band console (provider KVM / IPMI / serial): the true last resort, survives total software failure; depends on what the VPS provider offers, and is manual and slow. NEED TO KNOW: what console does the provider give these hosts.
+3. Signed, time-boxed sshd break-glass: the agent (or the watchdog) accepts a signed, expiring command that turns sshd back on for a window. Reuses the lease model; useless if the agent itself is the wedged thing.
+Recommendation: build 1 (watchdog) + 3 (signed sshd break-glass) as the in-band pair, and document 2 (provider console) as the true last resort. Do not disable sshd anywhere until this is built and drilled (the acceptance test includes a simulated wedge + recovery).
