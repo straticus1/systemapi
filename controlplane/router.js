@@ -15,7 +15,7 @@ const { hasScope, roleFromGroups, scopesForRole, intersectScopes, ALL } = requir
 const oauth = require('./oauth');
 const { issueLease, PTY_SESSION_RE, watchReasonOk } = require('./lease');
 const { issueTicket, TTL_MS: TICKET_TTL_MS } = require('./tickets');
-const { CHANNEL_PURPOSES, PURPOSE_SCOPES, validateBinding, policyDecision } = require('./channels');
+const { CHANNEL_PURPOSES, SYS_PURPOSES, PURPOSE_SCOPES, validateBinding, policyDecision } = require('./channels');
 const { fingerprint, randomToken, tokenEqual } = require('./token');
 const { sealSecret, openSecret } = require('./seal');
 const { assertWebhookURL } = require('./webhook');
@@ -30,7 +30,7 @@ const USER_RE = /^[a-zA-Z0-9][a-zA-Z0-9._@-]{0,128}$/;
 const RESOLVE_NAME_RE = /^[A-Za-z0-9._-]{1,253}$/;
 const RESOLVE_STALE_HOURS_DEFAULT = 24;
 const RETIRE_REASON_MAX = 256;
-const TICKET_PURPOSES = new Set(['terminal:open', 'terminal:root', 'breakglass:open', ...CHANNEL_PURPOSES, ...WATCH_PURPOSES.keys()]);
+const TICKET_PURPOSES = new Set(['terminal:open', 'terminal:root', 'breakglass:open', ...CHANNEL_PURPOSES, ...SYS_PURPOSES, ...WATCH_PURPOSES.keys()]);
 const TICKET_RATE_DEFAULT = 20;
 const TICKET_RATE_TCP_DEFAULT = 120;
 const PRIVILEGED_PURPOSES = new Set(['breakglass:open', 'terminal:root', 'file:root']);
@@ -405,6 +405,7 @@ async function issueAuditedTicket(fleet, principal, host, purpose, binding = nul
   if (watch) Object.assign(payload, { session_id: watch.sessionId, watch_id: watch.watchId, mode: watch.mode });
   if (binding && binding.target) payload.target = { host: binding.target.host, port: binding.target.port };
   if (binding && binding.root) payload.root = binding.root;
+  if (binding && binding.sys) payload.service = { unit: binding.sys.unit, action: binding.sys.action };
   await fleet.registry.appendAudit({
     tenant_id: host.tenant_id,
     host_id: host.host_id,
@@ -420,7 +421,8 @@ async function issueAuditedTicket(fleet, principal, host, purpose, binding = nul
     auth: { kind: principal.kind, keyId: principal.keyId || null, groupRole: principal.groupRole || null },
     target: binding && binding.target,
     root: binding && binding.root,
-    watch
+    watch,
+    sys: binding && binding.sys
   });
   return {
     ticket,
@@ -665,10 +667,10 @@ function mount(app, fleet) {
     requireScopeAnywhere(fleet, principal, scopes);
     const host = await requireHost(fleet, principal, hostId);
     for (const scope of scopes) requireScope(fleet, principal, host.tenant_id, scope);
-    if (CHANNEL_PURPOSES.has(purpose)) {
+    if (CHANNEL_PURPOSES.has(purpose) || SYS_PURPOSES.has(purpose)) {
       if (parsed.forbidden) throw http(403, 'target_forbidden');
       const denied = await policyDecision(fleet.registry, host.host_id, purpose, parsed.binding);
-      if (denied) throw http(denied === 'bad_target' || denied === 'bad_root' ? 400 : 403, denied);
+      if (denied) throw http(denied === 'bad_target' || denied === 'bad_root' || denied === 'bad_unit' || denied === 'bad_action' ? 400 : 403, denied);
     }
     res.json(await issueAuditedTicket(fleet, principal, host, purpose, parsed.binding));
   }));
