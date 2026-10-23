@@ -208,7 +208,7 @@ func runSysctlHelper(args []string) int {
 // doSysctlHelper reads the request, re-validates it (not trusting the caller),
 // and performs the write. It never panics or exits; it always returns a result.
 func doSysctlHelper(reqPath string) sysctlHelperRes {
-	data, err := readHandoffFile(reqPath)
+	data, err := readHandoffFile(reqPath, sysctlHandoffMax)
 	if err != nil {
 		return sysctlHelperRes{Error: "no_request"}
 	}
@@ -251,8 +251,10 @@ func writeHandoffFile(path string, data []byte) error {
 }
 
 // readHandoffFile reads a handoff file without following a symlink, refuses a
-// non-regular file, and caps the bytes.
-func readHandoffFile(path string) ([]byte, error) {
+// non-regular file, and caps the bytes at max. Shared by every mutation helper
+// (sysctl, config, systemd-override); each passes its own cap because a config
+// or unit-override request carries far more bytes than a sysctl one.
+func readHandoffFile(path string, max int64) ([]byte, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, err
@@ -265,7 +267,7 @@ func readHandoffFile(path string) ([]byte, error) {
 	if !info.Mode().IsRegular() {
 		return nil, errors.New("not a regular file")
 	}
-	return io.ReadAll(io.LimitReader(f, sysctlHandoffMax))
+	return io.ReadAll(io.LimitReader(f, max))
 }
 
 func writeHandoffResult(path string, res sysctlHelperRes) error {
@@ -278,7 +280,7 @@ func writeHandoffResult(path string, res sysctlHelperRes) error {
 
 func readHandoffResult(path string) (sysctlHelperRes, error) {
 	var res sysctlHelperRes
-	data, err := readHandoffFile(path)
+	data, err := readHandoffFile(path, sysctlHandoffMax)
 	if err != nil {
 		return res, err
 	}

@@ -1,0 +1,100 @@
+# Privilege-separated sys:config write helper for the SystemAPI agent
+# (docs/sah-os-management-design.md, mutation-helper section, option 2).
+# Extends the sysctl-set spike (sah-sysctl-helper@.service) to the ONE verb
+# sys:config write. Read that unit first; only the differences are noted.
+#
+# WHY THIS UNIT EXISTS
+# The agent runs under ProtectSystem=strict, which mounts /etc read-only, so the
+# agent cannot do a real /etc config write itself. Instead of widening the
+# agent's own sandbox (which would let every agent code path rewrite /etc), the
+# write is handed to THIS minimally-scoped, one-shot helper. Its sandbox is the
+# agent's hardening with exactly ONE relaxation: /etc is in ReadWritePaths
+# (ProtectSystem stays strict). The confinement lives here, in a committed unit;
+# the agent never constructs it at runtime. The agent only triggers the instance
+# and passes a request id as %i.
+#
+# TRIGGER (the unverified assumption, identical to the sysctl spike)
+#   systemctl start sah-config-helper@<id>.service
+# Whether the confined agent (NoNewPrivileges, restricted caps) is PERMITTED to
+# StartUnit this privileged unit over systemd's manager can only be confirmed on
+# a real host; see sah-sysctl-helper@.service. Not re-litigated here.
+#
+# HANDOFF
+# The agent writes /var/lib/systemapi-agent/config-helper/<id>.req (0600, that it
+# owns), the helper reads it, independently re-validates the target (rootShapeOk
+# + self-root deny) and re-verifies the content's SHA-256 against the
+# lease-bound hash, writes the config atomically (temp file, fsync, rename), and
+# writes /var/lib/systemapi-agent/config-helper/<id>.res back. One request per
+# invocation; the agent cleans both files up.
+#
+# %i is always a 32-char hex id minted by the agent (configHelperIDRE), so there
+# is no systemd instance-name escaping to reason about.
+#
+# WIRING (follow-up, NOT in this repo): deploy/miniapps1/agent/install-agent.sh
+# (another branch) must install this file to /etc/systemd/system/ and run
+# `systemctl daemon-reload`, and reconcile the ExecStart path and the hardening
+# set below with the agent's own hardened unit.
+
+[Unit]
+Description=SystemAPI config write helper (%i)
+Documentation=file:///usr/share/doc/systemapi/sah-os-management-design.md
+
+[Service]
+Type=oneshot
+# Only the request id is passed. The confinement is this unit, never an argument.
+ExecStart=/usr/local/bin/systemapi-agent __config-helper %i
+
+# Root, because writing a root-owned /etc config is privileged. The capability
+# bounding set below is the real limiter.
+User=root
+UMask=0077
+
+# A config write must not hang the manager; bound the whole invocation.
+RuntimeMaxSec=10
+
+# --- Sandbox: the agent's hardening with /etc writable, nothing else loosened ---
+
+# THE ONE RELAXATION vs the agent: /etc is writable. ProtectSystem=strict still
+# mounts the rest of the hierarchy read-only; ReadWritePaths carves out /etc
+# (for the config write) and the handoff dir (for the request/result files).
+ProtectSystem=strict
+ReadWritePaths=/etc /var/lib/systemapi-agent/config-helper
+
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+
+# No network. The helper only writes a file; it opens no socket.
+RestrictAddressFamilies=none
+IPAddressDeny=any
+
+# Kernel/host protections kept from the agent's sandbox. ProtectKernelTunables
+# stays =yes: this helper writes /etc files, never /proc/sys, so it must NOT
+# gain the sysctl-write relaxation the sysctl helper has.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ProtectProc=invisible
+
+# Writing a root-owned file under /etc needs to create/rename a temp file in the
+# target directory and chmod it: CAP_DAC_OVERRIDE (write regardless of the
+# directory's DAC bits), CAP_FOWNER (operate on files the helper does not own),
+# CAP_CHOWN (preserve/set ownership on replacement). No CAP_SYS_ADMIN and no
+# CAP_NET_* — this helper touches no kernel tunable and no socket.
+CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE
+AmbientCapabilities=
+
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+# Deliberately no [Install] section: started on demand by the agent, never
+# enabled or wanted by a boot target.
