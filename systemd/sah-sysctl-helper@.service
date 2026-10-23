@@ -1,0 +1,105 @@
+# Privilege-separated sysctl mutation helper for the SystemAPI agent
+# (docs/sah-os-management-design.md, "Finding 2026-10-23" + mutation-helper
+# section, option 2). Security-keystone spike for the ONE verb
+# sys:tweak sysctl-set.
+#
+# WHY THIS UNIT EXISTS
+# The agent runs under a sandbox with ProtectKernelTunables=yes, which makes
+# /proc/sys read-only, so the agent cannot write a sysctl itself. Instead of
+# widening the agent's own sandbox (which would hand every agent code path the
+# power to write kernel tunables), the write is handed to THIS minimally-scoped,
+# one-shot helper. Its sandbox is the agent's hardening MINUS exactly one knob
+# (ProtectKernelTunables) and nothing else. The confinement lives here, in a
+# committed unit; the agent never constructs it at runtime. The agent only
+# triggers the instance and passes a request id as %i.
+#
+# TRIGGER (the unverified assumption this spike tests)
+# The agent starts an instance of this template over systemd's manager (the same
+# StartUnit/job-wait access it uses to restart a service), e.g.
+#   systemctl start sah-sysctl-helper@<id>.service
+# whether the agent, under NoNewPrivileges and a restricted capability set, is
+# actually PERMITTED to StartUnit this privileged unit over D-Bus can only be
+# confirmed on a real host. That is the point of the spike.
+#
+# HANDOFF
+# The agent writes /var/lib/systemapi-agent/sysctl-helper/<id>.req (0600, that it
+# owns), the helper reads it, re-validates the key/value independently, writes
+# /proc/sys, and writes /var/lib/systemapi-agent/sysctl-helper/<id>.res back. One
+# request per invocation; the agent cleans both files up.
+#
+# %i is always a 32-char hex id minted by the agent (sysctlHelperIDRE), so there
+# is no systemd instance-name escaping to reason about.
+#
+# WIRING (follow-up, NOT in this repo): deploy/miniapps1/agent/install-agent.sh
+# (on another branch) must install this file to /etc/systemd/system/ and run
+# `systemctl daemon-reload`. It must also reconcile the ExecStart path and the
+# hardening set below with the agent's own hardened unit, so this helper is
+# provably "the agent's sandbox minus ProtectKernelTunables".
+
+[Unit]
+Description=SystemAPI sysctl mutation helper (%i)
+Documentation=file:///usr/share/doc/systemapi/sah-os-management-design.md
+
+[Service]
+Type=oneshot
+# Only the request id is passed. The confinement is this unit, never an argument.
+ExecStart=/usr/local/bin/systemapi-agent __sysctl-helper %i
+
+# Root, because writing /proc/sys is privileged. The capability bounding set
+# below is the real limiter.
+User=root
+UMask=0077
+
+# A kernel write must not hang the manager; bound the whole invocation.
+RuntimeMaxSec=10
+
+# --- Sandbox: the agent's hardening MINUS ProtectKernelTunables ---
+
+# THE ONE RELAXATION vs the agent. =yes on the agent makes /proc/sys read-only;
+# =no here, and only here, lets this helper write a sysctl. Nothing else is
+# loosened.
+ProtectKernelTunables=no
+
+NoNewPrivileges=yes
+# ProtectSystem=strict mounts the whole hierarchy read-only except /dev /proc
+# /sys; /proc/sys writability is governed by ProtectKernelTunables above, not by
+# this. The handoff dir is the only non-/proc path the helper may write.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/systemapi-agent/sysctl-helper
+ProtectHome=yes
+PrivateTmp=yes
+
+# No network. The helper only writes /proc/sys; it opens no socket.
+# NOTE: PrivateNetwork is deliberately NOT set. net.* sysctls live in the host
+# network namespace, and a private netns would silently write that namespace's
+# knobs instead of the host's. Socket use is denied directly instead.
+RestrictAddressFamilies=none
+IPAddressDeny=any
+
+# Kernel/host protections kept from the agent's sandbox.
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# ProtectProc hides other processes; ProcSubset is left at the default (all)
+# ON PURPOSE, because ProcSubset=pid would hide /proc/sys and break the write.
+ProtectProc=invisible
+
+# The granted sysctl keys decide which of these is actually needed: net.* needs
+# CAP_NET_ADMIN, kernel/vm/fs.* needs CAP_SYS_ADMIN. This is the superset for
+# v1; tightening per-key is a follow-up once the policy key set is fixed.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN
+AmbientCapabilities=
+
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+# Deliberately no [Install] section: this template is started on demand by the
+# agent, never enabled or wanted by a boot target.

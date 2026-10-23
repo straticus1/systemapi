@@ -439,7 +439,14 @@ func (c *channelConn) sysTweak(msg sysTweakMsg, now time.Time) {
 			result["output"] = capSysOutput(out)
 		}
 	case "sysctl-set":
-		actErr = tw.SysctlSet(msg.Key, msg.Value, []string{msg.Key})
+		// Privilege-separated write (sysctl_helper.go). The agent's own sandbox
+		// has ProtectKernelTunables=yes (/proc/sys read-only), so it cannot
+		// write a sysctl itself; it hands off to the committed helper unit. The
+		// lease + policy gate above is unchanged. NOTE: the other tweak verbs
+		// (sysctl-get, resource-limit-set, unit-override-set) still call the
+		// Phase 0 Tweaks backend directly and are NOT yet helper'd; this spike
+		// is sysctl-set only.
+		actErr = sysctlSetViaHelper(msg.Key, msg.Value)
 		result["key"] = msg.Key
 	case "resource-limit-set":
 		actErr = tw.SetResourceLimit(msg.Unit, msg.Limit, msg.Value, sysTweakOverrideRoot)

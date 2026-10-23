@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"os"
 	"testing"
 	"time"
 )
@@ -139,15 +140,30 @@ func TestSysTweakSysctlGetHappyPath(t *testing.T) {
 }
 
 func TestSysTweakSysctlSetHappyPath(t *testing.T) {
+	// sysctl-set is privilege-separated now (sysctl_helper.go): the channel
+	// hands off to the helper instead of calling the Tweaks backend. The
+	// trigger stands in for systemd and runs the helper in-process; the write
+	// seam is faked so no real /proc/sys knob is touched.
 	h := newSysTwkHarness(t, true)
+	withHelperStateDir(t)
+	calls := withFakeWrite(t, nil)
+	prev := sysctlHelperTrigger
+	sysctlHelperTrigger = func(id string) error { runSysctlHelper([]string{id}); return nil }
+	t.Cleanup(func() { sysctlHelperTrigger = prev })
+
 	rid := newSysRequestID(t)
 	h.send(t, tweakFrame(t, h, rid, "sysctl-set", "net.ipv4.ip_forward", "1", "", "", "", "", inFuture(time.Minute)))
 	p := h.result(t, rid)
-	if p["ok"] != true {
+	if p["ok"] != true || p["key"] != "net.ipv4.ip_forward" {
 		t.Fatalf("unexpected result: %v", p)
 	}
-	if len(h.tw.sets) != 1 || h.tw.sets[0][0] != "net.ipv4.ip_forward" || h.tw.sets[0][1] != "1" {
-		t.Fatalf("sets=%v", h.tw.sets)
+	// The write went through the helper seam...
+	if len(*calls) != 1 || (*calls)[0][0] != "/proc/sys/net/ipv4/ip_forward" || (*calls)[0][1] != "1" {
+		t.Fatalf("helper write calls=%v", *calls)
+	}
+	// ...and NOT through the Phase 0 backend.
+	if len(h.tw.sets) != 0 {
+		t.Fatalf("sysctl-set must not call the backend any more: %v", h.tw.sets)
 	}
 }
 
@@ -292,16 +308,20 @@ func TestSysTweakRefusesWrongKeyLease(t *testing.T) {
 }
 
 func TestSysTweakReportsActionFailure(t *testing.T) {
+	// A failed sysctl write surfaces as action_failed. The failure now comes
+	// from the helper (its write seam returns an error), not the backend.
 	h := newSysTwkHarness(t, true)
-	h.tw.errSet = errTweakTargetBad // any non-nil backend error
+	withHelperStateDir(t)
+	withFakeWrite(t, os.ErrPermission) // the sandbox denies the write
+	prev := sysctlHelperTrigger
+	sysctlHelperTrigger = func(id string) error { runSysctlHelper([]string{id}); return nil }
+	t.Cleanup(func() { sysctlHelperTrigger = prev })
+
 	rid := newSysRequestID(t)
 	h.send(t, tweakFrame(t, h, rid, "sysctl-set", "net.ipv4.ip_forward", "1", "", "", "", "", inFuture(time.Minute)))
 	p := h.result(t, rid)
 	if p["ok"] != false || p["error"] != "action_failed" {
 		t.Fatalf("want action_failed, got %v", p)
-	}
-	if len(h.tw.sets) != 1 {
-		t.Fatalf("the set should still have been attempted, got %v", h.tw.sets)
 	}
 }
 

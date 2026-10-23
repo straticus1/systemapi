@@ -57,6 +57,13 @@ func main() {
 		// agent starts it with the session's identity already dropped.
 		os.Exit(runFileHelper(os.Stdin, os.Stdout))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "__sysctl-helper" {
+		// The privilege-separated sysctl writer (sysctl_helper.go), started
+		// only by the committed sah-sysctl-helper@.service unit whose sandbox
+		// is the agent's minus ProtectKernelTunables. It reads one request,
+		// re-validates it, writes the sysctl, writes the result, and exits.
+		os.Exit(runSysctlHelper(os.Args[2:]))
+	}
 	serverURL := flag.String("server", "ws://localhost:3003/api/v1/systems/stream", "WebSocket stream URL")
 	apiKeyFlag := flag.String("api-key", "", "API key (visible in the process list); prefer SYSTEMAPI_API_KEY or --api-key-file")
 	apiKeyFileFlag := flag.String("api-key-file", "", "file holding the API key (mode 0600)")

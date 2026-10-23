@@ -68,6 +68,68 @@ Config, service, package, and tweak writes are root-equivalent. `~/development/a
 2. Tweaks v1: sysctl, resource limits, unit/launchd overrides. Kernel modules and firewall rules stay door-only until Phase 3 is solid.
 3. API shape: REST resources for the common verbs; Sysscripts for complex multi-step logic.
 
+## Finding 2026-10-23: the sysctl-set sandbox paradox, and the mutation helper
+
+The agent is hardened with `ProtectKernelTunables=yes`, which makes `/proc/sys`
+read-only for the agent process. That is correct for an unwedgeable agent (a
+compromised agent must not be able to rewrite kernel tunables at will). But it
+also means the agent **cannot** satisfy `sys:tweak sysctl-set` by writing
+`/proc/sys` itself: the write fails closed inside its own sandbox. The same
+tension will recur for any verb that mutates a resource the agent's sandbox
+protects.
+
+Options considered:
+
+1. **Widen the agent's own sandbox** (drop `ProtectKernelTunables`). Rejected:
+   it hands every agent code path — terminal, file, package, Starlark — the
+   power to write any kernel tunable. One hardening knob would protect nothing.
+2. **Privilege-separated mutation helper (chosen).** A separate, minimally
+   scoped helper does the write. Its sandbox is the agent's **minus exactly the
+   one protection the verb needs**, and that sandbox lives in a **committed
+   per-verb systemd unit**, not constructed by the agent at runtime. The agent
+   gates the request (lease + policy) exactly as before, then triggers the
+   helper through systemd's manager (the same `StartUnit`/job-wait access it
+   already uses to restart a service) passing only a request id. The helper
+   re-validates the request independently and performs the write. Both the
+   confinement and the re-validation are outside the agent's trust in the
+   caller.
+3. A long-lived privileged side-process. Rejected for v1: a persistent
+   privileged daemon is a larger standing target than a one-shot unit that
+   exists only for the duration of a single write.
+
+**Spike (2026-10-23), sysctl-set only.** Implemented for the ONE verb to prove
+the mechanism; the other tweak verbs (`sysctl-get` is a read and works;
+`resource-limit-set` and `unit-override-set` still call the Phase 0 backend
+directly) are intentionally left un-helper'd until the mechanism is validated on
+a host.
+
+- Agent side: `systemapi-agent/sysctl_helper.go` `sysctlSetViaHelper` writes a
+  `{key,value}` request (0600, `O_EXCL`, `O_NOFOLLOW`) under
+  `/var/lib/systemapi-agent/sysctl-helper/<id>.req`, triggers the unit, reads
+  `<id>.res`, and cleans both up. One request per invocation, fresh random id.
+- Helper side: the hidden `systemapi-agent __sysctl-helper <id>` subcommand
+  re-checks the key against the same `sysctlKeyRE` and `deniedSysctl` set the
+  channel uses and the value against `sysctlValueOK`, resolves the `/proc/sys`
+  path (traversal-checked), writes, and records `{ok,error,errno}`. It trusts
+  nothing from the caller and fails closed.
+- Sandbox: committed in `systemd/sah-sysctl-helper@.service`. It is the agent's
+  hardening **minus `ProtectKernelTunables`** and nothing else:
+  `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ReadWritePaths` limited to the
+  handoff dir, no network, a short `RuntimeMaxSec`, a `CAP_NET_ADMIN
+  CAP_SYS_ADMIN` bounding set. `PrivateNetwork` is deliberately **off** so
+  `net.*` sysctls land on the host namespace, not a private one.
+
+**Unverified host assumption this spike exists to test:** that the agent, under
+its own sandbox (`NoNewPrivileges`, a restricted capability set), is actually
+permitted to `StartUnit` the privileged helper unit over D-Bus. If PID 1's
+policy refuses, the handoff + helper + committed unit stay correct and only the
+trigger edge needs another mechanism.
+
+**Wiring follow-up (separate branch):** `deploy/.../install-agent.sh` must
+install `systemd/sah-sysctl-helper@.service` and run `systemctl daemon-reload`,
+and reconcile its hardening set and `ExecStart` path with the agent's own
+hardened unit.
+
 ## Open questions
 
 - The Phase 3 recovery path (which option, or combination).
