@@ -132,3 +132,43 @@ Shape (to settle before building):
 - Per-verb FIXED sandboxes, committed and reviewed, NOT sandboxes the agent constructs at runtime (an agent that can choose a transient unit's sandbox is itself an escape surface). Each verb's helper gets only what it needs: sysctl-set → a unit without ProtectKernelTunables running `sysctl -w <key>=<value>`; config-write → ReadWritePaths scoped to the one allowed dir; unit-override/resource-limit → ReadWritePaths=/etc/systemd/system; package install/remove → the package manager's required paths. Fixed argv, no shell, the lease binds the exact parameters, the per-host deny-by-default policy is unchanged.
 - Open choice: one committed helper unit per verb (most auditable) vs the agent calling `systemd-run` with a per-verb fixed parameter set (fewer moving parts, but the parameter construction must be constrained so it cannot be widened). Recommendation: committed per-verb helpers, so the sandbox lives in the door/repo and not in agent-constructed arguments.
 - Must confirm the agent is allowed to StartTransientUnit / reach the helper over D-Bus under its current scoping (service restart working suggests manager access, but creating units is a separate permission to verify on the host).
+
+## sah-service — detailed spec (Phase 3 recovery daemon), 2026-10-23
+
+Build-ready spec written during the autonomous run. Two shape calls (marked DECISION) are deliberately left for Ryan; everything else is settled here.
+
+### Purpose and the one hard requirement
+sah-service is the independent way back into a host when the main agent is wedged and sshd is off. Its one hard requirement: it must not share a failure mode with the agent. A bad agent build, a hardening regression (the openat2/ProtectKernelTunables class), a crash loop, or a lost enrollment must leave sah-service standing and able to recover the agent. Everything below serves that.
+
+### Independence
+- Its own binary (not a subcommand of systemapi-agent — a shared binary shares a bad build). Small, statically linked, few deps.
+- Its own systemd unit, its own enrollment key and host identity row, its own StateDirectory. It does NOT read the agent's config, key, or state.
+- Conservative to a fault: it never self-updates in a way that can brick it (an update installs beside the running one and is adopted only after it proves healthy), and it never applies a config that could remove its own reachability.
+- Minimal, fixed sandbox. It is strictly less capable than a shell: recovery verbs only, no arbitrary exec. Smaller attack surface than the agent, never bigger.
+
+### Capabilities (all narrow, signed, deny-by-default, audited)
+1. health — report its own and the agent's status (unit state, last enrollment, last heartbeat). A read.
+2. agent-restart — `systemctl restart systemapi-agent`. 
+3. agent-rollback — restore the agent's `.prev` binary and restart (the mutation-helper deploys already keep `.prev`).
+4. sshd-break-glass — re-enable sshd for a signed, time-boxed window, then auto-disable. THE risky one; see gating below.
+It is NOT a general runner. No config/package/sysctl writes, no shell. If a recovery needs more than these verbs, that is a human-at-console event, not a sah-service action.
+
+### Watchdog
+sah-service watches the agent: systemd unit state plus a liveness signal (the agent writes a heartbeat file, or sah-service probes the agent's health). On "wedged" (crash-looping, or enrolled-but-not-reconnecting past a threshold), it escalates: restart, then if that fails rollback, then raise an alert. Thresholds and backoff are committed config, not runtime-tunable by the agent.
+
+### The sshd break-glass (the sharp edge)
+Re-enabling sshd is the capability that makes ssh-off safe to attempt, and the one most worth abusing. Gating: a signed, short-TTL grant (minutes), single-use, that names the host; sah-service enables sshd, starts a timer, and disables it again at expiry even if nothing else happens (fail-safe to closed). Every enable/disable is an audit-chain row. The grant is issued the same way a lease is, from the control plane, under an admin scope distinct from the operator scopes (`recovery:sshd`). Losing the control plane must not leave sshd stuck open: the auto-disable timer is local to sah-service.
+
+### DECISION 1 (Ryan): transport
+Does sah-service ride the existing control plane on its own recovery channel, or stand on a separate minimal endpoint? Recommendation: its own channel on the existing control plane (reuses enrollment, lease signing, audit chain, RBAC — less new surface), but with its own key and its own scopes so a compromised agent credential cannot drive recovery. A separate endpoint only if we want recovery to survive the main control plane being down, which argues for a second, tiny control surface — more robust, more to build and secure.
+
+### DECISION 2 (Ryan): key provisioning across an agent re-key
+sah-service's key must survive an agent re-key (the agent's key was retired once already this project). Options: (a) provisioned once at host bring-up and never tied to the agent's lifecycle; (b) a sub-identity the control plane mints for the host that both the agent and sah-service derive from but hold separately. Recommendation: (a) — a standalone enrollment minted at install, rotated on its own schedule, with zero coupling to the agent's key, so retiring/rekeying the agent never touches recovery.
+
+### Build phases (once the two decisions land)
+0. The daemon skeleton: own binary, own unit, enrollment, health verb, heartbeat/watch of the agent (no mutations yet). Deployable and observable first.
+1. agent-restart + agent-rollback verbs (reuse the .prev convention).
+2. sshd break-glass with the local auto-disable timer and the `recovery:sshd` scope.
+3. The acceptance test: disable sshd on one host, simulate an agent wedge, and recover through sah-service alone.
+
+Until phase 3 passes and is drilled, sshd stays on everywhere.
