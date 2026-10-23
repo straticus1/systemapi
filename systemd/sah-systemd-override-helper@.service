@@ -1,0 +1,106 @@
+# Privilege-separated systemd drop-in override helper for the SystemAPI agent
+# (docs/sah-os-management-design.md, mutation-helper section, option 2).
+# Extends the sysctl-set spike (sah-sysctl-helper@.service) to the TWO tweak
+# verbs that write a systemd drop-in: sys:tweak unit-override-set and
+# sys:tweak resource-limit-set. Both land at
+# /etc/systemd/system/<unit>.d/<name>.conf, so ONE unit serves them. Read
+# sah-sysctl-helper@.service first; only the differences are noted.
+#
+# WHY THIS UNIT EXISTS
+# The agent runs under ProtectSystem=strict, so it cannot write
+# /etc/systemd/system itself. Instead of widening the agent's own sandbox, the
+# write is handed to THIS minimally-scoped, one-shot helper. Its sandbox is the
+# agent's hardening with exactly ONE relaxation: /etc/systemd/system is in
+# ReadWritePaths (ProtectSystem stays strict). The confinement lives here, in a
+# committed unit; the agent never constructs it. The agent only triggers the
+# instance and passes a request id as %i.
+#
+# TRIGGER (the unverified assumption, identical to the sysctl spike)
+#   systemctl start sah-systemd-override-helper@<id>.service
+# Whether the confined agent may StartUnit this privileged unit over systemd's
+# manager can only be confirmed on a real host; see sah-sysctl-helper@.service.
+#
+# HANDOFF
+# The agent writes /var/lib/systemapi-agent/override-helper/<id>.req (0600, that
+# it owns), the helper reads it, independently re-validates the unit name
+# (serviceNameRE) and, per kind, either the resource-limit directive/value (and
+# rebuilds the drop-in body itself) or the override name/body (re-verifying the
+# body's SHA-256 against the lease-bound hash), writes the drop-in atomically
+# (mkdir <unit>.d, temp file, fsync, rename) under /etc/systemd/system, and
+# writes /var/lib/systemapi-agent/override-helper/<id>.res back. One request per
+# invocation; the agent cleans both files up.
+#
+# NO DAEMON-RELOAD: the Phase 0 backend wrote the drop-in without a
+# `systemctl daemon-reload`; this helper preserves that exactly and only writes
+# the file. Activating the drop-in (a reload/restart) is a separate privileged
+# step, a follow-up, not part of this write.
+#
+# %i is always a 32-char hex id minted by the agent (overrideHelperIDRE).
+#
+# WIRING (follow-up, NOT in this repo): deploy/miniapps1/agent/install-agent.sh
+# (another branch) must install this file to /etc/systemd/system/ and run
+# `systemctl daemon-reload`, and reconcile the ExecStart path and the hardening
+# set below with the agent's own hardened unit.
+
+[Unit]
+Description=SystemAPI systemd override helper (%i)
+Documentation=file:///usr/share/doc/systemapi/sah-os-management-design.md
+
+[Service]
+Type=oneshot
+# Only the request id is passed. The confinement is this unit, never an argument.
+ExecStart=/usr/local/bin/systemapi-agent __systemd-override-helper %i
+
+# Root, because writing a root-owned /etc/systemd/system drop-in is privileged.
+# The capability bounding set below is the real limiter.
+User=root
+UMask=0077
+
+# A drop-in write must not hang the manager; bound the whole invocation.
+RuntimeMaxSec=10
+
+# --- Sandbox: the agent's hardening with /etc/systemd/system writable only ---
+
+# THE ONE RELAXATION vs the agent: /etc/systemd/system is writable. Narrower
+# than the config helper's /etc on purpose. ProtectSystem=strict still mounts
+# the rest read-only; ReadWritePaths carves out the drop-in root and the handoff
+# dir.
+ProtectSystem=strict
+ReadWritePaths=/etc/systemd/system /var/lib/systemapi-agent/override-helper
+
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+
+# No network. The helper only writes a file; it opens no socket.
+RestrictAddressFamilies=none
+IPAddressDeny=any
+
+# Kernel/host protections kept from the agent's sandbox. ProtectKernelTunables
+# stays =yes: this helper writes /etc files, never /proc/sys.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ProtectProc=invisible
+
+# Writing a root-owned drop-in (create the <unit>.d directory, create/rename a
+# temp file in it, chmod it): CAP_DAC_OVERRIDE, CAP_FOWNER, CAP_CHOWN. No
+# CAP_SYS_ADMIN and no CAP_NET_* — this helper touches no kernel tunable and no
+# socket.
+CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE
+AmbientCapabilities=
+
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+# Deliberately no [Install] section: started on demand by the agent, never
+# enabled or wanted by a boot target.
