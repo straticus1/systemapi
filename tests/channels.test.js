@@ -404,3 +404,94 @@ test('channel leases: payload builders, vectors, and negative cases', () => {
   assert.equal(lease.verifyLease(pub, fl, fileStart, now + 200_000).error, 'expired');
   assert.equal(lease.verifyLease(otherPub, fl, fileStart, now).error, 'bad_signature');
 });
+
+// MESH §2, §14 (docs/sah-mesh-protocol.md): mesh:open is its own operator
+// scope and a binding-less channel purpose.
+test('mesh:open: operator scope distinct from tcp:open; binding-less; policy per stream target', async () => {
+  assert.equal(scopesForRole('operator').has('mesh:open'), true);
+  assert.equal(scopesForRole('viewer').has('mesh:open'), false);
+  assert.equal(OPERATOR.includes('mesh:open'), true);
+  assert.deepEqual(ch.PURPOSE_SCOPES['mesh:open'], ['mesh:open']);
+  assert.equal(ch.CHANNEL_PURPOSES.has('mesh:open'), true);
+  assert.equal(ch.TCP_PURPOSES.has('mesh:open'), false);
+  // A target in the body is ignored: the ticket has no binding.
+  const parsed = ch.validateBinding('mesh:open', { target: { host: '10.0.0.1', port: 1 } });
+  assert.deepEqual(parsed, { ok: true, forbidden: false, binding: null, checked: null });
+  assert.deepEqual(ch.validateBinding('mesh:open', { target: { host: '127.0.0.1', port: 1 } }).binding, null);
+  const reg = new MemoryRegistry({ NODE_ENV: 'test' });
+  assert.equal(await ch.policyDecision(reg, HOST_A, 'mesh:open', null), null);
+  assert.equal(await ch.policyDecision(reg, HOST_A, 'mesh:open', undefined), null);
+  // A stream target is checked exactly as a TCP target.
+  assert.equal(await ch.policyDecision(reg, HOST_A, 'mesh:open', { target: { host: 'local', port: 5432 } }), 'target_denied');
+  assert.equal(await ch.policyDecision(reg, HOST_A, 'mesh:open', { target: { host: '169.254.169.254', port: 80 } }), 'target_forbidden');
+  assert.equal(await ch.policyDecision(reg, HOST_A, 'mesh:open', { target: { host: 'db.internal', port: 80 } }), 'bad_target');
+  // A mesh ticket consumes with no binding and no expected binding.
+  const store = new Map();
+  const t = issueTicket(store, { hostId: HOST_A, purpose: 'mesh:open', tenantId: 'acme', actor: 'op-1' });
+  assert.equal(consumeTicket(store, t, HOST_A, 'tcp:open'), null);
+  const t2 = issueTicket(store, { hostId: HOST_A, purpose: 'mesh:open', tenantId: 'acme', actor: 'op-1' });
+  assert.equal(consumeTicket(store, t2, HOST_A, 'mesh:open').purpose, 'mesh:open');
+  const t3 = issueTicket(store, { hostId: HOST_A, purpose: 'tcp:open', tenantId: 'acme', actor: 'op-1', target: { host: 'local', port: 22 } });
+  assert.equal(consumeTicket(store, t3, HOST_A, 'mesh:open'), null);
+});
+
+test('ws-ticket mesh:open: scopes do not cross tcp:open, no target in the audit row, tcp budget', async () => {
+  const { fm, server, ticket } = await rig();
+  try {
+    const mesh = (key, extra = {}) => ticket(key, { purpose: 'mesh:open', ...extra });
+    assert.deepEqual(await mesh('viewer-key'), { status: 403, body: { error: 'scope_denied' } });
+    // No policy yet: a mesh ticket still issues (policy is per stream).
+    const ok = await mesh('op-key');
+    assert.equal(ok.status, 200);
+    assert.equal(ok.body.purpose, 'mesh:open');
+    assert.equal(ok.body.host_id, HOST_A);
+    assert.equal(ok.body.expires_in, 60);
+    const row = fm.tickets.get(ok.body.ticket);
+    assert.equal(row.purpose, 'mesh:open');
+    assert.equal(row.target, null);
+    assert.equal(row.root, null);
+    // A target in the body is ignored, even a refused one.
+    const ignored = await mesh('op-key', { target: { host: '169.254.169.254', port: 80 } });
+    assert.equal(ignored.status, 200);
+    assert.equal(fm.tickets.get(ignored.body.ticket).target, null);
+    assert.equal((await mesh('op-key', { host_id: HOST_B })).status, 404);
+
+    // A key with tcp:open but not mesh:open cannot open a mesh, and the reverse.
+    await fm.registry.setScopes('ak_op', ['hosts:read', 'tcp:open']);
+    assert.deepEqual(await mesh('op-key'), { status: 403, body: { error: 'scope_denied' } });
+    await fm.registry.setHostChannelPolicy(HOST_A, { tcp_policy: { allow: [{ local: true, ports: [22] }] } });
+    assert.equal((await ticket('op-key', { purpose: 'tcp:open', target: { host: 'local', port: 22 } })).status, 200);
+    await fm.registry.setScopes('ak_op', ['hosts:read', 'mesh:open']);
+    assert.equal((await mesh('op-key')).status, 200);
+    assert.deepEqual(await ticket('op-key', { purpose: 'tcp:open', target: { host: 'local', port: 22 } }), { status: 403, body: { error: 'scope_denied' } });
+
+    const issued = fm.registry.audit.filter((r) => r.action === 'ticket_issued').map((r) => r.payload);
+    assert.deepEqual(issued, [
+      { purpose: 'mesh:open' },
+      { purpose: 'mesh:open' },
+      { purpose: 'tcp:open', target: { host: 'local', port: 22 } },
+      { purpose: 'mesh:open' }
+    ]);
+    for (const r of fm.registry.audit) assert.equal(JSON.stringify(r).includes('stk_'), false);
+  } finally {
+    server.close();
+  }
+});
+
+test('ws-ticket mesh:open spends the tcp budget, not terminal', async () => {
+  const { fm, server, ticket } = await rig({ SYSTEMAPI_TICKET_RATE_TCP: '3', SYSTEMAPI_TICKET_RATE_PER_HOST: '2' });
+  try {
+    await fm.registry.setHostChannelPolicy(HOST_A, { tcp_policy: { allow: [{ local: true, ports: [22] }] } });
+    assert.equal((await ticket('admin-key', { purpose: 'mesh:open' })).status, 200);
+    assert.equal((await ticket('admin-key', { purpose: 'tcp:open', target: { host: 'local', port: 22 } })).status, 200);
+    assert.equal((await ticket('admin-key', { purpose: 'mesh:open' })).status, 200);
+    assert.equal((await ticket('admin-key', { purpose: 'mesh:open' })).status, 429);
+    assert.equal((await ticket('admin-key', { purpose: 'tcp:open', target: { host: 'local', port: 22 } })).status, 429);
+    // The terminal budget is untouched.
+    assert.equal((await ticket('admin-key', { purpose: 'terminal:open' })).status, 200);
+    assert.equal((await ticket('admin-key', { purpose: 'terminal:open' })).status, 200);
+    assert.equal((await ticket('admin-key', { purpose: 'terminal:open' })).status, 429);
+  } finally {
+    server.close();
+  }
+});

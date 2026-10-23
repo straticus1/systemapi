@@ -2,6 +2,9 @@
  * TCP-forward channel, server side (docs/sah-tcp-protocol.md).
  *
  * One WebSocket carries one TCP connection that the host's agent dials.
+ * The mesh channel (playground/mesh.js, docs/sah-mesh-protocol.md) starts
+ * its streams through startSession() with a per-stream client view, so a
+ * mesh stream is one of these sessions: same lease, limits, caps and rows.
  * Threats: an SSRF pivot into the host's network (the ticket's bound target
  * is re-validated, the refused classes and the server policy re-checked and
  * the actor's scope re-checked at the upgrade; the lease signs the exact
@@ -106,6 +109,12 @@ class TcpChannels {
         return n;
     }
 
+    // Live TCP streams per actor, always below the per-agent cap. Mesh
+    // streams are sessions here too, so the caps are shared (MESH §5).
+    perActor() {
+        return envInt(this.env, 'SYSTEMAPI_TCP_MAX_PER_ACTOR', TCP_PER_ACTOR_DEFAULT, 1, TCP_PER_AGENT - 1);
+    }
+
     async open(ws, parsed, hostId) {
         const fm = this.fm;
         let session = null;
@@ -184,20 +193,50 @@ class TcpChannels {
         }
         const actor = row.actor || null;
         // Always below the per-agent cap, so one actor never takes every stream.
-        const perActor = envInt(this.env, 'SYSTEMAPI_TCP_MAX_PER_ACTOR', TCP_PER_ACTOR_DEFAULT, 1, TCP_PER_AGENT - 1);
-        if (this.liveFor((s) => s.actor === actor) >= perActor || this.liveFor((s) => s.agent === agentWs) >= TCP_PER_AGENT) {
+        if (this.liveFor((s) => s.actor === actor) >= this.perActor() || this.liveFor((s) => s.agent === agentWs) >= TCP_PER_AGENT) {
             console.warn('[Fleet] tcp refused: session cap reached');
             this.failSocket(ws, 'cap_reached');
             return;
         }
 
+        const s = this.startSession(ws, {
+            hostId,
+            tenantId: row.tenantId,
+            actor,
+            auth: row.auth || null,
+            target: checked.target,
+            agent: agentWs,
+            clientEof: early.eof
+        });
+        if (!s) return;
+        session = s;
+    }
+
+    // Builds and starts one TCP session on `client`, which is the client
+    // WebSocket for tcp:open, or a per-stream view of a mesh socket
+    // (playground/mesh.js) that offers readyState, bufferedAmount, send,
+    // close, pause, resume and isPaused. opts: hostId, tenantId, actor, auth,
+    // target (validated), agent (the agent ws), clientEof, and for a mesh
+    // stream purpose ('mesh:open', re-checked at renewal), mesh (the msh_
+    // id), stream (the client's stream id), encode (binary frame wrapper),
+    // clientCredit (CreditStream toward the client) and onSent(n) (client
+    // credit return). Returns the session, or null after failing the client.
+    // The caller has already consumed the ticket, re-checked scope and
+    // policy, found the agent and checked the caps.
+    startSession(client, opts) {
+        const fm = this.fm;
+        const ws = client;
+        const { hostId, tenantId, actor, auth, target, agent: agentWs } = opts;
+        if (!fm.signer) {
+            this.failSocket(ws, 'lease_required');
+            return null;
+        }
         const sessionId = `${SESSION_PREFIX}${randomToken(16)}`;
         const maxSeconds = envInt(this.env, 'SYSTEMAPI_TCP_MAX_SECONDS', TCP_MAX_SECONDS_DEFAULT, 1, TCP_MAX_SECONDS_CAP);
         const idleSeconds = envInt(this.env, 'SYSTEMAPI_TCP_IDLE_SECONDS', TCP_IDLE_SECONDS_DEFAULT, 1, TCP_MAX_SECONDS_CAP);
         const maxBytes = envInt(this.env, 'SYSTEMAPI_TCP_MAX_BYTES', TCP_MAX_BYTES_DEFAULT, 1, TCP_MAX_BYTES_CAP);
         const startedMs = Date.now();
         const deadlineUnix = Math.floor(startedMs / 1000) + maxSeconds;
-        const target = checked.target;
         let lease;
         try {
             lease = issueLease(fm.signer, {
@@ -208,35 +247,38 @@ class TcpChannels {
             });
         } catch (err) {
             this.failSocket(ws, 'lease_required');
-            return;
+            return null;
         }
         let stream;
         try {
             stream = fm.agentCreditLedger(agentWs).open(sessionId, { window: TCP_WINDOW });
         } catch (err) {
             this.failSocket(ws, 'internal');
-            return;
+            return null;
         }
         const s = {
             id: sessionId,
             hostId,
-            tenantId: row.tenantId,
-            actor,
-            auth: row.auth || null,
+            tenantId,
+            actor: actor || null,
+            auth: auth || null,
+            purpose: opts.purpose || TCP_PURPOSE,
+            mesh: typeof opts.mesh === 'string' ? opts.mesh : null,
+            stream: Number.isInteger(opts.stream) ? opts.stream : null,
             target,
             peer: null,
             expectedPeer: expectedPeer(target),
             via: target.host !== 'local',
             client: ws,
             agent: agentWs,
-            stream,
+            ledger: stream,
             sink: null,
             source: null,
             agentConnected: false,
             connected: false,
             ended: false,
             finalized: false,
-            clientEof: early.eof,
+            clientEof: !!opts.clientEof,
             clientEofSent: false,
             targetEof: false,
             targetEofDelivered: false,
@@ -261,34 +303,45 @@ class TcpChannels {
             client: ws,
             stream,
             pollMs: this.pollMs,
-            onCredit: (n) => sendJSON(s.agent, creditFrame('tcp', s.id, n))
+            onCredit: (n) => sendJSON(s.agent, creditFrame('tcp', s.id, n)),
+            encode: opts.encode || null,
+            credit: opts.clientCredit || null
         });
         s.source = new AgentSource({
             client: ws,
             stream,
             send: (chunk) => {
                 if (s.agent.readyState === WebSocket.OPEN) s.agent.send(encodeData(s.id, chunk));
-            }
+            },
+            onSent: opts.onSent || null
         });
         this.sessions.set(sessionId, s);
-        session = s;
-        sendJSON(ws, { type: 'tcp_status', payload: { status: 'connecting' } });
-        sendJSON(agentWs, {
-            type: 'tcp_open',
-            session_id: sessionId,
-            target: { host: target.host, port: target.port },
-            deadline_unix: deadlineUnix,
-            idle_s: idleSeconds,
-            max_bytes: maxBytes,
-            lease
-        });
-        s.renewTimer = unref(setInterval(() => { this.renew(s); }, this.renewMs));
-        s.maxTimer = unref(setTimeout(() => {
-            this.end(s, 'max_duration', { notifyClient: true, notifyAgent: true });
-        }, maxSeconds * 1000));
-        s.startTimer = unref(setTimeout(() => {
-            if (!s.connected) this.end(s, 'start_timeout', { error: 'internal', notifyAgent: true });
-        }, this.startTimeoutMs));
+        // Past this point a throw leaves a session with an open credit-ledger
+        // entry and possibly live timers; end it so caps and timers release.
+        try {
+            sendJSON(ws, { type: 'tcp_status', payload: { status: 'connecting' } });
+            sendJSON(agentWs, {
+                type: 'tcp_open',
+                session_id: sessionId,
+                target: { host: target.host, port: target.port },
+                deadline_unix: deadlineUnix,
+                idle_s: idleSeconds,
+                max_bytes: maxBytes,
+                lease
+            });
+            s.renewTimer = unref(setInterval(() => { this.renew(s); }, this.renewMs));
+            s.maxTimer = unref(setTimeout(() => {
+                this.end(s, 'max_duration', { notifyClient: true, notifyAgent: true });
+            }, maxSeconds * 1000));
+            s.startTimer = unref(setTimeout(() => {
+                if (!s.connected) this.end(s, 'start_timeout', { error: 'internal', notifyAgent: true });
+            }, this.startTimeoutMs));
+        } catch (err) {
+            console.error('[Fleet] tcp startSession failed after open:', err && err.message);
+            this.end(s, 'internal', { error: 'internal', notifyAgent: true });
+            return null;
+        }
+        return s;
     }
 
     // Each renewal re-checks the ticket's grant first (TCP §4.2): an actor
@@ -302,7 +355,7 @@ class TcpChannels {
         let denied;
         try {
             denied = await recheckChannelTicket(this.fm.registry,
-                { actor: s.actor, tenantId: s.tenantId, auth: s.auth, hostId: s.hostId }, TCP_PURPOSE, { target: s.target });
+                { actor: s.actor, tenantId: s.tenantId, auth: s.auth, hostId: s.hostId }, s.purpose || TCP_PURPOSE, { target: s.target });
         } finally {
             s.renewing = false;
         }
@@ -499,7 +552,7 @@ class TcpChannels {
                 host_id: s.hostId,
                 actor: s.actor,
                 action: 'tcp_start',
-                payload: { session_id: s.id, target: { host: s.target.host, port: s.target.port }, peer: s.peer, via: s.via }
+                payload: this.withMesh(s, { session_id: s.id, target: { host: s.target.host, port: s.target.port }, peer: s.peer, via: s.via })
             });
         } catch (err) {
             console.error('[Fleet] tcp start audit failed:', err.message);
@@ -588,13 +641,19 @@ class TcpChannels {
         this.finalize(s, null);
     }
 
+    // MESH §9: a mesh stream's rows name the session and the stream id.
+    withMesh(s, payload) {
+        if (s.mesh === null || s.mesh === undefined) return payload;
+        return { ...payload, mesh: s.mesh, stream: s.stream };
+    }
+
     // Writes the tcp_end row once, retried like terminal_end.
     finalize(s, agentCounts) {
         if (s.finalized) return;
         s.finalized = true;
         clearTimeout(s.finalTimer);
         this.stopping.delete(s.id);
-        const payload = {
+        const payload = this.withMesh(s, {
             session_id: s.id,
             reason: s.endReason,
             target: { host: s.target.host, port: s.target.port },
@@ -605,7 +664,7 @@ class TcpChannels {
             agent_bytes_in: agentCounts ? agentCounts.bytes_in : null,
             agent_bytes_out: agentCounts ? agentCounts.bytes_out : null,
             duration_s: Math.round((Date.now() - s.startedMs) / 1000)
-        };
+        });
         const fm = this.fm;
         appendAuditRetrying(fm.registry, {
             tenant_id: s.tenantId,

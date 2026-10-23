@@ -6,8 +6,11 @@
 // session to a tenant by itself. admin implies every scope. terminal:root (a
 // root shell) and file:root (file operations as root) are granted to admin
 // only, and so is terminal:watch (view another user's terminal session; an
-// admin can hand a support key only this scope). tcp:open, file:read and file:write are operator scopes; the
-// file:write purpose needs both file:read and file:write (channels.js).
+// admin can hand a support key only this scope). tcp:open, mesh:open,
+// file:read and file:write are operator scopes; mesh:open (a multiplexed
+// mesh session, docs/sah-mesh-protocol.md) is distinct from tcp:open so an
+// API key can hold either without the other; the file:write purpose needs
+// both file:read and file:write (channels.js).
 // ticketScopesHeld re-checks a channel ticket's scopes at the WebSocket
 // upgrade against the actor's CURRENT membership (and, for an API key, its
 // current key scopes), so a role or key downgraded in the ticket's 60 s
@@ -26,6 +29,7 @@ const ALL = Object.freeze([
   'terminal:watch',
   'breakglass:open',
   'tcp:open',
+  'mesh:open',
   'file:read',
   'file:write',
   'file:root',
@@ -40,6 +44,7 @@ const OPERATOR = Object.freeze([
   'exec:run',
   'terminal:open',
   'tcp:open',
+  'mesh:open',
   'file:read',
   'file:write',
   'alerts:write',

@@ -130,11 +130,17 @@ async function appendAuditRetrying(registry, entry, delaysMs, onFail, noteSecuri
 // agent (onCredit(n), batched by the CreditStream) only while it is under
 // that line too. Held bytes are bounded by the stream's window. frameMax
 // is the largest binary frame sent (64 KiB; the file channel sends each
-// read_chunk as one frame of up to chunk_max).
+// read_chunk as one frame of up to chunk_max). encode(chunk) wraps each
+// binary frame before it is sent (the mesh channel prefixes a stream id;
+// default identity). credit, when given, is a CreditStream toward the
+// client (MESH §6): a chunk leaves only inside credit.sendable(), and a
+// grant from the client re-pumps.
 class ClientSink {
-    constructor({ client, stream, onCredit, maxBuffered = CLIENT_BUFFER_MAX, pollMs = PUMP_POLL_MS, frameMax = CHANNEL_FRAME_MAX }) {
+    constructor({ client, stream, onCredit, maxBuffered = CLIENT_BUFFER_MAX, pollMs = PUMP_POLL_MS, frameMax = CHANNEL_FRAME_MAX, encode = null, credit = null }) {
         this.client = client;
         this.frameMax = frameMax;
+        this.encode = typeof encode === 'function' ? encode : (chunk) => chunk;
+        this.credit = credit || null;
         this.stream = stream;
         this.onCredit = onCredit;
         this.maxBuffered = maxBuffered;
@@ -183,8 +189,11 @@ class ClientSink {
                 if (this.stopped) return;
                 continue;
             }
-            const take = Math.min(item.length, this.frameMax);
-            ws.send(item.subarray(0, take));
+            let take = Math.min(item.length, this.frameMax);
+            if (this.credit) take = Math.min(take, this.credit.sendable(this.frameMax));
+            if (take <= 0) break;
+            if (this.credit) this.credit.take(take);
+            ws.send(this.encode(item.subarray(0, take)));
             this.queuedBytes -= take;
             this.uncredited += take;
             if (take === item.length) this.items.shift();
@@ -195,8 +204,16 @@ class ClientSink {
             this.uncredited = 0;
             if (credit > 0) this.onCredit(credit);
         }
-        const blocked = this.items.length > 0 || this.uncredited > 0;
-        if (blocked && !this.timer && !this.stopped) {
+        // Poll for bufferedAmount backpressure or credit owed back to the
+        // agent, but not for being out of client send credit: a credit grant
+        // (onCredit / the mesh channel's mesh_credit) re-pumps on its own.
+        let poll = this.uncredited > 0;
+        if (this.items.length > 0) {
+            const creditBlocked = this.credit ? this.credit.sendable(1) === 0 : false;
+            const bufferBlocked = ws.bufferedAmount >= this.maxBuffered;
+            if (bufferBlocked || !creditBlocked) poll = true;
+        }
+        if (poll && !this.timer && !this.stopped) {
             this.timer = unref(setTimeout(() => {
                 this.timer = null;
                 this.pump();
@@ -218,12 +235,15 @@ class ClientSink {
 // socket is paused while bytes wait for credit or no credit is left, and
 // resumed once the queue is empty and credit is back. after(fn) runs fn once everything queued before it was sent
 // (tcp_eof ordering). push returns false past maxQueued (bytes a paused
-// socket had already parsed); the caller ends the stream.
+// socket had already parsed); the caller ends the stream. onSent(n), when
+// given, runs after each chunk of n bytes left toward the agent (the mesh
+// channel returns client credit there, MESH §6).
 class AgentSource {
-    constructor({ client, stream, send, maxQueued = CLIENT_BUFFER_MAX }) {
+    constructor({ client, stream, send, maxQueued = CLIENT_BUFFER_MAX, onSent = null }) {
         this.client = client;
         this.stream = stream;
         this.send = send;
+        this.onSent = typeof onSent === 'function' ? onSent : null;
         this.maxQueued = maxQueued;
         this.items = [];
         this.queuedBytes = 0;
@@ -261,6 +281,7 @@ class AgentSource {
             this.stream.take(take);
             this.send(item.subarray(0, take));
             this.queuedBytes -= take;
+            if (this.onSent) this.onSent(take);
             if (take === item.length) this.items.shift();
             else this.items[0] = item.subarray(take);
         }

@@ -13,8 +13,11 @@
 'use strict';
 
 const TCP_PURPOSES = new Set(['tcp:open']);
+// A mesh session (docs/sah-mesh-protocol.md §2) has no binding at ticket
+// time; each stream names its target at mesh_open and is checked as TCP.
+const MESH_PURPOSES = new Set(['mesh:open']);
 const FILE_PURPOSES = new Set(['file:read', 'file:write', 'file:root']);
-const CHANNEL_PURPOSES = new Set([...TCP_PURPOSES, ...FILE_PURPOSES]);
+const CHANNEL_PURPOSES = new Set([...TCP_PURPOSES, ...MESH_PURPOSES, ...FILE_PURPOSES]);
 const ROOT_MAX_BYTES = 4096;
 const POLICY_MAX_ENTRIES = 256;
 const POLICY_MAX_PORTS = 256;
@@ -22,6 +25,7 @@ const POLICY_MAX_PORTS = 256;
 // Scopes each purpose needs. file:write needs file:read too (FILE §2).
 const PURPOSE_SCOPES = Object.freeze({
   'tcp:open': ['tcp:open'],
+  'mesh:open': ['mesh:open'],
   'file:read': ['file:read'],
   'file:write': ['file:read', 'file:write'],
   'file:root': ['file:root']
@@ -309,6 +313,8 @@ function filePolicyAllows(policy, purpose, root) {
 // { ok:false, error }. target_forbidden is reported separately in
 // `forbidden` so the route can answer scope errors first.
 function validateBinding(purpose, body) {
+  // MESH §2: no binding; a target or root in the body is ignored.
+  if (MESH_PURPOSES.has(purpose)) return { ok: true, forbidden: false, binding: null, checked: null };
   if (TCP_PURPOSES.has(purpose)) {
     const checked = validateTcpTarget(body && body.target);
     if (!checked.ok && checked.error === 'bad_target') return { ok: false, error: 'bad_target' };
@@ -339,7 +345,10 @@ async function effectivePolicies(registry, hostId) {
 // policyDecision: null when the binding is allowed, else the error code.
 // Run at ticket issue and again at the upgrade (TCP §4.2, FILE §2).
 async function policyDecision(registry, hostId, purpose, binding) {
-  if (TCP_PURPOSES.has(purpose)) {
+  // MESH: the session itself has no target (null); a stream's target is
+  // checked exactly like a TCP target (MESH §4).
+  if (MESH_PURPOSES.has(purpose) && (binding === null || binding === undefined)) return null;
+  if (TCP_PURPOSES.has(purpose) || MESH_PURPOSES.has(purpose)) {
     const checked = validateTcpTarget(binding && binding.target);
     if (!checked.ok) return checked.error;
     const { tcp } = await effectivePolicies(registry, hostId);
@@ -383,6 +392,7 @@ function parseCapabilities(header) {
 
 module.exports = {
   TCP_PURPOSES,
+  MESH_PURPOSES,
   FILE_PURPOSES,
   CHANNEL_PURPOSES,
   PURPOSE_SCOPES,
