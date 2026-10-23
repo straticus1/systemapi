@@ -64,6 +64,24 @@ func main() {
 		// re-validates it, writes the sysctl, writes the result, and exits.
 		os.Exit(runSysctlHelper(os.Args[2:]))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "__config-helper" {
+		// The privilege-separated sys:config writer (config_helper.go), started
+		// only by the committed sah-config-helper@.service unit whose sandbox
+		// is the agent's with /etc in ReadWritePaths (ProtectSystem still
+		// strict). It reads one request, re-validates the target and content
+		// hash, writes the config, writes the result, and exits.
+		os.Exit(runConfigHelper(os.Args[2:]))
+	}
+	if len(os.Args) > 1 && os.Args[1] == "__systemd-override-helper" {
+		// The privilege-separated systemd drop-in writer
+		// (systemd_override_helper.go), started only by the committed
+		// sah-systemd-override-helper@.service unit whose sandbox is the agent's
+		// with /etc/systemd/system in ReadWritePaths. It serves both
+		// sys:tweak resource-limit-set and unit-override-set: it reads one
+		// request, re-validates it, writes the drop-in, writes the result, and
+		// exits.
+		os.Exit(runOverrideHelper(os.Args[2:]))
+	}
 	serverURL := flag.String("server", "ws://localhost:3003/api/v1/systems/stream", "WebSocket stream URL")
 	apiKeyFlag := flag.String("api-key", "", "API key (visible in the process list); prefer SYSTEMAPI_API_KEY or --api-key-file")
 	apiKeyFileFlag := flag.String("api-key-file", "", "file holding the API key (mode 0600)")

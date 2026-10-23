@@ -97,11 +97,8 @@ Options considered:
    privileged daemon is a larger standing target than a one-shot unit that
    exists only for the duration of a single write.
 
-**Spike (2026-10-23), sysctl-set only.** Implemented for the ONE verb to prove
-the mechanism; the other tweak verbs (`sysctl-get` is a read and works;
-`resource-limit-set` and `unit-override-set` still call the Phase 0 backend
-directly) are intentionally left un-helper'd until the mechanism is validated on
-a host.
+**Spike (2026-10-23), sysctl-set.** Implemented for the ONE verb first to prove
+the mechanism; `sysctl-get` is a read and still calls the Phase 0 backend.
 
 - Agent side: `systemapi-agent/sysctl_helper.go` `sysctlSetViaHelper` writes a
   `{key,value}` request (0600, `O_EXCL`, `O_NOFOLLOW`) under
@@ -119,15 +116,47 @@ a host.
   CAP_SYS_ADMIN` bounding set. `PrivateNetwork` is deliberately **off** so
   `net.*` sysctls land on the host namespace, not a private one.
 
-**Unverified host assumption this spike exists to test:** that the agent, under
+**Extended (2026-10-23) to the other bounded write verbs**, following the sysctl
+spike as the exact template, under the SAME unverified host assumption (below):
+
+- `sys:config write` — `systemapi-agent/config_helper.go` `configWriteViaHelper`
+  writes a `{target,content,sha}` request, triggers `sah-config-helper@.service`,
+  reads the result, cleans up. The hidden `systemapi-agent __config-helper <id>`
+  subcommand re-validates the target against the same `rootShapeOk` the channel
+  uses, independently refuses the agent/server self-roots (`configSelfRoots`, the
+  Go copy of the control plane's `CONFIG_SELF_ROOTS`, so the config channel can
+  never rewrite the agent's own config), re-verifies the content's SHA-256
+  against the lease-bound hash, and does an atomic write (temp file, fsync,
+  rename). Its sandbox is the agent's with the ONE relaxation `ReadWritePaths=/etc`
+  (`ProtectSystem` stays strict; `ProtectKernelTunables` stays `yes`), caps
+  `CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE`.
+- `sys:tweak resource-limit-set` and `unit-override-set` — both write a drop-in
+  at `/etc/systemd/system/<unit>.d/<name>.conf`, so ONE helper
+  (`systemapi-agent/systemd_override_helper.go`, unit
+  `sah-systemd-override-helper@.service`) serves both. The hidden
+  `systemapi-agent __systemd-override-helper <id>` subcommand re-validates the
+  unit (`serviceNameRE`) and, per kind, the resource-limit directive/value
+  (rebuilding the body itself) or the override name/body (re-verifying its
+  SHA-256), pins the path under `/etc/systemd/system`, and writes atomically. Its
+  sandbox's ONE relaxation is `ReadWritePaths=/etc/systemd/system`, same caps as
+  the config helper, `ProtectKernelTunables` stays `yes`. It does NOT run
+  `systemctl daemon-reload` — the Phase 0 backend did not either; activating the
+  drop-in is a separate step and a follow-up.
+
+Package install/remove, the reads, and `config reload` are deliberately left on
+their existing paths.
+
+**Unverified host assumption these helpers exist to test:** that the agent, under
 its own sandbox (`NoNewPrivileges`, a restricted capability set), is actually
-permitted to `StartUnit` the privileged helper unit over D-Bus. If PID 1's
-policy refuses, the handoff + helper + committed unit stay correct and only the
+permitted to `StartUnit` a privileged helper unit over D-Bus. If PID 1's
+policy refuses, the handoffs + helpers + committed units stay correct and only the
 trigger edge needs another mechanism.
 
 **Wiring follow-up (separate branch):** `deploy/.../install-agent.sh` must
-install `systemd/sah-sysctl-helper@.service` and run `systemctl daemon-reload`,
-and reconcile its hardening set and `ExecStart` path with the agent's own
+install `systemd/sah-sysctl-helper@.service`,
+`systemd/sah-config-helper@.service` and
+`systemd/sah-systemd-override-helper@.service`, run `systemctl daemon-reload`,
+and reconcile each unit's hardening set and `ExecStart` path with the agent's own
 hardened unit.
 
 ## Open questions

@@ -47,11 +47,6 @@ var sysConfig = func() ConfigStore { return currentPlatform().Config }
 // sysTweaks returns the host's Tweaks backend; tests replace it.
 var sysTweaks = func() Tweaks { return currentPlatform().Tweaks }
 
-// sysTweakOverrideRoot is the fixed prefix a resource-limit or unit-override
-// write lands under; the Phase 0 Tweaks backend pins the full path beneath it.
-// The real allowlist is the per-host tweak unit policy plus the lease.
-var sysTweakOverrideRoot = []string{"/etc/systemd/system"}
-
 // sysConfigReadFile reads one config file for a sys:config read. It opens the
 // final component without following a symlink and refuses anything that is not
 // a regular file, so a planted symlink cannot redirect the read out of an
@@ -365,7 +360,15 @@ func (c *channelConn) sysConfig(msg sysConfigMsg, now time.Time) {
 			result["output"] = out
 		}
 	case "write":
-		actErr = sysConfig().AtomicWrite(msg.Target, msg.Content)
+		// Privilege-separated write (config_helper.go). The agent's own sandbox
+		// has ProtectSystem=strict (/etc read-only), so it cannot write a real
+		// /etc config itself; it hands off to the committed helper unit whose
+		// one relaxation is /etc in ReadWritePaths. The lease + policy gate
+		// above is unchanged; the content hash (contentSHA) is carried through
+		// and re-verified by the helper. read and reload are NOT helper'd: read
+		// is a read, and reload runs `systemctl reload` over systemd like a
+		// service restart and already works.
+		actErr = configWriteViaHelper(msg.Target, msg.Content, contentSHA)
 	case "reload":
 		var out string
 		out, actErr = sysConfig().Reload(msg.Target)
@@ -397,9 +400,12 @@ type sysTweakMsg struct {
 
 // sysTweak applies one kernel/service knob: sysctl get/set, a resource limit,
 // or a unit override. It rebuilds the signed payload from the frame (hashing a
-// unit-override body), verifies the lease, applies its own gate, then calls
-// the Phase 0 Tweaks backend, which re-checks the hard-denied sysctl keys, the
-// value shapes and the AllowConfigWrite prefix.
+// unit-override body), verifies the lease, applies its own gate, then performs
+// the verb. sysctl-get reads through the Phase 0 Tweaks backend; the mutating
+// verbs (sysctl-set, resource-limit-set, unit-override-set) are
+// privilege-separated through committed helper units
+// (sysctl_helper.go / systemd_override_helper.go), which re-validate the
+// request independently before the root-equivalent write.
 func (c *channelConn) sysTweak(msg sysTweakMsg, now time.Time) {
 	rid := msg.RequestID
 	if !sysRequestRe.MatchString(rid) {
@@ -442,18 +448,27 @@ func (c *channelConn) sysTweak(msg sysTweakMsg, now time.Time) {
 		// Privilege-separated write (sysctl_helper.go). The agent's own sandbox
 		// has ProtectKernelTunables=yes (/proc/sys read-only), so it cannot
 		// write a sysctl itself; it hands off to the committed helper unit. The
-		// lease + policy gate above is unchanged. NOTE: the other tweak verbs
-		// (sysctl-get, resource-limit-set, unit-override-set) still call the
-		// Phase 0 Tweaks backend directly and are NOT yet helper'd; this spike
-		// is sysctl-set only.
+		// lease + policy gate above is unchanged. The other mutating verbs
+		// (resource-limit-set, unit-override-set, and sys:config write) are now
+		// privilege-separated the same way; only sysctl-get (a read) still calls
+		// the Phase 0 Tweaks backend directly.
 		actErr = sysctlSetViaHelper(msg.Key, msg.Value)
 		result["key"] = msg.Key
 	case "resource-limit-set":
-		actErr = tw.SetResourceLimit(msg.Unit, msg.Limit, msg.Value, sysTweakOverrideRoot)
+		// Privilege-separated write (systemd_override_helper.go): a drop-in
+		// under /etc/systemd/system, which the agent's ProtectSystem=strict
+		// sandbox forbids. Handed off to the committed helper whose one
+		// relaxation is /etc/systemd/system in ReadWritePaths. The lease +
+		// policy gate above is unchanged; the helper rebuilds the limit body
+		// itself from unit/limit/value.
+		actErr = resourceLimitSetViaHelper(msg.Unit, msg.Limit, msg.Value)
 		result["unit"] = msg.Unit
 		result["limit"] = msg.Limit
 	case "unit-override-set":
-		actErr = tw.SetUnitOverride(msg.Unit, msg.Name, msg.Content, sysTweakOverrideRoot)
+		// Privilege-separated write (systemd_override_helper.go), same helper as
+		// resource-limit-set. The content hash (contentSHA) is carried through
+		// and re-verified by the helper.
+		actErr = unitOverrideSetViaHelper(msg.Unit, msg.Name, msg.Content, contentSHA)
 		result["unit"] = msg.Unit
 		result["name"] = msg.Name
 	}

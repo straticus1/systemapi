@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"os"
 	"testing"
 	"time"
 )
@@ -144,15 +145,30 @@ func TestSysConfigReadHappyPath(t *testing.T) {
 }
 
 func TestSysConfigWriteHappyPath(t *testing.T) {
+	// config write is privilege-separated now (config_helper.go): the channel
+	// hands off to the helper instead of calling the ConfigStore. The trigger
+	// stands in for systemd and runs the helper in-process; the write seam is
+	// faked so no real /etc file is touched.
 	h := newSysCfgHarness(t, true)
+	withConfigHelperStateDir(t)
+	calls := withFakeConfigWrite(t, nil)
+	prev := configHelperTrigger
+	configHelperTrigger = func(id string) error { runConfigHelper([]string{id}); return nil }
+	t.Cleanup(func() { configHelperTrigger = prev })
+
 	rid := newSysRequestID(t)
 	h.send(t, h.frame(t, rid, "write", "/etc/nginx/nginx.conf", "server {}\n", "", "", "", inFuture(time.Minute)))
 	p := h.result(t, rid)
 	if p["ok"] != true || p["action"] != "write" {
 		t.Fatalf("unexpected result: %v", p)
 	}
-	if len(h.cs.writes) != 1 || h.cs.writes[0] != [2]string{"/etc/nginx/nginx.conf", "server {}\n"} {
-		t.Fatalf("writes=%v", h.cs.writes)
+	// The write went through the helper seam...
+	if len(*calls) != 1 || (*calls)[0][0] != "/etc/nginx/nginx.conf" || (*calls)[0][1] != "server {}\n" {
+		t.Fatalf("helper write calls=%v", *calls)
+	}
+	// ...and NOT through the Phase 0 ConfigStore.
+	if len(h.cs.writes) != 0 {
+		t.Fatalf("config write must not call the ConfigStore any more: %v", h.cs.writes)
 	}
 }
 
@@ -265,16 +281,23 @@ func TestSysConfigRefusesWrongKey(t *testing.T) {
 }
 
 func TestSysConfigReportsActionFailure(t *testing.T) {
+	// A failed config write surfaces as action_failed. The failure now comes
+	// from the helper (its write seam returns an error), not the ConfigStore.
 	h := newSysCfgHarness(t, true)
-	h.cs.writeErr = errCfgTargetBad // any non-nil error from the write
+	withConfigHelperStateDir(t)
+	calls := withFakeConfigWrite(t, os.ErrPermission) // the sandbox denies the write
+	prev := configHelperTrigger
+	configHelperTrigger = func(id string) error { runConfigHelper([]string{id}); return nil }
+	t.Cleanup(func() { configHelperTrigger = prev })
+
 	rid := newSysRequestID(t)
 	h.send(t, h.frame(t, rid, "write", "/etc/nginx/nginx.conf", "x\n", "", "", "", inFuture(time.Minute)))
 	p := h.result(t, rid)
 	if p["ok"] != false || p["error"] != "action_failed" {
 		t.Fatalf("want action_failed, got %v", p)
 	}
-	if len(h.cs.writes) != 1 {
-		t.Fatalf("the write should still have been attempted, got %v", h.cs.writes)
+	if len(*calls) != 1 {
+		t.Fatalf("the helper write should still have been attempted, got %v", *calls)
 	}
 }
 

@@ -168,16 +168,32 @@ func TestSysTweakSysctlSetHappyPath(t *testing.T) {
 }
 
 func TestSysTweakResourceLimitHappyPath(t *testing.T) {
+	// resource-limit-set is privilege-separated now
+	// (systemd_override_helper.go): the channel hands off to the override
+	// helper instead of calling the Tweaks backend. The trigger stands in for
+	// systemd; the write seam is faked.
 	h := newSysTwkHarness(t, true)
+	withOverrideHelperStateDir(t)
+	calls := withFakeOverrideWrite(t, nil)
+	prev := overrideHelperTrigger
+	overrideHelperTrigger = func(id string) error { runOverrideHelper([]string{id}); return nil }
+	t.Cleanup(func() { overrideHelperTrigger = prev })
+
 	rid := newSysRequestID(t)
 	h.send(t, tweakFrame(t, h, rid, "resource-limit-set", "", "65536", "nginx.service", "LimitNOFILE", "", "", inFuture(time.Minute)))
 	p := h.result(t, rid)
 	if p["ok"] != true {
 		t.Fatalf("unexpected result: %v", p)
 	}
-	// The channel pins the override root; the backend owns the full path.
-	if len(h.tw.limits) != 1 || h.tw.limits[0][1] != "LimitNOFILE" || h.tw.limits[0][2] != "65536" {
-		t.Fatalf("limits=%v", h.tw.limits)
+	// The helper rebuilt the drop-in body and path...
+	wantPath := "/etc/systemd/system/nginx.service.d/limit-limitnofile.conf"
+	wantBody := "[Service]\nLimitNOFILE=65536\n"
+	if len(*calls) != 1 || (*calls)[0][0] != wantPath || (*calls)[0][1] != wantBody {
+		t.Fatalf("helper write calls=%v", *calls)
+	}
+	// ...and NOT through the Phase 0 backend.
+	if len(h.tw.limits) != 0 {
+		t.Fatalf("resource-limit-set must not call the backend any more: %v", h.tw.limits)
 	}
 }
 
@@ -200,7 +216,17 @@ func TestSysTweakResourceLimitNeedsAValue(t *testing.T) {
 }
 
 func TestSysTweakUnitOverrideHappyPath(t *testing.T) {
+	// unit-override-set is privilege-separated now
+	// (systemd_override_helper.go), through the same helper as
+	// resource-limit-set. The trigger stands in for systemd; the write seam is
+	// faked.
 	h := newSysTwkHarness(t, true)
+	withOverrideHelperStateDir(t)
+	calls := withFakeOverrideWrite(t, nil)
+	prev := overrideHelperTrigger
+	overrideHelperTrigger = func(id string) error { runOverrideHelper([]string{id}); return nil }
+	t.Cleanup(func() { overrideHelperTrigger = prev })
+
 	rid := newSysRequestID(t)
 	content := "[Service]\nLimitNOFILE=65536\n"
 	h.send(t, tweakFrame(t, h, rid, "unit-override-set", "", "", "nginx.service", "", "limit-nofile", content, inFuture(time.Minute)))
@@ -208,8 +234,14 @@ func TestSysTweakUnitOverrideHappyPath(t *testing.T) {
 	if p["ok"] != true {
 		t.Fatalf("unexpected result: %v", p)
 	}
-	if len(h.tw.overrides) != 1 || h.tw.overrides[0][2] != content {
-		t.Fatalf("overrides=%v", h.tw.overrides)
+	// The write went through the helper seam (unit-override carries the body)...
+	wantPath := "/etc/systemd/system/nginx.service.d/limit-nofile.conf"
+	if len(*calls) != 1 || (*calls)[0][0] != wantPath || (*calls)[0][1] != content {
+		t.Fatalf("helper write calls=%v", *calls)
+	}
+	// ...and NOT through the Phase 0 backend.
+	if len(h.tw.overrides) != 0 {
+		t.Fatalf("unit-override-set must not call the backend any more: %v", h.tw.overrides)
 	}
 }
 
