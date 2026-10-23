@@ -109,3 +109,26 @@ Properties (all load-bearing — this is the thing that must not fail when every
 - It is SAH's own out-of-band lifeline, so the fleet does not depend on a provider console. The provider console is the last resort only if both the agent and sah-service are dead.
 
 Open for Ryan to shape: the name (`sah-service`), whether it rides the existing control plane on its own channel or a separate minimal endpoint, and how its key is provisioned so it survives an agent re-key.
+
+## Finding 2026-10-23: the agent sandbox blocks the write verbs (and the mutation-helper decision)
+
+Deploying the full verb set to miniapps1 and testing it live surfaced the real constraint. The agent's systemd unit is hardened for its original read/PTY/file/tcp role:
+```
+ProtectSystem=strict     # whole FS read-only except ReadWritePaths
+ReadWritePaths=/var/lib/systemapi-agent /var/tmp/sah-filetest /home/sahuser
+ProtectKernelTunables=yes  # /proc/sys read-only
+```
+Live results against that sandbox:
+- Work: `sys:service` all actions (systemd over D-Bus, not an FS write — restart proven), and every read (`sysctl-get`, `config read`, `package query`).
+- Blocked: `sys:tweak sysctl-set` (writes /proc/sys), `sys:config write` to a real path like /etc (ProtectSystem=strict), `sys:tweak` resource-limit / unit-override (write /etc/systemd), `sys:package install`/`remove` (write /var/lib/dpkg, /usr).
+
+The channels, leases, policy allowlists and audit all work; the agent's own sandbox blocks the mutations. That is defense-in-depth working, not a bug. The verbs are built and policy-correct but their write paths cannot execute until this is resolved.
+
+DECISION (Ryan, 2026-10-23): option 2, a privilege-separated mutation helper. NOT option 1 (loosening the always-on agent's sandbox), which would turn the agent into an unhardened root process with only the lease as a gate.
+
+Architecture subtlety: a forked child does NOT help. ProtectSystem=strict and ProtectKernelTunables are mount-namespace properties the agent's children inherit, so a child is as walled off as the agent (the existing file-helper only writes inside ReadWritePaths; it never escapes). The mutation helper must therefore be privilege-SEPARATED: a distinct unit created by pid 1 (the agent asks systemd, as it already does for service control and as sah-finish.sh did via `systemd-run`), with its own write-capable but tightly-scoped sandbox, that performs exactly one lease-bound mutation and exits. The agent never holds the broad write capability; NoNewPrivileges on the agent does not stop this, because pid 1 does the spawning.
+
+Shape (to settle before building):
+- Per-verb FIXED sandboxes, committed and reviewed, NOT sandboxes the agent constructs at runtime (an agent that can choose a transient unit's sandbox is itself an escape surface). Each verb's helper gets only what it needs: sysctl-set → a unit without ProtectKernelTunables running `sysctl -w <key>=<value>`; config-write → ReadWritePaths scoped to the one allowed dir; unit-override/resource-limit → ReadWritePaths=/etc/systemd/system; package install/remove → the package manager's required paths. Fixed argv, no shell, the lease binds the exact parameters, the per-host deny-by-default policy is unchanged.
+- Open choice: one committed helper unit per verb (most auditable) vs the agent calling `systemd-run` with a per-verb fixed parameter set (fewer moving parts, but the parameter construction must be constrained so it cannot be widened). Recommendation: committed per-verb helpers, so the sandbox lives in the door/repo and not in agent-constructed arguments.
+- Must confirm the agent is allowed to StartTransientUnit / reach the helper over D-Bus under its current scoping (service restart working suggests manager access, but creating units is a separate permission to verify on the host).
