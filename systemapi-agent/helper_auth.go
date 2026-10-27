@@ -24,8 +24,9 @@ package main
 //     within leaseSkew/leaseMaxTTL, payload hash.
 //   - The lease nonce is consumed once in a durable store under the helper's
 //     own state dir (helperReplayDir), which the agent's sandbox cannot write.
-//     One O_EXCL file per nonce holding its expiry; entries past expiry+skew
-//     are pruned (such a lease no longer verifies anyway) and the store refuses
+//     One O_EXCL file per nonce holding its expiry, recorded under an
+//     exclusive flock; entries past expiry+helperReplayRetain are pruned
+//     (such a lease no longer verifies anywhere) and the store refuses
 //     once helperReplayMax live entries exist, so it stays bounded. A helper
 //     restart keeps the store, so a replay stays refused.
 //
@@ -66,6 +67,20 @@ var (
 )
 
 const helperTrustMax = 4 * 1024
+
+// helperReplayLockName is the flock file inside helperReplayDir that
+// serialises check+prune+record across concurrent helper processes. It is not
+// a nonce entry: it is neither counted nor pruned.
+const helperReplayLockName = ".lock"
+
+// helperReplayRetain is how long past its lease expiry a consumed nonce is
+// kept. verifyLease accepts a lease until expiry+leaseSkew, judged by each
+// helper's own clock read before it consumes. Keeping the entry until
+// expiry+2*leaseSkew+1m covers that window, a second leaseSkew of clock
+// disagreement between helper processes, and up to a minute between one
+// helper's verify and its consume, so a prune by a later helper can never
+// remove an entry a concurrent helper could still verify and re-consume.
+const helperReplayRetain = 2*leaseSkew + time.Minute
 
 // helperReplayMax bounds the live consumed-nonce entries. A var only so tests
 // can exercise the full-store refusal without writing thousands of files.
@@ -167,7 +182,9 @@ func loadHelperTrust() (ed25519.PublicKey, string, error) {
 }
 
 // consumeHelperNonce records nonce as used, durably, or returns errReplay if
-// it already was. Entries whose lease expired more than leaseSkew ago are
+// it already was. It holds an exclusive flock on helperReplayLockName (opened
+// O_NOFOLLOW) for the whole check+prune+record, so concurrent helpers are
+// serialised. Entries whose lease expired more than helperReplayRetain ago are
 // pruned first; the store refuses when helperReplayMax live entries remain.
 func consumeHelperNonce(nonce string, expiresUnix int64, now time.Time) error {
 	if !nonceHexRe.MatchString(nonce) {
@@ -186,6 +203,18 @@ func consumeHelperNonce(nonce string, expiresUnix int64, now time.Time) error {
 	if err := trustedNode(dirInfo); err != nil {
 		return fmt.Errorf("replay dir: %w", err)
 	}
+	lock, err := os.OpenFile(filepath.Join(helperReplayDir, helperReplayLockName), os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return fmt.Errorf("replay lock: %w", err)
+	}
+	defer lock.Close()
+	if info, err := lock.Stat(); err != nil || !info.Mode().IsRegular() {
+		return errors.New("replay lock is not a regular file")
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("replay lock: %w", err)
+	}
+	// Released by the deferred Close.
 	if _, err := os.Lstat(filepath.Join(helperReplayDir, nonce)); err == nil {
 		return errReplay
 	} else if !os.IsNotExist(err) {
@@ -195,10 +224,13 @@ func consumeHelperNonce(nonce string, expiresUnix int64, now time.Time) error {
 	if err != nil {
 		return err
 	}
-	cutoff := now.Add(-leaseSkew).Unix()
+	cutoff := now.Add(-helperReplayRetain).Unix()
 	live := 0
 	for _, e := range entries {
 		name := e.Name()
+		if name == helperReplayLockName {
+			continue
+		}
 		p := filepath.Join(helperReplayDir, name)
 		b, err := readHandoffFile(p, 32)
 		exp, perr := strconv.ParseInt(string(b), 10, 64)

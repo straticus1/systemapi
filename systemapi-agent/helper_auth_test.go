@@ -17,9 +17,13 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -420,5 +424,103 @@ func TestOverrideHelperRequiresMatchingLease(t *testing.T) {
 	}
 	if len(*calls) != 0 {
 		t.Fatalf("write must not run: %v", *calls)
+	}
+}
+
+// The last moment a lease verifies is expiry+leaseSkew. A helper that verified
+// it then must still find its nonce recorded even if another helper, running a
+// little later, pruned the store in between: an entry is kept until well past
+// the acceptance window, so the same lease cannot be consumed twice.
+func TestHelperAuthPruneKeepsEntriesThatCanStillVerify(t *testing.T) {
+	newHelperSigner(t)
+	exp := time.Now().Unix()
+	edge := time.Unix(exp, 0).Add(leaseSkew) // the last second verifyLease accepts
+	nonce := "0123456789abcdef0123456789abcdef"
+	if err := consumeHelperNonce(nonce, exp, edge); err != nil {
+		t.Fatal(err)
+	}
+	// Another helper, a little later, consumes an unrelated nonce and prunes.
+	if err := consumeHelperNonce("fedcba9876543210fedcba9876543210", exp+300, edge.Add(5*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	// A second helper that verified the same lease at the edge must be refused.
+	if err := consumeHelperNonce(nonce, exp, edge); !errors.Is(err, errReplay) {
+		t.Fatalf("lease consumed twice across a prune: %v", err)
+	}
+}
+
+// Parallel helpers consuming the same nonce at the expiry edge, interleaved
+// with helpers that prune: exactly one consume of that nonce succeeds.
+func TestHelperAuthConcurrentConsumeNearExpiry(t *testing.T) {
+	newHelperSigner(t)
+	exp := time.Now().Unix()
+	edge := time.Unix(exp, 0).Add(leaseSkew)
+	nonce := "00112233445566778899aabbccddeeff"
+	const n = 16
+	var wg sync.WaitGroup
+	var ok atomic.Int32
+	errs := make(chan error, 2*n)
+	for i := 0; i < n; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			err := consumeHelperNonce(nonce, exp, edge)
+			if err == nil {
+				ok.Add(1)
+			} else if !errors.Is(err, errReplay) {
+				errs <- err
+			}
+		}()
+		go func(i int) {
+			defer wg.Done()
+			other := fmt.Sprintf("%032x", i+1)
+			if err := consumeHelperNonce(other, exp+300, edge.Add(time.Duration(i+1)*time.Second)); err != nil {
+				errs <- err
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("unexpected store error: %v", err)
+	}
+	if got := ok.Load(); got != 1 {
+		t.Fatalf("same nonce consumed %d times, want exactly 1", got)
+	}
+}
+
+// The lock file lives in the store but is not a nonce: it must not count
+// toward helperReplayMax nor be pruned.
+func TestHelperAuthReplayLockNotCounted(t *testing.T) {
+	newHelperSigner(t)
+	prevMax := helperReplayMax
+	helperReplayMax = 1
+	t.Cleanup(func() { helperReplayMax = prevMax })
+	now := time.Now()
+	if err := consumeHelperNonce("0123456789abcdef0123456789abcdef", now.Add(time.Minute).Unix(), now); err != nil {
+		t.Fatalf("first entry refused (lock file counted?): %v", err)
+	}
+	info, err := os.Lstat(filepath.Join(helperReplayDir, helperReplayLockName))
+	if err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("lock file missing or not regular: %v", err)
+	}
+}
+
+// A symlink planted at the lock path is refused, not followed.
+func TestHelperAuthReplayLockRefusesSymlink(t *testing.T) {
+	newHelperSigner(t)
+	if err := os.MkdirAll(helperReplayDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "elsewhere")
+	if err := os.Symlink(target, filepath.Join(helperReplayDir, helperReplayLockName)); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if err := consumeHelperNonce("0123456789abcdef0123456789abcdef", now.Add(time.Minute).Unix(), now); err == nil {
+		t.Fatal("a symlinked lock file must be refused")
+	}
+	if _, err := os.Lstat(target); !os.IsNotExist(err) {
+		t.Fatalf("lock symlink was followed: %v", err)
 	}
 }
