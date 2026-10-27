@@ -158,7 +158,7 @@ function parseConfigDir(text) {
 
 function parseTweakSysctl(text) {
   if (typeof text !== 'string' || !SYSCTL_KEY_RE.test(text) || sysctlDenied(text)) {
-    throw usage(`bad --tweak-sysctl: ${JSON.stringify(text)} is not an allowable sysctl key (lowercase letters, digits, ".", "_"; not a hard-denied key)`);
+    throw usage(`bad --tweak-sysctl: ${JSON.stringify(text)} is not an allowable sysctl key (dot-separated non-empty segments of lowercase letters, digits, "_"; not a hard-denied key)`);
   }
   return text;
 }

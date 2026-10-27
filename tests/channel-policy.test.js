@@ -425,6 +425,12 @@ test('--tweak-sysctl / --tweak-unit write the tweak allowlists the sys:tweak rou
   // A hard-denied sysctl key can never be granted.
   await assert.rejects(run(['set', '--tenant', 'afterdark', '--host', 'miniapps1', '--reason', 'x', '--tweak-sysctl', 'kernel.core_pattern'], { registry: reg }),
     (err) => err.code === 'usage');
+  // Nor a malformed spelling that the agent's /proc/sys path cleaning would
+  // collapse onto it.
+  for (const bad of require('../controlplane/testdata/sysctl-deny-vectors.json').rejected) {
+    await assert.rejects(run(['set', '--tenant', 'afterdark', '--host', 'miniapps1', '--reason', 'x', '--tweak-sysctl', bad], { registry: reg }),
+      (err) => err.code === 'usage', bad);
+  }
 });
 
 test('clear denies all services; inherit defers to the tenant; a bad unit is refused', async () => {

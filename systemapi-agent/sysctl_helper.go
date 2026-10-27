@@ -27,7 +27,7 @@ package main
 //     the payload it rebuilds from the exact key and value, checks
 //     host/action/expiry, and consumes the nonce in a durable store the agent
 //     cannot write. It also independently re-validates the key against the
-//     same sysctlKeyRE and sysctlDenied list the channel uses, and the value
+//     same sysctlKeyOK shape and sysctlDenied list the channel uses, and the value
 //     against sysctlValueOK. The per-host sysctl allowlist is enforced by the
 //     control plane before it signs. It fails closed on every error.
 //   - The handoff files are the agent's own: 0600, under the agent's writable
@@ -144,7 +144,7 @@ func sysctlSetViaHelper(key, value string, lease *Lease) error {
 	// Defensive re-validation at the agent gate. The real authorization is the
 	// lease + per-host allowlist (already enforced); the helper re-validates
 	// again, independently. Fail closed.
-	if sysctlDenied(key) || !sysctlKeyRE.MatchString(key) {
+	if sysctlDenied(key) || !sysctlKeyOK(key) {
 		return fmt.Errorf("sysctl not allowed")
 	}
 	if !sysctlValueOK(value) {
@@ -230,7 +230,7 @@ func doSysctlHelper(reqPath string) sysctlHelperRes {
 	// Independent re-validation: the same key shape and DENIED_SYSCTL set the
 	// channel uses, plus the value shape. The helper trusts none of this from
 	// the caller and fails closed.
-	if sysctlDenied(req.Key) || !sysctlKeyRE.MatchString(req.Key) {
+	if sysctlDenied(req.Key) || !sysctlKeyOK(req.Key) {
 		return sysctlHelperRes{Error: "key_denied"}
 	}
 	if !sysctlValueOK(req.Value) {

@@ -121,8 +121,10 @@ func TestSysctlHelperRefusesDeniedKey(t *testing.T) {
 func TestSysctlHelperRefusesMalformedKey(t *testing.T) {
 	dir := withHelperStateDir(t)
 	calls := withFakeWrite(t, nil)
-	// Uppercase and a trailing newline both fail sysctlKeyRE.
-	for _, bad := range []string{"Net.ipv4.ip_forward", "net.ipv4.ip_forward\n", "", "net/ipv4/ip_forward"} {
+	// Uppercase and a trailing newline both fail the sysctl key shape.
+	// Empty dot segments would clean onto the real (denied) file.
+	for _, bad := range []string{"Net.ipv4.ip_forward", "net.ipv4.ip_forward\n", "", "net/ipv4/ip_forward",
+		"kernel.core_pattern.", "kernel..core_pattern", "fs..binfmt_misc.register", "kernel.modprobe."} {
 		writeReqFile(t, dir, testHelperID, sysctlHelperReq{Key: bad, Value: "1"})
 		if code := runSysctlHelper([]string{testHelperID}); code != 0 {
 			t.Fatalf("exit=%d for key %q", code, bad)

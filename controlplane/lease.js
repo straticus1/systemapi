@@ -32,7 +32,7 @@
 'use strict';
 
 const crypto = require('node:crypto');
-const { validateFileRoot, sysctlDenied } = require('./channels');
+const { validateFileRoot, sysctlDenied, SYSCTL_KEY_RE } = require('./channels');
 const { randomBytes, timingSafeEqual } = crypto;
 
 const ACTIONS = new Set(['sysscript', 'pty', 'pty_root', 'breakglass', 'tcp', 'file', 'file_root', 'xfer', 'xfer_root', 'sys_service', 'sys_package', 'sys_config', 'sys_tweak']);
@@ -229,7 +229,6 @@ function sysConfigPayload(action, target, contentSha256) {
 // override body rides the agent frame bound by its SHA-256. The agent rebuilds
 // this from the frame, so a lease for one key/unit/verb/value never acts on
 // another. Shapes mirror systemapi-agent/grant.go and platform_tweak.go.
-const TWEAK_SYSCTL_KEY_RE = /^[a-z][a-z0-9_.]{0,127}$/;
 const TWEAK_OVERRIDE_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
 const TWEAK_LIMIT_VALUE_RE = /^[a-zA-Z0-9:._]{1,64}$/;
 const TWEAK_RESOURCE_LIMITS = new Set(['LimitCPU', 'LimitFSIZE', 'LimitDATA', 'LimitSTACK', 'LimitCORE', 'LimitRSS',
@@ -237,7 +236,7 @@ const TWEAK_RESOURCE_LIMITS = new Set(['LimitCPU', 'LimitFSIZE', 'LimitDATA', 'L
   'LimitNICE', 'LimitRTPRIO', 'LimitRTTIME']);
 function sysTweakPayload(tw, contentSha256) {
   if (!tw || typeof tw !== 'object') throw badPayload();
-  const sysctlKeyOk = (k) => typeof k === 'string' && TWEAK_SYSCTL_KEY_RE.test(k) && !sysctlDenied(k);
+  const sysctlKeyOk = (k) => typeof k === 'string' && SYSCTL_KEY_RE.test(k) && !sysctlDenied(k);
   const unitOk = (u) => typeof u === 'string' && SERVICE_UNIT_RE.test(u);
   switch (tw.verb) {
     case 'sysctl-get':

@@ -105,10 +105,13 @@ the mechanism; `sysctl-get` is a read and still calls the Phase 0 backend.
   `/var/lib/systemapi-agent/sysctl-helper/<id>.req`, triggers the unit, reads
   `<id>.res`, and cleans both up. One request per invocation, fresh random id.
 - Helper side: the hidden `systemapi-agent __sysctl-helper <id>` subcommand
-  re-checks the key against the same `sysctlKeyRE` and `sysctlDenied` list the
-  channel uses and the value against `sysctlValueOK`, resolves the `/proc/sys`
-  path (traversal-checked), writes, and records `{ok,error,errno}`. It trusts
-  nothing from the caller and fails closed.
+  re-checks the key against the same `sysctlKeyOK` shape (dot-separated
+  non-empty segments, so `kernel.core_pattern.` or `kernel..core_pattern` can
+  never clean onto a denied file) and `sysctlDenied` list the channel uses and
+  the value against `sysctlValueOK`, resolves the `/proc/sys` path
+  (traversal-checked, then mapped back to a dotted key that must equal the
+  input and is deny-checked again), writes, and records `{ok,error,errno}`. It
+  trusts nothing from the caller and fails closed.
 - Sandbox: committed in `systemd/sah-sysctl-helper@.service`. It is the agent's
   hardening **minus `ProtectKernelTunables`** and nothing else:
   `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ReadWritePaths` limited to the

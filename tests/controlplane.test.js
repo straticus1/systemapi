@@ -1591,7 +1591,8 @@ test('clampEntitlements denies host lists to operators and stars to admins', () 
   const filtered = clampEntitlements({
     allow_images: ['nginx:latest', '*', 'a..b', 'bad\n', 1, ''],
     allow_packages: pkgs,
-    allow_sysctl: ['kernel.core_pattern', 'kernel.modprobe', 'kernel.hotplug', 'net.ipv4.ip_forward'],
+    allow_sysctl: ['kernel.core_pattern', 'kernel.modprobe', 'kernel.hotplug', 'net.ipv4.ip_forward',
+      'kernel.core_pattern.', 'kernel..modprobe', 'fs..binfmt_misc.register'],
     allow_linux: 'yes',
     allow_k8s: true
   }, admin);

@@ -1,5 +1,5 @@
 {
-  "comment": "Shared by tests/channels.test.js and systemapi-agent/sys_grant_test.go: both sysctl deny lists must agree on every key here.",
+  "comment": "Shared by tests/channels.test.js and systemapi-agent/sys_grant_test.go: both sysctl deny lists must agree on every key here. \"rejected\" keys are malformed (empty dot segments) and must be refused by every place a key is accepted on both sides, because /proc/sys path cleaning would otherwise collapse them onto a denied file.",
   "denied": [
     "kernel.core_pattern",
     "kernel.modprobe",
@@ -35,5 +35,20 @@
     "fs.binfmt_miscx",
     "kernel.sysrqx",
     "kernel.usermodehelperx"
+  ],
+  "rejected": [
+    "kernel.core_pattern.",
+    ".kernel.core_pattern",
+    "kernel..core_pattern",
+    "kernel.modprobe.",
+    ".kernel.modprobe",
+    "kernel..modprobe",
+    "fs.binfmt_misc.register.",
+    ".fs.binfmt_misc.register",
+    "fs..binfmt_misc.register",
+    "fs.binfmt_misc..register",
+    "net.ipv4.ip_forward.",
+    "net..ipv4.ip_forward",
+    "a..b"
   ]
 }

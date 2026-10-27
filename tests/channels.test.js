@@ -724,4 +724,17 @@ test('sysctl deny list matches the agent (shared vectors)', () => {
     assert.equal(ch.sysctlDenied(k), false, k);
     assert.equal(ch.validateTweakBinding({ verb: 'sysctl-get', key: k }).ok, true, k);
   }
+  // Malformed keys (empty dot segments) collapse onto real /proc/sys files on
+  // the agent; every place a key is accepted must refuse them.
+  assert.ok(vec.rejected.length > 0);
+  assert.equal(ch.SYSCTL_KEY_RE.test(`a${'b'.repeat(127)}`), true);
+  assert.equal(ch.SYSCTL_KEY_RE.test(`a${'b'.repeat(128)}`), false);
+  for (const k of vec.rejected) {
+    assert.equal(ch.SYSCTL_KEY_RE.test(k), false, k);
+    for (const verb of ['sysctl-get', 'sysctl-set']) {
+      assert.equal(ch.validateTweakBinding({ verb, key: k, value: '1' }).error, 'bad_tweak', k);
+      assert.throws(() => lease.sysTweakPayload({ verb, key: k, value: '1' }), /bad_payload/, k);
+    }
+    assert.equal(ch.parseTweakPolicy({ sysctls: [k] }), null, k);
+  }
 });

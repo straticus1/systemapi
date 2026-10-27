@@ -42,7 +42,11 @@ var (
 	packageNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9.+_-]{0,127}$`)
 	imageNameRE   = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,200}$`)
 	ifaceNameRE   = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9._:-]{0,14}$`)
-	sysctlKeyRE   = regexp.MustCompile(`^[a-z][a-z0-9_.]{0,127}$`)
+	// One or more non-empty segments separated by single dots, starting with a
+	// letter. An empty segment ("a..b", "a.b.", ".a") would map onto a
+	// different /proc/sys file after path cleaning and dodge the deny list.
+	// Check through sysctlKeyOK, which also applies sysctlKeyMax.
+	sysctlKeyRE   = regexp.MustCompile(`^[a-z][a-z0-9_]*(\.[a-z0-9_]+)*$`)
 	osReleaseKeyRE = regexp.MustCompile(`^[A-Z0-9_]+$`)
 	procfsPIDFile = regexp.MustCompile(`^[0-9]+/(status|cmdline|io|limits|stat|cgroup)$`)
 	dns1123RE     = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$`)
@@ -138,7 +142,7 @@ func dropDeniedSysctl(in []string) []string {
 	}
 	out := make([]string, 0, len(in))
 	for _, item := range in {
-		if sysctlDenied(item) {
+		if sysctlDenied(item) || !sysctlKeyOK(item) {
 			continue
 		}
 		out = append(out, item)
@@ -149,11 +153,19 @@ func dropDeniedSysctl(in []string) []string {
 	return out
 }
 
+// sysctlKeyMax caps a sysctl key's length.
+const sysctlKeyMax = 128
+
+// sysctlKeyOK reports whether key has the canonical sysctl shape.
+func sysctlKeyOK(key string) bool {
+	return len(key) <= sysctlKeyMax && sysctlKeyRE.MatchString(key)
+}
+
 func sysctlGranted(allow []string, key string) bool {
 	if sysctlDenied(key) {
 		return false
 	}
-	if !sysctlKeyRE.MatchString(key) {
+	if !sysctlKeyOK(key) {
 		return false
 	}
 	return exactGrant(allow, key)
@@ -167,7 +179,7 @@ func sysctlValueOK(v string) bool {
 }
 
 func sysctlProcPath(key string) (string, error) {
-	if !sysctlKeyRE.MatchString(key) {
+	if !sysctlKeyOK(key) {
 		return "", fmt.Errorf("sysctl not allowed")
 	}
 	if sysctlDenied(key) {
@@ -178,7 +190,24 @@ func sysctlProcPath(key string) (string, error) {
 	if full == "/proc/sys" || !pathWithin("/proc/sys", full) {
 		return "", fmt.Errorf("sysctl not allowed")
 	}
+	// Defence in depth: the file actually written is named by the cleaned
+	// path, so deny-check the key that path spells and refuse any key that
+	// cleaning changed.
+	canon := sysctlKeyFromProcPath(full)
+	if canon != key || sysctlDenied(canon) {
+		return "", fmt.Errorf("sysctl not allowed")
+	}
 	return full, nil
+}
+
+// sysctlKeyFromProcPath maps a path under /proc/sys back to its dotted key,
+// or "" when the path is not a clean path strictly below /proc/sys.
+func sysctlKeyFromProcPath(full string) string {
+	rel, ok := strings.CutPrefix(full, "/proc/sys/")
+	if !ok || rel == "" || filepath.Clean(full) != full {
+		return ""
+	}
+	return strings.ReplaceAll(rel, "/", ".")
 }
 
 func procfsRelOK(rel string) bool {

@@ -45,10 +45,14 @@ const CONFIG_CONTENT_MAX = 64 * 1024;
 // The sys:tweak channel verbs. sysctl-get is a read; the rest are mutations.
 // Kernel modules and firewall rules are out of v1 (design Decision 2).
 const TWEAK_VERBS = new Set(['sysctl-get', 'sysctl-set', 'resource-limit-set', 'unit-override-set']);
-// Mirrors systemapi-agent/grant.go sysctlKeyRE, deniedSysctl, sysctlValueCap
-// and platform_tweak.go resourceLimits, overrideNameRE, limitValueRE,
-// overrideContentCap.
-const SYSCTL_KEY_RE = /^[a-z][a-z0-9_.]{0,127}$/;
+// Mirrors systemapi-agent/grant.go sysctlKeyOK (sysctlKeyRE + sysctlKeyMax),
+// sysctlDenied, sysctlValueCap and platform_tweak.go resourceLimits,
+// overrideNameRE, limitValueRE, overrideContentCap.
+// A sysctl key is one or more non-empty segments separated by single dots,
+// starting with a letter, at most 128 chars. An empty segment ("a..b",
+// "a.b.") would map onto a different /proc/sys file after the agent's path
+// cleaning and dodge the deny list.
+const SYSCTL_KEY_RE = /^(?=.{1,128}$)[a-z][a-z0-9_]*(\.[a-z0-9_]+)*$/;
 const SYSCTL_VALUE_MAX = 256;
 // The hard sysctl deny list: keys that run a root helper or weaken kernel
 // hardening. Mirrors systemapi-agent/grant.go deniedSysctlExact and

@@ -131,9 +131,13 @@ func TestSysctlPathAndGrant(t *testing.T) {
 	if _, err := sysctlProcPath("kernel.core_pattern"); err == nil || !strings.Contains(err.Error(), "sysctl not allowed") {
 		t.Fatal(err)
 	}
-	got, err = sysctlProcPath("a..b")
-	if err != nil || got != "/proc/sys/a/b" {
-		t.Fatalf("%s %v", got, err)
+	// Empty dot segments would be collapsed by filepath.Clean onto a different
+	// (possibly denied) /proc/sys file; the key shape refuses them outright.
+	if got, err := sysctlProcPath("a..b"); err == nil {
+		t.Fatalf("a..b mapped to %s", got)
+	}
+	if !sysctlKeyOK("a"+strings.Repeat("b", 127)) || sysctlKeyOK("a"+strings.Repeat("b", 128)) {
+		t.Fatal("sysctl key length cap is not 128")
 	}
 	if exactGrant([]string{"a..b"}, "a..b") || sysctlGranted([]string{"a..b"}, "a..b") {
 		t.Fatal("dotdot key granted")
@@ -215,13 +219,14 @@ func TestSysctlDenyVectors(t *testing.T) {
 		t.Fatal(err)
 	}
 	var v struct {
-		Denied  []string `json:"denied"`
-		Allowed []string `json:"allowed"`
+		Denied   []string `json:"denied"`
+		Allowed  []string `json:"allowed"`
+		Rejected []string `json:"rejected"`
 	}
 	if err := json.Unmarshal(blob, &v); err != nil {
 		t.Fatal(err)
 	}
-	if len(v.Denied) == 0 || len(v.Allowed) == 0 {
+	if len(v.Denied) == 0 || len(v.Allowed) == 0 || len(v.Rejected) == 0 {
 		t.Fatal("empty vectors")
 	}
 	for _, k := range v.Denied {
@@ -244,6 +249,47 @@ func TestSysctlDenyVectors(t *testing.T) {
 	for _, k := range v.Allowed {
 		if sysctlDenied(k) || !sysctlGranted([]string{k}, k) {
 			t.Errorf("%s must be grantable", k)
+		}
+	}
+	// Malformed keys (empty dot segments) must be refused everywhere a key is
+	// accepted: filepath.Clean would collapse them onto a real, possibly
+	// denied, /proc/sys file.
+	for _, k := range v.Rejected {
+		if sysctlKeyOK(k) {
+			t.Errorf("%q must fail the key shape", k)
+		}
+		if sysctlGranted([]string{k}, k) {
+			t.Errorf("%q must never be granted", k)
+		}
+		if p, err := sysctlProcPath(k); err == nil {
+			t.Errorf("%q must have no proc path, got %s", k, p)
+		}
+		if got := dropDeniedSysctl([]string{k}); got != nil {
+			t.Errorf("%q survived dropDeniedSysctl", k)
+		}
+		for _, verb := range []string{"sysctl-get", "sysctl-set"} {
+			if _, err := sysTweakLeasePayload(verb, k, "1", "", "", "", ""); err == nil {
+				t.Errorf("%q must not form a %s payload", k, verb)
+			}
+		}
+	}
+}
+
+// Defence in depth: whatever passes the key shape, the /proc/sys path is
+// mapped back to a dotted key and that canonical key must equal the input.
+func TestSysctlProcPathCanonicalRoundTrip(t *testing.T) {
+	for _, k := range []string{"net.ipv4.ip_forward", "vm.swappiness", "fs.inotify.max_user_watches"} {
+		p, err := sysctlProcPath(k)
+		if err != nil {
+			t.Fatalf("%s: %v", k, err)
+		}
+		if got := sysctlKeyFromProcPath(p); got != k {
+			t.Fatalf("%s round-tripped to %q", k, got)
+		}
+	}
+	for _, p := range []string{"/proc/sys", "/proc/sysx/a", "/etc/passwd", "/proc/sys/../etc"} {
+		if got := sysctlKeyFromProcPath(p); got != "" {
+			t.Fatalf("%s mapped to key %q", p, got)
 		}
 	}
 }
