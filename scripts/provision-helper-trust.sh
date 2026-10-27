@@ -2,7 +2,7 @@
 # provision-helper-trust.sh — install the mutation helpers' trust anchor,
 # /etc/systemapi-agent/helper-trust.json (systemapi-agent/helper_auth.go).
 #
-# usage: provision-helper-trust.sh --pubkey <base64 control key> [--host-id <uuid>]
+# usage: provision-helper-trust.sh --pubkey <base64 control key> --host-id <uuid>
 #                                  [--state <agent.json>] [--out <trust file>]
 #
 # The control-plane public key is the root of trust for every helper write, so
@@ -10,9 +10,13 @@
 # operator reading it from the control plane), never from the agent: agent.json
 # lives in the agent-writable state dir, so a compromised agent could have put
 # its own key there. This script takes the pinned key as --pubkey, reads
-# agent.json only to CROSS-CHECK it, and refuses on any mismatch. Pass
-# --host-id too when the install bundle pins it; otherwise host_id comes from
-# agent.json (it only selects which host's leases verify; it grants no key).
+# agent.json only to CROSS-CHECK it, and refuses on any mismatch. --host-id is
+# required for the same reason: it selects which host's leases verify, so it is
+# pinned out of band too and never defaulted from agent.json.
+#
+# Linux only: the final rename uses GNU mv -T (never move INTO a directory that
+# appeared at the trust path). The script probes for -T and refuses without it
+# (BSD/macOS mv has no -T).
 #
 # Threats: a key substituted in agent.json, a symlink planted at the trust file,
 # its directory or agent.json, a partial write, and a non-root run. Every
@@ -47,11 +51,11 @@ done
 [ -n "$PUBKEY" ] || die "--pubkey is required (the out-of-band pinned control-plane key)"
 # A canonical standard-base64 32-byte Ed25519 key: 43 characters and one "=".
 [[ "$PUBKEY" =~ ^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$ ]] || die "--pubkey is not a base64 32-byte key"
+[ -n "$HOST_ID" ] || die "--host-id is required (the out-of-band pinned host id)"
 UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-if [ -n "$HOST_ID" ]; then
-  [[ "$HOST_ID" =~ $UUID_RE ]] || die "--host-id is not a host id"
-fi
+[[ "$HOST_ID" =~ $UUID_RE ]] || die "--host-id is not a host id"
 command -v jq >/dev/null 2>&1 || die "jq is required"
+mv -T --help >/dev/null 2>&1 || die "needs GNU mv -T (coreutils); this script targets Linux hosts"
 
 [ ! -L "$STATE" ] || die "$STATE is a symlink"
 [ -f "$STATE" ] || die "$STATE is not a regular file (has the agent enrolled?)"
@@ -59,9 +63,7 @@ STATE_KEY=$(jq -er '.control_pubkey | strings' "$STATE") || die "$STATE has no c
 STATE_HOST=$(jq -er '.host_id | strings' "$STATE") || die "$STATE has no host_id"
 [ "$STATE_KEY" = "$PUBKEY" ] || die "control_pubkey in $STATE does not match the pinned --pubkey; refusing"
 [[ "$STATE_HOST" =~ $UUID_RE ]] || die "host_id in $STATE is not a host id"
-if [ -n "$HOST_ID" ]; then
-  [ "$STATE_HOST" = "$HOST_ID" ] || die "host_id in $STATE does not match --host-id; refusing"
-fi
+[ "$STATE_HOST" = "$HOST_ID" ] || die "host_id in $STATE does not match --host-id; refusing"
 
 DIR=$(dirname "$OUT")
 [ ! -L "$DIR" ] || die "$DIR is a symlink"
@@ -81,11 +83,11 @@ fi
 
 TMP=$(mktemp "$DIR/.helper-trust.XXXXXX")
 trap 'rm -f "$TMP"' EXIT
-jq -n --arg h "$STATE_HOST" --arg k "$PUBKEY" '{host_id: $h, control_pubkey: $k}' > "$TMP"
+jq -n --arg h "$HOST_ID" --arg k "$PUBKEY" '{host_id: $h, control_pubkey: $k}' > "$TMP"
 chown root:root "$TMP"
 chmod 0644 "$TMP"
 sync
-mv -f "$TMP" "$OUT"
+mv -fT "$TMP" "$OUT"
 trap - EXIT
 sync
-echo "provision-helper-trust: wrote $OUT for host $STATE_HOST"
+echo "provision-helper-trust: wrote $OUT for host $HOST_ID"

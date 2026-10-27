@@ -45,7 +45,7 @@
 # operator from the control plane), never copied from agent.json, which the
 # agent can write; the script cross-checks it against agent.json and refuses
 # on a mismatch, refuses symlinks, and writes 0644 root:root atomically:
-#   scripts/provision-helper-trust.sh --pubkey <pinned base64 key> [--host-id <id>]
+#   scripts/provision-helper-trust.sh --pubkey <pinned base64 key> --host-id <pinned id>
 # Without it every helper write fails closed with trust_unavailable.
 #
 # LIMITS (security review finding 1, an open owner design decision). "The
