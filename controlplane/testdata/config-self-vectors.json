@@ -27,7 +27,11 @@
     "/etc/systemd/system/sah-config-.service.d/x.conf",
     "/etc/systemd/system/systemapi-.service.d/x.conf",
     "/etc/systemd/system.control/systemapi-agent.service.d/50-x.conf",
-    "/etc/systemd/system.control/sah-config-helper@.service.d/50-x.conf"
+    "/etc/systemd/system.control/sah-config-helper@.service.d/50-x.conf",
+    "/etc/ld.so.preload",
+    "/etc/systemd/system.conf",
+    "/etc/systemd/system.conf.d",
+    "/etc/systemd/system.conf.d/50-env.conf"
   ],
   "allowed": [
     "/etc/nginx/nginx.conf",
@@ -39,6 +43,9 @@
     "/etc/systemd/system/sah-helper.service",
     "/etc/systemd/system/nginx-.service.d/x.conf",
     "/etc/systemd/system/multi-user.target.wants/nginx.service",
-    "/etc/systemd/timesyncd.conf"
+    "/etc/systemd/timesyncd.conf",
+    "/etc/ld.so.preloadx",
+    "/etc/systemd/system.confx",
+    "/etc/systemd/user.conf.d/x.conf"
   ]
 }

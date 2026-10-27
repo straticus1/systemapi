@@ -96,12 +96,17 @@ var configHelperIDRE = regexp.MustCompile(`^[0-9a-f]{32}$`)
 // if the (0600, agent-owned) request file asks for it. Deny by prefix on a
 // component boundary. It includes the helpers' own replay store and trust
 // file and the agent's unit; the helper units and drop-ins that apply to them
-// are matched by pattern (configSystemdSelfEntry).
+// are matched by pattern (configSystemdSelfEntry). /etc/ld.so.preload (loaded
+// into every dynamically linked process, the agent and helpers included) and
+// the system manager's config (system.conf, system.conf.d: DefaultEnvironment
+// and friends apply to every service) are denied too. user.conf(.d) is not:
+// it configures user managers, which run neither the agent nor a helper.
 var configSelfRoots = []string{
 	"/proc", "/sys", "/dev", "/boot",
 	"/var/lib/systemapi-agent", "/etc/systemapi-agent", "/var/lib/postgresql", "/etc/sahcore",
 	"/var/lib/sah-helper", "/etc/systemapi-agent/helper-trust.json",
 	"/etc/systemd/system/systemapi-agent.service", "/etc/systemd/system/systemapi-agent.service.d",
+	"/etc/ld.so.preload", "/etc/systemd/system.conf", "/etc/systemd/system.conf.d",
 }
 
 // configSystemdUnitDirs hold unit files and drop-ins systemd applies to the

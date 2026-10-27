@@ -130,7 +130,8 @@ spike as the exact template, under the SAME unverified host assumption (below):
   uses, independently refuses the agent/server self-roots (`configSelfRoots`, the
   Go copy of the control plane's `CONFIG_SELF_ROOTS`, so the config channel can
   never rewrite the agent's own config; it also covers the helpers' replay store
-  `/var/lib/sah-helper`, the trust file, the agent's unit and, by pattern, the
+  `/var/lib/sah-helper`, the trust file, the agent's unit, `/etc/ld.so.preload`,
+  `/etc/systemd/system.conf(.d)` and, by pattern, the
   `sah-*-helper@` units and any drop-in dir under `/etc/systemd/system` or
   `system.control` that applies to them; `controlplane/testdata/config-self-vectors.json`
   keeps the Go and JS lists in parity), verifies the signed lease itself (see
@@ -202,6 +203,19 @@ access narrowed (for example a non-root agent with a polkit rule that allows
 only `StartUnit` of the `sah-*-helper@` instances and the service verbs it
 needs, or an equivalent bus filter); that choice is the owner's and is not made
 here.
+
+In the same vein, the self-root deny list is not a complete fence around the
+agent: a config-write grant under `/etc` can still reach the agent and helpers
+indirectly, for example through `/etc/systemd/system.conf.d` (manager-wide
+`DefaultEnvironment` and friends), `/etc/ld.so.preload` (loaded into every
+dynamically linked process) or a unit placed in a `*.wants` directory. The two
+cheap, clearly agent-affecting ones, `/etc/ld.so.preload` and the system
+manager config (`/etc/systemd/system.conf`, `/etc/systemd/system.conf.d`), are
+now self-roots on both sides (shared vectors); `user.conf(.d)` is left alone
+because user managers run neither the agent nor a helper. Paths like
+`*.wants`, `ld.so.conf.d`, PAM, cron and sudoers stay reachable by any `/etc`
+grant that covers them, so a `--config` grant must be treated as root-equivalent
+for the subtree it names, consistent with the finding-1 decision above.
 
 **Unverified host assumption these helpers exist to test:** that the agent, under
 its own sandbox (`NoNewPrivileges`, a restricted capability set), is actually

@@ -72,13 +72,16 @@ const LIST_FLAGS = new Set(['--tcp-local', '--file-read', '--file-write', '--ser
 // The agent's and server's own config/state: never an allowed sys:config path,
 // so the config channel can never rewrite the agent's own config (a lockout
 // risk the design calls out) or the server's.
-// Also the mutation helpers' replay store and trust file and the agent's unit.
+// Also the mutation helpers' replay store and trust file and the agent's unit,
+// /etc/ld.so.preload (loaded into every process, the agent's included) and the
+// system manager config system.conf(.d) (applies to every service).
 // Mirrors systemapi-agent/config_helper.go configSelfRoots; the shared vectors
 // in controlplane/testdata/config-self-vectors.json keep the two in parity.
 const CONFIG_SELF_ROOTS = ['/proc', '/sys', '/dev', '/boot', '/var/lib/systemapi-agent',
   '/etc/systemapi-agent', '/var/lib/postgresql', '/etc/sahcore',
   '/var/lib/sah-helper', '/etc/systemapi-agent/helper-trust.json',
-  '/etc/systemd/system/systemapi-agent.service', '/etc/systemd/system/systemapi-agent.service.d'];
+  '/etc/systemd/system/systemapi-agent.service', '/etc/systemd/system/systemapi-agent.service.d',
+  '/etc/ld.so.preload', '/etc/systemd/system.conf', '/etc/systemd/system.conf.d'];
 // Unit dirs whose entries systemd applies to the agent and helpers; entries
 // are matched by pattern (systemdSelfEntry), mirroring configSystemdUnitDirs,
 // configHelperUnitRE and configSystemdSelfEntry in config_helper.go.
