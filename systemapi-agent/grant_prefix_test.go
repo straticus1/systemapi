@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPathGrantAllowsBoundary(t *testing.T) {
@@ -83,5 +84,33 @@ print(r["success"], r["error"])`)
 	}
 	if !strings.Contains(out, "False") || !strings.Contains(out, "not granted") {
 		t.Fatalf("sibling prefix must be refused, got %q", out)
+	}
+}
+
+// A symlink loop such as a -> a/b must not hang or stack-overflow the agent:
+// resolution is bounded and a path it cannot resolve is denied, even under "*".
+func TestPathGrantAllowsSymlinkLoopDenied(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	loop := filepath.Join(dir, "a")
+	if err := os.Symlink(filepath.Join(loop, "b"), loop); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan [2]bool, 1)
+	go func() {
+		done <- [2]bool{
+			pathGrantAllows(filepath.Join(loop, "x"), []string{dir}),
+			pathGrantAllows(loop, []string{"*"}),
+		}
+	}()
+	select {
+	case got := <-done:
+		if got[0] || got[1] {
+			t.Fatalf("a path through a symlink loop must be denied, got %v", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("pathGrantAllows did not return on a symlink loop")
 	}
 }
