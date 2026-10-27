@@ -137,6 +137,10 @@ func configTargetShapeOK(p string) bool {
 }
 
 // configTargetDenied reports whether target is, or sits beneath, a self-root.
+// It is a string check; it holds for the file actually written because the
+// write (writeFileAtomicSync, config_write_linux.go) opens the parent with
+// RESOLVE_NO_SYMLINKS and refuses any symlinked component, so a link such as
+// /etc/app -> /etc/systemapi-agent cannot carry the write into a self-root.
 func configTargetDenied(target string) bool {
 	for _, s := range configSelfRoots {
 		if target == s || strings.HasPrefix(target, s+"/") {
@@ -304,51 +308,4 @@ func readConfigResult(path string) (configHelperRes, error) {
 		return res, err
 	}
 	return res, nil
-}
-
-// writeFileAtomicSync writes content to path through a temp file in the SAME
-// directory, fsyncs it, renames it over path, and fsyncs the directory so the
-// rename is durable. Shared by the config and systemd-override helpers (both
-// are independent, fail-closed /etc writers). The temp file is created 0600 by
-// CreateTemp and chmod'd to perm before the rename; a leftover temp is removed
-// on any error. It does not follow or create a backup — the control plane
-// holds the bytes and can re-push.
-func writeFileAtomicSync(path, content string, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".systemapi-helper-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	// Remove the temp on any early return; a no-op after a successful rename.
-	committed := false
-	defer func() {
-		if !committed {
-			_ = os.Remove(tmpName)
-		}
-	}()
-	if _, err := tmp.WriteString(content); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(perm); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return err
-	}
-	committed = true
-	if d, err := os.Open(dir); err == nil {
-		_ = d.Sync()
-		_ = d.Close()
-	}
-	return nil
 }

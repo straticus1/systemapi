@@ -269,29 +269,3 @@ func TestConfigWriteViaHelperRejectsMissingLeaseBeforeHandoff(t *testing.T) {
 		t.Fatal("helper must not be triggered without a lease")
 	}
 }
-
-// TestWriteFileAtomicSyncReplacesContent proves the real write seam actually
-// lands the bytes (temp-file, fsync, rename) in a temp dir, so the fake used by
-// the other tests is standing in for a working primitive.
-func TestWriteFileAtomicSyncReplacesContent(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "x.conf")
-	if err := os.WriteFile(path, []byte("old\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeFileAtomicSync(path, "new\n", 0o644); err != nil {
-		t.Fatalf("writeFileAtomicSync: %v", err)
-	}
-	got, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != "new\n" {
-		t.Fatalf("content=%q, want new", got)
-	}
-	// No temp file left behind.
-	entries, _ := os.ReadDir(dir)
-	if len(entries) != 1 {
-		t.Fatalf("stray files: %v", entries)
-	}
-}
