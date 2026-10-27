@@ -112,7 +112,8 @@ the mechanism; `sysctl-get` is a read and still calls the Phase 0 backend.
 - Sandbox: committed in `systemd/sah-sysctl-helper@.service`. It is the agent's
   hardening **minus `ProtectKernelTunables`** and nothing else:
   `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ReadWritePaths` limited to the
-  handoff dir, no network, a short `RuntimeMaxSec`, a `CAP_NET_ADMIN
+  handoff dir, no network, a short `TimeoutStartSec` (`RuntimeMaxSec` is ignored for
+  `Type=oneshot`), a `CAP_NET_ADMIN
   CAP_SYS_ADMIN` bounding set. `PrivateNetwork` is deliberately **off** so
   `net.*` sysctls land on the host namespace, not a private one.
 

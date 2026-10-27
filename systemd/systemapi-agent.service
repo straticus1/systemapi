@@ -28,7 +28,60 @@ RestartSec=30
 User=root
 UMask=0077
 StateDirectory=systemapi-agent
+StateDirectoryMode=0700
 KillMode=control-group
+TimeoutStopSec=15
+
+# Hardening (docs/sah-os-management-design.md, "the agent sandbox blocks the
+# write verbs"). This is the sandbox deployed on miniapps1 by
+# deploy/miniapps1/agent/install-agent.sh (deploy/miniapps1 branch), with that
+# host's paths replaced by placeholders. The shells and helper children the
+# agent forks inherit all of it.
+#   - ProtectSystem=strict: the file system is read-only except the
+#     StateDirectory (/var/lib/systemapi-agent, which also holds the mutation
+#     helpers' handoff dirs) and ReadWritePaths. /etc is read-only here, which
+#     is what keeps /etc/systemapi-agent (api-key, helper-trust.json) out of a
+#     compromised agent's reach; /var/lib/sah-helper (the helpers' replay
+#     store) is likewise not writable.
+#   - ProtectKernelTunables=yes: /proc/sys is read-only.
+#   - The write verbs (sys:config write, sys:tweak sysctl-set, resource-limit,
+#     unit-override) therefore run in the committed one-shot helper units
+#     (sah-*-helper@.service), each relaxing exactly one of these protections
+#     and re-verifying the signed lease itself. Do NOT loosen this unit to make
+#     a write verb work.
+#   - ProtectHome=tmpfs hides /home, /root and /run/user; BindPaths brings back
+#     only the --pty-user home.
+#   - No SystemCallFilter and no MemoryDenyWriteExecute: shells run arbitrary
+#     programs, and a filter list that lags the kernel would block openat2 in
+#     the file helper. RestrictSUIDSGID stays off for the same openat2 reason
+#     (systemd 252 answers openat2 with ENOSYS under it); NoNewPrivileges and
+#     the bounding set remain.
+#   - A root session keeps only the bounding set below: it cannot write outside
+#     ReadWritePaths, read other owners' files without becoming them, gain
+#     privileges through a setuid binary, load modules, change sysctls, mount,
+#     or change the network.
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_FOWNER CAP_KILL
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=tmpfs
+BindPaths=/home/CHANGE_ME_PTY_USER
+ReadWritePaths=/home/CHANGE_ME_PTY_USER
+# Add the host's secrets and data stores here (a leading - skips a missing path).
+InaccessiblePaths=-/root -/var/spool/cron -/var/lib/postgresql -/run/postgresql -/run/redis
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=no
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

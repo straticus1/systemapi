@@ -68,7 +68,8 @@ StateDirectory=sah-helper
 StateDirectoryMode=0700
 
 # A config write must not hang the manager; bound the whole invocation.
-RuntimeMaxSec=10
+# RuntimeMaxSec= is ignored for Type=oneshot; the start timeout bounds it.
+TimeoutStartSec=10
 
 # --- Sandbox: the agent's hardening with /etc writable, nothing else loosened ---
 
