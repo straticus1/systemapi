@@ -9,7 +9,7 @@ const assert = require('node:assert/strict');
 
 const { MemoryRegistry, PgRegistry } = require('../controlplane/registry');
 const { policyDecision } = require('../controlplane/channels');
-const { run, parseArgs, ACTOR, MAX_ENTRIES, SYSTEM_ROOTS } = require('../scripts/channel-policy');
+const { run, parseArgs, ACTOR, MAX_ENTRIES, SYSTEM_ROOTS, configSelfDenied } = require('../scripts/channel-policy');
 
 const HOST_A = '11111111-1111-4111-8111-111111111111';
 const HOST_B = '22222222-2222-4222-8222-222222222222';
@@ -404,7 +404,10 @@ test('--config writes a per-host config-path allowlist the sys:config route then
   assert.equal(await policyDecision(reg, HOST_B, 'sys:config', { sys: { action: 'read', target: '/etc/nginx/nginx.conf' } }), 'path_denied');
   // The agent's and server's own config/state can never be granted, nor can a
   // one-level or too-wide path.
-  for (const bad of ['/etc/systemapi-agent', '/etc/sahcore', '/var/lib/systemapi-agent', '/etc', '/']) {
+  for (const bad of ['/etc/systemapi-agent', '/etc/sahcore', '/var/lib/systemapi-agent', '/etc', '/',
+    '/var/lib/sah-helper', '/etc/systemd', '/etc/systemd/system', '/etc/systemd/system.control',
+    '/etc/systemd/system/systemapi-agent.service.d', '/etc/systemd/system/sah-config-helper@.service.d',
+    '/etc/systemd/system/service.d', '/etc/systemd/system/sah-.service.d']) {
     await assert.rejects(run(['set', '--tenant', 'afterdark', '--host', 'miniapps1', '--reason', 'x', '--config', bad], { registry: reg }),
       (err) => err.code === 'usage', bad);
   }
@@ -450,5 +453,20 @@ test('main: a database that cannot be reached or configured fails with a code, n
     assert.match(r.err, /^channel-policy failed: [A-Za-z0-9_]+$/);
     assert.equal(r.err.includes(SECRET), false);
     assert.equal(r.out, '');
+  }
+});
+
+test('config self-roots match the agent helper (shared vectors)', async () => {
+  const vec = require('../controlplane/testdata/config-self-vectors.json');
+  assert.ok(vec.denied.length > 0 && vec.allowed.length > 0);
+  for (const p of vec.denied) assert.equal(configSelfDenied(p), true, p);
+  for (const p of vec.allowed) assert.equal(configSelfDenied(p), false, p);
+  const reg = await fixture();
+  const out = await run(['set', '--tenant', 'afterdark', '--host', 'miniapps1', '--reason', 'x',
+    '--config', '/etc/systemd/system/nginx.service.d'], { registry: reg });
+  assert.deepEqual(out.host_config_policy, { paths: ['/etc/systemd/system/nginx.service.d'] });
+  for (const unit of ['systemapi-agent.service', 'sah-config-helper@.service', 'sah-config-helper@abc.service', 'sah-.service', 'service']) {
+    await assert.rejects(run(['set', '--tenant', 'afterdark', '--host', 'miniapps1', '--reason', 'x', '--tweak-unit', unit], { registry: reg }),
+      (err) => err.code === 'usage', unit);
   }
 });

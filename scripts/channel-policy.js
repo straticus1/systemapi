@@ -72,8 +72,42 @@ const LIST_FLAGS = new Set(['--tcp-local', '--file-read', '--file-write', '--ser
 // The agent's and server's own config/state: never an allowed sys:config path,
 // so the config channel can never rewrite the agent's own config (a lockout
 // risk the design calls out) or the server's.
+// Also the mutation helpers' replay store and trust file and the agent's unit.
+// Mirrors systemapi-agent/config_helper.go configSelfRoots; the shared vectors
+// in controlplane/testdata/config-self-vectors.json keep the two in parity.
 const CONFIG_SELF_ROOTS = ['/proc', '/sys', '/dev', '/boot', '/var/lib/systemapi-agent',
-  '/etc/systemapi-agent', '/var/lib/postgresql', '/etc/sahcore'];
+  '/etc/systemapi-agent', '/var/lib/postgresql', '/etc/sahcore',
+  '/var/lib/sah-helper', '/etc/systemapi-agent/helper-trust.json',
+  '/etc/systemd/system/systemapi-agent.service', '/etc/systemd/system/systemapi-agent.service.d'];
+// Unit dirs whose entries systemd applies to the agent and helpers; entries
+// are matched by pattern (systemdSelfEntry), mirroring configSystemdUnitDirs,
+// configHelperUnitRE and configSystemdSelfEntry in config_helper.go.
+const SYSTEMD_UNIT_DIRS = ['/etc/systemd/system', '/etc/systemd/system.control'];
+const HELPER_UNIT_RE = /^sah-[^/]*-helper@[^/]*\.service$/;
+
+// systemdSelfEntry: name (one entry directly under a unit dir) is the agent's
+// or a helper's unit, or a drop-in dir that applies to one (<unit>.d, the
+// top-level service.d, or a prefix drop-in <p>-.service.d covering them).
+function systemdSelfEntry(name) {
+  const unit = name.endsWith('.d') ? name.slice(0, -2) : name;
+  if (unit === 'systemapi-agent.service' || unit === 'service' || HELPER_UNIT_RE.test(unit)) return true;
+  if (unit !== name && unit.endsWith('-.service')) {
+    const p = unit.slice(0, -'.service'.length);
+    return 'systemapi-agent'.startsWith(p) || p.startsWith('sah-');
+  }
+  return false;
+}
+
+// configSelfDenied: path is, or sits beneath, a self-root or a systemd entry
+// that applies to the agent or a helper. The same check the helper applies to
+// a write target (configTargetDenied).
+function configSelfDenied(path) {
+  if (CONFIG_SELF_ROOTS.some((s) => path === s || path.startsWith(`${s}/`))) return true;
+  for (const d of SYSTEMD_UNIT_DIRS) {
+    if (path.startsWith(`${d}/`) && systemdSelfEntry(path.slice(d.length + 1).split('/')[0])) return true;
+  }
+  return false;
+}
 
 function fail(code, message = code) {
   const err = new Error(message);
@@ -115,7 +149,9 @@ function parseConfigDir(text) {
   if (!checked.ok) throw usage('bad --config: an absolute directory with no "..", ".", "//", trailing "/" or control bytes');
   const root = checked.root;
   if (root.split('/').length - 1 < 2) throw usage(`bad --config: "${root}" is too wide; name a directory at least two levels down`);
-  const self = CONFIG_SELF_ROOTS.find((s) => root === s || root.startsWith(`${s}/`) || s.startsWith(`${root}/`));
+  // A grant at or above a unit dir would contain the agent's and helpers' units.
+  const self = configSelfDenied(root) ? root
+    : [...CONFIG_SELF_ROOTS, ...SYSTEMD_UNIT_DIRS].find((s) => s === root || s.startsWith(`${root}/`));
   if (self) throw usage(`bad --config: "${root}" is, sits in or contains the protected path ${self}`);
   return root;
 }
@@ -131,6 +167,9 @@ function parseTweakUnit(text) {
   if (typeof text !== 'string' || !SERVICE_UNIT_RE.test(text)) {
     throw usage(`bad --tweak-unit: ${JSON.stringify(text)} is not a unit name`);
   }
+  // Same refusal as the override helper's overrideResolve: never the agent's
+  // or a helper's unit, nor a drop-in that applies to them.
+  if (systemdSelfEntry(`${text}.d`)) throw usage(`bad --tweak-unit: ${JSON.stringify(text)} is the agent's or a helper's unit`);
   return text;
 }
 
@@ -329,4 +368,4 @@ async function main(argv = process.argv.slice(2), stdout = process.stdout) {
 
 if (require.main === module) main();
 
-module.exports = { run, main, parseArgs, ACTOR, MAX_ENTRIES, SYSTEM_ROOTS };
+module.exports = { run, main, parseArgs, ACTOR, MAX_ENTRIES, SYSTEM_ROOTS, CONFIG_SELF_ROOTS, configSelfDenied };

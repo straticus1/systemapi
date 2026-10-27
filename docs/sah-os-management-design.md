@@ -126,9 +126,13 @@ spike as the exact template, under the SAME unverified host assumption (below):
   subcommand re-validates the target against the same `rootShapeOk` the channel
   uses, independently refuses the agent/server self-roots (`configSelfRoots`, the
   Go copy of the control plane's `CONFIG_SELF_ROOTS`, so the config channel can
-  never rewrite the agent's own config), verifies the signed lease itself (see
-  below), and does an atomic write (temp file, fsync,
-  rename). Its sandbox is the agent's with the ONE relaxation `ReadWritePaths=/etc`
+  never rewrite the agent's own config; it also covers the helpers' replay store
+  `/var/lib/sah-helper`, the trust file, the agent's unit and, by pattern, the
+  `sah-*-helper@` units and any drop-in dir under `/etc/systemd/system` or
+  `system.control` that applies to them; `controlplane/testdata/config-self-vectors.json`
+  keeps the Go and JS lists in parity), verifies the signed lease itself (see
+  below), and does an atomic write (temp file, fsync, rename relative to a
+  parent opened with `openat2(RESOLVE_NO_SYMLINKS)`, so no symlinked parent). Its sandbox is the agent's with the ONE relaxation `ReadWritePaths=/etc`
   (`ProtectSystem` stays strict; `ProtectKernelTunables` stays `yes`), caps
   `CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE`.
 - `sys:tweak resource-limit-set` and `unit-override-set` — both write a drop-in
@@ -138,7 +142,10 @@ spike as the exact template, under the SAME unverified host assumption (below):
   `systemapi-agent __systemd-override-helper <id>` subcommand re-validates the
   unit (`serviceNameRE`) and, per kind, the resource-limit directive/value
   (rebuilding the body itself) or the override name/body (bound by its SHA-256
-  in the lease, which the helper verifies itself), pins the path under `/etc/systemd/system`, and writes atomically. Its
+  in the lease, which the helper verifies itself), refuses the agent's and the
+  helpers' own units and any top-level or prefix drop-in that applies to them
+  (`configSystemdSelfEntry`; `--tweak-unit` refuses the same names), pins the
+  path under `/etc/systemd/system`, and writes atomically. Its
   sandbox's ONE relaxation is `ReadWritePaths=/etc/systemd/system`, same caps as
   the config helper, `ProtectKernelTunables` stays `yes`. It does NOT run
   `systemctl daemon-reload` — the Phase 0 backend did not either; activating the

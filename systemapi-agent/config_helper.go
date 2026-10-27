@@ -94,10 +94,39 @@ var configHelperIDRE = regexp.MustCompile(`^[0-9a-f]{32}$`)
 // around these, and the helper refuses to WRITE at or beneath them, so the
 // config channel can never rewrite the agent's own config, keys or state even
 // if the (0600, agent-owned) request file asks for it. Deny by prefix on a
-// component boundary.
+// component boundary. It includes the helpers' own replay store and trust
+// file and the agent's unit; the helper units and drop-ins that apply to them
+// are matched by pattern (configSystemdSelfEntry).
 var configSelfRoots = []string{
 	"/proc", "/sys", "/dev", "/boot",
 	"/var/lib/systemapi-agent", "/etc/systemapi-agent", "/var/lib/postgresql", "/etc/sahcore",
+	"/var/lib/sah-helper", "/etc/systemapi-agent/helper-trust.json",
+	"/etc/systemd/system/systemapi-agent.service", "/etc/systemd/system/systemapi-agent.service.d",
+}
+
+// configSystemdUnitDirs hold unit files and drop-ins systemd applies to the
+// agent and the helpers. Mirrors channel-policy.js SYSTEMD_UNIT_DIRS.
+var configSystemdUnitDirs = []string{"/etc/systemd/system", "/etc/systemd/system.control"}
+
+// configHelperUnitRE matches a mutation helper's unit, template or instance
+// (sah-config-helper@.service, sah-sysctl-helper@<id>.service, any future
+// sah-*-helper@). Mirrors channel-policy.js HELPER_UNIT_RE.
+var configHelperUnitRE = regexp.MustCompile(`^sah-[^/]*-helper@[^/]*\.service$`)
+
+// configSystemdSelfEntry reports whether name, one entry directly under a
+// systemd unit dir, is the agent's or a helper's unit or a drop-in directory
+// that applies to one: <unit>.d, the top-level service.d, or a prefix drop-in
+// <p>-.service.d whose prefix could match systemapi-agent or a sah- unit.
+func configSystemdSelfEntry(name string) bool {
+	unit := strings.TrimSuffix(name, ".d")
+	if unit == "systemapi-agent.service" || unit == "service" || configHelperUnitRE.MatchString(unit) {
+		return true
+	}
+	if unit != name && strings.HasSuffix(unit, "-.service") {
+		p := strings.TrimSuffix(unit, ".service")
+		return strings.HasPrefix("systemapi-agent", p) || strings.HasPrefix(p, "sah-")
+	}
+	return false
 }
 
 // configHelperReq is the agent->helper request. One per invocation. Lease is
@@ -136,7 +165,8 @@ func configTargetShapeOK(p string) bool {
 	return true
 }
 
-// configTargetDenied reports whether target is, or sits beneath, a self-root.
+// configTargetDenied reports whether target is, or sits beneath, a self-root
+// or a systemd unit/drop-in entry that applies to the agent or a helper.
 // It is a string check; it holds for the file actually written because the
 // write (writeFileAtomicSync, config_write_linux.go) opens the parent with
 // RESOLVE_NO_SYMLINKS and refuses any symlinked component, so a link such as
@@ -145,6 +175,14 @@ func configTargetDenied(target string) bool {
 	for _, s := range configSelfRoots {
 		if target == s || strings.HasPrefix(target, s+"/") {
 			return true
+		}
+	}
+	for _, d := range configSystemdUnitDirs {
+		if rest, ok := strings.CutPrefix(target, d+"/"); ok {
+			entry, _, _ := strings.Cut(rest, "/")
+			if configSystemdSelfEntry(entry) {
+				return true
+			}
 		}
 	}
 	return false

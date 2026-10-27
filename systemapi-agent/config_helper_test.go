@@ -269,3 +269,32 @@ func TestConfigWriteViaHelperRejectsMissingLeaseBeforeHandoff(t *testing.T) {
 		t.Fatal("helper must not be triggered without a lease")
 	}
 }
+
+// Parity with the control plane: the helper's self-root deny agrees with
+// scripts/channel-policy.js configSelfDenied on every shared vector.
+func TestConfigSelfDenyVectors(t *testing.T) {
+	blob, err := os.ReadFile(filepath.Join("..", "controlplane", "testdata", "config-self-vectors.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v struct {
+		Denied  []string `json:"denied"`
+		Allowed []string `json:"allowed"`
+	}
+	if err := json.Unmarshal(blob, &v); err != nil {
+		t.Fatal(err)
+	}
+	if len(v.Denied) == 0 || len(v.Allowed) == 0 {
+		t.Fatal("empty vectors")
+	}
+	for _, p := range v.Denied {
+		if !configTargetDenied(p) || configRevalidate(p, "x") != "target_denied" {
+			t.Errorf("%s must be denied", p)
+		}
+	}
+	for _, p := range v.Allowed {
+		if configTargetDenied(p) {
+			t.Errorf("%s must not be denied", p)
+		}
+	}
+}

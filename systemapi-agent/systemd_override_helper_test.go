@@ -326,3 +326,35 @@ func TestOverrideSetViaHelperRejectsBadUnitBeforeHandoff(t *testing.T) {
 		t.Fatal("helper must not be triggered for a bad unit")
 	}
 }
+
+// The override helper must never write a drop-in for the agent's own unit, a
+// mutation helper's unit, or a prefix/top-level drop-in that applies to them.
+func TestOverrideHelperRefusesSelfUnits(t *testing.T) {
+	dir := withOverrideHelperStateDir(t)
+	calls := withFakeOverrideWrite(t, nil)
+	for _, unit := range []string{
+		"systemapi-agent.service", "sah-config-helper@.service", "sah-sysctl-helper@.service",
+		"sah-systemd-override-helper@.service", "sah-config-helper@0123456789abcdef0123456789abcdef.service",
+		"sah-future-helper@.service", "service", "sah-.service", "systemapi-.service",
+	} {
+		for _, req := range []overrideHelperReq{unitOverrideReq(unit, "x", "[Service]\nX=1\n"), {Kind: overrideKindLimit, Unit: unit, Limit: "LimitNOFILE", Value: "1024"}} {
+			if _, _, _, _, code := overrideResolve(req); code != "unit_denied" {
+				t.Fatalf("unit %q kind %s: code=%q, want unit_denied", unit, req.Kind, code)
+			}
+			writeOverrideReqFile(t, dir, testHelperID, req)
+			if code := runOverrideHelper([]string{testHelperID}); code != 0 {
+				t.Fatalf("exit=%d for unit %q", code, unit)
+			}
+			if res := readOverrideResFile(t, dir, testHelperID); res.OK || res.Error != "unit_denied" {
+				t.Fatalf("unit %q: result=%+v, want unit_denied", unit, res)
+			}
+			_ = os.Remove(filepath.Join(dir, testHelperID+".res"))
+		}
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("write must not run for a self unit: %v", *calls)
+	}
+	if _, _, _, _, code := overrideResolve(unitOverrideReq("nginx.service", "x", "[Service]\nX=1\n")); code != "" {
+		t.Fatalf("nginx.service must still resolve: %q", code)
+	}
+}

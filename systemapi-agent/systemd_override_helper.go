@@ -168,6 +168,12 @@ func overrideResolve(req overrideHelperReq) (name, content, path, payload, code 
 	}
 	dir := filepath.Join(overrideSystemdRoot, req.Unit+".d")
 	path = filepath.Join(dir, name+".conf")
+	// Never a drop-in for the agent's own unit, a helper's unit, or a
+	// top-level/prefix drop-in that applies to them: that would let the
+	// override channel lift the agent's or a helper's sandbox.
+	if configSystemdSelfEntry(req.Unit + ".d") {
+		return "", "", "", "", "unit_denied"
+	}
 	// Defensive: the regexes already forbid "/" and ".." so this always holds,
 	// but re-assert it so the write can never escape the systemd root.
 	if filepath.Clean(path) != path || !pathWithin(overrideSystemdRoot, path) {
