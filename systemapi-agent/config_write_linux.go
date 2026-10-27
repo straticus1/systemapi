@@ -12,6 +12,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// atomicDirSync fsyncs the target directory after the rename. A var only so
+// tests can inject a failure.
+var atomicDirSync = unix.Fsync
+
 // writeFileAtomicSync writes content to path through a temp file in the SAME
 // directory, fsyncs it, renames it over path, and fsyncs the directory so the
 // rename is durable. Shared by the config and systemd-override helpers (both
@@ -86,6 +90,7 @@ func writeFileAtomicSync(path, content string, perm os.FileMode) error {
 		return err
 	}
 	committed = true
-	_ = unix.Fsync(dfd)
-	return nil
+	// The new content is in place, but without a durable directory entry a
+	// crash may roll it back; report that rather than claim success.
+	return atomicDirSync(dfd)
 }

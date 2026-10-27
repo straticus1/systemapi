@@ -8,6 +8,7 @@ package main
 // /etc/systemapi-agent), and a relative or unclean target.
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -75,5 +76,17 @@ func TestWriteFileAtomicSyncRefusesBadPath(t *testing.T) {
 		if err := writeFileAtomicSync(p, "x\n", 0o644); err == nil {
 			t.Fatalf("%q must be refused", p)
 		}
+	}
+}
+
+// A failed directory fsync means the rename may not survive a crash; the
+// write must report it, not claim success.
+func TestWriteFileAtomicSyncReportsDirSyncFailure(t *testing.T) {
+	prev := atomicDirSync
+	atomicDirSync = func(int) error { return errors.New("injected fsync failure") }
+	t.Cleanup(func() { atomicDirSync = prev })
+	path := filepath.Join(t.TempDir(), "x.conf")
+	if err := writeFileAtomicSync(path, "x\n", 0o644); err == nil {
+		t.Fatal("a directory fsync failure must be returned")
 	}
 }
