@@ -183,6 +183,23 @@ group/other writable.
 This boundary holds only with the hardened agent unit: an unsandboxed root
 agent can edit `/etc` and the replay store directly.
 
+**Limit: not a boundary against a compromised agent today (security review
+finding 1, open owner design decision).** The sandbox confines the agent's OWN
+file operations only. The agent runs as root with access to systemd's manager
+over D-Bus (that is how it restarts services and triggers the helpers), and
+PID 1 is outside every sandbox. A compromised agent can therefore start or
+create a unit with no sandbox (for example a transient unit through
+`StartTransientUnit` / `systemd-run`) and act as unconfined root, bypassing the
+helpers, their lease check, the trust file and the replay store entirely. So
+while the agent is root with systemd bus access, the mutation helpers are NOT a
+security boundary against a compromised agent: they keep every legitimate write
+lease-checked and confine bugs and an attacker limited to the agent's request
+files, nothing more. Making them a real boundary needs the agent's manager
+access narrowed (for example a non-root agent with a polkit rule that allows
+only `StartUnit` of the `sah-*-helper@` instances and the service verbs it
+needs, or an equivalent bus filter); that choice is the owner's and is not made
+here.
+
 **Unverified host assumption these helpers exist to test:** that the agent, under
 its own sandbox (`NoNewPrivileges`, a restricted capability set), is actually
 permitted to `StartUnit` a privileged helper unit over D-Bus. If PID 1's

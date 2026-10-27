@@ -54,6 +54,18 @@
 # on a mismatch, refuses symlinks, and writes 0644 root:root atomically:
 #   scripts/provision-helper-trust.sh --pubkey <pinned base64 key> [--host-id <id>]
 # Without it every helper write fails closed with trust_unavailable.
+#
+# LIMITS (security review finding 1, an open owner design decision). "The
+# agent's sandbox cannot write" /etc, /proc/sys or the replay store holds only
+# for the agent's OWN file operations. The agent runs as root and can talk to
+# systemd's manager over D-Bus (that is how it starts this unit), and PID 1 is
+# outside every sandbox: a compromised agent can start or create a unit with
+# no sandbox at all (for example a transient unit via StartTransientUnit /
+# systemd-run) and write anything as unconfined root, bypassing this helper
+# and its lease check entirely. So while the agent is root with systemd bus
+# access, this helper is NOT a security boundary against a compromised agent.
+# It confines bugs and an attacker limited to the agent's request files, and it
+# keeps every legitimate write lease-checked; it does not contain the agent.
 
 [Unit]
 Description=SystemAPI systemd override helper (%i)

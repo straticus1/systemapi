@@ -37,7 +37,11 @@ package main
 // proceeds on error. Does NOT protect against an attacker who already has root
 // outside the agent's sandbox (they can edit the trust file), against a stolen
 // control-plane signing key, or against an unhardened agent unit (without
-// ProtectSystem=strict the agent can write /etc and the replay store).
+// ProtectSystem=strict the agent can write /etc and the replay store). Nor,
+// today, against a compromised agent at all: the agent is root with systemd
+// bus access, so it can start an unsandboxed unit of its own and bypass the
+// helpers entirely (security review finding 1, an open design decision; see
+// docs/sah-os-management-design.md).
 // Provisioning helperTrustPath is an install step:
 // scripts/provision-helper-trust.sh takes the control key as an out-of-band
 // pinned value and refuses if agent.json disagrees (see the helper units).

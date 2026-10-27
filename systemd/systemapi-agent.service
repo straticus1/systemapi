@@ -39,10 +39,11 @@ TimeoutStopSec=15
 # agent forks inherit all of it.
 #   - ProtectSystem=strict: the file system is read-only except the
 #     StateDirectory (/var/lib/systemapi-agent, which also holds the mutation
-#     helpers' handoff dirs) and ReadWritePaths. /etc is read-only here, which
-#     is what keeps /etc/systemapi-agent (api-key, helper-trust.json) out of a
-#     compromised agent's reach; /var/lib/sah-helper (the helpers' replay
-#     store) is likewise not writable.
+#     helpers' handoff dirs) and ReadWritePaths. /etc is read-only here, so
+#     the agent's own file operations cannot touch /etc/systemapi-agent
+#     (api-key, helper-trust.json) or /var/lib/sah-helper (the helpers' replay
+#     store). See the last point for why this does not stop a compromised
+#     agent.
 #   - ProtectKernelTunables=yes: /proc/sys is read-only.
 #   - The write verbs (sys:config write, sys:tweak sysctl-set, resource-limit,
 #     unit-override) therefore run in the committed one-shot helper units
@@ -56,10 +57,21 @@ TimeoutStopSec=15
 #     the file helper. RestrictSUIDSGID stays off for the same openat2 reason
 #     (systemd 252 answers openat2 with ENOSYS under it); NoNewPrivileges and
 #     the bounding set remain.
-#   - A root session keeps only the bounding set below: it cannot write outside
-#     ReadWritePaths, read other owners' files without becoming them, gain
+#   - A root session's OWN operations keep only the bounding set below: its
+#     direct file writes are limited to ReadWritePaths, and it cannot gain
 #     privileges through a setuid binary, load modules, change sysctls, mount,
-#     or change the network.
+#     or change the network itself.
+#   - That is NOT containment of a compromised agent (security review
+#     finding 1, an open owner design decision). The agent runs as root with
+#     access to systemd's manager over D-Bus (it restarts services and starts
+#     the helper units that way), and PID 1 is outside this sandbox. A
+#     compromised agent can ask the manager to start or create a unit with no
+#     sandbox (for example a transient unit via StartTransientUnit /
+#     systemd-run) and act as unconfined root, writing outside ReadWritePaths,
+#     /etc/systemapi-agent and the helpers' replay store included. So while the
+#     agent is root with systemd bus access, neither this hardening nor the
+#     mutation helpers are a security boundary against a compromised agent;
+#     they confine bugs and an attacker limited to the agent's own code paths.
 NoNewPrivileges=yes
 CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_FOWNER CAP_KILL
 AmbientCapabilities=
