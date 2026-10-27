@@ -22,15 +22,18 @@ package main
 //     the control plane enforces the per-host config-path allowlist, which can
 //     never include the agent/server self-roots (channel-policy.js
 //     CONFIG_SELF_ROOTS). That authorization stays entirely on the agent side.
-//   - The helper does NOT trust the caller. It independently re-validates the
-//     target against the same rootShapeOk the channel uses, independently
-//     refuses the agent/server self-roots (configSelfRoots, the Go copy of the
-//     control-plane CONFIG_SELF_ROOTS deny set, so the config channel can never
-//     rewrite the agent's own config even if the request file asks for it), and
-//     independently re-verifies that the content hashes to the lease-bound
-//     SHA-256 before writing. It fails closed otherwise. It cannot widen policy
-//     because it has no lease and no allowlist; its only extra power is that
-//     its sandbox lets it write /etc.
+//   - The helper does NOT trust the caller, which may be a compromised agent.
+//     It authorizes the write itself (helper_auth.go): the request carries
+//     the original signed lease, and the helper verifies it against the
+//     control-plane key it loads from its own root-owned trust file, rebuilds
+//     the payload from the exact target and the SHA-256 it computes over the
+//     content, checks host/action/expiry, and consumes the nonce in a durable
+//     store the agent cannot write. It also independently re-validates the
+//     target against rootShapeOk and refuses the agent/server self-roots
+//     (configSelfRoots, the Go copy of the control-plane CONFIG_SELF_ROOTS
+//     deny set). The per-host config-path allowlist is enforced by the control
+//     plane before it signs, so a lease only exists for an allowed path. It
+//     fails closed on every error with a recorded result.
 //   - The handoff files are the agent's own: 0600, under the agent's writable
 //     state dir, O_EXCL on write and O_NOFOLLOW on both ends, one request per
 //     invocation keyed by a fresh random id, and cleaned up after.
@@ -55,6 +58,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"crypto/rand"
 )
@@ -96,12 +100,13 @@ var configSelfRoots = []string{
 	"/var/lib/systemapi-agent", "/etc/systemapi-agent", "/var/lib/postgresql", "/etc/sahcore",
 }
 
-// configHelperReq is the agent->helper request. One per invocation. SHA is the
-// content's SHA-256 as bound in the lease; the helper re-verifies it.
+// configHelperReq is the agent->helper request. One per invocation. Lease is
+// the signed sys_config lease exactly as the control plane sent it; the helper
+// verifies it itself and hashes Content itself.
 type configHelperReq struct {
 	Target  string `json:"target"`
 	Content string `json:"content"`
-	SHA     string `json:"sha"`
+	Lease   *Lease `json:"lease"`
 }
 
 // configHelperRes is the helper->agent result.
@@ -141,18 +146,16 @@ func configTargetDenied(target string) bool {
 	return false
 }
 
-// configRevalidate is the independent re-validation shared by the agent-side
-// handoff and the helper subcommand. It returns "" when the write is allowed,
-// or a stable error code. It trusts nothing from the caller and fails closed.
-func configRevalidate(target, content, sha string) string {
+// configRevalidate is the shape re-validation shared by the agent-side
+// handoff and the helper subcommand. It returns "" when the target and size
+// are acceptable, or a stable error code. The lease check is separate
+// (helperAuthorize) and runs only in the helper.
+func configRevalidate(target, content string) string {
 	if !configTargetShapeOK(target) || configTargetDenied(target) {
 		return "target_denied"
 	}
 	if len(content) > configContentMax {
 		return "content_denied"
-	}
-	if !hashHexRe.MatchString(sha) || sysSHA256Hex(content) != sha {
-		return "hash_mismatch"
 	}
 	return ""
 }
@@ -180,12 +183,15 @@ var configHelperWrite = func(path, content string) error {
 // configWriteViaHelper is the agent-side handoff for sys:config write. The
 // channel has already verified the lease (which binds target + content hash)
 // and applied checkSysConfigPolicy; this re-validates defensively, writes a
-// 0600 request the agent owns, triggers the committed helper unit, and reads
-// back its result. It never writes /etc itself (the agent's sandbox forbids
-// it). Request and result files are removed before returning.
-func configWriteViaHelper(target, content, contentSHA string) error {
-	if code := configRevalidate(target, content, contentSHA); code != "" {
+// 0600 request carrying the original lease, triggers the committed helper
+// unit, and reads back its result. It never writes /etc itself (the agent's
+// sandbox forbids it). Request and result files are removed before returning.
+func configWriteViaHelper(target, content string, lease *Lease) error {
+	if code := configRevalidate(target, content); code != "" {
 		return fmt.Errorf("config write refused: %s", code)
+	}
+	if lease == nil {
+		return fmt.Errorf("config write refused: lease_missing")
 	}
 	if err := os.MkdirAll(configHelperStateDir, 0o700); err != nil {
 		return fmt.Errorf("handoff dir: %w", err)
@@ -200,7 +206,7 @@ func configWriteViaHelper(target, content, contentSHA string) error {
 	defer os.Remove(reqPath)
 	defer os.Remove(resPath)
 
-	reqBytes, err := json.Marshal(configHelperReq{Target: target, Content: content, SHA: contentSHA})
+	reqBytes, err := json.Marshal(configHelperReq{Target: target, Content: content, Lease: lease})
 	if err != nil {
 		return err
 	}
@@ -229,7 +235,7 @@ func configWriteViaHelper(target, content, contentSHA string) error {
 
 // runConfigHelper is the hidden `__config-helper <id>` subcommand of the agent
 // binary, invoked only by the committed helper unit. It reads one request,
-// re-validates it independently, performs the write under its own sandbox, and
+// re-validates and authorizes it independently, performs the write under its own sandbox, and
 // writes a result file. It returns 0 whenever it managed to record a result
 // (success OR a logical refusal/failure); non-zero only when it could not read
 // the request id or write the result at all.
@@ -249,8 +255,9 @@ func runConfigHelper(args []string) int {
 	return 0
 }
 
-// doConfigHelper reads the request, re-validates it (not trusting the caller),
-// and performs the write. It never panics or exits; it always returns a result.
+// doConfigHelper reads the request, re-validates and authorizes it (not
+// trusting the caller), and performs the write. It never panics or exits; it
+// always returns a result.
 func doConfigHelper(reqPath string) configHelperRes {
 	data, err := readHandoffFile(reqPath, configHandoffMax)
 	if err != nil {
@@ -260,16 +267,18 @@ func doConfigHelper(reqPath string) configHelperRes {
 	if err := json.Unmarshal(data, &req); err != nil {
 		return configHelperRes{Error: "bad_request"}
 	}
-	// Independent re-validation: same rootShapeOk + self-root deny + content
-	// hash the channel/agent used. The helper trusts none of this from the
-	// caller and fails closed.
-	switch configRevalidate(req.Target, req.Content, req.SHA) {
-	case "target_denied":
+	// Independent re-validation: same rootShapeOk + self-root deny the
+	// channel/agent used, then the helper's own lease check over the exact
+	// target and the hash of the exact content it will write.
+	if code := configRevalidate(req.Target, req.Content); code != "" {
+		return configHelperRes{Error: code}
+	}
+	payload, err := sysConfigLeasePayload("write", req.Target, sysSHA256Hex(req.Content))
+	if err != nil {
 		return configHelperRes{Error: "target_denied"}
-	case "content_denied":
-		return configHelperRes{Error: "content_denied"}
-	case "hash_mismatch":
-		return configHelperRes{Error: "hash_mismatch"}
+	}
+	if code := helperAuthorize("sys_config", payload, req.Lease, time.Now()); code != "" {
+		return configHelperRes{Error: code}
 	}
 	if err := configHelperWrite(req.Target, req.Content); err != nil {
 		return configHelperRes{Error: "write_failed", Errno: errnoOf(err)}

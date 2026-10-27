@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // withHelperStateDir points the handoff dir at a temp dir and restores it.
@@ -70,10 +71,21 @@ func readResFile(t *testing.T, dir, id string) sysctlHelperRes {
 
 const testHelperID = "00112233445566778899aabbccddeeff"
 
+// signedSysctlReq builds a request carrying a valid sys_tweak lease.
+func signedSysctlReq(t *testing.T, key, value string) sysctlHelperReq {
+	t.Helper()
+	priv := newHelperSigner(t)
+	payload, err := sysTweakLeasePayload("sysctl-set", key, value, "", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sysctlHelperReq{Key: key, Value: value, Lease: signLease(t, priv, ptyTestHost, "sys_tweak", payload, inFuture(time.Minute))}
+}
+
 func TestSysctlHelperWritesGrantedKey(t *testing.T) {
 	dir := withHelperStateDir(t)
 	calls := withFakeWrite(t, nil)
-	writeReqFile(t, dir, testHelperID, sysctlHelperReq{Key: "net.ipv4.ip_forward", Value: "1"})
+	writeReqFile(t, dir, testHelperID, signedSysctlReq(t, "net.ipv4.ip_forward", "1"))
 
 	if code := runSysctlHelper([]string{testHelperID}); code != 0 {
 		t.Fatalf("exit=%d, want 0", code)
@@ -163,7 +175,7 @@ func TestSysctlHelperRecordsErrno(t *testing.T) {
 	dir := withHelperStateDir(t)
 	// Simulate the sandbox denying the write (EACCES).
 	withFakeWrite(t, os.ErrPermission)
-	writeReqFile(t, dir, testHelperID, sysctlHelperReq{Key: "net.ipv4.ip_forward", Value: "1"})
+	writeReqFile(t, dir, testHelperID, signedSysctlReq(t, "net.ipv4.ip_forward", "1"))
 	if code := runSysctlHelper([]string{testHelperID}); code != 0 {
 		t.Fatalf("exit=%d, want 0", code)
 	}
@@ -187,7 +199,8 @@ func TestSysctlSetViaHelperHandoffAndCleanup(t *testing.T) {
 	}
 	t.Cleanup(func() { sysctlHelperTrigger = prev })
 
-	if err := sysctlSetViaHelper("net.ipv4.ip_forward", "1"); err != nil {
+	req := signedSysctlReq(t, "net.ipv4.ip_forward", "1")
+	if err := sysctlSetViaHelper("net.ipv4.ip_forward", "1", req.Lease); err != nil {
 		t.Fatalf("sysctlSetViaHelper: %v", err)
 	}
 	if len(*calls) != 1 || (*calls)[0][1] != "1" {
@@ -210,7 +223,8 @@ func TestSysctlSetViaHelperRejectsDeniedKeyBeforeHandoff(t *testing.T) {
 	sysctlHelperTrigger = func(id string) error { triggered = true; return nil }
 	t.Cleanup(func() { sysctlHelperTrigger = prev })
 
-	if err := sysctlSetViaHelper("kernel.core_pattern", "|/x"); err == nil {
+	req := signedSysctlReq(t, "net.ipv4.ip_forward", "1")
+	if err := sysctlSetViaHelper("kernel.core_pattern", "|/x", req.Lease); err == nil {
 		t.Fatal("expected refusal for a denied key")
 	}
 	if triggered {

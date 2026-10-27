@@ -35,6 +35,20 @@
 # `systemctl daemon-reload`, and reconcile the ExecStart path and the hardening
 # set below with the agent's own hardened unit.
 
+# LEASE CHECK (helper_auth.go). The helper re-verifies the signed lease the
+# agent passes in the request against the control-plane key in
+# /etc/systemapi-agent/helper-trust.json, and consumes its nonce in
+# /var/lib/sah-helper/consumed (StateDirectory below), which the agent's own
+# sandbox cannot write. Provision the trust file once, as root, after the agent
+# has enrolled (public values only; agent.json also holds the private seed, so
+# copy just these two fields):
+#   install -d -o root -g root -m 0755 /etc/systemapi-agent
+#   jq '{host_id, control_pubkey}' /var/lib/systemapi-agent/agent.json \
+#     > /etc/systemapi-agent/helper-trust.json
+#   chown root:root /etc/systemapi-agent/helper-trust.json
+#   chmod 0644 /etc/systemapi-agent/helper-trust.json
+# Without it every helper write fails closed with trust_unavailable.
+
 [Unit]
 Description=SystemAPI config write helper (%i)
 Documentation=file:///usr/share/doc/systemapi/sah-os-management-design.md
@@ -48,6 +62,10 @@ ExecStart=/usr/local/bin/systemapi-agent __config-helper %i
 # bounding set below is the real limiter.
 User=root
 UMask=0077
+# The durable replay store (helper_auth.go), shared by every helper and
+# never in the agent's ReadWritePaths.
+StateDirectory=sah-helper
+StateDirectoryMode=0700
 
 # A config write must not hang the manager; bound the whole invocation.
 RuntimeMaxSec=10
@@ -58,7 +76,7 @@ RuntimeMaxSec=10
 # mounts the rest of the hierarchy read-only; ReadWritePaths carves out /etc
 # (for the config write) and the handoff dir (for the request/result files).
 ProtectSystem=strict
-ReadWritePaths=/etc /var/lib/systemapi-agent/config-helper
+ReadWritePaths=/etc /var/lib/systemapi-agent/config-helper /var/lib/sah-helper
 
 NoNewPrivileges=yes
 ProtectHome=yes

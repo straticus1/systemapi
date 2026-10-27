@@ -7,7 +7,7 @@ package main
 // Threats exercised: the helper must not trust the caller. These tests prove it
 // refuses a bad unit name, an out-of-set resource limit or bad value, a bad
 // override name, oversized/null override content, a content hash that does not
-// match the lease-bound SHA-256, and an unknown kind, even when the request
+// match the signed lease, and an unknown kind, even when the request
 // file asks for them; that it rebuilds the resource-limit body itself (never
 // writing a caller-supplied limit body); that the drop-in path always lands
 // under /etc/systemd/system; that the handoff is one-shot and cleans up; and
@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func withOverrideHelperStateDir(t *testing.T) string {
@@ -70,16 +71,36 @@ func readOverrideResFile(t *testing.T, dir, id string) overrideHelperRes {
 	return res
 }
 
+// unitOverrideReq builds a request with no lease, for refusals that must
+// happen on shape alone (before any lease check).
 func unitOverrideReq(unit, name, content string) overrideHelperReq {
-	return overrideHelperReq{Kind: overrideKindUnit, Unit: unit, Name: name, Content: content, SHA: sysSHA256Hex(content)}
+	return overrideHelperReq{Kind: overrideKindUnit, Unit: unit, Name: name, Content: content}
+}
+
+// signOverrideReq attaches a valid sys_tweak lease for req's exact fields.
+func signOverrideReq(t *testing.T, req overrideHelperReq) overrideHelperReq {
+	t.Helper()
+	priv := newHelperSigner(t)
+	var payload string
+	var err error
+	if req.Kind == overrideKindLimit {
+		payload, err = sysTweakLeasePayload("resource-limit-set", "", req.Value, req.Unit, req.Limit, "", "")
+	} else {
+		payload, err = sysTweakLeasePayload("unit-override-set", "", "", req.Unit, "", req.Name, sysSHA256Hex(req.Content))
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Lease = signLease(t, priv, ptyTestHost, "sys_tweak", payload, inFuture(time.Minute))
+	return req
 }
 
 func TestOverrideHelperWritesResourceLimit(t *testing.T) {
 	dir := withOverrideHelperStateDir(t)
 	calls := withFakeOverrideWrite(t, nil)
-	writeOverrideReqFile(t, dir, testHelperID, overrideHelperReq{
+	writeOverrideReqFile(t, dir, testHelperID, signOverrideReq(t, overrideHelperReq{
 		Kind: overrideKindLimit, Unit: "nginx.service", Limit: "LimitNOFILE", Value: "65536",
-	})
+	}))
 	if code := runOverrideHelper([]string{testHelperID}); code != 0 {
 		t.Fatalf("exit=%d, want 0", code)
 	}
@@ -99,7 +120,7 @@ func TestOverrideHelperWritesUnitOverride(t *testing.T) {
 	dir := withOverrideHelperStateDir(t)
 	calls := withFakeOverrideWrite(t, nil)
 	content := "[Service]\nLimitNOFILE=65536\n"
-	writeOverrideReqFile(t, dir, testHelperID, unitOverrideReq("nginx.service", "limit-nofile", content))
+	writeOverrideReqFile(t, dir, testHelperID, signOverrideReq(t, unitOverrideReq("nginx.service", "limit-nofile", content)))
 	if code := runOverrideHelper([]string{testHelperID}); code != 0 {
 		t.Fatalf("exit=%d, want 0", code)
 	}
@@ -201,15 +222,15 @@ func TestOverrideHelperRefusesBadContent(t *testing.T) {
 func TestOverrideHelperRefusesHashMismatch(t *testing.T) {
 	dir := withOverrideHelperStateDir(t)
 	calls := withFakeOverrideWrite(t, nil)
-	writeOverrideReqFile(t, dir, testHelperID, overrideHelperReq{
-		Kind: overrideKindUnit, Unit: "nginx.service", Name: "limit-nofile",
-		Content: "evil\n", SHA: sysSHA256Hex("good\n"),
-	})
+	// The lease binds "good\n"; the request carries "evil\n".
+	req := signOverrideReq(t, unitOverrideReq("nginx.service", "limit-nofile", "good\n"))
+	req.Content = "evil\n"
+	writeOverrideReqFile(t, dir, testHelperID, req)
 	if code := runOverrideHelper([]string{testHelperID}); code != 0 {
 		t.Fatalf("exit=%d", code)
 	}
-	if res := readOverrideResFile(t, dir, testHelperID); res.OK || res.Error != "hash_mismatch" {
-		t.Fatalf("result=%+v, want hash_mismatch", res)
+	if res := readOverrideResFile(t, dir, testHelperID); res.OK || res.Error != "lease_payload_mismatch" {
+		t.Fatalf("result=%+v, want lease_payload_mismatch", res)
 	}
 	if len(*calls) != 0 {
 		t.Fatalf("write must not run on a hash mismatch: %v", *calls)
@@ -246,9 +267,9 @@ func TestOverrideHelperRefusesBadID(t *testing.T) {
 func TestOverrideHelperRecordsErrno(t *testing.T) {
 	dir := withOverrideHelperStateDir(t)
 	withFakeOverrideWrite(t, os.ErrPermission)
-	writeOverrideReqFile(t, dir, testHelperID, overrideHelperReq{
+	writeOverrideReqFile(t, dir, testHelperID, signOverrideReq(t, overrideHelperReq{
 		Kind: overrideKindLimit, Unit: "nginx.service", Limit: "LimitNOFILE", Value: "65536",
-	})
+	}))
 	if code := runOverrideHelper([]string{testHelperID}); code != 0 {
 		t.Fatalf("exit=%d", code)
 	}
@@ -270,11 +291,13 @@ func TestOverrideSetViaHelperHandoffAndCleanup(t *testing.T) {
 	}
 	t.Cleanup(func() { overrideHelperTrigger = prev })
 
-	if err := resourceLimitSetViaHelper("nginx.service", "LimitNOFILE", "65536"); err != nil {
+	limit := signOverrideReq(t, overrideHelperReq{Kind: overrideKindLimit, Unit: "nginx.service", Limit: "LimitNOFILE", Value: "65536"})
+	if err := resourceLimitSetViaHelper("nginx.service", "LimitNOFILE", "65536", limit.Lease); err != nil {
 		t.Fatalf("resourceLimitSetViaHelper: %v", err)
 	}
 	content := "[Service]\nLimitNOFILE=1024\n"
-	if err := unitOverrideSetViaHelper("nginx.service", "limit-nofile", content, sysSHA256Hex(content)); err != nil {
+	unit := signOverrideReq(t, unitOverrideReq("nginx.service", "limit-nofile", content))
+	if err := unitOverrideSetViaHelper("nginx.service", "limit-nofile", content, unit.Lease); err != nil {
 		t.Fatalf("unitOverrideSetViaHelper: %v", err)
 	}
 	if len(*calls) != 2 {
@@ -296,7 +319,7 @@ func TestOverrideSetViaHelperRejectsBadUnitBeforeHandoff(t *testing.T) {
 	overrideHelperTrigger = func(id string) error { triggered = true; return nil }
 	t.Cleanup(func() { overrideHelperTrigger = prev })
 
-	if err := resourceLimitSetViaHelper("bad unit", "LimitNOFILE", "65536"); err == nil {
+	if err := resourceLimitSetViaHelper("bad unit", "LimitNOFILE", "65536", &Lease{}); err == nil {
 		t.Fatal("expected refusal for a bad unit")
 	}
 	if triggered {

@@ -52,6 +52,8 @@ func newSysCfgHarness(t *testing.T, avail bool) *sysCfgHarness {
 	if err := pinControlPublicKey(base64.StdEncoding.EncodeToString(pub), ptyTestHost); err != nil {
 		t.Fatal(err)
 	}
+	// The mutation helpers verify the same lease against their own trust file.
+	withHelperTrust(t, pub, ptyTestHost)
 	h := &sysCfgHarness{priv: priv, out: newFakeOut(), cs: &fakeConfigStore{avail: avail}, readOut: "listen 80;\n"}
 	prevCfg := sysConfig
 	prevRead := sysConfigReadFile

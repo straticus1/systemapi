@@ -22,15 +22,21 @@ package main
 //     resource-limit-set, the exact unit/limit/value; for unit-override-set it
 //     binds the unit, the drop-in name and the body's SHA-256. The per-host
 //     unit allowlist is enforced by the control plane.
-//   - The helper does NOT trust the caller. It INDEPENDENTLY re-validates the
-//     unit name (serviceNameRE, the agent's SERVICE_UNIT_RE), and then, per
+//   - The helper does NOT trust the caller, which may be a compromised agent.
+//     It authorizes the write itself (helper_auth.go): the request carries
+//     the original signed sys_tweak lease, and the helper verifies it against
+//     the control-plane key it loads from its own root-owned trust file, over
+//     the payload it rebuilds from the exact unit/limit/value (or unit, name
+//     and the SHA-256 it computes over the body), checks host/action/expiry,
+//     and consumes the nonce in a durable store the agent cannot write. It
+//     also INDEPENDENTLY re-validates the unit name (serviceNameRE) and, per
 //     kind: for a resource limit, that the directive is in the closed
 //     resourceLimits set and the value matches limitValueRE, and it rebuilds
 //     the drop-in body itself (it never writes caller-supplied content for a
-//     limit); for a unit override, that the drop-in name matches overrideNameRE
-//     and the body is non-empty, within overrideContentCap and null-free, and
-//     that the body hashes to the lease-bound SHA-256. It then pins the path
-//     under /etc/systemd/system and refuses anything else. It fails closed.
+//     limit); for a unit override, that the drop-in name matches
+//     overrideNameRE and the body is non-empty, within overrideContentCap and
+//     null-free. It then pins the path under /etc/systemd/system and refuses
+//     anything else. It fails closed.
 //   - The handoff files are the agent's own: 0600, O_EXCL on write, O_NOFOLLOW
 //     on both ends, one request per invocation keyed by a fresh random id,
 //     cleaned up after.
@@ -62,6 +68,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"crypto/rand"
 )
@@ -96,16 +103,18 @@ const (
 )
 
 // overrideHelperReq is the agent->helper request. One per invocation.
-//   - kind=unit-override: Unit, Name, Content, SHA (body bound by hash).
+//   - kind=unit-override: Unit, Name, Content (body bound by its hash in the lease).
 //   - kind=resource-limit: Unit, Limit, Value (body rebuilt by the helper).
+//
+// Lease is the signed sys_tweak lease exactly as the control plane sent it.
 type overrideHelperReq struct {
 	Kind    string `json:"kind"`
 	Unit    string `json:"unit"`
 	Name    string `json:"name,omitempty"`
 	Content string `json:"content,omitempty"`
-	SHA     string `json:"sha,omitempty"`
 	Limit   string `json:"limit,omitempty"`
 	Value   string `json:"value,omitempty"`
+	Lease   *Lease `json:"lease"`
 }
 
 // overrideHelperRes is the helper->agent result.
@@ -115,22 +124,22 @@ type overrideHelperRes struct {
 	Errno int    `json:"errno,omitempty"`
 }
 
-// overrideResolve independently re-validates a request and resolves the
-// concrete drop-in name, body and path. It returns ("","","", code) with a
-// stable error code on refusal, else (name, content, path, ""). Shared by the
-// agent-side handoff and the helper subcommand; trusts nothing and fails
-// closed.
-func overrideResolve(req overrideHelperReq) (name, content, path, code string) {
+// overrideResolve independently re-validates a request's shape and resolves
+// the concrete drop-in name, body, path and the sys_tweak lease payload that
+// must authorize it. It returns code != "" on refusal. Shared by the agent-side
+// handoff and the helper subcommand; trusts nothing and fails closed. The
+// lease itself is checked only in the helper (helperAuthorize).
+func overrideResolve(req overrideHelperReq) (name, content, path, payload, code string) {
 	if !serviceNameRE.MatchString(req.Unit) {
-		return "", "", "", "unit_denied"
+		return "", "", "", "", "unit_denied"
 	}
 	switch req.Kind {
 	case overrideKindLimit:
 		if _, ok := resourceLimits[req.Limit]; !ok {
-			return "", "", "", "limit_denied"
+			return "", "", "", "", "limit_denied"
 		}
 		if !limitValueRE.MatchString(req.Value) {
-			return "", "", "", "value_denied"
+			return "", "", "", "", "value_denied"
 		}
 		// Rebuild the drop-in exactly as platform_tweak.go SetResourceLimit
 		// does; the helper never writes a caller-supplied limit body.
@@ -138,27 +147,33 @@ func overrideResolve(req overrideHelperReq) (name, content, path, code string) {
 		content = "[Service]\n" + req.Limit + "=" + req.Value + "\n"
 	case overrideKindUnit:
 		if !overrideNameRE.MatchString(req.Name) {
-			return "", "", "", "name_denied"
+			return "", "", "", "", "name_denied"
 		}
 		if req.Content == "" || len(req.Content) > overrideContentCap || strings.ContainsRune(req.Content, 0) {
-			return "", "", "", "content_denied"
-		}
-		if !hashHexRe.MatchString(req.SHA) || sysSHA256Hex(req.Content) != req.SHA {
-			return "", "", "", "hash_mismatch"
+			return "", "", "", "", "content_denied"
 		}
 		name = req.Name
 		content = req.Content
 	default:
-		return "", "", "", "bad_request"
+		return "", "", "", "", "bad_request"
+	}
+	var err error
+	if req.Kind == overrideKindLimit {
+		payload, err = sysTweakLeasePayload("resource-limit-set", "", req.Value, req.Unit, req.Limit, "", "")
+	} else {
+		payload, err = sysTweakLeasePayload("unit-override-set", "", "", req.Unit, "", name, sysSHA256Hex(content))
+	}
+	if err != nil {
+		return "", "", "", "", "bad_request"
 	}
 	dir := filepath.Join(overrideSystemdRoot, req.Unit+".d")
 	path = filepath.Join(dir, name+".conf")
 	// Defensive: the regexes already forbid "/" and ".." so this always holds,
 	// but re-assert it so the write can never escape the systemd root.
 	if filepath.Clean(path) != path || !pathWithin(overrideSystemdRoot, path) {
-		return "", "", "", "unit_denied"
+		return "", "", "", "", "unit_denied"
 	}
-	return name, content, path, ""
+	return name, content, path, payload, ""
 }
 
 // overrideHelperTrigger starts the committed, privileged helper unit, passing
@@ -184,19 +199,19 @@ var overrideHelperWrite = func(path, content string) error {
 // unitOverrideSetViaHelper is the agent-side handoff for sys:tweak
 // unit-override-set. The channel has verified the lease (unit + name + body
 // hash) and applied checkSysTweakPolicy; this re-validates defensively and
-// hands off. contentSHA is the hash the channel already computed and bound.
-func unitOverrideSetViaHelper(unit, name, content, contentSHA string) error {
+// hands off the request with the original lease for the helper to verify.
+func unitOverrideSetViaHelper(unit, name, content string, lease *Lease) error {
 	return overrideSetViaHelper(overrideHelperReq{
-		Kind: overrideKindUnit, Unit: unit, Name: name, Content: content, SHA: contentSHA,
+		Kind: overrideKindUnit, Unit: unit, Name: name, Content: content, Lease: lease,
 	})
 }
 
 // resourceLimitSetViaHelper is the agent-side handoff for sys:tweak
 // resource-limit-set. The lease binds unit/limit/value directly; there is no
 // caller-supplied body.
-func resourceLimitSetViaHelper(unit, limit, value string) error {
+func resourceLimitSetViaHelper(unit, limit, value string, lease *Lease) error {
 	return overrideSetViaHelper(overrideHelperReq{
-		Kind: overrideKindLimit, Unit: unit, Limit: limit, Value: value,
+		Kind: overrideKindLimit, Unit: unit, Limit: limit, Value: value, Lease: lease,
 	})
 }
 
@@ -204,8 +219,11 @@ func resourceLimitSetViaHelper(unit, limit, value string) error {
 // committed helper unit, and reads back its result. It re-validates defensively
 // before the handoff and never writes /etc itself.
 func overrideSetViaHelper(req overrideHelperReq) error {
-	if _, _, _, code := overrideResolve(req); code != "" {
+	if _, _, _, _, code := overrideResolve(req); code != "" {
 		return fmt.Errorf("unit override refused: %s", code)
+	}
+	if req.Lease == nil {
+		return fmt.Errorf("unit override refused: lease_missing")
 	}
 	if err := os.MkdirAll(overrideHelperStateDir, 0o700); err != nil {
 		return fmt.Errorf("handoff dir: %w", err)
@@ -267,8 +285,8 @@ func runOverrideHelper(args []string) int {
 	return 0
 }
 
-// doOverrideHelper reads the request, re-validates it (not trusting the
-// caller), rebuilds the drop-in, and performs the write. It never panics or
+// doOverrideHelper reads the request, re-validates and authorizes it (not
+// trusting the caller), rebuilds the drop-in, and performs the write. It never panics or
 // exits; it always returns a result.
 func doOverrideHelper(reqPath string) overrideHelperRes {
 	data, err := readHandoffFile(reqPath, overrideHandoffMax)
@@ -279,8 +297,11 @@ func doOverrideHelper(reqPath string) overrideHelperRes {
 	if err := json.Unmarshal(data, &req); err != nil {
 		return overrideHelperRes{Error: "bad_request"}
 	}
-	_, content, path, code := overrideResolve(req)
+	_, content, path, payload, code := overrideResolve(req)
 	if code != "" {
+		return overrideHelperRes{Error: code}
+	}
+	if code := helperAuthorize("sys_tweak", payload, req.Lease, time.Now()); code != "" {
 		return overrideHelperRes{Error: code}
 	}
 	if err := overrideHelperWrite(path, content); err != nil {

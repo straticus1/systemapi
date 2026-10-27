@@ -120,13 +120,13 @@ the mechanism; `sysctl-get` is a read and still calls the Phase 0 backend.
 spike as the exact template, under the SAME unverified host assumption (below):
 
 - `sys:config write` — `systemapi-agent/config_helper.go` `configWriteViaHelper`
-  writes a `{target,content,sha}` request, triggers `sah-config-helper@.service`,
+  writes a `{target,content,lease}` request, triggers `sah-config-helper@.service`,
   reads the result, cleans up. The hidden `systemapi-agent __config-helper <id>`
   subcommand re-validates the target against the same `rootShapeOk` the channel
   uses, independently refuses the agent/server self-roots (`configSelfRoots`, the
   Go copy of the control plane's `CONFIG_SELF_ROOTS`, so the config channel can
-  never rewrite the agent's own config), re-verifies the content's SHA-256
-  against the lease-bound hash, and does an atomic write (temp file, fsync,
+  never rewrite the agent's own config), verifies the signed lease itself (see
+  below), and does an atomic write (temp file, fsync,
   rename). Its sandbox is the agent's with the ONE relaxation `ReadWritePaths=/etc`
   (`ProtectSystem` stays strict; `ProtectKernelTunables` stays `yes`), caps
   `CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE`.
@@ -136,8 +136,8 @@ spike as the exact template, under the SAME unverified host assumption (below):
   `sah-systemd-override-helper@.service`) serves both. The hidden
   `systemapi-agent __systemd-override-helper <id>` subcommand re-validates the
   unit (`serviceNameRE`) and, per kind, the resource-limit directive/value
-  (rebuilding the body itself) or the override name/body (re-verifying its
-  SHA-256), pins the path under `/etc/systemd/system`, and writes atomically. Its
+  (rebuilding the body itself) or the override name/body (bound by its SHA-256
+  in the lease, which the helper verifies itself), pins the path under `/etc/systemd/system`, and writes atomically. Its
   sandbox's ONE relaxation is `ReadWritePaths=/etc/systemd/system`, same caps as
   the config helper, `ProtectKernelTunables` stays `yes`. It does NOT run
   `systemctl daemon-reload` — the Phase 0 backend did not either; activating the
@@ -145,6 +145,25 @@ spike as the exact template, under the SAME unverified host assumption (below):
 
 Package install/remove, the reads, and `config reload` are deliberately left on
 their existing paths.
+
+**Helper-side lease check (2026-10-26).** The first cut above had each helper
+re-check only shape and a content hash the agent itself supplied, so a
+compromised agent could ask a helper to write any shape-valid target (e.g.
+`/etc/sudoers`). Each helper now authorizes the write on its own
+(`systemapi-agent/helper_auth.go`): the request carries the original signed
+lease; the helper loads the control-plane public key and host id from
+`/etc/systemapi-agent/helper-trust.json` (root-owned, not group/other writable,
+no symlink, in a root-owned non-writable dir; read-only to the agent under
+`ProtectSystem=strict`; NOT the agent-writable `agent.json`), rebuilds the
+payload from the exact target/key/unit and the hash it computes over the
+content, runs `verifyLease` (signature, host, action, expiry/skew, payload),
+and consumes the nonce once in `/var/lib/sah-helper/consumed`, a durable,
+bounded store in the helpers' own `StateDirectory` that survives a restart.
+Every failure is a recorded result code (`lease_missing`, `lease_<reason>`,
+`trust_unavailable`, `replay`, `replay_store`). The trust file is an install
+step (see the helper units); until it exists every helper write fails closed.
+This boundary holds only with the hardened agent unit: an unsandboxed root
+agent can edit `/etc` and the replay store directly.
 
 **Unverified host assumption these helpers exist to test:** that the agent, under
 its own sandbox (`NoNewPrivileges`, a restricted capability set), is actually

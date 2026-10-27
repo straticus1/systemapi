@@ -364,11 +364,11 @@ func (c *channelConn) sysConfig(msg sysConfigMsg, now time.Time) {
 		// has ProtectSystem=strict (/etc read-only), so it cannot write a real
 		// /etc config itself; it hands off to the committed helper unit whose
 		// one relaxation is /etc in ReadWritePaths. The lease + policy gate
-		// above is unchanged; the content hash (contentSHA) is carried through
-		// and re-verified by the helper. read and reload are NOT helper'd: read
+		// above is unchanged; the original lease is handed to the helper, which
+		// verifies it itself (helper_auth.go). read and reload are NOT helper'd: read
 		// is a read, and reload runs `systemctl reload` over systemd like a
 		// service restart and already works.
-		actErr = configWriteViaHelper(msg.Target, msg.Content, contentSHA)
+		actErr = configWriteViaHelper(msg.Target, msg.Content, msg.Lease)
 	case "reload":
 		var out string
 		out, actErr = sysConfig().Reload(msg.Target)
@@ -452,7 +452,7 @@ func (c *channelConn) sysTweak(msg sysTweakMsg, now time.Time) {
 		// (resource-limit-set, unit-override-set, and sys:config write) are now
 		// privilege-separated the same way; only sysctl-get (a read) still calls
 		// the Phase 0 Tweaks backend directly.
-		actErr = sysctlSetViaHelper(msg.Key, msg.Value)
+		actErr = sysctlSetViaHelper(msg.Key, msg.Value, msg.Lease)
 		result["key"] = msg.Key
 	case "resource-limit-set":
 		// Privilege-separated write (systemd_override_helper.go): a drop-in
@@ -461,14 +461,14 @@ func (c *channelConn) sysTweak(msg sysTweakMsg, now time.Time) {
 		// relaxation is /etc/systemd/system in ReadWritePaths. The lease +
 		// policy gate above is unchanged; the helper rebuilds the limit body
 		// itself from unit/limit/value.
-		actErr = resourceLimitSetViaHelper(msg.Unit, msg.Limit, msg.Value)
+		actErr = resourceLimitSetViaHelper(msg.Unit, msg.Limit, msg.Value, msg.Lease)
 		result["unit"] = msg.Unit
 		result["limit"] = msg.Limit
 	case "unit-override-set":
 		// Privilege-separated write (systemd_override_helper.go), same helper as
-		// resource-limit-set. The content hash (contentSHA) is carried through
-		// and re-verified by the helper.
-		actErr = unitOverrideSetViaHelper(msg.Unit, msg.Name, msg.Content, contentSHA)
+		// resource-limit-set. The original lease is handed to the helper, which
+		// verifies it itself (helper_auth.go).
+		actErr = unitOverrideSetViaHelper(msg.Unit, msg.Name, msg.Content, msg.Lease)
 		result["unit"] = msg.Unit
 		result["name"] = msg.Name
 	}

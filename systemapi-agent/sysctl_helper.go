@@ -20,11 +20,16 @@ package main
 //     the control plane enforces the per-host sysctl allowlist, and
 //     checkSysTweakPolicy re-checks the shape and the DENIED_SYSCTL set. That
 //     authorization stays entirely on the agent side.
-//   - The helper does NOT trust the caller. It independently re-validates the
-//     key against the same sysctlKeyRE and deniedSysctl set the channel uses,
-//     and the value against sysctlValueOK, and refuses otherwise (fail closed).
-//     It cannot widen policy because it has no lease and no allowlist; its only
-//     extra power is that its sandbox lets it write /proc/sys.
+//   - The helper does NOT trust the caller, which may be a compromised agent.
+//     It authorizes the write itself (helper_auth.go): the request carries
+//     the original signed sys_tweak lease, and the helper verifies it against
+//     the control-plane key it loads from its own root-owned trust file, over
+//     the payload it rebuilds from the exact key and value, checks
+//     host/action/expiry, and consumes the nonce in a durable store the agent
+//     cannot write. It also independently re-validates the key against the
+//     same sysctlKeyRE and deniedSysctl set the channel uses, and the value
+//     against sysctlValueOK. The per-host sysctl allowlist is enforced by the
+//     control plane before it signs. It fails closed on every error.
 //   - The handoff files are the agent's own: 0600, under the agent's writable
 //     state dir, O_EXCL on write and O_NOFOLLOW on both ends, one request per
 //     invocation keyed by a fresh random id, and cleaned up after. A planted
@@ -59,6 +64,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"syscall"
+	"time"
 
 	"crypto/rand"
 )
@@ -74,8 +80,8 @@ var sysctlHelperStateDir = "/var/lib/systemapi-agent/sysctl-helper"
 // (systemd/sah-sysctl-helper@.service). The instance name is the request id.
 const sysctlHelperUnitPrefix = "sah-sysctl-helper@"
 
-// sysctlHandoffMax caps a handoff file. A request is {key,value} and a result
-// is {ok,error,errno}; both are tiny.
+// sysctlHandoffMax caps a handoff file. A request is {key,value,lease} and a
+// result is {ok,error,errno}; both are small.
 const sysctlHandoffMax = 4 * 1024
 
 // sysctlHelperIDRE matches the fresh random id the agent mints for one
@@ -83,10 +89,12 @@ const sysctlHandoffMax = 4 * 1024
 // filename component.
 var sysctlHelperIDRE = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
-// sysctlHelperReq is the agent->helper request. One per invocation.
+// sysctlHelperReq is the agent->helper request. One per invocation. Lease is
+// the signed sys_tweak lease exactly as the control plane sent it.
 type sysctlHelperReq struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
+	Lease *Lease `json:"lease"`
 }
 
 // sysctlHelperRes is the helper->agent result.
@@ -132,7 +140,7 @@ var sysctlHelperWrite = func(path, value string) error {
 // committed helper unit, and reads back its result. It never writes /proc/sys
 // itself (the agent's sandbox forbids it). Request and result files are removed
 // before returning, so the handoff is one-shot and leaves nothing behind.
-func sysctlSetViaHelper(key, value string) error {
+func sysctlSetViaHelper(key, value string, lease *Lease) error {
 	// Defensive re-validation at the agent gate. The real authorization is the
 	// lease + per-host allowlist (already enforced); the helper re-validates
 	// again, independently. Fail closed.
@@ -141,6 +149,9 @@ func sysctlSetViaHelper(key, value string) error {
 	}
 	if !sysctlValueOK(value) {
 		return fmt.Errorf("sysctl value not allowed")
+	}
+	if lease == nil {
+		return fmt.Errorf("sysctl set refused: lease_missing")
 	}
 	if err := os.MkdirAll(sysctlHelperStateDir, 0o700); err != nil {
 		return fmt.Errorf("handoff dir: %w", err)
@@ -156,7 +167,7 @@ func sysctlSetViaHelper(key, value string) error {
 	defer os.Remove(reqPath)
 	defer os.Remove(resPath)
 
-	reqBytes, err := json.Marshal(sysctlHelperReq{Key: key, Value: value})
+	reqBytes, err := json.Marshal(sysctlHelperReq{Key: key, Value: value, Lease: lease})
 	if err != nil {
 		return err
 	}
@@ -205,8 +216,8 @@ func runSysctlHelper(args []string) int {
 	return 0
 }
 
-// doSysctlHelper reads the request, re-validates it (not trusting the caller),
-// and performs the write. It never panics or exits; it always returns a result.
+// doSysctlHelper reads the request, re-validates and authorizes it (not
+// trusting the caller), and performs the write. It never panics or exits; it always returns a result.
 func doSysctlHelper(reqPath string) sysctlHelperRes {
 	data, err := readHandoffFile(reqPath, sysctlHandoffMax)
 	if err != nil {
@@ -228,6 +239,13 @@ func doSysctlHelper(reqPath string) sysctlHelperRes {
 	path, err := sysctlProcPath(req.Key)
 	if err != nil {
 		return sysctlHelperRes{Error: "key_denied"}
+	}
+	payload, err := sysTweakLeasePayload("sysctl-set", req.Key, req.Value, "", "", "", "")
+	if err != nil {
+		return sysctlHelperRes{Error: "key_denied"}
+	}
+	if code := helperAuthorize("sys_tweak", payload, req.Lease, time.Now()); code != "" {
+		return sysctlHelperRes{Error: code}
 	}
 	if err := sysctlHelperWrite(path, req.Value); err != nil {
 		return sysctlHelperRes{Error: "write_failed", Errno: errnoOf(err)}

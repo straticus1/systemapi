@@ -63,6 +63,8 @@ func newSysTwkHarness(t *testing.T, avail bool) *sysTwkHarness {
 	if err := pinControlPublicKey(base64.StdEncoding.EncodeToString(pub), ptyTestHost); err != nil {
 		t.Fatal(err)
 	}
+	// The mutation helpers verify the same lease against their own trust file.
+	withHelperTrust(t, pub, ptyTestHost)
 	h := &sysTwkHarness{priv: priv, out: newFakeOut(), tw: &fakeTweaks{avail: avail, getOut: "1\n"}}
 	prev := sysTweaks
 	sysTweaks = func() Tweaks { return h.tw }

@@ -36,6 +36,20 @@
 # hardening set below with the agent's own hardened unit, so this helper is
 # provably "the agent's sandbox minus ProtectKernelTunables".
 
+# LEASE CHECK (helper_auth.go). The helper re-verifies the signed lease the
+# agent passes in the request against the control-plane key in
+# /etc/systemapi-agent/helper-trust.json, and consumes its nonce in
+# /var/lib/sah-helper/consumed (StateDirectory below), which the agent's own
+# sandbox cannot write. Provision the trust file once, as root, after the agent
+# has enrolled (public values only; agent.json also holds the private seed, so
+# copy just these two fields):
+#   install -d -o root -g root -m 0755 /etc/systemapi-agent
+#   jq '{host_id, control_pubkey}' /var/lib/systemapi-agent/agent.json \
+#     > /etc/systemapi-agent/helper-trust.json
+#   chown root:root /etc/systemapi-agent/helper-trust.json
+#   chmod 0644 /etc/systemapi-agent/helper-trust.json
+# Without it every helper write fails closed with trust_unavailable.
+
 [Unit]
 Description=SystemAPI sysctl mutation helper (%i)
 Documentation=file:///usr/share/doc/systemapi/sah-os-management-design.md
@@ -49,6 +63,10 @@ ExecStart=/usr/local/bin/systemapi-agent __sysctl-helper %i
 # below is the real limiter.
 User=root
 UMask=0077
+# The durable replay store (helper_auth.go), shared by every helper and
+# never in the agent's ReadWritePaths.
+StateDirectory=sah-helper
+StateDirectoryMode=0700
 
 # A kernel write must not hang the manager; bound the whole invocation.
 RuntimeMaxSec=10
@@ -65,7 +83,7 @@ NoNewPrivileges=yes
 # /sys; /proc/sys writability is governed by ProtectKernelTunables above, not by
 # this. The handoff dir is the only non-/proc path the helper may write.
 ProtectSystem=strict
-ReadWritePaths=/var/lib/systemapi-agent/sysctl-helper
+ReadWritePaths=/var/lib/systemapi-agent/sysctl-helper /var/lib/sah-helper
 ProtectHome=yes
 PrivateTmp=yes
 

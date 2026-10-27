@@ -4,8 +4,9 @@ package main
 //
 // Threats exercised: the helper must not trust the caller. These tests prove it
 // refuses a self-root target (/etc/systemapi-agent/...), a traversal/bad-shape
-// target, oversized content, and a content hash that does not match the
-// lease-bound SHA-256, even when the request file asks for them; that it
+// target, oversized content, and content that does not match the signed
+// lease, even when the request file asks for them (the lease checks
+// themselves are in helper_auth_test.go); that it
 // records a precise result and never performs the write in those cases; that
 // the agent-side handoff is one-shot and cleans up; and that a self-root target
 // is refused at the agent gate before any handoff. No test writes a real /etc
@@ -17,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // withConfigHelperStateDir points the handoff dir at a temp dir and restores it.
@@ -69,15 +71,23 @@ func readConfigResFile(t *testing.T, dir, id string) configHelperRes {
 	return res
 }
 
-// configReq builds a request whose SHA matches the content (the happy shape).
+// configReq builds a request with no lease, for refusals that must happen on
+// shape alone (before any lease check).
 func configReq(target, content string) configHelperReq {
-	return configHelperReq{Target: target, Content: content, SHA: sysSHA256Hex(content)}
+	return configHelperReq{Target: target, Content: content}
+}
+
+// signedConfigReq builds a request carrying a valid lease for target/content.
+func signedConfigReq(t *testing.T, target, content string) configHelperReq {
+	t.Helper()
+	priv := newHelperSigner(t)
+	return configHelperReq{Target: target, Content: content, Lease: configWriteLease(t, priv, target, content, inFuture(time.Minute))}
 }
 
 func TestConfigHelperWritesGrantedTarget(t *testing.T) {
 	dir := withConfigHelperStateDir(t)
 	calls := withFakeConfigWrite(t, nil)
-	writeConfigReqFile(t, dir, testHelperID, configReq("/etc/nginx/nginx.conf", "server {}\n"))
+	writeConfigReqFile(t, dir, testHelperID, signedConfigReq(t, "/etc/nginx/nginx.conf", "server {}\n"))
 
 	if code := runConfigHelper([]string{testHelperID}); code != 0 {
 		t.Fatalf("exit=%d, want 0", code)
@@ -141,16 +151,16 @@ func TestConfigHelperRefusesBadShapeTarget(t *testing.T) {
 func TestConfigHelperRefusesHashMismatch(t *testing.T) {
 	dir := withConfigHelperStateDir(t)
 	calls := withFakeConfigWrite(t, nil)
-	// The SHA is for "good\n" but the content is "evil\n": refuse.
-	writeConfigReqFile(t, dir, testHelperID, configHelperReq{
-		Target: "/etc/nginx/nginx.conf", Content: "evil\n", SHA: sysSHA256Hex("good\n"),
-	})
+	// The lease is for "good\n" but the content is "evil\n": refuse.
+	req := signedConfigReq(t, "/etc/nginx/nginx.conf", "good\n")
+	req.Content = "evil\n"
+	writeConfigReqFile(t, dir, testHelperID, req)
 	if code := runConfigHelper([]string{testHelperID}); code != 0 {
 		t.Fatalf("exit=%d, want 0", code)
 	}
 	res := readConfigResFile(t, dir, testHelperID)
-	if res.OK || res.Error != "hash_mismatch" {
-		t.Fatalf("result=%+v, want hash_mismatch", res)
+	if res.OK || res.Error != "lease_payload_mismatch" {
+		t.Fatalf("result=%+v, want lease_payload_mismatch", res)
 	}
 	if len(*calls) != 0 {
 		t.Fatalf("write must not run on a hash mismatch: %v", *calls)
@@ -189,7 +199,7 @@ func TestConfigHelperRefusesBadID(t *testing.T) {
 func TestConfigHelperRecordsErrno(t *testing.T) {
 	dir := withConfigHelperStateDir(t)
 	withFakeConfigWrite(t, os.ErrPermission) // the sandbox denies the write
-	writeConfigReqFile(t, dir, testHelperID, configReq("/etc/nginx/nginx.conf", "x\n"))
+	writeConfigReqFile(t, dir, testHelperID, signedConfigReq(t, "/etc/nginx/nginx.conf", "x\n"))
 	if code := runConfigHelper([]string{testHelperID}); code != 0 {
 		t.Fatalf("exit=%d, want 0", code)
 	}
@@ -213,7 +223,8 @@ func TestConfigWriteViaHelperHandoffAndCleanup(t *testing.T) {
 	t.Cleanup(func() { configHelperTrigger = prev })
 
 	content := "server {}\n"
-	if err := configWriteViaHelper("/etc/nginx/nginx.conf", content, sysSHA256Hex(content)); err != nil {
+	req := signedConfigReq(t, "/etc/nginx/nginx.conf", content)
+	if err := configWriteViaHelper("/etc/nginx/nginx.conf", content, req.Lease); err != nil {
 		t.Fatalf("configWriteViaHelper: %v", err)
 	}
 	if len(*calls) != 1 || (*calls)[0][1] != content {
@@ -235,8 +246,8 @@ func TestConfigWriteViaHelperRejectsSelfRootBeforeHandoff(t *testing.T) {
 	configHelperTrigger = func(id string) error { triggered = true; return nil }
 	t.Cleanup(func() { configHelperTrigger = prev })
 
-	content := "x\n"
-	if err := configWriteViaHelper("/etc/systemapi-agent/api-key", content, sysSHA256Hex(content)); err == nil {
+	req := signedConfigReq(t, "/etc/nginx/nginx.conf", "x\n")
+	if err := configWriteViaHelper("/etc/systemapi-agent/api-key", "x\n", req.Lease); err == nil {
 		t.Fatal("expected refusal for a self-root target")
 	}
 	if triggered {
@@ -244,19 +255,18 @@ func TestConfigWriteViaHelperRejectsSelfRootBeforeHandoff(t *testing.T) {
 	}
 }
 
-func TestConfigWriteViaHelperRejectsHashMismatchBeforeHandoff(t *testing.T) {
+func TestConfigWriteViaHelperRejectsMissingLeaseBeforeHandoff(t *testing.T) {
 	withConfigHelperStateDir(t)
 	triggered := false
 	prev := configHelperTrigger
 	configHelperTrigger = func(id string) error { triggered = true; return nil }
 	t.Cleanup(func() { configHelperTrigger = prev })
 
-	// Content does not hash to the supplied SHA.
-	if err := configWriteViaHelper("/etc/nginx/nginx.conf", "evil\n", sysSHA256Hex("good\n")); err == nil {
-		t.Fatal("expected refusal for a hash mismatch")
+	if err := configWriteViaHelper("/etc/nginx/nginx.conf", "x\n", nil); err == nil {
+		t.Fatal("expected refusal without a lease")
 	}
 	if triggered {
-		t.Fatal("helper must not be triggered on a hash mismatch")
+		t.Fatal("helper must not be triggered without a lease")
 	}
 }
 
