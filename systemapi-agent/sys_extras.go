@@ -176,13 +176,7 @@ func (engine *SysscriptEngine) fsStat(thread *starlark.Thread, b *starlark.Built
 	if err := starlark.UnpackArgs("stat", args, kwargs, "path", &path); err != nil {
 		return starlark.None, err
 	}
-	allowed := false
-	for _, prefix := range engine.Entitlements.AllowFSRead {
-		if prefix == "*" || strings.HasPrefix(path, prefix) {
-			allowed = true
-			break
-		}
-	}
+	allowed := pathGrantAllows(path, engine.Entitlements.AllowFSRead)
 	if !allowed {
 		return starlark.None, fmt.Errorf("security exception: read to %s not granted", path)
 	}
@@ -207,13 +201,7 @@ func (engine *SysscriptEngine) fsGlob(thread *starlark.Thread, b *starlark.Built
 	if err := starlark.UnpackArgs("glob", args, kwargs, "pattern", &pattern); err != nil {
 		return starlark.None, err
 	}
-	allowed := false
-	for _, prefix := range engine.Entitlements.AllowFSRead {
-		if prefix == "*" || strings.HasPrefix(pattern, prefix) {
-			allowed = true
-			break
-		}
-	}
+	allowed := pathGrantAllows(pattern, engine.Entitlements.AllowFSRead)
 	if !allowed {
 		return starlark.None, fmt.Errorf("security exception: read to %s not granted", pattern)
 	}
@@ -234,13 +222,7 @@ func (engine *SysscriptEngine) fsMkdir(thread *starlark.Thread, b *starlark.Buil
 	if err := starlark.UnpackArgs("mkdir", args, kwargs, "path", &path, "mode?", &modeStr); err != nil {
 		return starlark.None, err
 	}
-	allowed := false
-	for _, prefix := range engine.Entitlements.AllowFSWrite {
-		if prefix == "*" || strings.HasPrefix(path, prefix) {
-			allowed = true
-			break
-		}
-	}
+	allowed := pathGrantAllows(path, engine.Entitlements.AllowFSWrite)
 	if !allowed {
 		return starlark.None, fmt.Errorf("security exception: write to %s not granted", path)
 	}
@@ -265,13 +247,7 @@ func (engine *SysscriptEngine) fsRm(thread *starlark.Thread, b *starlark.Builtin
 	if err := starlark.UnpackArgs("rm", args, kwargs, "path", &path, "recursive?", &recursive); err != nil {
 		return starlark.None, err
 	}
-	allowed := false
-	for _, prefix := range engine.Entitlements.AllowFSWrite {
-		if prefix == "*" || strings.HasPrefix(path, prefix) {
-			allowed = true
-			break
-		}
-	}
+	allowed := pathGrantAllows(path, engine.Entitlements.AllowFSWrite)
 	if !allowed {
 		return starlark.None, fmt.Errorf("security exception: write to %s not granted", path)
 	}
@@ -293,13 +269,7 @@ func (engine *SysscriptEngine) fsChmod(thread *starlark.Thread, b *starlark.Buil
 	if err := starlark.UnpackArgs("chmod", args, kwargs, "path", &path, "mode", &modeStr); err != nil {
 		return starlark.None, err
 	}
-	allowed := false
-	for _, prefix := range engine.Entitlements.AllowFSWrite {
-		if prefix == "*" || strings.HasPrefix(path, prefix) {
-			allowed = true
-			break
-		}
-	}
+	allowed := pathGrantAllows(path, engine.Entitlements.AllowFSWrite)
 	if !allowed {
 		return starlark.None, fmt.Errorf("security exception: write to %s not granted", path)
 	}

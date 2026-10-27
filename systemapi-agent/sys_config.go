@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"strings"
 	"time"
 
 	"go.starlark.net/starlark"
@@ -17,13 +16,7 @@ func (engine *SysscriptEngine) configWrite(thread *starlark.Thread, b *starlark.
 		return starlark.None, err
 	}
 
-	allowed := false
-	for _, prefix := range engine.Entitlements.AllowConfigWrite {
-		if prefix == "*" || strings.HasPrefix(path, prefix) {
-			allowed = true
-			break
-		}
-	}
+	allowed := pathGrantAllows(path, engine.Entitlements.AllowConfigWrite)
 	if !allowed {
 		result := starlark.NewDict(2)
 		result.SetKey(starlark.String("success"), starlark.False)
@@ -143,13 +136,7 @@ func (engine *SysscriptEngine) configBackup(thread *starlark.Thread, b *starlark
 		return starlark.None, err
 	}
 
-	allowed := false
-	for _, prefix := range engine.Entitlements.AllowFSRead {
-		if prefix == "*" || strings.HasPrefix(path, prefix) {
-			allowed = true
-			break
-		}
-	}
+	allowed := pathGrantAllows(path, engine.Entitlements.AllowFSRead)
 	if !allowed {
 		result := starlark.NewDict(3)
 		result.SetKey(starlark.String("success"), starlark.False)
@@ -181,20 +168,9 @@ func (engine *SysscriptEngine) configRestore(thread *starlark.Thread, b *starlar
 	}
 
 	// Check AllowFSWrite or AllowConfigWrite
-	allowed := false
-	for _, prefix := range engine.Entitlements.AllowFSWrite {
-		if prefix == "*" || strings.HasPrefix(path, prefix) {
-			allowed = true
-			break
-		}
-	}
+	allowed := pathGrantAllows(path, engine.Entitlements.AllowFSWrite)
 	if !allowed {
-		for _, prefix := range engine.Entitlements.AllowConfigWrite {
-			if prefix == "*" || strings.HasPrefix(path, prefix) {
-				allowed = true
-				break
-			}
-		}
+		allowed = pathGrantAllows(path, engine.Entitlements.AllowConfigWrite)
 	}
 	if !allowed {
 		result := starlark.NewDict(2)

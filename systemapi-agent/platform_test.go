@@ -165,16 +165,16 @@ func TestConfigStoreValidateAndReload(t *testing.T) {
 }
 
 func TestConfigWriteAllowed(t *testing.T) {
-	if !configWriteAllowed("/etc/nginx/nginx.conf", []string{"/etc/nginx/"}) {
+	if !pathGrantAllows("/etc/nginx/nginx.conf", []string{"/etc/nginx/"}) {
 		t.Fatal("prefix match should be allowed")
 	}
-	if !configWriteAllowed("/anything", []string{"*"}) {
+	if !pathGrantAllows("/anything", []string{"*"}) {
 		t.Fatal("* should allow")
 	}
-	if configWriteAllowed("/etc/passwd", []string{"/etc/nginx/"}) {
+	if pathGrantAllows("/etc/passwd", []string{"/etc/nginx/"}) {
 		t.Fatal("out-of-prefix path must be denied")
 	}
-	if configWriteAllowed("/etc/passwd", nil) {
+	if pathGrantAllows("/etc/passwd", nil) {
 		t.Fatal("empty allow list is not allow-all")
 	}
 }

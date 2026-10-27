@@ -110,22 +110,11 @@ func (t *tweaksBackend) SetUnitOverride(unit, name, content string, allowConfigW
 	}
 	dir := filepath.Join("/etc/systemd/system", unit+".d")
 	path := filepath.Join(dir, name+".conf")
-	if !configWriteAllowed(path, allowConfigWrite) {
+	if !pathGrantAllows(path, allowConfigWrite) {
 		return fmt.Errorf("unit override to %s not granted", path)
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("unit override: %w", err)
 	}
 	return t.cm.AtomicWrite(path, content)
-}
-
-// configWriteAllowed is the AllowConfigWrite prefix gate used by
-// sys.config.write, applied here so a unit override cannot escape it.
-func configWriteAllowed(path string, allow []string) bool {
-	for _, prefix := range allow {
-		if prefix == "*" || strings.HasPrefix(path, prefix) {
-			return true
-		}
-	}
-	return false
 }

@@ -474,13 +474,7 @@ func (engine *SysscriptEngine) fsRead(thread *starlark.Thread, b *starlark.Built
 		return starlark.None, err
 	}
 
-	allowed := false
-	for _, prefix := range engine.Entitlements.AllowFSRead {
-		if prefix == "*" || strings.HasPrefix(path, prefix) {
-			allowed = true
-			break
-		}
-	}
+	allowed := pathGrantAllows(path, engine.Entitlements.AllowFSRead)
 	if !allowed {
 		return starlark.None, fmt.Errorf("security exception: read to %s not granted", path)
 	}
@@ -499,13 +493,7 @@ func (engine *SysscriptEngine) fsWrite(thread *starlark.Thread, b *starlark.Buil
 		return starlark.None, err
 	}
 
-	allowed := false
-	for _, prefix := range engine.Entitlements.AllowFSWrite {
-		if prefix == "*" || strings.HasPrefix(path, prefix) {
-			allowed = true
-			break
-		}
-	}
+	allowed := pathGrantAllows(path, engine.Entitlements.AllowFSWrite)
 	if !allowed {
 		return starlark.None, fmt.Errorf("security exception: write to %s not granted", path)
 	}

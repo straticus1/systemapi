@@ -217,6 +217,64 @@ func pathWithin(root, candidate string) bool {
 	return !filepath.IsAbs(rel)
 }
 
+// pathGrantAllows is the Sysscript path-grant gate (AllowConfigWrite,
+// AllowFSRead, AllowFSWrite). path must have the server's rootShapeOk shape
+// (absolute, no control byte, no empty, "." or ".." component, no trailing
+// slash). A grant matches the path itself or anything beneath it on a
+// component boundary, so "/etc/example" does not admit "/etc/example-evil".
+// The match must also hold after resolving symlinks in the existing part of
+// both paths, so a symlink inside a granted directory cannot point the access
+// outside it. "*" admits any well-formed path. A malformed grant matches
+// nothing. The check is not atomic with the later file operation (a symlink
+// swapped in afterwards is not caught here).
+func pathGrantAllows(path string, grants []string) bool {
+	if path == "/" || !xferRootOK(path) {
+		return false
+	}
+	resolved := resolveExisting(path)
+	for _, g := range grants {
+		if g == "*" {
+			return true
+		}
+		if len(g) > 1 {
+			g = strings.TrimSuffix(g, "/")
+		}
+		if !xferRootOK(g) {
+			continue
+		}
+		if pathWithin(g, path) && pathWithin(resolveExisting(g), resolved) {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveExisting resolves symlinks in the longest existing prefix of the
+// absolute path p and re-appends the part that does not exist yet.
+func resolveExisting(p string) string {
+	cur, rest := p, ""
+	for {
+		if r, err := filepath.EvalSymlinks(cur); err == nil {
+			return filepath.Join(r, rest)
+		}
+		if info, err := os.Lstat(cur); err == nil && info.Mode()&os.ModeSymlink != 0 {
+			// A dangling symlink: resolve its target lexically.
+			if target, err := os.Readlink(cur); err == nil {
+				if !filepath.IsAbs(target) {
+					target = filepath.Join(filepath.Dir(cur), target)
+				}
+				return filepath.Join(resolveExisting(filepath.Dir(target)), filepath.Base(target), rest)
+			}
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return p
+		}
+		rest = filepath.Join(filepath.Base(cur), rest)
+		cur = parent
+	}
+}
+
 func mountHardDenied(cleaned string) bool {
 	if cleaned == "/" {
 		return true
