@@ -352,15 +352,16 @@ async function runScript(fleet, principal, host, script, entitlements) {
 //   somebody's terminal);
 //   SYSTEMAPI_TICKET_RATE_PRIVILEGED (default 20), so one operator cannot
 //   starve another user or an admin's break-glass;
-// - tcp: tcp:open; SYSTEMAPI_TICKET_RATE_TCP (default 120), because one RDP
-//   or HTTP session opens several connections (TCP §2);
+// - tcp: tcp:open and mesh:open; SYSTEMAPI_TICKET_RATE_TCP (default 120),
+//   because one RDP or HTTP session opens several connections (TCP §2); a
+//   mesh session costs one ticket however many streams it carries (MESH §2);
 // - xfer: xfer:put, xfer:get grants; SYSTEMAPI_TICKET_RATE_XFER (default
 //   20), so a scripted put loop cannot lock the operator out of the shell
 //   or file session needed to diagnose it.
 // In process memory, like the tickets themselves.
 function ticketBudget(purpose) {
   if (PRIVILEGED_PURPOSES.has(purpose) || purpose === 'xfer:root' || WATCH_PURPOSES.has(purpose)) return 'privileged';
-  if (purpose === 'tcp:open') return 'tcp';
+  if (purpose === 'tcp:open' || purpose === 'mesh:open') return 'tcp';
   if (purpose === 'xfer:put' || purpose === 'xfer:get') return 'xfer';
   return 'terminal';
 }

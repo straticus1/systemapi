@@ -6,8 +6,11 @@
 // session to a tenant by itself. admin implies every scope. terminal:root (a
 // root shell) and file:root (file operations as root) are granted to admin
 // only, and so is terminal:watch (view another user's terminal session; an
-// admin can hand a support key only this scope). tcp:open, file:read and file:write are operator scopes; the
-// file:write purpose needs both file:read and file:write (channels.js).
+// admin can hand a support key only this scope). tcp:open, mesh:open,
+// file:read and file:write are operator scopes; mesh:open (a multiplexed
+// mesh session, docs/sah-mesh-protocol.md) is distinct from tcp:open so an
+// API key can hold either without the other; the file:write purpose needs
+// both file:read and file:write (channels.js).
 // sys:service (control a unit), sys:package (query/install/remove/upgrade a
 // package), sys:config (read/write a config path, reload a unit) and sys:tweak
 // (sysctl get/set, resource-limit and unit-override; their ws-ticket purposes)
@@ -33,6 +36,7 @@ const ALL = Object.freeze([
   'terminal:watch',
   'breakglass:open',
   'tcp:open',
+  'mesh:open',
   'file:read',
   'file:write',
   'file:root',
@@ -51,6 +55,7 @@ const OPERATOR = Object.freeze([
   'exec:run',
   'terminal:open',
   'tcp:open',
+  'mesh:open',
   'file:read',
   'file:write',
   'sys:service',

@@ -56,6 +56,7 @@ const { parseCapabilities } = require('../controlplane/channels');
 const { CreditLedger } = require('../controlplane/credit');
 const { deliverWebhooks, COOLDOWN_MS } = require('../controlplane/router');
 const { TcpChannels } = require('./tcp');
+const { MeshChannels } = require('./mesh');
 const { FileChannels } = require('./file');
 const { SysChannels } = require('./sys');
 const { XferGrants } = require('./xfer');
@@ -183,6 +184,8 @@ class FleetManager {
         this.env = process.env;
         // TCP-forward channel sessions (playground/tcp.js).
         this.tcp = new TcpChannels(this);
+        // Mesh channel sessions (playground/mesh.js): multiplexed TCP streams.
+        this.mesh = new MeshChannels(this);
         // File channel sessions (playground/file.js).
         this.file = new FileChannels(this);
         // Service-management channel sessions (playground/sys.js).
@@ -231,6 +234,10 @@ class FleetManager {
         }
         if (parsed.pathname.startsWith('/api/v1/systems/tcp/')) {
             this.tcp.upgrade(request, socket, head, parsed);
+            return;
+        }
+        if (parsed.pathname.startsWith('/api/v1/systems/mesh/')) {
+            this.mesh.upgrade(request, socket, head, parsed);
             return;
         }
         if (parsed.pathname.startsWith('/api/v1/systems/file/')) {
@@ -861,6 +868,7 @@ class FleetManager {
                     if (session.agent === ws) this.finalizeTerminal(session, null);
                 }
                 this.tcp.onAgentGone(ws);
+                this.mesh.onAgentGone(ws);
                 this.file.onAgentGone(ws);
                 this.xfer.onAgentGone(ws);
                 this.sys.onAgentGone(ws);

@@ -12,7 +12,9 @@ folded in: see §15.
 sahlink accepts a local TCP connection. For each connection it gets a ticket and
 opens one WebSocket. SystemAPI asks the host's agent to dial the target and
 relays the bytes. The host needs no inbound port. One WebSocket carries exactly
-one TCP connection, with no multiplexing on the client socket.
+one TCP connection, with no multiplexing on the client socket. The
+multiplexed form, one socket per host carrying many streams, is
+`sah-mesh-protocol.md`; each of its streams is a session of this contract.
 
 ## 1. Auth, resolve, transport
 

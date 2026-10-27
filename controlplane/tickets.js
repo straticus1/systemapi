@@ -4,7 +4,9 @@
 // (tcp:open, file:*) are also bound to their target or root, and a sys:service
 // ticket to its { unit, action }: the binding is
 // stored on the ticket, a channel ticket without one is refused at consume,
-// and a caller that passes an expected binding must match it exactly. A watch
+// and a caller that passes an expected binding must match it exactly. A
+// mesh:open ticket is bound to host and purpose only; its streams name their
+// targets later (docs/sah-mesh-protocol.md §2). A watch
 // ticket (terminal:watch, terminal:watch_rw) is bound to one granted watch
 // (session id, watch id, mode) and is refused at consume without it. Tickets
 // live in this process's memory: they do not survive a restart and are not
@@ -69,6 +71,8 @@ function bindingOk(row, expect) {
     if (expect && expect.root !== undefined && expect.root !== row.root) return false;
     return true;
   }
+  // MESH §2: a mesh ticket is bound to host and purpose only.
+  if (row.purpose === 'mesh:open') return true;
   if (row.purpose === 'terminal:watch' || row.purpose === 'terminal:watch_rw') {
     return !!(row.watch && typeof row.watch.watchId === 'string' && row.watch.mode === (row.purpose === 'terminal:watch' ? 'ro' : 'rw'));
   }
