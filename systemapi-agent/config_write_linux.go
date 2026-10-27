@@ -23,11 +23,15 @@ var atomicDirSync = unix.Fsync
 // the control plane holds the bytes and can re-push.
 //
 // Threats: a symlink in any parent directory redirecting a root write outside
-// the path that was checked. The parent is opened with openat2 beneath "/" with
-// RESOLVE_NO_SYMLINKS (and no magic links or cross-device escapes via
-// /proc), so every component of the directory must be a real directory and the
-// string path the callers deny-check (configTargetDenied, overrideResolve) is
-// the path actually written. The temp file is created O_EXCL|O_NOFOLLOW 0600
+// the path that was checked. The parent is opened with openat2 with
+// RESOLVE_BENEATH "/", RESOLVE_NO_SYMLINKS and RESOLVE_NO_MAGICLINKS (no
+// /proc magic links), so every component of the directory must be a real
+// directory and the string path the callers deny-check (configTargetDenied,
+// overrideResolve) is the path actually written. RESOLVE_NO_XDEV is
+// deliberately NOT set: resolution may cross mount points, because a granted
+// /etc subtree can legitimately sit on another mount (a separate /etc, bind
+// mounts in containers or image-based distros) and refusing that would break
+// valid writes; a mount only exists if root put it there (see below). The temp file is created O_EXCL|O_NOFOLLOW 0600
 // relative to that directory fd, chmod'd to perm, fsync'd, and renamed with
 // renameat on the same fd, so nothing after the open re-resolves the path. A
 // symlink at the final component is replaced, not followed. A leftover temp is

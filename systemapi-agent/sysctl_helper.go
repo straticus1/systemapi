@@ -18,7 +18,7 @@ package main
 //   - The agent gates the channel on lease + per-host policy (sys.go /
 //     sys_policy.go, unchanged): the Ed25519 lease binds the exact key/value,
 //     the control plane enforces the per-host sysctl allowlist, and
-//     checkSysTweakPolicy re-checks the shape and the DENIED_SYSCTL set. That
+//     checkSysTweakPolicy re-checks the shape and the sysctlDenied list. That
 //     authorization stays entirely on the agent side.
 //   - The helper does NOT trust the caller, which may be a compromised agent.
 //     It authorizes the write itself (helper_auth.go): the request carries
@@ -227,7 +227,7 @@ func doSysctlHelper(reqPath string) sysctlHelperRes {
 	if err := json.Unmarshal(data, &req); err != nil {
 		return sysctlHelperRes{Error: "bad_request"}
 	}
-	// Independent re-validation: the same key shape and DENIED_SYSCTL set the
+	// Independent re-validation: the same key shape and sysctlDenied list the
 	// channel uses, plus the value shape. The helper trusts none of this from
 	// the caller and fails closed.
 	if sysctlDenied(req.Key) || !sysctlKeyOK(req.Key) {
