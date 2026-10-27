@@ -169,7 +169,17 @@ and consumes the nonce once in `/var/lib/sah-helper/consumed`, a durable,
 bounded store in the helpers' own `StateDirectory` that survives a restart.
 Every failure is a recorded result code (`lease_missing`, `lease_<reason>`,
 `trust_unavailable`, `replay`, `replay_store`). The trust file is an install
-step (see the helper units); until it exists every helper write fails closed.
+step, `scripts/provision-helper-trust.sh --pubkey <key> [--host-id <id>]` (see
+the helper units); until it exists every helper write fails closed. The
+control-plane key it installs is the trust anchor for every helper write, so it
+must be an out-of-band pinned value (the install bundle, or read by the
+operator from the control plane), never copied from `agent.json`, which the
+agent can write. The script cross-checks the pinned key (and `--host-id`, when
+given) against `agent.json`, refuses on a mismatch, refuses a symlinked trust
+file, trust dir or state file, and writes `0644 root:root` through a same-dir
+temp file and rename. `loadHelperTrust` checks only the trust file and its
+immediate directory, so `/etc` itself must stay root-owned and not
+group/other writable.
 This boundary holds only with the hardened agent unit: an unsandboxed root
 agent can edit `/etc` and the replay store directly.
 

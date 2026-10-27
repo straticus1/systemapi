@@ -38,7 +38,9 @@ package main
 // outside the agent's sandbox (they can edit the trust file), against a stolen
 // control-plane signing key, or against an unhardened agent unit (without
 // ProtectSystem=strict the agent can write /etc and the replay store).
-// Provisioning helperTrustPath is an install step (see the helper units).
+// Provisioning helperTrustPath is an install step:
+// scripts/provision-helper-trust.sh takes the control key as an out-of-band
+// pinned value and refuses if agent.json disagrees (see the helper units).
 
 import (
 	"crypto/ed25519"
@@ -131,6 +133,11 @@ func trustedNode(info os.FileInfo) error {
 // loadHelperTrust reads the control public key and host id from
 // helperTrustPath, refusing a symlink, a non-regular file, a writable or
 // foreign-owned file or directory, and an oversized or malformed body.
+// Only the file and its IMMEDIATE directory are checked (Lstat, so that
+// directory itself is not a symlink); ancestors such as /etc and / are
+// trusted to be root-owned and not group/other writable, and a symlinked
+// ancestor is followed. A host where an unprivileged user can rename an
+// ancestor can substitute the whole directory.
 func loadHelperTrust() (ed25519.PublicKey, string, error) {
 	dirInfo, err := os.Lstat(filepath.Dir(helperTrustPath))
 	if err != nil {
