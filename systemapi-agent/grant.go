@@ -72,6 +72,13 @@ var deniedSysctlExact = map[string]struct{}{
 	"kernel.modules_disabled":          {},
 	"kernel.sysrq":                     {},
 	"kernel.perf_event_paranoid":       {},
+	"kernel.randomize_va_space":        {},
+	"kernel.unprivileged_userns_clone": {},
+	"kernel.io_uring_disabled":         {},
+	"vm.mmap_min_addr":                 {},
+	"fs.suid_dumpable":                 {},
+	"net.core.bpf_jit_harden":          {},
+	"user.max_user_namespaces":         {},
 }
 
 // deniedSysctlPrefixes deny every key that starts with the prefix. A prefix

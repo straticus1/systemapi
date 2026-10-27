@@ -60,7 +60,9 @@ const SYSCTL_VALUE_MAX = 256;
 // parity. Always check through sysctlDenied.
 const DENIED_SYSCTL = new Set(['kernel.core_pattern', 'kernel.modprobe', 'kernel.hotplug', 'kernel.poweroff_cmd',
   'kernel.kptr_restrict', 'kernel.dmesg_restrict', 'kernel.unprivileged_bpf_disabled', 'kernel.kexec_load_disabled',
-  'kernel.modules_disabled', 'kernel.sysrq', 'kernel.perf_event_paranoid']);
+  'kernel.modules_disabled', 'kernel.sysrq', 'kernel.perf_event_paranoid', 'kernel.randomize_va_space',
+  'kernel.unprivileged_userns_clone', 'kernel.io_uring_disabled', 'vm.mmap_min_addr', 'fs.suid_dumpable',
+  'net.core.bpf_jit_harden', 'user.max_user_namespaces']);
 // A prefix ending in "." also denies the bare subtree name (fs.binfmt_misc).
 const DENIED_SYSCTL_PREFIXES = ['fs.binfmt_misc.', 'kernel.usermodehelper.', 'fs.protected_', 'kernel.yama.'];
 function sysctlDenied(key) {

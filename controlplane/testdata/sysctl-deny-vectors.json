@@ -23,7 +23,14 @@
     "kernel.kexec_load_disabled",
     "kernel.modules_disabled",
     "kernel.sysrq",
-    "kernel.perf_event_paranoid"
+    "kernel.perf_event_paranoid",
+    "vm.mmap_min_addr",
+    "kernel.randomize_va_space",
+    "fs.suid_dumpable",
+    "net.core.bpf_jit_harden",
+    "user.max_user_namespaces",
+    "kernel.unprivileged_userns_clone",
+    "kernel.io_uring_disabled"
   ],
   "allowed": [
     "net.ipv4.ip_forward",
@@ -34,7 +41,9 @@
     "kernel.yamax",
     "fs.binfmt_miscx",
     "kernel.sysrqx",
-    "kernel.usermodehelperx"
+    "kernel.usermodehelperx",
+    "net.core.bpf_jit_enable_x",
+    "user.max_inotify_watches"
   ],
   "rejected": [
     "kernel.core_pattern.",
