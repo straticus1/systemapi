@@ -70,6 +70,31 @@ func TestWriteFileAtomicSyncRefusesSymlinkedParent(t *testing.T) {
 	}
 }
 
+// An absolute symlink is already refused by RESOLVE_BENEATH alone (it jumps to
+// "/" during resolution). A RELATIVE link that stays beneath "/" is caught only
+// by RESOLVE_NO_SYMLINKS, so this case is what pins that flag.
+func TestWriteFileAtomicSyncRefusesRelativeSymlinkedParent(t *testing.T) {
+	base := t.TempDir()
+	real := filepath.Join(base, "protected")
+	if err := os.MkdirAll(filepath.Join(real, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "granted")
+	if err := os.Symlink("protected", link); err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []string{filepath.Join(link, "x.conf"), filepath.Join(link, "sub", "x.conf")} {
+		if err := writeFileAtomicSync(target, "evil\n", 0o644); err == nil {
+			t.Fatalf("%s: a relative symlinked parent must be refused", target)
+		}
+	}
+	for _, p := range []string{filepath.Join(real, "x.conf"), filepath.Join(real, "sub", "x.conf")} {
+		if _, err := os.Lstat(p); !os.IsNotExist(err) {
+			t.Fatalf("write landed through the relative symlink at %s: %v", p, err)
+		}
+	}
+}
+
 func TestWriteFileAtomicSyncRefusesBadPath(t *testing.T) {
 	dir := t.TempDir()
 	for _, p := range []string{"rel/x.conf", dir + "/../x.conf", dir + "//x.conf", "/"} {
