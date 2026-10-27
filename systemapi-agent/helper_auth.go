@@ -92,6 +92,11 @@ const helperReplayRetain = 2*leaseSkew + time.Minute
 // can exercise the full-store refusal without writing thousands of files.
 var helperReplayMax = 4096
 
+// helperReplayHook is a no-op test seam called, under the replay lock, just
+// before an expired entry is pruned ("prune") and before the nonce is
+// recorded ("record"), so tests can assert the flock is held there.
+var helperReplayHook = func(stage string) {}
+
 // errReplay marks a nonce that was already consumed.
 var errReplay = errors.New("replay")
 
@@ -246,6 +251,7 @@ func consumeHelperNonce(nonce string, expiresUnix int64, now time.Time) error {
 		b, err := readHandoffFile(p, 32)
 		exp, perr := strconv.ParseInt(string(b), 10, 64)
 		if err == nil && perr == nil && nonceHexRe.MatchString(name) && exp < cutoff {
+			helperReplayHook("prune")
 			if err := os.Remove(p); err != nil {
 				return err
 			}
@@ -257,6 +263,7 @@ func consumeHelperNonce(nonce string, expiresUnix int64, now time.Time) error {
 	if live >= helperReplayMax {
 		return errors.New("replay store full")
 	}
+	helperReplayHook("record")
 	f, err := os.OpenFile(filepath.Join(helperReplayDir, nonce), os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		if os.IsExist(err) {
