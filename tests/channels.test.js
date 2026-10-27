@@ -709,3 +709,19 @@ test('ws-ticket mesh:open spends the tcp budget, not terminal', async () => {
     server.close();
   }
 });
+
+test('sysctl deny list matches the agent (shared vectors)', () => {
+  const lease = require('../controlplane/lease');
+  const vec = require('../controlplane/testdata/sysctl-deny-vectors.json');
+  assert.ok(vec.denied.length > 0 && vec.allowed.length > 0);
+  for (const k of vec.denied) {
+    assert.equal(ch.sysctlDenied(k), true, k);
+    assert.equal(ch.validateTweakBinding({ verb: 'sysctl-get', key: k }).error, 'bad_tweak', k);
+    assert.equal(ch.parseTweakPolicy({ sysctls: [k] }), null, k);
+    assert.throws(() => lease.sysTweakPayload({ verb: 'sysctl-get', key: k }), /bad_payload/, k);
+  }
+  for (const k of vec.allowed) {
+    assert.equal(ch.sysctlDenied(k), false, k);
+    assert.equal(ch.validateTweakBinding({ verb: 'sysctl-get', key: k }).ok, true, k);
+  }
+});

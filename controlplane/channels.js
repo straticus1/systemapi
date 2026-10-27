@@ -50,7 +50,20 @@ const TWEAK_VERBS = new Set(['sysctl-get', 'sysctl-set', 'resource-limit-set', '
 // overrideContentCap.
 const SYSCTL_KEY_RE = /^[a-z][a-z0-9_.]{0,127}$/;
 const SYSCTL_VALUE_MAX = 256;
-const DENIED_SYSCTL = new Set(['kernel.core_pattern', 'kernel.modprobe', 'kernel.hotplug']);
+// The hard sysctl deny list: keys that run a root helper or weaken kernel
+// hardening. Mirrors systemapi-agent/grant.go deniedSysctlExact and
+// deniedSysctlPrefixes; testdata/sysctl-deny-vectors.json keeps them in
+// parity. Always check through sysctlDenied.
+const DENIED_SYSCTL = new Set(['kernel.core_pattern', 'kernel.modprobe', 'kernel.hotplug', 'kernel.poweroff_cmd',
+  'kernel.kptr_restrict', 'kernel.dmesg_restrict', 'kernel.unprivileged_bpf_disabled', 'kernel.kexec_load_disabled',
+  'kernel.modules_disabled', 'kernel.sysrq', 'kernel.perf_event_paranoid']);
+// A prefix ending in "." also denies the bare subtree name (fs.binfmt_misc).
+const DENIED_SYSCTL_PREFIXES = ['fs.binfmt_misc.', 'kernel.usermodehelper.', 'fs.protected_', 'kernel.yama.'];
+function sysctlDenied(key) {
+  if (typeof key !== 'string') return true;
+  if (DENIED_SYSCTL.has(key)) return true;
+  return DENIED_SYSCTL_PREFIXES.some((p) => key.startsWith(p) || `${key}.` === p);
+}
 const OVERRIDE_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
 const LIMIT_VALUE_RE = /^[a-zA-Z0-9:._]{1,64}$/;
 const OVERRIDE_CONTENT_MAX = 64 * 1024;
@@ -476,7 +489,7 @@ function validateTweakBinding(tw) {
   const { verb } = tw;
   if (!TWEAK_VERBS.has(verb)) return { ok: false, error: 'bad_action' };
   if (verb === 'sysctl-get' || verb === 'sysctl-set') {
-    if (typeof tw.key !== 'string' || !SYSCTL_KEY_RE.test(tw.key) || DENIED_SYSCTL.has(tw.key)) return { ok: false, error: 'bad_tweak' };
+    if (typeof tw.key !== 'string' || !SYSCTL_KEY_RE.test(tw.key) || sysctlDenied(tw.key)) return { ok: false, error: 'bad_tweak' };
     if (verb === 'sysctl-get') return { ok: true, tweak: { verb, key: tw.key } };
     if (typeof tw.value !== 'string' || tw.value.length === 0 || tw.value.length > SYSCTL_VALUE_MAX
       || /[\n\r\u0000]/.test(tw.value)) return { ok: false, error: 'bad_tweak' };
@@ -508,7 +521,7 @@ function parseTweakPolicy(raw) {
   if (!Array.isArray(sysctls) || !Array.isArray(units) || sysctls.length > POLICY_MAX_ENTRIES || units.length > POLICY_MAX_ENTRIES) return null;
   const outKeys = [];
   for (const k of sysctls) {
-    if (typeof k !== 'string' || !SYSCTL_KEY_RE.test(k) || DENIED_SYSCTL.has(k)) return null;
+    if (typeof k !== 'string' || !SYSCTL_KEY_RE.test(k) || sysctlDenied(k)) return null;
     outKeys.push(k);
   }
   const outUnits = [];
@@ -704,6 +717,8 @@ module.exports = {
   OVERRIDE_CONTENT_MAX,
   SYSCTL_KEY_RE,
   DENIED_SYSCTL,
+  DENIED_SYSCTL_PREFIXES,
+  sysctlDenied,
   validateTweakBinding,
   parseTweakPolicy,
   tweakPolicyAllows,

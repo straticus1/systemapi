@@ -138,7 +138,7 @@ func checkSysTweakPolicy(verb, key, unit string) error {
 		return errTweakBadAction
 	}
 	if verb == "sysctl-get" || verb == "sysctl-set" {
-		if _, denied := deniedSysctl[key]; denied || !sysctlKeyRE.MatchString(key) {
+		if sysctlDenied(key) || !sysctlKeyRE.MatchString(key) {
 			return errTweakTargetBad
 		}
 		return nil

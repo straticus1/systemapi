@@ -32,7 +32,7 @@
 'use strict';
 
 const crypto = require('node:crypto');
-const { validateFileRoot } = require('./channels');
+const { validateFileRoot, sysctlDenied } = require('./channels');
 const { randomBytes, timingSafeEqual } = crypto;
 
 const ACTIONS = new Set(['sysscript', 'pty', 'pty_root', 'breakglass', 'tcp', 'file', 'file_root', 'xfer', 'xfer_root', 'sys_service', 'sys_package', 'sys_config', 'sys_tweak']);
@@ -235,10 +235,9 @@ const TWEAK_LIMIT_VALUE_RE = /^[a-zA-Z0-9:._]{1,64}$/;
 const TWEAK_RESOURCE_LIMITS = new Set(['LimitCPU', 'LimitFSIZE', 'LimitDATA', 'LimitSTACK', 'LimitCORE', 'LimitRSS',
   'LimitNOFILE', 'LimitAS', 'LimitNPROC', 'LimitMEMLOCK', 'LimitLOCKS', 'LimitSIGPENDING', 'LimitMSGQUEUE',
   'LimitNICE', 'LimitRTPRIO', 'LimitRTTIME']);
-const TWEAK_DENIED_SYSCTL = new Set(['kernel.core_pattern', 'kernel.modprobe', 'kernel.hotplug']);
 function sysTweakPayload(tw, contentSha256) {
   if (!tw || typeof tw !== 'object') throw badPayload();
-  const sysctlKeyOk = (k) => typeof k === 'string' && TWEAK_SYSCTL_KEY_RE.test(k) && !TWEAK_DENIED_SYSCTL.has(k);
+  const sysctlKeyOk = (k) => typeof k === 'string' && TWEAK_SYSCTL_KEY_RE.test(k) && !sysctlDenied(k);
   const unitOk = (u) => typeof u === 'string' && SERVICE_UNIT_RE.test(u);
   switch (tw.verb) {
     case 'sysctl-get':

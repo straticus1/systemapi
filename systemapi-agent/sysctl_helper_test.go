@@ -102,7 +102,7 @@ func TestSysctlHelperWritesGrantedKey(t *testing.T) {
 func TestSysctlHelperRefusesDeniedKey(t *testing.T) {
 	dir := withHelperStateDir(t)
 	calls := withFakeWrite(t, nil)
-	// kernel.core_pattern is in deniedSysctl; the helper must refuse it even
+	// kernel.core_pattern is denied by sysctlDenied; the helper must refuse it even
 	// though the request file asks for it.
 	writeReqFile(t, dir, testHelperID, sysctlHelperReq{Key: "kernel.core_pattern", Value: "|/evil"})
 

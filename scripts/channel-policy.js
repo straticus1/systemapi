@@ -50,7 +50,7 @@
 
 const path = require('node:path');
 const { validateTenant } = require('../controlplane/sshkey');
-const { validateFileRoot, effectivePolicies, SERVICE_UNIT_RE, PACKAGE_NAME_RE, SYSCTL_KEY_RE, DENIED_SYSCTL } = require('../controlplane/channels');
+const { validateFileRoot, effectivePolicies, SERVICE_UNIT_RE, PACKAGE_NAME_RE, SYSCTL_KEY_RE, sysctlDenied } = require('../controlplane/channels');
 
 const ACTOR = 'cli:channel-policy';
 const MAX_ENTRIES = 16;
@@ -121,7 +121,7 @@ function parseConfigDir(text) {
 }
 
 function parseTweakSysctl(text) {
-  if (typeof text !== 'string' || !SYSCTL_KEY_RE.test(text) || DENIED_SYSCTL.has(text)) {
+  if (typeof text !== 'string' || !SYSCTL_KEY_RE.test(text) || sysctlDenied(text)) {
     throw usage(`bad --tweak-sysctl: ${JSON.stringify(text)} is not an allowable sysctl key (lowercase letters, digits, ".", "_"; not a hard-denied key)`);
   }
   return text;

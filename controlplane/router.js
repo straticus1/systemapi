@@ -15,7 +15,7 @@ const { hasScope, roleFromGroups, scopesForRole, intersectScopes, ALL } = requir
 const oauth = require('./oauth');
 const { issueLease, PTY_SESSION_RE, watchReasonOk } = require('./lease');
 const { issueTicket, TTL_MS: TICKET_TTL_MS } = require('./tickets');
-const { CHANNEL_PURPOSES, SYS_PURPOSES, PURPOSE_SCOPES, validateBinding, policyDecision } = require('./channels');
+const { CHANNEL_PURPOSES, SYS_PURPOSES, PURPOSE_SCOPES, validateBinding, policyDecision, sysctlDenied } = require('./channels');
 const { fingerprint, randomToken, tokenEqual } = require('./token');
 const { sealSecret, openSecret } = require('./seal');
 const { assertWebhookURL } = require('./webhook');
@@ -55,7 +55,6 @@ const LIST_ENTITLEMENTS = [
   'allow_mount_targets',
   'allow_sysctl'
 ];
-const DENIED_SYSCTL = new Set(['kernel.core_pattern', 'kernel.modprobe', 'kernel.hotplug']);
 
 function http(status, code) {
   const err = new Error(code);
@@ -305,7 +304,7 @@ function clampEntitlements(requested, scopes) {
     }
     for (const key of LIST_ENTITLEMENTS) {
       let items = clampList(requested[key]);
-      if (key === 'allow_sysctl') items = items.filter((item) => !DENIED_SYSCTL.has(item));
+      if (key === 'allow_sysctl') items = items.filter((item) => !sysctlDenied(item));
       out[key] = items;
     }
   }

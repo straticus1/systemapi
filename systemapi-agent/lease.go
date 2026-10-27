@@ -240,11 +240,11 @@ func sysConfigLeasePayload(action, target, contentSHA string) (string, error) {
 // (docs/sah-os-management-design.md), byte-for-byte the server's
 // sysTweakPayload (controlplane/lease.js). A unit-override body is bound by
 // contentSHA; other verbs' short values ride the payload. Field shapes reuse
-// the agent's existing guards (grant.go sysctlKeyRE/deniedSysctl/sysctlValueOK,
+// the agent's existing guards (grant.go sysctlKeyRE/sysctlDenied/sysctlValueOK,
 // platform_tweak.go resourceLimits/limitValueRE/overrideNameRE).
 func sysTweakLeasePayload(verb, key, value, unit, limit, name, contentSHA string) (string, error) {
 	sysctlKeyOK := func(k string) bool {
-		if _, denied := deniedSysctl[k]; denied {
+		if sysctlDenied(k) {
 			return false
 		}
 		return sysctlKeyRE.MatchString(k)

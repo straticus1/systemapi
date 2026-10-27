@@ -105,7 +105,7 @@ the mechanism; `sysctl-get` is a read and still calls the Phase 0 backend.
   `/var/lib/systemapi-agent/sysctl-helper/<id>.req`, triggers the unit, reads
   `<id>.res`, and cleans both up. One request per invocation, fresh random id.
 - Helper side: the hidden `systemapi-agent __sysctl-helper <id>` subcommand
-  re-checks the key against the same `sysctlKeyRE` and `deniedSysctl` set the
+  re-checks the key against the same `sysctlKeyRE` and `sysctlDenied` list the
   channel uses and the value against `sysctlValueOK`, resolves the `/proc/sys`
   path (traversal-checked), writes, and records `{ok,error,errno}`. It trusts
   nothing from the caller and fails closed.

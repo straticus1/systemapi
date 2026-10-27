@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -203,5 +204,46 @@ func TestResolvBody(t *testing.T) {
 	}
 	if _, err := resolvBody([]string{"1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4"}); err == nil || !strings.Contains(err.Error(), "nameserver rejected") {
 		t.Fatal(err)
+	}
+}
+
+// Parity with the control plane: every key in the shared vector file is
+// denied (or allowed) by the agent exactly as by controlplane/channels.js.
+func TestSysctlDenyVectors(t *testing.T) {
+	blob, err := os.ReadFile(filepath.Join("..", "controlplane", "testdata", "sysctl-deny-vectors.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v struct {
+		Denied  []string `json:"denied"`
+		Allowed []string `json:"allowed"`
+	}
+	if err := json.Unmarshal(blob, &v); err != nil {
+		t.Fatal(err)
+	}
+	if len(v.Denied) == 0 || len(v.Allowed) == 0 {
+		t.Fatal("empty vectors")
+	}
+	for _, k := range v.Denied {
+		if !sysctlDenied(k) {
+			t.Errorf("%s must be denied", k)
+		}
+		if sysctlGranted([]string{k}, k) {
+			t.Errorf("%s must never be granted", k)
+		}
+		if _, err := sysctlProcPath(k); err == nil {
+			t.Errorf("%s must have no proc path", k)
+		}
+		if got := dropDeniedSysctl([]string{k}); got != nil {
+			t.Errorf("%s survived dropDeniedSysctl", k)
+		}
+		if _, err := sysTweakLeasePayload("sysctl-get", k, "", "", "", "", ""); err == nil {
+			t.Errorf("%s must not form a tweak payload", k)
+		}
+	}
+	for _, k := range v.Allowed {
+		if sysctlDenied(k) || !sysctlGranted([]string{k}, k) {
+			t.Errorf("%s must be grantable", k)
+		}
 	}
 }

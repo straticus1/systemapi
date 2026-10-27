@@ -1,0 +1,39 @@
+{
+  "comment": "Shared by tests/channels.test.js and systemapi-agent/sys_grant_test.go: both sysctl deny lists must agree on every key here.",
+  "denied": [
+    "kernel.core_pattern",
+    "kernel.modprobe",
+    "kernel.hotplug",
+    "kernel.poweroff_cmd",
+    "kernel.usermodehelper",
+    "kernel.usermodehelper.bset",
+    "kernel.usermodehelper.inheritable",
+    "fs.binfmt_misc",
+    "fs.binfmt_misc.register",
+    "fs.binfmt_misc.status",
+    "fs.protected_symlinks",
+    "fs.protected_hardlinks",
+    "fs.protected_fifos",
+    "fs.protected_regular",
+    "kernel.yama",
+    "kernel.yama.ptrace_scope",
+    "kernel.kptr_restrict",
+    "kernel.dmesg_restrict",
+    "kernel.unprivileged_bpf_disabled",
+    "kernel.kexec_load_disabled",
+    "kernel.modules_disabled",
+    "kernel.sysrq",
+    "kernel.perf_event_paranoid"
+  ],
+  "allowed": [
+    "net.ipv4.ip_forward",
+    "vm.swappiness",
+    "fs.file_max",
+    "fs.inotify.max_user_watches",
+    "kernel.pid_max",
+    "kernel.yamax",
+    "fs.binfmt_miscx",
+    "kernel.sysrqx",
+    "kernel.usermodehelperx"
+  ]
+}

@@ -50,10 +50,46 @@ var (
 	uptimeRE      = regexp.MustCompile(`^[0-9]+(\.[0-9]+)?$`)
 )
 
-var deniedSysctl = map[string]struct{}{
-	"kernel.core_pattern": {},
-	"kernel.modprobe":     {},
-	"kernel.hotplug":      {},
+// deniedSysctlExact and deniedSysctlPrefixes are the hard sysctl deny list:
+// keys that run a root helper (core_pattern, modprobe, hotplug, poweroff_cmd,
+// usermodehelper, binfmt_misc) or that weaken kernel hardening. Mirrored by
+// controlplane/channels.js DENIED_SYSCTL/DENIED_SYSCTL_PREFIXES; the shared
+// vectors in controlplane/testdata/sysctl-deny-vectors.json keep them in
+// parity. Always check through sysctlDenied.
+var deniedSysctlExact = map[string]struct{}{
+	"kernel.core_pattern":              {},
+	"kernel.modprobe":                  {},
+	"kernel.hotplug":                   {},
+	"kernel.poweroff_cmd":              {},
+	"kernel.kptr_restrict":             {},
+	"kernel.dmesg_restrict":            {},
+	"kernel.unprivileged_bpf_disabled": {},
+	"kernel.kexec_load_disabled":       {},
+	"kernel.modules_disabled":          {},
+	"kernel.sysrq":                     {},
+	"kernel.perf_event_paranoid":       {},
+}
+
+// deniedSysctlPrefixes deny every key that starts with the prefix. A prefix
+// ending in "." also denies the bare subtree name (fs.binfmt_misc).
+var deniedSysctlPrefixes = []string{
+	"fs.binfmt_misc.",
+	"kernel.usermodehelper.",
+	"fs.protected_",
+	"kernel.yama.",
+}
+
+// sysctlDenied reports whether key is on the hard deny list.
+func sysctlDenied(key string) bool {
+	if _, ok := deniedSysctlExact[key]; ok {
+		return true
+	}
+	for _, p := range deniedSysctlPrefixes {
+		if strings.HasPrefix(key, p) || key+"." == p {
+			return true
+		}
+	}
+	return false
 }
 
 var deniedMountRoots = []string{
@@ -102,7 +138,7 @@ func dropDeniedSysctl(in []string) []string {
 	}
 	out := make([]string, 0, len(in))
 	for _, item := range in {
-		if _, denied := deniedSysctl[item]; denied {
+		if sysctlDenied(item) {
 			continue
 		}
 		out = append(out, item)
@@ -114,7 +150,7 @@ func dropDeniedSysctl(in []string) []string {
 }
 
 func sysctlGranted(allow []string, key string) bool {
-	if _, denied := deniedSysctl[key]; denied {
+	if sysctlDenied(key) {
 		return false
 	}
 	if !sysctlKeyRE.MatchString(key) {
@@ -134,7 +170,7 @@ func sysctlProcPath(key string) (string, error) {
 	if !sysctlKeyRE.MatchString(key) {
 		return "", fmt.Errorf("sysctl not allowed")
 	}
-	if _, denied := deniedSysctl[key]; denied {
+	if sysctlDenied(key) {
 		return "", fmt.Errorf("sysctl not allowed")
 	}
 	rel := strings.ReplaceAll(key, ".", "/")
