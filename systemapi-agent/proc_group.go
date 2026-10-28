@@ -6,16 +6,17 @@ package main
 // children it forked, running (an apt that keeps going after the server
 // gave up, a `sleep 600 &` that holds the output pipe open), and a group
 // signal that lands on an unrelated process after the leader's pid was
-// reused. On linux and the BSDs the child leads its own process group; when
+// reused. On linux and darwin the child leads its own process group; when
 // the context ends the whole group gets SIGTERM, then SIGKILL after
-// jobKillGrace (sooner when the leader exits first). The leader is not
+// jobKillGrace (sooner once the leader has exited and the agent's output
+// pipes are closed). Setsid is refused, as it would leave that group. The leader is not
 // reaped until that escalation is over, so its pid, which is the group id,
 // cannot be reused while the group is signalled. Output written to a
 // non-file Stdout/Stderr goes through pipes the agent owns, and the leader
 // is reaped only after they reach EOF or the context ends. Does NOT reach a
 // grandchild that moved itself into another group or session (setsid); with
 // the shipped unit's KillMode=control-group, stopping the service still does.
-// Elsewhere (windows) only the direct child is killed.
+// Elsewhere (windows, the BSDs) only the direct child is killed.
 
 import (
 	"bytes"

@@ -22,6 +22,7 @@ const dockerAPIVersion = "v1.41"
 
 // DockerClient communicates with the Docker Engine API over a Unix socket.
 type DockerClient struct {
+	ctx        context.Context // parent of every call; nil refuses all calls
 	client     *http.Client
 	socketPath string
 	baseURL    string // default "http://localhost" for Unix socket; overridden in tests
@@ -76,7 +77,8 @@ type ContainerStats struct {
 
 // NewDockerClient creates a client that talks to the Docker Engine API.
 // Per D-01: reads DOCKER_HOST env var; falls back to /var/run/docker.sock.
-func NewDockerClient() *DockerClient {
+// Every call is bounded by ctx (the script's context) and a per-call timeout.
+func NewDockerClient(ctx context.Context) *DockerClient {
 	socketPath := "/var/run/docker.sock"
 	if h := os.Getenv("DOCKER_HOST"); h != "" {
 		if strings.HasPrefix(h, "unix://") {
@@ -91,6 +93,7 @@ func NewDockerClient() *DockerClient {
 		},
 	}
 	return &DockerClient{
+		ctx:        ctx,
 		client:     &http.Client{Transport: transport, Timeout: 10 * time.Second},
 		socketPath: socketPath,
 		baseURL:    "http://localhost",
@@ -114,7 +117,7 @@ func isValidContainerID(id string) bool {
 // ListContainers returns all containers (running and stopped) from the Docker API.
 func (dc *DockerClient) ListContainers() ([]DockerContainer, error) {
 	url := fmt.Sprintf("%s/%s/containers/json?all=true", dc.baseURL, dockerAPIVersion)
-	resp, err := dc.client.Get(url)
+	resp, err := dc.send(http.MethodGet, url, "", nil)
 	if err != nil {
 		return nil, fmt.Errorf("docker list: %w", err)
 	}
@@ -139,7 +142,7 @@ func (dc *DockerClient) GetContainerStats(id string) (*ContainerStats, error) {
 	}
 
 	url := fmt.Sprintf("%s/%s/containers/%s/stats?stream=false", dc.baseURL, dockerAPIVersion, id)
-	resp, err := dc.client.Get(url)
+	resp, err := dc.send(http.MethodGet, url, "", nil)
 	if err != nil {
 		return nil, fmt.Errorf("docker stats: %w", err)
 	}
@@ -216,7 +219,7 @@ func (dc *DockerClient) RestartContainer(id string) error {
 // doContainerPost sends a POST to a Docker container lifecycle endpoint and checks status.
 // 204 (No Content) and 304 (Not Modified / already in target state) are both success.
 func (dc *DockerClient) doContainerPost(url, op string) error {
-	resp, err := dc.client.Post(url, "application/json", nil)
+	resp, err := dc.send(http.MethodPost, url, "application/json", nil)
 	if err != nil {
 		return fmt.Errorf("docker %s: %w", op, err)
 	}
@@ -254,7 +257,7 @@ func (dc *DockerClient) Inspect(id string) (map[string]string, error) {
 		return nil, fmt.Errorf("invalid container id")
 	}
 	url := fmt.Sprintf("%s/%s/containers/%s/json", dc.baseURL, dockerAPIVersion, id)
-	resp, err := dc.client.Get(url)
+	resp, err := dc.send(http.MethodGet, url, "", nil)
 	if err != nil {
 		return nil, fmt.Errorf("docker inspect: %w", err)
 	}
@@ -288,7 +291,7 @@ func (dc *DockerClient) Logs(id string) (string, error) {
 		return "", fmt.Errorf("invalid container id")
 	}
 	url := fmt.Sprintf("%s/%s/containers/%s/logs?stdout=1&stderr=1&tail=200", dc.baseURL, dockerAPIVersion, id)
-	resp, err := dc.client.Get(url)
+	resp, err := dc.send(http.MethodGet, url, "", nil)
 	if err != nil {
 		return "", fmt.Errorf("docker logs: %w", err)
 	}
@@ -357,7 +360,7 @@ func (dc *DockerClient) createContainer(image string, cmd []string) (string, err
 		return "", err
 	}
 	url := fmt.Sprintf("%s/%s/containers/create", dc.baseURL, dockerAPIVersion)
-	resp, err := dc.client.Post(url, "application/json", bytes.NewReader(raw))
+	resp, err := dc.send(http.MethodPost, url, "application/json", bytes.NewReader(raw))
 	if err != nil {
 		return "", fmt.Errorf("docker create: %w", err)
 	}
@@ -401,7 +404,7 @@ func (dc *DockerClient) Exec(id string, cmd []string) (string, error) {
 		return "", err
 	}
 	createURL := fmt.Sprintf("%s/%s/containers/%s/exec", dc.baseURL, dockerAPIVersion, id)
-	resp, err := dc.client.Post(createURL, "application/json", bytes.NewReader(payload))
+	resp, err := dc.send(http.MethodPost, createURL, "application/json", bytes.NewReader(payload))
 	if err != nil {
 		return "", fmt.Errorf("docker exec: %w", err)
 	}
@@ -439,13 +442,44 @@ func (dc *DockerClient) Exec(id string, cmd []string) (string, error) {
 	return demuxDocker(stream)
 }
 
+func (dc *DockerClient) requireClient() error {
+	if dc == nil || dc.client == nil || dc.ctx == nil {
+		return fmt.Errorf("docker client not initialized")
+	}
+	return nil
+}
+
+// send makes one request bound to the client's context (the script's
+// deadline and cancel) and to the client's own timeout.
+func (dc *DockerClient) send(method, url, contentType string, body io.Reader) (*http.Response, error) {
+	if err := dc.requireClient(); err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(dc.ctx, method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	return dc.client.Do(req)
+}
+
 func (dc *DockerClient) useUnixExec() bool {
 	return dc.socketPath != "" && dc.baseURL == "http://localhost"
 }
 
 func (dc *DockerClient) execHTTP(url string, body []byte) ([]byte, error) {
+	if err := dc.requireClient(); err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(dc.ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("docker exec: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
 	client := &http.Client{Transport: dc.client.Transport, Timeout: 15 * time.Second}
-	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("docker exec: %w", err)
 	}
@@ -461,11 +495,17 @@ func (dc *DockerClient) execHTTP(url string, body []byte) ([]byte, error) {
 }
 
 func (dc *DockerClient) execUnix(path string, body []byte) ([]byte, error) {
-	conn, err := net.DialTimeout("unix", dc.socketPath, 15*time.Second)
+	if err := dc.requireClient(); err != nil {
+		return nil, err
+	}
+	conn, err := (&net.Dialer{Timeout: 15 * time.Second}).DialContext(dc.ctx, "unix", dc.socketPath)
 	if err != nil {
 		return nil, fmt.Errorf("docker exec: %w", err)
 	}
 	defer conn.Close()
+	// The script's deadline or cancel ends a read or write in progress.
+	stopClose := context.AfterFunc(dc.ctx, func() { _ = conn.Close() })
+	defer stopClose()
 	if err := conn.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
 		return nil, err
 	}
@@ -583,8 +623,8 @@ func splitImageRef(ref string) (string, string) {
 
 // doJSON sends one request, checks the status, and decodes a capped body.
 func (dc *DockerClient) doJSON(op, method, url string, body any, ok []int, out any) error {
-	if dc == nil || dc.client == nil {
-		return fmt.Errorf("docker client not initialized")
+	if err := dc.requireClient(); err != nil {
+		return err
 	}
 	var reader io.Reader
 	if body != nil {
@@ -594,7 +634,7 @@ func (dc *DockerClient) doJSON(op, method, url string, body any, ok []int, out a
 		}
 		reader = bytes.NewReader(raw)
 	}
-	req, err := http.NewRequest(method, url, reader)
+	req, err := http.NewRequestWithContext(dc.ctx, method, url, reader)
 	if err != nil {
 		return fmt.Errorf("docker %s: %w", op, err)
 	}

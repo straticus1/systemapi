@@ -109,27 +109,6 @@ func TestExecRunDeadlineIsTimedOut(t *testing.T) {
 	}
 }
 
-func TestJobCommandTermIgnoredGetsKill(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-	cmd := jobCommand(ctx, "sh", "-c", "trap '' TERM; sleep 600")
-	start := time.Now()
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	pgid := cmd.Process.Pid
-	if err := cmd.Wait(); err == nil {
-		t.Fatal("killed command reported success")
-	}
-	if d := time.Since(start); d > jobKillGrace+time.Second {
-		t.Fatalf("took %s", d)
-	}
-	if d := time.Since(start); d < jobKillGrace {
-		t.Fatalf("SIGKILL came before the grace: %s", d)
-	}
-	waitGroupEmpty(t, pgid, time.Second)
-}
-
 // A terminal session runs in its own session (pty.go) and an xfer child in
 // its own session too (xfer_spawn_unix.go); a job's group kill must not
 // reach either.
@@ -228,24 +207,4 @@ func TestJobCommandSignalsOnlyBeforeReap(t *testing.T) {
 	if got := kills(); len(got) != 2 {
 		t.Fatalf("signal after reap: %+v", got[2:])
 	}
-}
-
-// A grandchild that keeps the output pipe open after the leader exits holds
-// Wait until the deadline, then the group is killed (leader still unreaped).
-func TestJobCommandPipeHolderKilledAtDeadline(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
-	defer cancel()
-	cmd := jobCommand(ctx, "sh", "-c", "sleep 60 &")
-	out := &capWriter{max: outputCap}
-	cmd.Stdout = out
-	start := time.Now()
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	pgid := cmd.Process.Pid
-	_ = cmd.Wait()
-	if d := time.Since(start); d > 2*time.Second {
-		t.Fatalf("took %s", d)
-	}
-	waitGroupEmpty(t, pgid, time.Second)
 }

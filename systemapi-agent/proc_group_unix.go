@@ -1,4 +1,4 @@
-//go:build linux || darwin || freebsd || netbsd || openbsd || dragonfly
+//go:build linux || darwin
 
 package main
 
@@ -52,6 +52,10 @@ func (c *jobCmd) Start() error {
 	attrs := c.SysProcAttr
 	if attrs == nil {
 		attrs = &syscall.SysProcAttr{}
+	}
+	if attrs.Setsid {
+		// A new session would leave the group this kill path targets.
+		return errors.New("jobCommand: Setsid is not allowed")
 	}
 	attrs.Setpgid = true
 	attrs.Pgid = 0
@@ -150,8 +154,13 @@ func (c *jobCmd) Start() error {
 	return nil
 }
 
-// escalate sends SIGTERM to the group, waits for the leader or the grace,
-// then sends SIGKILL. It runs only while the leader is unreaped.
+// escalate sends SIGTERM to the group, then SIGKILL once the leader has
+// exited and every agent-owned output pipe is closed (no group member is
+// still writing), or when jobKillGrace runs out, whichever is first. The
+// leader exiting alone does not end the grace: a grandchild (dpkg under apt,
+// a shell's trap) may still be cleaning up. It runs only while the leader
+// is unreaped. A grandchild that redirected its output away from the
+// agent's pipes is not waited for once the leader has exited.
 func (g *procGroup) escalate() {
 	if err := groupKill(g.pgid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
 		log.Printf("job process group %d: SIGTERM: %v", g.pgid, err)
@@ -160,6 +169,10 @@ func (g *procGroup) escalate() {
 	defer t.Stop()
 	select {
 	case <-g.exited:
+		select {
+		case <-g.copied:
+		case <-t.C:
+		}
 	case <-t.C:
 	}
 	if err := groupKill(g.pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {

@@ -312,3 +312,20 @@ func TestLegacySysscriptBusyOverConnection(t *testing.T) {
 		t.Fatalf("forged=%v", res)
 	}
 }
+
+func TestSysscriptRequestIDCapped(t *testing.T) {
+	out := newFakeOut()
+	raw, err := json.Marshal(map[string]interface{}{"type": "sysscript", "request_id": strings.Repeat("r", requestIDMaxBytes+1), "script": "print(1)\n"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	processIncomingMessage(out, "host", t.TempDir(), raw)
+	if len(out.jsons) != 1 {
+		t.Fatalf("frames=%v", out.jsons)
+	}
+	m := out.jsons[0]
+	p, _ := m["payload"].(map[string]interface{})
+	if _, echoed := m["request_id"]; echoed || m["type"] != "command_result" || p["error"] != "bad_request" {
+		t.Fatalf("frame=%v", m)
+	}
+}

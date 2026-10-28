@@ -117,7 +117,7 @@ var telemetryClientsOnce sync.Once
 
 func ensureTelemetryClients() {
 	telemetryClientsOnce.Do(func() {
-		dockerClientTelemetry = NewDockerClient()
+		dockerClientTelemetry = NewDockerClient(context.Background())
 		k3sClientTelemetry, _ = NewK3sClient(context.Background()) // nil if no kubeconfig (D-05: non-fatal)
 	})
 }

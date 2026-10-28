@@ -22,6 +22,7 @@ import (
 func newTestDockerClient(handler http.Handler) (*DockerClient, *httptest.Server) {
 	srv := httptest.NewServer(handler)
 	dc := &DockerClient{
+		ctx:     context.Background(),
 		client:  srv.Client(),
 		baseURL: srv.URL,
 	}

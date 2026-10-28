@@ -185,7 +185,7 @@ func NewSysscriptEngine(ctx context.Context, perms *Entitlements) *SysscriptEngi
 	}
 	engine := &SysscriptEngine{ctx: ctx, Entitlements: perms, cm: &ConfigManager{}}
 	if perms.AllowContainers {
-		engine.dockerClient = NewDockerClient()
+		engine.dockerClient = NewDockerClient(ctx)
 	}
 	if perms.AllowK3s {
 		var err error

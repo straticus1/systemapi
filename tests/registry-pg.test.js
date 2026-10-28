@@ -136,9 +136,11 @@ test('channel-policy writes the host policy and its audit row together, or neith
 
 test('channel-policy main() against the database prints the summary and never the credentials', async () => {
   const { main } = require('../scripts/channel-policy');
-  const secret = 'pg-secret-not-real';
+  // With a password in SYSTEMAPI_TEST_DATABASE_URL (npm run test:pg) the real
+  // one is the secret that must not be printed; a trust-auth server takes any.
   const u = new URL(withDatabase(BASE, DB));
-  u.password = secret;
+  if (!u.password) u.password = 'pg-secret-not-real';
+  const secret = decodeURIComponent(u.password);
   const keys = ['ENV_FILE', 'DATABASE_URL', 'DB_PASSWORD'];
   const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
   process.env.ENV_FILE = '/dev/null';

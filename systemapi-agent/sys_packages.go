@@ -22,7 +22,24 @@ import (
 
 // Every verb runs under the script's context (its deadline and cancel), and
 // the package manager's whole process group is stopped when it ends
-// (jobCommand: SIGTERM, a grace, then SIGKILL).
+// (jobCommand: SIGTERM, a grace, then SIGKILL). Scripts run concurrently, so
+// every verb that invokes the package manager holds packageLock: one at a
+// time per agent, as when scripts ran one after another.
+
+// packageLock serializes package manager runs across scripts. It is a
+// channel so waiting for it ends with the script's context.
+var packageLock = make(chan struct{}, 1)
+
+// lockPackages takes packageLock or fails when ctx ends first. The caller
+// must call the returned unlock.
+func lockPackages(ctx context.Context, mgr, what string) (func(), error) {
+	select {
+	case packageLock <- struct{}{}:
+		return func() { <-packageLock }, nil
+	case <-ctx.Done():
+		return nil, packageCtxErr(ctx, mgr, what+" (waiting for another package operation)", false)
+	}
+}
 
 // packageListMax caps inventory rows. A large host carries a few thousand.
 const packageListMax = 20000
@@ -124,6 +141,11 @@ func changePackage(ctx context.Context, verb, name string, allow []string) error
 	if err != nil {
 		return err
 	}
+	unlock, err := lockPackages(ctx, mgr, "package "+verb)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if verb == "remove" {
 		if err := checkRemoveOnly(ctx, mgr, m, name); err != nil {
 			return err
@@ -190,6 +212,11 @@ func queryPackage(ctx context.Context, name string, allow []string) (bool, strin
 	if err != nil {
 		return false, "", err
 	}
+	unlock, err := lockPackages(ctx, mgr, "package query")
+	if err != nil {
+		return false, "", err
+	}
+	defer unlock()
 	out, code, err := runPackageQuery(ctx, argv)
 	if ctx.Err() != nil {
 		return false, "", packageCtxErr(ctx, mgr, "package query", false)
@@ -232,6 +259,11 @@ func listPackages(ctx context.Context, allow []string) ([]pkgEntry, error) {
 	if err != nil {
 		return nil, err
 	}
+	unlock, err := lockPackages(ctx, mgr, "package list")
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	out, code, err := runPackageQuery(ctx, argv)
 	if ctx.Err() != nil {
 		return nil, packageCtxErr(ctx, mgr, "package list", false)

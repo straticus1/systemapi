@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -469,5 +470,64 @@ func TestPackageVerbsUseScriptContext(t *testing.T) {
 	runPackageQuery = func(c context.Context, argv []string) (string, int, error) { return "", -1, c.Err() }
 	if _, _, err := queryPackage(expired, "nginx", []string{"nginx"}); err == nil || !strings.Contains(err.Error(), "timed out (script deadline)") || strings.Contains(err.Error(), "dpkg") {
 		t.Fatalf("query err=%v", err)
+	}
+}
+
+// TestPackageVerbsSerialize: scripts run concurrently, but two package
+// changes never run the package manager at the same time, and a script
+// waiting for the lock gives up at its own deadline.
+func TestPackageVerbsSerialize(t *testing.T) {
+	restorePackageQueryHook(t)
+	lookupPackageManager = func() (string, error) { return "apt-get", nil }
+	var mu sync.Mutex
+	inside, maxInside := 0, 0
+	release := make(chan struct{})
+	entered := make(chan struct{}, 4)
+	runPackageInstall = func(c context.Context, argv []string) error {
+		mu.Lock()
+		inside++
+		if inside > maxInside {
+			maxInside = inside
+		}
+		mu.Unlock()
+		entered <- struct{}{}
+		<-release
+		mu.Lock()
+		inside--
+		mu.Unlock()
+		return nil
+	}
+	if !hostLinux() {
+		if err := changePackage(context.Background(), "install", "nginx", []string{"nginx"}); err == nil || !strings.Contains(err.Error(), "requires linux") {
+			t.Fatalf("non-linux must refuse: %v", err)
+		}
+		return
+	}
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() { errs <- changePackage(context.Background(), "install", "nginx", []string{"nginx"}) }()
+	}
+	<-entered
+	select {
+	case <-entered:
+		t.Fatal("a second package change ran while the first held the manager")
+	case <-time.After(200 * time.Millisecond):
+	}
+	// A third script with a short deadline gives up waiting for the lock.
+	short, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, _, err := queryPackage(short, "nginx", []string{"nginx"}); err == nil || !strings.Contains(err.Error(), "waiting for another package operation") {
+		t.Fatalf("queued query err=%v", err)
+	}
+	release <- struct{}{}
+	<-entered
+	release <- struct{}{}
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if maxInside != 1 {
+		t.Fatalf("max concurrent package runs = %d", maxInside)
 	}
 }

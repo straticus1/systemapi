@@ -202,7 +202,7 @@ func resourcePath(apiVersion, kind, namespace string) (string, error) {
 // ListNodes returns all nodes from the Kubernetes API.
 // On error, returns nil slice and the error.
 func (kc *K3sClient) ListNodes() ([]K8sNode, error) {
-	resp, err := kc.client.Get(kc.serverURL + "/api/v1/nodes")
+	resp, err := kc.send(http.MethodGet, kc.serverURL+"/api/v1/nodes", "", nil)
 	if err != nil {
 		return nil, fmt.Errorf("k3s list nodes: %w", err)
 	}
@@ -238,7 +238,7 @@ func (kc *K3sClient) ListPods(namespace string) ([]K8sPod, error) {
 		path = kc.serverURL + "/api/v1/namespaces/" + namespace + "/pods"
 	}
 
-	resp, err := kc.client.Get(path)
+	resp, err := kc.send(http.MethodGet, path, "", nil)
 	if err != nil {
 		return nil, fmt.Errorf("k3s list pods: %w", err)
 	}
@@ -309,7 +309,7 @@ func (kc *K3sClient) Apply(yamlStr string) error {
 	fullURL := kc.serverURL + path
 
 	// POST to create
-	resp, err := kc.client.Post(fullURL, "application/json", bytes.NewReader(jsonBytes))
+	resp, err := kc.send(http.MethodPost, fullURL, "application/json", bytes.NewReader(jsonBytes))
 	if err != nil {
 		return fmt.Errorf("k3s apply POST: %w", err)
 	}
@@ -338,11 +338,22 @@ func (kc *K3sClient) Apply(yamlStr string) error {
 
 // doPatch sends a strategic-merge-patch request to the given URL.
 func (kc *K3sClient) doPatch(url string, body []byte) (*http.Response, error) {
-	req, err := http.NewRequest(http.MethodPatch, url, bytes.NewReader(body))
+	return kc.send(http.MethodPatch, url, "application/strategic-merge-patch+json", bytes.NewReader(body))
+}
+
+// send makes one request bound to the client's context (the script's
+// deadline and cancel) and to the client's kubeCallTimeout.
+func (kc *K3sClient) send(method, url, contentType string, body io.Reader) (*http.Response, error) {
+	if err := kc.requireClient(); err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(kc.ctx, method, url, body)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/strategic-merge-patch+json")
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
 	return kc.client.Do(req)
 }
 

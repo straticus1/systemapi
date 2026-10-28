@@ -261,6 +261,11 @@ func processIncomingMessage(out ptyOut, hostID, stateDir string, message []byte)
 
 	switch cmd.Type {
 	case "sysscript":
+		if len(cmd.RequestID) > requestIDMaxBytes {
+			log.Printf("sysscript refused: request_id too long")
+			writeCommandResult(out, "", "bad_request", "", false)
+			return
+		}
 		if len(cmd.Script) > scriptMaxBytes {
 			writeCommandResult(out, cmd.RequestID, "script_too_large", "", false)
 			return
@@ -334,6 +339,10 @@ func processIncomingMessage(out ptyOut, hostID, stateDir string, message []byte)
 		handlePTYStop(cmd.SessionID)
 	}
 }
+
+// requestIDMaxBytes caps the request_id echoed back in command_result and
+// alert frames.
+const requestIDMaxBytes = 256
 
 // writeCommandResult sends the legacy command_result frame, its encoded size
 // capped at jobFrameMax (encodeOutputFrame).
