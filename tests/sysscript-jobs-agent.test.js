@@ -10,7 +10,9 @@
 //   SYSTEMAPI_E2E_RUN            label value on every container started here
 //   SYSTEMAPI_E2E_IMAGE          the agent container image
 //   SYSTEMAPI_E2E_PROXY_HOST     where the agent container can reach this host
-// It fails, not skips, without them. Not part of npm test.
+//   SYSTEMAPI_E2E_NETWORK        the docker network the agent container joins
+// It fails, not skips, without them. Not part of npm test. E2E_SLACK
+// (default 1) multiplies every upper timing bound, for slow or loaded hosts.
 //
 // Enrollment follows production: scripts/bootstrap-admin.js mints the key,
 // the agent reads it from a 0600 root file with --api-key-file, --state and
@@ -34,6 +36,10 @@ const DB_URL = process.env.SYSTEMAPI_TEST_DATABASE_URL;
 const RUN = process.env.SYSTEMAPI_E2E_RUN;
 const IMAGE = process.env.SYSTEMAPI_E2E_IMAGE || 'debian:bookworm-slim';
 const PROXY_HOST = process.env.SYSTEMAPI_E2E_PROXY_HOST || '127.0.0.1';
+const NETWORK = process.env.SYSTEMAPI_E2E_NETWORK;
+const SLACK = Number(process.env.E2E_SLACK || 1);
+// An upper timing bound in ms, stretched by E2E_SLACK.
+const within = (ms) => ms * SLACK;
 const TENANT = 'e2e';
 const HOSTNAME = 'e2e-agent';
 const ALLOW_EXEC = { allow_exec: true };
@@ -316,14 +322,15 @@ async function mintKey() {
   });
   assert.equal(res.code, 0, `bootstrap-admin failed: ${res.stderr.trim()}`);
   const printed = JSON.parse(res.stdout.trim().split('\n').pop());
-  assert.match(printed.api_key, /^ak_live_/);
+  // Never echo the key in an assertion message.
+  assert.ok(typeof printed.api_key === 'string' && printed.api_key.startsWith('ak_live_'), 'bootstrap-admin printed no ak_live_ key');
   return printed.api_key;
 }
 
 async function startContainer() {
   const name = `systemapi-e2e-agent-${RUN}`;
   await docker(['run', '-d', '--init', '--name', name, '--label', `systemapi-e2e=${RUN}`,
-    '--add-host', 'host.docker.internal:host-gateway', IMAGE, 'sleep', 'infinity']);
+    '--network', NETWORK, '--add-host', 'host.docker.internal:host-gateway', IMAGE, 'sleep', 'infinity']);
   st.container = name;
   await exec('useradd -m -s /bin/sh ops && mkdir -p /etc/systemapi-agent /var/lib/systemapi-agent');
   await exec('umask 077 && cat > /etc/systemapi-agent/api-key', { input: `${st.apiKey}\n` });
@@ -385,6 +392,8 @@ test.before(async () => {
   assert.ok(AGENT_BIN, 'SYSTEMAPI_AGENT_BIN is required (run npm run test:agent)');
   assert.ok(DB_URL, 'SYSTEMAPI_TEST_DATABASE_URL is required (run npm run test:agent)');
   assert.ok(RUN && /^[a-f0-9]{6,32}$/.test(RUN), 'SYSTEMAPI_E2E_RUN is required (run npm run test:agent)');
+  assert.ok(NETWORK, 'SYSTEMAPI_E2E_NETWORK is required (run npm run test:agent)');
+  assert.ok(Number.isFinite(SLACK) && SLACK >= 1, 'E2E_SLACK must be a number >= 1');
   st.pool = new Pool({ connectionString: DB_URL });
   await startServer();
   st.apiKey = await mintKey();
@@ -424,6 +433,7 @@ test('the agent enrolls with the bootstrap key and advertises sysscript_jobs', a
   const { rows } = await st.pool.query('SELECT agent_caps FROM cp_hosts WHERE host_id = $1', [st.hostId]);
   assert.ok(rows[0].agent_caps.includes('sysscript_jobs'), JSON.stringify(rows[0]));
   const sync = st.proxy.find((e) => e.type === 'sysscript_job_sync');
+  assert.ok(sync, 'the agent sent a sysscript_job_sync');
   assert.deepEqual(sync.sync, { active: [], unacked: [] });
 });
 
@@ -435,13 +445,15 @@ test('a long job returns its id at once and the agent stays live while it runs',
   const long = await submit('r = sys.exec.run("sleep", "40")\nprint("long done", r["error"])');
   assert.equal(long.status, 202, long.text);
   assert.match(long.body.job_id, /^sjb_[A-Za-z0-9_-]{22}$/);
-  assert.ok(long.ms < 1000, `202 took ${long.ms} ms`);
+  assert.ok(long.ms < within(1000), `202 took ${long.ms} ms`);
   st.pending.long = { id: long.body.job_id, at: Date.now() };
 
   // Legacy /execute on a capable agent: 40 s gives 504 + job_id at ~28 s,
   // 5 s gives today's 200 shape.
+  // These settle later; a rejection becomes {error} so it is never unhandled
+  // when an earlier assertion fails.
   const execute = (script) => api('POST', `/api/v1/fleet/${encodeURIComponent(st.hostId)}/execute`,
-    { script, entitlements: ALLOW_EXEC });
+    { script, entitlements: ALLOW_EXEC }).catch((error) => ({ error }));
   st.pending.legacy40 = execute('sys.exec.run("sleep", "40")\nprint("legacy forty")');
   const legacy5 = execute('sys.exec.run("sleep", "5")\nprint("legacy five")');
 
@@ -473,12 +485,13 @@ test('a long job returns its id at once and the agent stays live while it runs',
   });
   const newcomerMs = Date.now() - newcomerStarted;
   assert.deepEqual(refused, { type: 'enroll_error', error: 'host_connected' });
-  assert.ok(newcomerMs < 5000, `displacement probe took ${newcomerMs} ms`);
+  assert.ok(newcomerMs < within(5000), `displacement probe took ${newcomerMs} ms`);
   assert.equal(st.proxy.live().length, 1, 'the real agent kept its one socket');
   console.log(`pty round trip idle=${idle} ms, during job=${busy.join(',')} ms; newcomer refused in ${newcomerMs} ms`);
-  for (const ms of busy) assert.ok(ms < 1000, `pty round trip ${ms} ms while a job runs`);
+  for (const ms of busy) assert.ok(ms < within(1000), `pty round trip ${ms} ms while a job runs`);
 
   const five = await legacy5;
+  assert.ifError(five.error);
   assert.equal(five.status, 200, five.text);
   assert.equal(five.body.success, true);
   assert.equal(five.body.request_id, five.body.job_id);
@@ -505,7 +518,9 @@ test('cancel ends the job and kills its process group', async () => {
   const pgid = procs.mine[0].pgid;
   assert.equal(procs.mine[1].pgid, pgid, 'both children share the job group');
   const agentPid = Number((await exec('cat /run/systemapi-agent.pid')).trim());
-  assert.notEqual(pgid, procs.list.find((p) => p.pid === agentPid).pgid, 'the job has its own group');
+  const agent = procs.list.find((p) => p.pid === agentPid);
+  assert.ok(agent, `agent pid ${agentPid} not found`);
+  assert.notEqual(pgid, agent.pgid, 'the job has its own group');
   const leader = procs.list.find((p) => p.pid === pgid);
   assert.ok(leader && leader.cmd.startsWith('sh -c'), `group leader ${JSON.stringify(leader)}`);
 
@@ -515,7 +530,7 @@ test('cancel ends the job and kills its process group', async () => {
   const done = await waitStatus(id, ['cancelled', 'failed', 'succeeded', 'timed_out'], 15000);
   const tookMs = Date.now() - started;
   assert.equal(done.status, 'cancelled', JSON.stringify(done));
-  assert.ok(tookMs < 12000, `cancelled after ${tookMs} ms`);
+  assert.ok(tookMs < within(12000), `cancelled after ${tookMs} ms`);
   const left = (await processes()).filter((p) => p.pgid === pgid || /^sleep 61[78]$/.test(p.cmd));
   assert.deepEqual(left, [], 'no process of the job group remains');
   console.log(`cancel: group ${pgid} gone, job cancelled after ${tookMs} ms`);
@@ -529,21 +544,23 @@ test('timeout_s=2 ends a busy loop as timed_out', async () => {
   const res = await submit(spin, { timeout_s: 2, wait_s: 10 });
   assert.equal(res.status, 200, res.text);
   assert.equal(res.body.job.status, 'timed_out');
-  assert.ok(res.ms < 3500, `timed_out after ${res.ms} ms`);
+  assert.ok(res.ms < within(3500), `timed_out after ${res.ms} ms`);
   console.log(`timeout_s=2 busy loop: timed_out in ${res.ms} ms`);
 });
 
 // AC 1, 3, 11 (the ends of the jobs started above).
 test('the long job and the legacy 40 s script both end succeeded', async () => {
+  assert.ok(st.pending.long && st.pending.legacy40, 'the jobs from the long-job test were started');
   const legacy = await st.pending.legacy40;
+  assert.ifError(legacy.error);
   assert.equal(legacy.status, 504, legacy.text);
   assert.equal(legacy.body.error, 'agent_timeout');
   assert.match(legacy.body.job_id, /^sjb_/);
-  assert.ok(legacy.ms >= 27000 && legacy.ms < 31000, `504 after ${legacy.ms} ms`);
+  assert.ok(legacy.ms >= 27000 && legacy.ms < within(31000), `504 after ${legacy.ms} ms`);
 
   const long = await waitStatus(st.pending.long.id, ['succeeded', 'failed', 'cancelled', 'timed_out'], 30000);
   assert.equal(long.status, 'succeeded', JSON.stringify(long));
-  assert.ok(long.duration_ms >= 39000 && long.duration_ms < 45000, `duration_ms ${long.duration_ms}`);
+  assert.ok(long.duration_ms >= 39000 && long.duration_ms < within(45000), `duration_ms ${long.duration_ms}`);
   assert.equal(long.output_visible, true);
   assert.match(long.output, /long done None/);
   console.log(`legacy /execute 40 s script: 504 agent_timeout in ${legacy.ms} ms; long job succeeded, duration_ms=${long.duration_ms}`);
@@ -575,6 +592,7 @@ test('NUL bytes and 1 MiB of escaping output keep the socket up', async () => {
   assert.equal(nul.body.job.status, 'succeeded');
   // The agent sends the NUL; the server stores U+FFFD (PostgreSQL TEXT).
   const nulFrame = st.proxy.find((e) => e.dir === 'up' && e.type === 'sysscript_job_result' && e.job_id === nul.body.job.job_id);
+  assert.ok(nulFrame, 'NUL result frame seen on the wire');
   assert.equal(nulFrame.nul, true);
   assert.equal(nul.body.job.output, 'a�b\n');
 
@@ -586,15 +604,17 @@ test('NUL bytes and 1 MiB of escaping output keep the socket up', async () => {
     assert.equal(job.output_truncated, true, label);
     assert.ok(job.output.length > 0, label);
     const frame = st.proxy.find((e) => e.dir === 'up' && e.type === 'sysscript_job_result' && e.job_id === job.job_id);
+    assert.ok(frame, `${label}: result frame seen on the wire`);
     assert.ok(frame.size <= 1 << 20, `${label}: result frame ${frame.size} bytes`);
     console.log(`${label} x 1 MiB: frame ${frame.size} bytes, stored ${job.output.length} chars, truncated`);
   }
   assert.equal(st.proxy.conns.length, connsBefore, 'no reconnect');
   assert.equal(st.proxy.live().length, 1);
   assert.equal(st.proxy.find((e) => e.op === 8), undefined, 'no close frame either way');
+  assert.ok(st.pty, 'the PTY session from the long-job test exists');
   assert.equal(st.pty.closed, false, 'the PTY session is still open');
   const ms = await ptyRoundTrip(st.pty);
-  assert.ok(ms < 1000, `pty round trip ${ms} ms after the big frames`);
+  assert.ok(ms < within(1000), `pty round trip ${ms} ms after the big frames`);
   st.pty.ws.close();
   st.pty = null;
 });
@@ -607,6 +627,7 @@ test('a dropped socket hides a result; the agent re-sends it after sync and it i
   const id = res.body.job_id;
   await waitStatus(id, ['running'], 10000);
   const [conn] = st.proxy.live();
+  assert.ok(conn, 'the agent is connected');
   conn.held = true;
   const swallowed = await waitUntil('swallowed result', () => st.proxy.find((e) => e.held && e.type === 'sysscript_job_result' && e.job_id === id), 15000);
   assert.equal(swallowed.status, 'succeeded');
@@ -628,6 +649,7 @@ test('a dropped socket hides a result; the agent re-sends it after sync and it i
 
   // Drop again: the acked result is gone from the next sync.
   const [again] = st.proxy.live();
+  assert.ok(again, 'the agent reconnected');
   again.client.destroy();
   again.upstream.destroy();
   const next = await waitSynced(again.id);
@@ -652,8 +674,13 @@ test('killing the agent mid-job ends the job agent_lost_job after the restart', 
   const job = await waitStatus(id, ['failed', 'succeeded', 'cancelled', 'timed_out'], 10000);
   assert.equal(job.status, 'failed');
   assert.equal(job.error, 'agent_lost_job');
-  const orphan = (await processes()).filter((p) => p.cmd === 'sleep 619');
-  console.log(`after SIGKILL of the agent: ${orphan.length} orphaned child(ren) of the lost job (Pdeathsig)`);
+  // The job's child got Pdeathsig when the agent died: none is left over.
+  let orphans = [];
+  await waitUntil('lost job children gone', async () => {
+    orphans = (await processes()).filter((p) => p.cmd === 'sleep 619');
+    return orphans.length === 0;
+  }, within(2000), 100).catch(() => {}); // a timeout fails the assertion below, which lists them
+  assert.deepEqual(orphans, [], 'orphaned children of the lost job');
 
   // The restarted agent runs jobs again.
   const after = await submit('print("back")', { wait_s: 20 });

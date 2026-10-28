@@ -6,37 +6,63 @@
 # tests/sysscript-jobs-agent.test.js. That test starts server.js against the
 # database, mints the agent key with scripts/bootstrap-admin.js, runs the
 # agent in a Linux container (--init) and drives it through the public HTTP
-# API. Every container carries this run's label and is removed whatever the
-# outcome, as is the work directory holding the binary.
+# API. Every container and network carries this run's label and is removed
+# whatever the outcome, as is the work directory holding the binary and the
+# password file. E2E_SLACK (default 1) stretches the test's timing bounds.
+#
+# Networks: Postgres and the agent each get their own labelled bridge
+# network, so neither shares the default bridge with unrelated containers
+# and the agent cannot reach Postgres. They are not --internal: an internal
+# network drops the published Postgres port and the agent's route to the
+# test's proxy on the host (host.docker.internal), which this test needs.
 set -eu
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-PG_IMAGE=${PG_TEST_IMAGE:-postgres:16}
-AGENT_IMAGE=${AGENT_TEST_IMAGE:-debian:bookworm-slim}
-GO_IMAGE=${GO_TEST_IMAGE:-golang:1.25}
+# Pinned by digest; the tag is what the digest was resolved from.
+PG_IMAGE=${PG_TEST_IMAGE:-postgres:16@sha256:1a6ab3f5345eb6dbe04a1349529caabdb0ab09293a09590fad07b2246bfa4b54}
+AGENT_IMAGE=${AGENT_TEST_IMAGE:-debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251}
+GO_IMAGE=${GO_TEST_IMAGE:-golang:1.25@sha256:699337d620559a59b4a2bb298ad59611e535d2ee755a34cf2d2a98f37578dc80}
 RUN=$(node -e 'process.stdout.write(require("crypto").randomBytes(6).toString("hex"))')
+LABEL="systemapi-e2e=$RUN"
 WORK=
 cleanup() {
-  ids=$(docker ps -aq --filter "label=systemapi-e2e=$RUN" 2>/dev/null || true)
+  ids=$(docker ps -aq --filter "label=$LABEL" 2>/dev/null || true)
   if [ -n "$ids" ]; then docker rm -f $ids >/dev/null 2>&1 || true; fi
+  nets=$(docker network ls -q --filter "label=$LABEL" 2>/dev/null || true)
+  if [ -n "$nets" ]; then docker network rm $nets >/dev/null 2>&1 || true; fi
   if [ -n "$WORK" ]; then rm -rf "$WORK"; fi
 }
 trap cleanup EXIT
-trap 'cleanup; exit 130' INT TERM
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 WORK=$(mktemp -d)
 
+# Only systemapi-agent/ is mounted, read-only; the binary goes to /out.
 ARCH=$(docker version -f '{{.Server.Arch}}')
 if command -v go >/dev/null 2>&1; then
   (cd "$REPO/systemapi-agent" && CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -o "$WORK/systemapi-agent" .)
 else
-  docker run --rm --label "systemapi-e2e=$RUN" \
-    -v "$REPO":/src -v "$WORK":/out \
+  docker run --rm --label "$LABEL" \
+    -v "$REPO/systemapi-agent":/src:ro -v "$WORK":/out \
     -v systemapi-gomod:/go/pkg/mod -v systemapi-gobuild:/root/.cache/go-build \
-    -e CGO_ENABLED=0 -w /src/systemapi-agent \
+    -e CGO_ENABLED=0 -w /src \
     "$GO_IMAGE" go build -o /out/systemapi-agent .
 fi
 
+DB_NET="systemapi-e2e-db-$RUN"
+AGENT_NET="systemapi-e2e-agent-$RUN"
+docker network create --label "$LABEL" "$DB_NET" >/dev/null
+docker network create --label "$LABEL" "$AGENT_NET" >/dev/null
+
+# The password reaches Postgres as a 0600 file mounted read-only, never on
+# the docker command line or in the container's environment. Postgres runs
+# as this user so it can read that file, with its data directory under /tmp
+# (the image's PGDATA belongs to its own postgres user).
 PASS=$(node -e 'process.stdout.write(require("crypto").randomBytes(18).toString("hex"))')
-CID=$(docker run -d --rm --label "systemapi-e2e=$RUN" -e POSTGRES_PASSWORD="$PASS" -p 127.0.0.1::5432 "$PG_IMAGE")
+(umask 077 && printf '%s' "$PASS" > "$WORK/pgpass")
+CID=$(docker run -d --rm --label "$LABEL" --network "$DB_NET" --user "$(id -u):$(id -g)" \
+  -e PGDATA=/tmp/pgdata \
+  -v "$WORK/pgpass":/run/secrets/pgpass:ro -e POSTGRES_PASSWORD_FILE=/run/secrets/pgpass \
+  -p 127.0.0.1::5432 "$PG_IMAGE")
 PORT=$(docker port "$CID" 5432/tcp | head -n 1 | sed 's/.*://')
 i=0
 until docker exec "$CID" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; do
@@ -58,5 +84,6 @@ SYSTEMAPI_AGENT_BIN="$WORK/systemapi-agent" \
 SYSTEMAPI_TEST_DATABASE_URL="postgres://postgres:$PASS@127.0.0.1:$PORT/postgres" \
 SYSTEMAPI_E2E_RUN="$RUN" \
 SYSTEMAPI_E2E_IMAGE="$AGENT_IMAGE" \
+SYSTEMAPI_E2E_NETWORK="$AGENT_NET" \
 SYSTEMAPI_E2E_PROXY_HOST="$PROXY_HOST" \
   node --test tests/sysscript-jobs-agent.test.js

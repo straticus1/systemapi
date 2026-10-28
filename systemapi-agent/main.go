@@ -81,8 +81,10 @@ func main() {
 	ptyRecordMinFreeFlag := flag.Uint64("pty-record-min-free", recordMinFreeDefault, "refuse a terminal session when the recording filesystem has less free space (bytes)")
 	sysscriptWorkersFlag := flag.Int("sysscript-workers", jobWorkersDefault, fmt.Sprintf("sysscripts run at once (1..%d); %d more may wait, then agent_busy", jobWorkersMax, jobPendingMax))
 	sysscriptLegacyFlag := flag.Int("sysscript-legacy-seconds", jobLegacyDefaultSec, fmt.Sprintf("whole-script deadline of a legacy sysscript frame (1..%d, at most --sysscript-max-seconds)", jobMaxSecondsMax))
+	sysscriptJobsFlag := flag.Bool("sysscript-jobs", true, "advertise async sysscript jobs (sysscript_jobs, Linux and macOS only); =false makes the server send this host's scripts the legacy way")
 	sysscriptMaxFlag := flag.Int("sysscript-max-seconds", jobMaxSecondsMax, fmt.Sprintf("ceiling for any sysscript deadline (1..%d)", jobMaxSecondsMax))
 	flag.Parse()
+	sysscriptJobsOn = *sysscriptJobsFlag
 	jc, err := parseJobFlags(*sysscriptWorkersFlag, *sysscriptLegacyFlag, *sysscriptMaxFlag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)

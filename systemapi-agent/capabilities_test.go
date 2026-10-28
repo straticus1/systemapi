@@ -8,17 +8,20 @@ import (
 )
 
 // expectedCaps builds the capability set this host should advertise from the
-// same probes the implementation uses: tcp, config and sysscript_jobs are
-// always on, pty off only on windows, file only on Linux with openat2, and
+// same probes the implementation uses: tcp and config are always on, pty off
+// only on windows, sysscript_jobs only on Linux and macOS (unless
+// --sysscript-jobs=false), file only on Linux with openat2, and
 // service/package/tweak follow their platform probes.
 func expectedCaps() string {
 	present := map[string]bool{
-		"tcp":            true, // tcp.go
-		"config":         true, // config store is a filesystem op, available everywhere
-		"sysscript_jobs": true, // sysscript_jobs.go, every platform
+		"tcp":    true, // tcp.go
+		"config": true, // config store is a filesystem op, available everywhere
 	}
 	if runtime.GOOS != "windows" {
 		present["pty"] = true
+	}
+	if runtime.GOOS == "linux" || runtime.GOOS == "darwin" {
+		present["sysscript_jobs"] = true // the process-group kill exists here
 	}
 	if runtime.GOOS == "linux" && openat2Available() {
 		present["file"] = true
@@ -46,9 +49,8 @@ func TestCapabilitiesAdvertiseOnlyWhatIsReal(t *testing.T) {
 	if got != want {
 		t.Fatalf("capabilities %q, want %q", got, want)
 	}
-	// config, sysscript_jobs and tcp are always advertised; a host that drops
-	// them is a bug (the server would send its scripts the legacy way).
-	for _, must := range []string{"config", "sysscript_jobs", "tcp"} {
+	// config and tcp are always advertised; a host that drops them is a bug.
+	for _, must := range []string{"config", "tcp"} {
 		if !strings.Contains(","+got+",", ","+must+",") {
 			t.Fatalf("capability %q must always be advertised, got %q", must, got)
 		}
@@ -69,5 +71,28 @@ func TestCapabilitiesAdvertiseOnlyWhatIsReal(t *testing.T) {
 		if c == "zz_test_off" {
 			t.Fatal("a capability whose probe fails was advertised")
 		}
+	}
+}
+
+func hasCap(name string) bool {
+	return strings.Contains(","+capabilitiesHeaderValue()+",", ","+name+",")
+}
+
+// sysscript_jobs: on by default on Linux and macOS only, and
+// --sysscript-jobs=false (sysscriptJobsOn) turns it off on any OS, so the
+// server sends that host's scripts the legacy way.
+func TestSysscriptJobsCapabilitySwitch(t *testing.T) {
+	defer func(prev bool) { sysscriptJobsOn = prev }(sysscriptJobsOn)
+	sysscriptJobsOn = true
+	groupKill := runtime.GOOS == "linux" || runtime.GOOS == "darwin"
+	if got := hasCap("sysscript_jobs"); got != groupKill {
+		t.Fatalf("GOOS=%s: sysscript_jobs advertised=%v, want %v", runtime.GOOS, got, groupKill)
+	}
+	sysscriptJobsOn = false
+	if hasCap("sysscript_jobs") {
+		t.Fatal("--sysscript-jobs=false still advertises sysscript_jobs")
+	}
+	if !hasCap("tcp") || !hasCap("config") {
+		t.Fatal("--sysscript-jobs=false must not touch other capabilities")
 	}
 }
