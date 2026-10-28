@@ -62,6 +62,7 @@ func TestJobPoolBusyAndStop(t *testing.T) {
 	m.submitLegacy(out, "r2", busyLoop, ents, time.Minute)
 	start := time.Now()
 	m.submitLegacy(out, "r3", busyLoop, ents, time.Minute)
+	m.flush(time.Second)
 	p := commandResult(out, "r3")
 	if p == nil || p["error"] != "agent_busy" || time.Since(start) > 100*time.Millisecond {
 		t.Fatalf("r3=%v after %s", p, time.Since(start))
@@ -75,6 +76,7 @@ func TestJobPoolBusyAndStop(t *testing.T) {
 		}
 	}
 	m.submitLegacy(out, "r4", "print(1)\n", ents, time.Minute)
+	m.flush(time.Second)
 	if p := commandResult(out, "r4"); p == nil || p["error"] != "agent_stopped" {
 		t.Fatalf("after stop r4=%v", p)
 	}

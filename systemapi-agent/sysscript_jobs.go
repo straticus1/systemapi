@@ -30,6 +30,19 @@ package main
 // the manager emits goes through one ordered queue and one writer
 // goroutine, so the read loop never writes, a job's frames are never
 // reordered, and the sync of a new connection precedes every later frame.
+// Two lanes share that queue: control frames (sync, accepted, running,
+// rejections) are written before bulk frames (results, alerts, legacy
+// frames), so a large backlog of results cannot delay a new job's
+// accepted. The queue is capped at jobQueueMax frames and jobQueueMaxBytes;
+// a frame for the current connection over the cap closes that connection
+// (the next connection's sync restores the state), and a legacy frame over
+// the cap is dropped; both are logged and counted. A status or rejection
+// emitted while the agent is not connected, or still queued when the
+// connection drops, is dropped: the server learns of an accepted or running
+// job from the next sync and of a refusal only by its own ack timeout. A
+// start frame repeated for a job the agent still holds (duplicate id or a
+// replayed lease) is answered with that job's current status or kept
+// result, not a rejection.
 // Cancel and ack are unsigned: cancel can only shorten work and ack only
 // frees memory; ids the agent does not hold are ignored.
 
@@ -58,6 +71,10 @@ const (
 	jobDoneBytesMax = 16 << 20
 	// jobRecentTTL is how long a job id stays a duplicate.
 	jobRecentTTL = 10 * time.Minute
+	// jobQueueMax and jobQueueMaxBytes cap the frames waiting for the
+	// writer: room for every kept result plus margin.
+	jobQueueMax      = 512
+	jobQueueMaxBytes = jobDoneBytesMax + 8<<20
 )
 
 var (
@@ -121,6 +138,10 @@ type sysscriptJob struct {
 	cancel  context.CancelCauseFunc
 	alerts  func(v interface{}) error
 	started time.Time
+	// deadline is an async job's effective deadline; runAt is when a worker
+	// picked it up (zero while queued). Both are read under jobManager.mu.
+	deadline time.Time
+	runAt    time.Time
 	// running, when set, is called as a worker picks the job up.
 	running func()
 	// finish reports the outcome. It is called exactly once, from a worker.
@@ -143,19 +164,24 @@ type jobDone struct {
 }
 
 type jobManager struct {
-	mu      sync.Mutex
-	cond    *sync.Cond // signals queue and writing changes
-	live    map[*sysscriptJob]struct{}
-	jobs    map[string]*sysscriptJob // async jobs queued or running
-	done    []jobDone                // finished async results, finish order
-	doneB   int
-	recent  map[string]time.Time // async job ids accepted, for duplicate_job
-	out     ptyOut               // the enrolled connection; nil while down
-	queue   []jobFrame
-	writing bool
-	stopped bool
-	pending chan *sysscriptJob
-	workers sync.WaitGroup
+	mu     sync.Mutex
+	cond   *sync.Cond // signals queue and writing changes
+	live   map[*sysscriptJob]struct{}
+	jobs   map[string]*sysscriptJob // async jobs queued or running
+	done   []jobDone                // finished async results, finish order
+	doneB  int
+	recent map[string]time.Time // async job ids accepted, for duplicate_job
+	out    ptyOut               // the enrolled connection; nil while down
+	// closeOut closes out; it is called once when out's frames overflow.
+	closeOut func()
+	ctl      []jobFrame // control lane, written first
+	bulk     []jobFrame // bulk lane
+	queueB   int        // bytes in both lanes
+	overflow int        // frames dropped over the queue cap
+	writing  bool
+	stopped  bool
+	pending  chan *sysscriptJob
+	workers  sync.WaitGroup
 }
 
 var (
@@ -202,12 +228,17 @@ func (m *jobManager) worker() {
 func (m *jobManager) writer() {
 	m.mu.Lock()
 	for {
-		for len(m.queue) == 0 {
+		for len(m.ctl) == 0 && len(m.bulk) == 0 {
 			m.cond.Wait()
 		}
-		f := m.queue[0]
-		m.queue[0] = jobFrame{}
-		m.queue = m.queue[1:]
+		lane := &m.ctl
+		if len(m.ctl) == 0 {
+			lane = &m.bulk
+		}
+		f := (*lane)[0]
+		(*lane)[0] = jobFrame{}
+		*lane = (*lane)[1:]
+		m.queueB -= len(f.b)
 		target := f.pin
 		if target == nil {
 			target = m.out
@@ -225,14 +256,54 @@ func (m *jobManager) writer() {
 	}
 }
 
-// enqueueLocked queues a frame for the writer. m.mu is held.
-func (m *jobManager) enqueueLocked(f jobFrame) {
-	m.queue = append(m.queue, f)
+// enqueueLocked queues a frame for the writer on the control or bulk lane.
+// Over the queue cap the frame is dropped; a frame for the current
+// connection also closes it, so detach clears the queue and the next sync
+// restores the state. m.mu is held.
+func (m *jobManager) enqueueLocked(f jobFrame, ctl bool) {
+	if len(m.ctl)+len(m.bulk) >= jobQueueMax || m.queueB+len(f.b) > jobQueueMaxBytes {
+		m.overflow++
+		if f.pin != nil {
+			log.Printf("sysscript frame dropped: writer queue full (%d dropped)", m.overflow)
+			return
+		}
+		log.Printf("sysscript frame dropped: writer queue full (%d dropped); closing the connection", m.overflow)
+		if m.closeOut != nil {
+			go m.closeOut()
+			m.closeOut = nil
+		}
+		return
+	}
+	if ctl {
+		m.ctl = append(m.ctl, f)
+	} else {
+		m.bulk = append(m.bulk, f)
+	}
+	m.queueB += len(f.b)
 	m.cond.Broadcast()
 }
 
-// sendFrame queues v for the current connection. With no connection the
-// frame is dropped and errNoConnection is returned.
+// dropUnpinnedLocked drops the queued frames meant for the current
+// connection. m.mu is held.
+func (m *jobManager) dropUnpinnedLocked() {
+	for _, lane := range []*[]jobFrame{&m.ctl, &m.bulk} {
+		keep := (*lane)[:0]
+		for _, f := range *lane {
+			if f.pin != nil {
+				keep = append(keep, f)
+			} else {
+				m.queueB -= len(f.b)
+			}
+		}
+		for i := len(keep); i < len(*lane); i++ {
+			(*lane)[i] = jobFrame{}
+		}
+		*lane = keep
+	}
+}
+
+// sendFrame queues v on the bulk lane for the current connection. With no
+// connection the frame is dropped and errNoConnection is returned.
 func (m *jobManager) sendFrame(v interface{}) error {
 	b, err := encodeFrame(v)
 	if err != nil {
@@ -243,34 +314,33 @@ func (m *jobManager) sendFrame(v interface{}) error {
 	if m.out == nil {
 		return errNoConnection
 	}
-	m.enqueueLocked(jobFrame{b: b})
+	m.enqueueLocked(jobFrame{b: b}, false)
 	return nil
 }
 
-// sendFrameTo queues an encoded frame for out only.
+// sendFrameTo queues an encoded frame on the bulk lane for out only.
 func (m *jobManager) sendFrameTo(out ptyOut, b []byte) {
 	m.mu.Lock()
-	m.enqueueLocked(jobFrame{b: b, pin: out})
+	m.enqueueLocked(jobFrame{b: b, pin: out}, false)
 	m.mu.Unlock()
 }
 
 // flush waits up to wait for the queue to drain. It reports whether it did.
 func (m *jobManager) flush(wait time.Duration) bool {
-	drained := make(chan struct{})
-	go func() {
+	timedOut := false
+	timer := time.AfterFunc(wait, func() {
 		m.mu.Lock()
-		for len(m.queue) > 0 || m.writing {
-			m.cond.Wait()
-		}
+		timedOut = true
+		m.cond.Broadcast()
 		m.mu.Unlock()
-		close(drained)
-	}()
-	select {
-	case <-drained:
-		return true
-	case <-time.After(wait):
-		return false
+	})
+	defer timer.Stop()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for (len(m.ctl) > 0 || len(m.bulk) > 0 || m.writing) && !timedOut {
+		m.cond.Wait()
 	}
+	return len(m.ctl) == 0 && len(m.bulk) == 0 && !m.writing
 }
 
 type jobSyncEntry struct {
@@ -287,21 +357,16 @@ type jobSyncPayload struct {
 // frames queued for the previous connection (kept results are in done),
 // then queues sysscript_job_sync and every unacked result in finish order.
 // A frame emitted afterwards queues behind them, so nothing overtakes the
-// sync. The agent calls it once a connection has enrolled.
-func (m *jobManager) attach(out ptyOut) {
+// sync. The sync is on the control lane and the results on the bulk lane,
+// so the sync is written first. closeOut closes out; it is used if out's
+// frames overflow the queue. The agent calls attach once a connection has
+// enrolled.
+func (m *jobManager) attach(out ptyOut, closeOut func()) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.out = out
-	keep := m.queue[:0]
-	for _, f := range m.queue {
-		if f.pin != nil {
-			keep = append(keep, f)
-		}
-	}
-	for i := len(keep); i < len(m.queue); i++ {
-		m.queue[i] = jobFrame{}
-	}
-	m.queue = keep
+	m.closeOut = closeOut
+	m.dropUnpinnedLocked()
 	sync := jobSyncPayload{Active: make([]string, 0, len(m.jobs)), Unacked: make([]jobSyncEntry, 0, len(m.done))}
 	for id := range m.jobs {
 		sync.Active = append(sync.Active, id)
@@ -315,9 +380,9 @@ func (m *jobManager) attach(out ptyOut) {
 		log.Printf("sysscript_job_sync not encoded: %v", err)
 		return
 	}
-	m.enqueueLocked(jobFrame{b: b})
+	m.enqueueLocked(jobFrame{b: b}, true)
 	for _, d := range m.done {
-		m.enqueueLocked(jobFrame{b: d.frame})
+		m.enqueueLocked(jobFrame{b: d.frame}, false)
 	}
 }
 
@@ -330,16 +395,8 @@ func (m *jobManager) detach(out ptyOut) {
 		return
 	}
 	m.out = nil
-	keep := m.queue[:0]
-	for _, f := range m.queue {
-		if f.pin != nil {
-			keep = append(keep, f)
-		}
-	}
-	for i := len(keep); i < len(m.queue); i++ {
-		m.queue[i] = jobFrame{}
-	}
-	m.queue = keep
+	m.closeOut = nil
+	m.dropUnpinnedLocked()
 }
 
 // submit queues j or refuses it at once: errAgentBusy when the pool and the
@@ -381,6 +438,11 @@ func (m *jobManager) run(j *sysscriptJob) {
 	}()
 	if errors.Is(context.Cause(j.ctx), errAgentStopped) {
 		err = errAgentStopped
+		return
+	}
+	if j.ctx.Err() != nil {
+		// Cancelled or timed out while queued: no running, no engine.
+		err = scriptCtxErr(j.ctx)
 		return
 	}
 	if j.running != nil {
@@ -470,7 +532,7 @@ func (m *jobManager) submitLegacy(out ptyOut, requestID, script string, ents *En
 	if err := m.submit(j); err != nil {
 		j.cancel(err)
 		log.Printf("sysscript %s refused: %s", requestID, err.Error())
-		writeCommandResult(out, requestID, err.Error(), "", false)
+		j.finish("", false, err)
 	}
 }
 
@@ -539,7 +601,7 @@ func (m *jobManager) rejectJob(id, code string) {
 	if m.out == nil {
 		return
 	}
-	m.enqueueLocked(jobFrame{b: b})
+	m.enqueueLocked(jobFrame{b: b}, true)
 }
 
 // startJob checks a sysscript_job frame on the read loop and queues it:
@@ -569,6 +631,9 @@ func (m *jobManager) startJob(hostID string, cmd *CommandMessage, now time.Time)
 		return
 	}
 	if err := authorizeCommand(hostID, "sysscript_job", payload, cmd.Lease, now); err != nil {
+		if err.Error() == "replay" && m.answerHeld(id) {
+			return
+		}
 		m.rejectJob(id, err.Error())
 		return
 	}
@@ -589,15 +654,17 @@ func (m *jobManager) startJob(hostID string, cmd *CommandMessage, now time.Time)
 	deadline := now.Add(limit)
 	base, cancel := context.WithCancelCause(context.Background())
 	ctx, stopTimer := context.WithDeadline(base, deadline)
-	j := &sysscriptJob{id: id, job: true, script: cmd.Script, ents: cmd.Entitlements, ctx: ctx, started: now}
+	j := &sysscriptJob{id: id, job: true, script: cmd.Script, ents: cmd.Entitlements, ctx: ctx, started: now, deadline: deadline}
 	j.cancel = func(cause error) {
 		cancel(cause)
 		stopTimer()
 	}
 	j.alerts = m.sendFrame
 	j.running = func() {
-		_ = m.sendFrame(ResponseMessage{Type: "sysscript_job_status", JobID: id,
-			Payload: jobStatusPayload{Status: "running", StartedUnix: time.Now().Unix()}})
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		j.runAt = time.Now()
+		m.statusLocked(j)
 	}
 	j.finish = func(output string, truncated bool, err error) {
 		status, errText := jobOutcome(err)
@@ -609,29 +676,71 @@ func (m *jobManager) startJob(hostID string, cmd *CommandMessage, now time.Time)
 		}
 		m.finishJob(id, status, b)
 	}
-	accepted, err := encodeFrame(ResponseMessage{Type: "sysscript_job_status", JobID: id,
-		Payload: jobStatusPayload{Status: "accepted", DeadlineUnix: deadline.Unix(), Queued: true}})
-	if err != nil {
-		j.cancel(err)
-		m.rejectJob(id, "internal")
-		return
-	}
 	m.mu.Lock()
 	code := m.admitLocked(j, now)
-	if code == "" {
+	switch code {
+	case "":
 		// Queued under the same lock as the hand-off to the pool, so
 		// "accepted" precedes the worker's "running".
-		if m.out != nil {
-			m.enqueueLocked(jobFrame{b: accepted})
+		m.statusLocked(j)
+	case "duplicate_job":
+		if m.answerHeldLocked(id) {
+			code = "held"
 		}
 	}
 	m.mu.Unlock()
+	if code == "held" {
+		j.cancel(errors.New("duplicate_job"))
+		return
+	}
 	if code != "" {
 		j.cancel(errors.New(code))
 		m.rejectJob(id, code)
 		return
 	}
 	log.Printf("sysscript job %s accepted deadline=%s", id, limit.Round(time.Second))
+}
+
+// statusLocked queues j's current status (accepted while queued, running
+// once picked up) on the control lane. m.mu is held.
+func (m *jobManager) statusLocked(j *sysscriptJob) {
+	if m.out == nil {
+		return
+	}
+	p := jobStatusPayload{Status: "accepted", DeadlineUnix: j.deadline.Unix(), Queued: true}
+	if !j.runAt.IsZero() {
+		p = jobStatusPayload{Status: "running", StartedUnix: j.runAt.Unix()}
+	}
+	b, err := encodeFrame(ResponseMessage{Type: "sysscript_job_status", JobID: j.id, Payload: p})
+	if err != nil {
+		log.Printf("sysscript job %s status not encoded: %v", j.id, err)
+		return
+	}
+	m.enqueueLocked(jobFrame{b: b}, true)
+}
+
+// answerHeld answers a repeated start frame for a job the agent holds with
+// its current status, or its kept result. It reports whether it did.
+func (m *jobManager) answerHeld(id string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.answerHeldLocked(id)
+}
+
+func (m *jobManager) answerHeldLocked(id string) bool {
+	if j, ok := m.jobs[id]; ok {
+		m.statusLocked(j)
+		return true
+	}
+	for _, d := range m.done {
+		if d.id == id {
+			if m.out != nil {
+				m.enqueueLocked(jobFrame{b: d.frame}, false)
+			}
+			return true
+		}
+	}
+	return false
 }
 
 // admitLocked refuses a duplicate id, then hands j to the pool. It returns
@@ -678,7 +787,7 @@ func (m *jobManager) finishJob(id, status string, frame []byte) {
 		m.done = m.done[1:]
 	}
 	if m.out != nil {
-		m.enqueueLocked(jobFrame{b: frame})
+		m.enqueueLocked(jobFrame{b: frame}, false)
 	}
 }
 
@@ -689,7 +798,9 @@ func (m *jobManager) ackJob(id string) {
 	for i, d := range m.done {
 		if d.id == id {
 			m.doneB -= len(d.frame)
-			m.done = append(m.done[:i], m.done[i+1:]...)
+			copy(m.done[i:], m.done[i+1:])
+			m.done[len(m.done)-1] = jobDone{}
+			m.done = m.done[:len(m.done)-1]
 			return
 		}
 	}

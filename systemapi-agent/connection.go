@@ -170,8 +170,10 @@ func (a *agentConn) runOnce(stop <-chan struct{}) (bool, error) {
 				}
 				// Attach the job manager here, on the read goroutine, so the
 				// sync goes out before any job frame from this connection
-				// is handled. attach only queues; it never writes.
-				jobMgr().attach(out)
+				// is handled. attach only queues; it never writes. If the
+				// job frames overflow the writer queue, the connection is
+				// closed and the next one resyncs.
+				jobMgr().attach(out, func() { _ = c.Close() })
 				signalEnroll(nil)
 			case "enroll_error":
 				log.Printf("enroll rejected: %s", peek.Error)

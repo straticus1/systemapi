@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -315,11 +316,15 @@ func TestJobRejections(t *testing.T) {
 		}
 	}
 
-	// Duplicate id: while the result is unacked, and after the ack.
+	// Duplicate id: while the result is unacked the kept result is sent
+	// again; after the ack the id is refused.
 	id := newJobID(t)
 	s.write(t, jobStart(t, priv, host, id, "print(1)\n", nil, dl, 30))
 	s.jobResult(t, id, 5*time.Second)
-	rejected("duplicate unacked", jobStart(t, priv, host, id, "print(1)\n", nil, dl, 30), id, "duplicate_job")
+	s.write(t, jobStart(t, priv, host, id, "print(1)\n", nil, dl, 30))
+	if res := s.nextJob(t, id, 2*time.Second); res["type"] != "sysscript_job_result" || payloadOf(res)["status"] != "succeeded" {
+		t.Fatalf("duplicate unacked: %v", res)
+	}
 	s.write(t, map[string]string{"type": "sysscript_job_ack", "job_id": id})
 	waitFor(t, "ack", 2*time.Second, func() bool { return len(doneIDs(m)) == 0 })
 	rejected("duplicate acked", jobStart(t, priv, host, id, "print(1)\n", nil, dl, 30), id, "duplicate_job")
@@ -354,7 +359,31 @@ func TestJobRejections(t *testing.T) {
 	frame = jobStart(t, priv, host, replay, "print(1)\n", nil, dl, 30)
 	s.write(t, frame)
 	s.jobResult(t, replay, 5*time.Second)
+	s.write(t, frame)
+	if res := s.nextJob(t, replay, 2*time.Second); res["type"] != "sysscript_job_result" || payloadOf(res)["status"] != "succeeded" {
+		t.Fatalf("replay of an unacked job: %v", res)
+	}
+	s.write(t, map[string]string{"type": "sysscript_job_ack", "job_id": replay})
+	waitFor(t, "ack", 2*time.Second, func() bool { return len(doneIDs(m)) == 0 })
 	rejected("replayed frame", frame, replay, "replay")
+
+	// A replayed or duplicate start for a running job gets its status.
+	held := newJobID(t)
+	frame = jobStart(t, priv, host, held, busyLoop, nil, dl, 2)
+	s.write(t, frame)
+	s.next(t, 2*time.Second, "running", func(f jobSrvFrame) bool {
+		return f.m["job_id"] == held && payloadOf(f.m)["status"] == "running"
+	})
+	s.write(t, frame)
+	s.write(t, jobStart(t, priv, host, held, busyLoop, nil, dl, 2))
+	for i := 0; i < 2; i++ {
+		if st := s.nextJob(t, held, 2*time.Second); st["type"] != "sysscript_job_status" || payloadOf(st)["status"] != "running" {
+			t.Fatalf("repeat %d of a running job: %v", i, st)
+		}
+	}
+	if res := s.jobResult(t, held, 4*time.Second); payloadOf(res)["status"] != "timed_out" {
+		t.Fatalf("held job %v", res)
+	}
 }
 
 // With every worker and queue slot taken a job is refused at once; at
@@ -372,7 +401,7 @@ func TestJobBusyAndAgentStopped(t *testing.T) {
 	}
 	m := newJobManager(1, 1)
 	out := newFakeOut()
-	m.attach(out)
+	m.attach(out, nil)
 	start := func(id string) {
 		raw, err := json.Marshal(jobStart(t, priv, ptyTestHost, id, busyLoop, nil, time.Now().Unix()+60, 60))
 		if err != nil {
@@ -459,7 +488,7 @@ func TestJobAttachOrderingRace(t *testing.T) {
 	}
 	out := newFakeOut()
 	close(startGate)
-	m.attach(out)
+	m.attach(out, nil)
 	wg.Wait()
 	if !m.flush(5 * time.Second) {
 		t.Fatal("queue did not drain")
@@ -534,5 +563,196 @@ func TestJobDoneCapDropsOldest(t *testing.T) {
 	m2.mu.Unlock()
 	if len(ids) != n-1 || ids[0] != fmt.Sprintf("sjb_big%015d", 1) || b > jobDoneBytesMax {
 		t.Fatalf("kept %d (%d bytes), oldest %s", len(ids), b, ids[0])
+	}
+}
+
+// gatedOut blocks every write until gate is closed: a stalled connection.
+type gatedOut struct {
+	*fakeOut
+	gate chan struct{}
+}
+
+func (g *gatedOut) WriteText(b []byte) error {
+	<-g.gate
+	return g.fakeOut.WriteText(b)
+}
+
+func (m *jobManager) queued() (frames, bytes, overflow int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.ctl) + len(m.bulk), m.queueB, m.overflow
+}
+
+// With the writer stalled, a flood of bad job frames fills the queue to its
+// cap and then closes the connection once; a legacy frame over the cap is
+// dropped. detach clears the frames and the next connection syncs first.
+func TestJobQueueOverflowClosesConnection(t *testing.T) {
+	m := newJobManager(1, 1)
+	out := &gatedOut{fakeOut: newFakeOut(), gate: make(chan struct{})}
+	var closed atomic.Int32
+	m.attach(out, func() { closed.Add(1) })
+	waitFor(t, "writer stalled on the sync", 2*time.Second, func() bool {
+		n, _, _ := m.queued()
+		return n == 0
+	})
+	for i := 0; i < jobQueueMax+100; i++ {
+		m.startJob(ptyTestHost, &CommandMessage{Type: "sysscript_job", JobID: "bad"}, time.Now())
+	}
+	n, b, over := m.queued()
+	if n != jobQueueMax || b > jobQueueMaxBytes || over != 100 {
+		t.Fatalf("queued %d frames (%d bytes), %d dropped", n, b, over)
+	}
+	waitFor(t, "connection closed", 2*time.Second, func() bool { return closed.Load() == 1 })
+	m.sendFrameTo(newFakeOut(), []byte(`{"type":"command_result"}`))
+	if _, _, over := m.queued(); over != 101 {
+		t.Fatalf("pinned frame over the cap not dropped: %d", over)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if closed.Load() != 1 {
+		t.Fatalf("closed %d times", closed.Load())
+	}
+	m.detach(out)
+	if n, b, _ := m.queued(); n != 0 || b != 0 {
+		t.Fatalf("after detach %d frames, %d bytes", n, b)
+	}
+	close(out.gate)
+	next := newFakeOut()
+	m.attach(next, nil)
+	if !m.flush(2 * time.Second) {
+		t.Fatal("queue did not drain")
+	}
+	next.mu.Lock()
+	defer next.mu.Unlock()
+	if len(next.jsons) != 1 || next.jsons[0]["type"] != "sysscript_job_sync" {
+		t.Fatalf("new connection got %v", next.jsons)
+	}
+	m.stopAll(5 * time.Second)
+}
+
+// After a reconnect with 16 MiB of unacked results queued behind a slow
+// writer, a newly dispatched job's accepted (control lane) is written before
+// the results (bulk lane), and the sync still comes first.
+func TestJobControlLaneBeforeBulk(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clearIdentity()
+	t.Cleanup(clearIdentity)
+	if err := pinControlPublicKey(base64.StdEncoding.EncodeToString(pub), ptyTestHost); err != nil {
+		t.Fatal(err)
+	}
+	m := newJobManager(1, 1)
+	defer m.stopAll(5 * time.Second)
+	big := strings.Repeat("a", 1<<20-8<<10)
+	for i := 0; i < 16; i++ {
+		id := fmt.Sprintf("sjb_bulk%014d", i)
+		b, err := jobResultFrame(id, "succeeded", "", big, false, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m.finishJob(id, "succeeded", b)
+	}
+	m.mu.Lock()
+	kept, keptB := len(m.done), m.doneB
+	m.mu.Unlock()
+	if kept != 16 || keptB < 15<<20 {
+		t.Fatalf("kept %d results, %d bytes", kept, keptB)
+	}
+	out := &gatedOut{fakeOut: newFakeOut(), gate: make(chan struct{})}
+	m.attach(out, nil)
+	waitFor(t, "writer stalled on the sync", 2*time.Second, func() bool {
+		n, _, _ := m.queued()
+		return n == 16
+	})
+	id := newJobID(t)
+	raw, err := json.Marshal(jobStart(t, priv, ptyTestHost, id, "print(1)\n", nil, time.Now().Unix()+60, 30))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cmd CommandMessage
+	if err := json.Unmarshal(raw, &cmd); err != nil {
+		t.Fatal(err)
+	}
+	m.startJob(ptyTestHost, &cmd, time.Now())
+	close(out.gate)
+	waitFor(t, "all frames", 10*time.Second, func() bool {
+		out.mu.Lock()
+		defer out.mu.Unlock()
+		results := 0
+		for _, f := range out.jsons {
+			if f["type"] == "sysscript_job_result" {
+				results++
+			}
+		}
+		return results == 17
+	})
+	out.mu.Lock()
+	defer out.mu.Unlock()
+	if out.jsons[0]["type"] != "sysscript_job_sync" {
+		t.Fatalf("first frame %v", out.jsons[0]["type"])
+	}
+	accepted, firstBulk := -1, -1
+	for i, f := range out.jsons {
+		if f["job_id"] == id && f["type"] == "sysscript_job_status" && payloadOf(f)["status"] == "accepted" && accepted < 0 {
+			accepted = i
+		}
+		if f["type"] == "sysscript_job_result" && firstBulk < 0 {
+			firstBulk = i
+		}
+	}
+	if accepted != 1 || firstBulk < accepted {
+		t.Fatalf("accepted at %d, first result at %d", accepted, firstBulk)
+	}
+}
+
+// A job whose deadline passes while it waits for a worker ends without a
+// running status.
+func TestJobEndedWhileQueuedSkipsRunning(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clearIdentity()
+	t.Cleanup(clearIdentity)
+	if err := pinControlPublicKey(base64.StdEncoding.EncodeToString(pub), ptyTestHost); err != nil {
+		t.Fatal(err)
+	}
+	m := newJobManager(1, 1)
+	defer m.stopAll(5 * time.Second)
+	out := newFakeOut()
+	m.attach(out, nil)
+	start := func(id string, timeoutS int) {
+		raw, err := json.Marshal(jobStart(t, priv, ptyTestHost, id, busyLoop, nil, time.Now().Unix()+60, timeoutS))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var cmd CommandMessage
+		if err := json.Unmarshal(raw, &cmd); err != nil {
+			t.Fatal(err)
+		}
+		m.startJob(ptyTestHost, &cmd, time.Now())
+	}
+	first, queued := newJobID(t), newJobID(t)
+	start(first, 60)
+	waitFor(t, "first job running", 2*time.Second, func() bool { return len(m.pending) == 0 })
+	start(queued, 1)
+	time.Sleep(1200 * time.Millisecond)
+	m.cancelJob(first, "user")
+	var frames []map[string]interface{}
+	waitFor(t, "queued job result", 5*time.Second, func() bool {
+		m.flush(time.Second)
+		out.mu.Lock()
+		defer out.mu.Unlock()
+		frames = frames[:0]
+		for _, f := range out.jsons {
+			if f["job_id"] == queued {
+				frames = append(frames, f)
+			}
+		}
+		return len(frames) > 0 && frames[len(frames)-1]["type"] == "sysscript_job_result"
+	})
+	if len(frames) != 2 || payloadOf(frames[0])["status"] != "accepted" || payloadOf(frames[1])["status"] != "timed_out" {
+		t.Fatalf("queued job frames %v", frames)
 	}
 }
