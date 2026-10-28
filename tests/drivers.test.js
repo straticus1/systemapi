@@ -382,6 +382,10 @@ const JOB_FAIL = 'sjb_' + 'f'.repeat(22);
 const JOB_STUCK = 'sjb_' + 'r'.repeat(22);
 const JOB_HIDDEN = 'sjb_' + 'h'.repeat(22);
 const JOB_OVER = 'sjb_' + 'o'.repeat(22);
+const JOB_FLAKY = 'sjb_' + 'k'.repeat(22);
+const JOB_DOWN = 'sjb_' + 'w'.repeat(22);
+const JOB_HANG = 'sjb_' + 'g'.repeat(22);
+const JOB_SKEW = 'sjb_' + 'z'.repeat(22);
 
 function jobRow(id, status, extra) {
   return {
@@ -404,6 +408,7 @@ function jobRow(id, status, extra) {
 function jobServer() {
   const { server, seen } = record(KEY);
   const gets = new Map();
+  const hung = [];
   server.on('request-done', (req, res, body) => {
     const reply = (status, obj) => {
       res.writeHead(status, { 'content-type': 'application/json' });
@@ -415,8 +420,10 @@ function jobServer() {
         reply(200, { job: jobRow(JOB_DONE, 'succeeded', { output: 'hi\n', duration_ms: 5 }) });
         return;
       }
-      const id = { slow: JOB_SLOW, fail: JOB_FAIL, stuck: JOB_STUCK }[sent.script] || JOB_DONE;
-      reply(202, { job_id: id, status: 'submitted', deadline_unix: Math.floor(Date.now() / 1000) + 300 });
+      const id = { slow: JOB_SLOW, fail: JOB_FAIL, stuck: JOB_STUCK, flaky: JOB_FLAKY, down: JOB_DOWN, hang: JOB_HANG }[sent.script] || JOB_DONE;
+      const accept = () => reply(202, { job_id: id, status: 'submitted', deadline_unix: Math.floor(Date.now() / 1000) + 300 });
+      if (sent.script === 'slowpost') setTimeout(accept, 11000);
+      else accept();
       return;
     }
     const get = /^\/api\/v1\/jobs\/(sjb_[A-Za-z0-9_-]{22})$/.exec(req.url);
@@ -434,6 +441,35 @@ function jobServer() {
       }
       if (id === JOB_HIDDEN) {
         reply(200, { job: jobRow(id, 'succeeded', { output_visible: false, output: null }) });
+        return;
+      }
+      if (id === JOB_FLAKY) {
+        if (n === 1) {
+          req.socket.destroy();
+          return;
+        }
+        if (n === 2) {
+          res.writeHead(502, { 'content-type': 'text/html' });
+          res.end('<html>bad gateway</html>');
+          return;
+        }
+        reply(200, { job: jobRow(id, 'succeeded', { output: 'flaky done\n' }) });
+        return;
+      }
+      if (id === JOB_DOWN) {
+        reply(429, { error: 'rate_limited' });
+        return;
+      }
+      if (id === JOB_HANG) {
+        hung.push(res);
+        return;
+      }
+      if (id === JOB_SKEW) {
+        // The client clock says the deadline is ~50 min away; the server
+        // clock (Date) says it passed 88 s ago, so 2 s of slack are left.
+        const deadline = Math.floor(Date.now() / 1000) + 3000;
+        res.setHeader('date', new Date((deadline + 88) * 1000).toUTCString());
+        reply(200, { job: jobRow(id, 'running', { deadline_unix: deadline }) });
         return;
       }
       if (id === JOB_STUCK) {
@@ -462,6 +498,7 @@ function jobServer() {
     }
     reply(404, { error: 'not_found' });
   });
+  server.on('close', () => hung.forEach((res) => res.destroy()));
   return { server, seen };
 }
 
@@ -491,6 +528,7 @@ test('jobs submit: async prints the id; --wait polls to the end; exit 0, 1 and 3
   const slow = await run(['jobs', 'submit', 'host-1', script, '--wait', '5'], env(base));
   assert.equal(slow.status, 0, slow.stderr);
   assert.equal(slow.stdout, 'slow done\n');
+  assert.equal(slow.stderr, 'job ' + JOB_SLOW + '\n');
   assert.equal(JSON.parse(seen[2].body).wait_s, 5);
   assert.deepEqual(seen.slice(3).map((row) => row.method + ' ' + row.url), [
     'GET /api/v1/jobs/' + JOB_SLOW,
@@ -501,7 +539,7 @@ test('jobs submit: async prints the id; --wait polls to the end; exit 0, 1 and 3
   const failed = await run(['jobs', 'submit', 'host-1', script, '--wait', '3'], env(base));
   assert.equal(failed.status, 1);
   assert.equal(failed.stdout, 'partial\n');
-  assert.match(failed.stderr, /^timed_out timed_out\n$/);
+  assert.equal(failed.stderr, 'job ' + JOB_FAIL + '\ntimed_out timed_out\n');
 
   fs.writeFileSync(script, 'stuck');
   const stuck = await run(['jobs', 'submit', 'host-1', script, '--wait', '1'], env(base));
@@ -529,6 +567,63 @@ test('jobs submit: async prints the id; --wait polls to the end; exit 0, 1 and 3
     assert.equal(out.stdout.includes(KEY), false);
     assert.equal(out.stderr.includes(KEY), false);
   }
+});
+
+test('jobs submit --wait retries network errors, 5xx and 429 until the wait ends, then exits 3 with the id', async (t) => {
+  const { server } = jobServer();
+  const port = await listen(server);
+  t.after(() => {
+    server.closeAllConnections();
+    return close(server);
+  });
+  const base = 'http://127.0.0.1:' + port;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'systemapi-jobs-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const script = path.join(dir, 'job.star');
+
+  fs.writeFileSync(script, 'flaky');
+  const flaky = await run(['jobs', 'submit', 'host-1', script, '--wait', '30'], env(base));
+  assert.equal(flaky.status, 0, flaky.stderr);
+  assert.equal(flaky.stdout, 'flaky done\n');
+  assert.equal(flaky.stderr, 'job ' + JOB_FLAKY + '\n');
+
+  fs.writeFileSync(script, 'down');
+  const down = await run(['jobs', 'submit', 'host-1', script, '--wait', '3'], env(base));
+  assert.equal(down.status, 3, down.stderr);
+  assert.equal(down.stdout, JOB_DOWN + '\n');
+  assert.match(down.stderr, /still running/);
+
+  // A GET that never answers is cut at the time left, not 20 s.
+  fs.writeFileSync(script, 'hang');
+  const t0 = Date.now();
+  const hang = await run(['jobs', 'submit', 'host-1', script, '--wait', '3'], env(base));
+  assert.equal(hang.status, 3, hang.stderr);
+  assert.equal(hang.stdout, JOB_HANG + '\n');
+  assert.ok(Date.now() - t0 < 8000, 'hung GET held the wait');
+});
+
+test('jobs wait with no --wait counts the deadline on the server clock', async (t) => {
+  const { server } = jobServer();
+  const port = await listen(server);
+  t.after(() => close(server));
+  const t0 = Date.now();
+  const skew = await run(['jobs', 'wait', JOB_SKEW], env('http://127.0.0.1:' + port));
+  assert.equal(skew.status, 3, skew.stderr);
+  assert.equal(skew.stdout, JOB_SKEW + '\n');
+  assert.ok(Date.now() - t0 < 10000, 'waited on the client clock');
+});
+
+test('jobs submit without --wait allows the POST 20 s', async (t) => {
+  const { server } = jobServer();
+  const port = await listen(server);
+  t.after(() => close(server));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'systemapi-jobs-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const script = path.join(dir, 'job.star');
+  fs.writeFileSync(script, 'slowpost');
+  const slow = await run(['jobs', 'submit', 'host-1', script], env('http://127.0.0.1:' + port));
+  assert.equal(slow.status, 0, slow.stderr);
+  assert.equal(slow.stdout, JOB_DONE + '\n');
 });
 
 test('jobs status, cancel and list', async (t) => {

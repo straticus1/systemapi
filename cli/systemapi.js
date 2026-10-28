@@ -11,7 +11,8 @@
 // retire needs an admin key: it posts the --reason (required) to
 // /api/v1/hosts/<id>/retire and sends force only when --force is given.
 // jobs submit/status/wait/cancel/list drive /api/v1/fleet/<id>/jobs and
-// /api/v1/jobs. A wait polls GET /api/v1/jobs/<id> every 2 s; exit 0 is
+// /api/v1/jobs. A wait polls GET /api/v1/jobs/<id> every 2 s (retrying
+// network errors, 429 and 5xx until the wait ends); exit 0 is
 // succeeded, 1 any other end (or an error), 3 still running (the job id is
 // printed). Output the server hides from this key is never fetched another
 // way; the CLI says so on stderr.
@@ -149,7 +150,9 @@ async function readLimited(res) {
   return Buffer.concat(chunks).toString('utf8');
 }
 
-async function request(cfg, method, pathname, body, { timeoutMs, query } = {}) {
+// With transient, a network failure or timeout comes back as status 0 and
+// a non-JSON 5xx/429 body as parsed null, for the caller to retry.
+async function request(cfg, method, pathname, body, { timeoutMs, query, transient = false } = {}) {
   const url = new URL(cfg.url.href);
   const prefix = url.pathname === '/' ? '' : url.pathname;
   url.pathname = prefix + pathname;
@@ -174,21 +177,28 @@ async function request(cfg, method, pathname, body, { timeoutMs, query } = {}) {
     init.body = JSON.stringify(body);
   }
   let res;
+  let text;
   try {
     res = await fetch(url, init);
-  } catch {
+    text = await readLimited(res);
+  } catch (err) {
+    if (err instanceof Exit) throw err;
+    if (transient) return { status: 0, parsed: null, date: null };
     fail(1, 'request_failed');
   }
-  const text = await readLimited(res);
   let parsed = null;
   if (text.trim()) {
     try {
       parsed = JSON.parse(text);
     } catch {
-      fail(1, 'bad_response');
+      if (!(transient && retryable(res.status))) fail(1, 'bad_response');
     }
   }
-  return { status: res.status, parsed };
+  return { status: res.status, parsed, date: res.headers.get('date') };
+}
+
+function retryable(status) {
+  return status === 0 || status === 429 || status >= 500;
 }
 
 async function requestPublic(base, method, pathname, body) {
@@ -408,22 +418,45 @@ function jobFrom(parsed) {
   return job;
 }
 
-async function getJob(cfg, id) {
-  const { status, parsed } = await request(cfg, 'GET', '/api/v1/jobs/' + encodeURIComponent(id));
-  if (status >= 400) fail(1, errorText(parsed, cfg.key));
-  return jobFrom(parsed);
+function jobPath(id) {
+  return '/api/v1/jobs/' + encodeURIComponent(id);
 }
 
-// Polls until the job ends or untilMs passes; returns the last view.
+// {job, date}: date is the server's Date header, or null.
+async function getJob(cfg, id) {
+  const { status, parsed, date } = await request(cfg, 'GET', jobPath(id));
+  if (status >= 400) fail(1, errorText(parsed, cfg.key));
+  return { job: jobFrom(parsed), date };
+}
+
+// Polls until the job ends or untilMs passes; returns the last view. A
+// network failure, timeout, 429 or 5xx is retried until untilMs. Each GET
+// waits at most the time left (at least 1 s, at most 20 s).
 async function pollJob(cfg, job, untilMs) {
   let latest = job;
   while (!JOB_TERMINAL.has(latest.status)) {
     const left = untilMs - Date.now();
     if (left <= 0) break;
     await sleep(Math.min(JOB_POLL_MS, left));
-    latest = await getJob(cfg, latest.job_id);
+    const timeoutMs = Math.min(20000, Math.max(1000, untilMs - Date.now()));
+    const { status, parsed } = await request(cfg, 'GET', jobPath(latest.job_id), undefined, { timeoutMs, transient: true });
+    if (retryable(status)) continue;
+    if (status >= 400) fail(1, errorText(parsed, cfg.key));
+    latest = jobFrom(parsed);
   }
   return latest;
+}
+
+// Default end of a wait with no --wait: the job's deadline + 90 s, counted
+// on the server's clock (its Date header) so client skew does not matter;
+// with no usable Date, timeout_s + 90 s from now.
+function defaultWaitUntil(job, date, startedMs) {
+  const serverNowS = date ? Date.parse(date) / 1000 : NaN;
+  if (typeof job.deadline_unix === 'number' && Number.isFinite(serverNowS)) {
+    return startedMs + (job.deadline_unix - serverNowS + JOB_DEADLINE_SLACK_S) * 1000;
+  }
+  const timeoutS = typeof job.timeout_s === 'number' && job.timeout_s > 0 ? job.timeout_s : 0;
+  return startedMs + (timeoutS + JOB_DEADLINE_SLACK_S) * 1000;
 }
 
 function jobExitCode(job) {
@@ -470,7 +503,7 @@ async function jobs(argv) {
     const body = { script, entitlements: { allow_exec: true }, wait_s: firstWait };
     if (flags.timeout !== undefined) body.timeout_s = flags.timeout;
     const { status, parsed } = await request(cfg, 'POST', '/api/v1/fleet/' + encodeURIComponent(host) + '/jobs', body,
-      { timeoutMs: (firstWait + 10) * 1000 });
+      { timeoutMs: firstWait > 0 ? (firstWait + 10) * 1000 : 20000 });
     if (status >= 400) fail(1, errorText(parsed, cfg.key));
     let job;
     if (status === 200) {
@@ -484,6 +517,8 @@ async function jobs(argv) {
       await emit(job.job_id + '\n', cfg.key);
       return;
     }
+    // The job exists from here on: say which one before waiting on it.
+    if (status === 202) await note('job ' + job.job_id, cfg.key);
     await reportJob(await pollJob(cfg, job, started + waitS * 1000), cfg.key);
     return;
   }
@@ -493,23 +528,20 @@ async function jobs(argv) {
     const id = requireJobId(positional[0]);
     const cfg = loadConfig();
     if (sub === 'cancel') {
-      const { status, parsed } = await request(cfg, 'POST', '/api/v1/jobs/' + encodeURIComponent(id) + '/cancel');
+      const { status, parsed } = await request(cfg, 'POST', jobPath(id) + '/cancel');
       if (status >= 400) fail(1, errorText(parsed, cfg.key));
       const job = jobFrom(parsed);
       await emit([job.job_id, job.status].map(cell).join('\t') + '\n', cfg.key);
       return;
     }
     const started = Date.now();
-    const job = await getJob(cfg, id);
+    const { job, date } = await getJob(cfg, id);
     if (sub === 'status') {
       await emit(JSON.stringify(job) + '\n', cfg.key);
       process.exitCode = jobExitCode(job);
       return;
     }
-    let untilMs = started + (flags.wait || 0) * 1000;
-    if (flags.wait === undefined) {
-      untilMs = typeof job.deadline_unix === 'number' ? (job.deadline_unix + JOB_DEADLINE_SLACK_S) * 1000 : started;
-    }
+    const untilMs = flags.wait === undefined ? defaultWaitUntil(job, date, started) : started + flags.wait * 1000;
     await reportJob(await pollJob(cfg, job, untilMs), cfg.key);
     return;
   }

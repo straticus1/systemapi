@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cpuLabel, scriptOutcome, terminalSocketURL, resizeFrameFor, jobActive, jobOutcome, jobClock } from './format.js';
+import { cpuLabel, scriptOutcome, terminalSocketURL, resizeFrameFor, jobActive, jobOutcome, jobClock, parseTimeout, jobErrorText, pollFailure } from './format.js';
 
 test('cpuLabel shows a real sample', () => {
   assert.equal(cpuLabel({ status: 'online', cpu_percent: 42.345 }), '42.3%');
@@ -71,4 +71,22 @@ test('jobClock counts up and down to the deadline', () => {
   assert.equal(jobClock(1000, 400, 43500), '42s elapsed, 357s to deadline');
   assert.equal(jobClock(1000, 10, 43500), '42s elapsed, 0s to deadline');
   assert.equal(jobClock(1000, undefined, 3000), '2s elapsed');
+});
+
+test('parseTimeout takes whole seconds within the limit only', () => {
+  assert.equal(parseTimeout('300'), 300);
+  assert.equal(parseTimeout(' 1800 '), 1800);
+  assert.equal(parseTimeout('1801'), null);
+  assert.equal(parseTimeout('3600', 3600), 3600);
+  for (const bad of ['', '0', '-1', '1.5', '1e3', 'abc', null, undefined]) assert.equal(parseTimeout(bad), null);
+});
+
+test('jobErrorText explains bad_timeout and passes other codes through', () => {
+  assert.match(jobErrorText('bad_timeout'), /1 to 1800/);
+  assert.equal(jobErrorText('agent_offline'), 'agent_offline');
+});
+
+test('pollFailure stops on 401/403/404/503 and retries the rest', () => {
+  for (const s of [401, 403, 404, 503]) assert.equal(pollFailure(s), 'stop');
+  for (const s of [undefined, 429, 500, 502, 504]) assert.equal(pollFailure(s), 'retry');
 });

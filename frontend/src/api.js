@@ -30,7 +30,7 @@ export const FleetAPI = {
     return res.data;
   },
   executeScript: async (hostId, script, entitlements = { allow_exec: false }) => {
-    const res = await api.post(`/api/v1/fleet/${hostId}/execute`, { script, entitlements });
+    const res = await api.post(`/api/v1/fleet/${encodeURIComponent(hostId)}/execute`, { script, entitlements });
     return res.data;
   },
   // Async sysscript jobs: each call is short (no wait_s), so the 10 s

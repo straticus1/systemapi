@@ -66,3 +66,31 @@ export function jobClock(startedMs, deadlineUnix, nowMs) {
   const left = Math.max(0, Math.ceil(deadlineUnix - nowMs / 1000));
   return `${elapsed}s elapsed, ${left}s to deadline`;
 }
+
+// The control plane's default job ceiling (SYSTEMAPI_SYSSCRIPT_JOB_MAX_S);
+// an operator can set it lower or up to 3600.
+export const JOB_TIMEOUT_MAX_S = 1800;
+
+// The timeout field's text as whole seconds in 1..max, or null.
+export function parseTimeout(text, max = JOB_TIMEOUT_MAX_S) {
+  const t = String(text ?? '').trim();
+  if (!/^[0-9]{1,6}$/.test(t)) return null;
+  const n = Number(t);
+  return n >= 1 && n <= max ? n : null;
+}
+
+// Readable text for a /jobs error code.
+export function jobErrorText(code, max = JOB_TIMEOUT_MAX_S) {
+  if (code === 'bad_timeout') {
+    return `Timeout must be a whole number of seconds from 1 to ${max}. The control plane may be set to a lower limit.`;
+  }
+  return code;
+}
+
+// What a failed job poll means: 'stop' (it will not get better: signed
+// out, no access, gone, or jobs switched off) or 'retry' (later, with
+// back-off: network, 429, other 5xx).
+export function pollFailure(status) {
+  if (status === 401 || status === 403 || status === 404 || status === 503) return 'stop';
+  return 'retry';
+}
