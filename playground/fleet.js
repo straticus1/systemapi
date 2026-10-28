@@ -18,7 +18,9 @@
  * upgrade path, agent frames and binary data, and ends them when the agent
  * connection drops. Session watching (§7.2) lives in playground/watch.js;
  * this file routes watch tickets on the terminal path, watch_consent frames
- * and the session's output to its watchers.
+ * and the session's output to its watchers. Async sysscript jobs live in
+ * playground/jobs.js (with its own Threats note); this file routes their
+ * agent frames (only after enroll) to it and tells it about enroll and close.
  * One live agent per host: a second connection for a host whose agent is
  * connected (it already passed enroll, so it holds the same key and SSH public
  * key) wins only when the live socket fails a ping probe
@@ -60,6 +62,7 @@ const { MeshChannels } = require('./mesh');
 const { FileChannels } = require('./file');
 const { XferGrants } = require('./xfer');
 const { TerminalWatches } = require('./watch');
+const { SysscriptJobs } = require('./jobs');
 const { rejectUpgrade } = require('./channel');
 
 const PTY_FRAME_MAX = 64 * 1024;
@@ -196,6 +199,8 @@ class FleetManager {
         this.xfer = new XferGrants(this);
         // Terminal session watches (playground/watch.js).
         this.watch = new TerminalWatches(this);
+        // Async sysscript jobs (playground/jobs.js).
+        this.jobs = new SysscriptJobs(this);
 
         const accessKey = process.env.DARKSTORAGE_ACCESS_KEY;
         const secretKey = process.env.DARKSTORAGE_SECRET_KEY;
@@ -831,7 +836,16 @@ class FleetManager {
                         this.pendingExecutions.delete(msg.request_id);
                     }
                 } else if (msg.type === 'sysscript_alert') {
-                    if (hostId) await this.onAgentAlert(hostId, msg);
+                    // An alert from an async job carries job_id and goes on
+                    // the host's job chain; request_id alerts are legacy.
+                    if (hostId && typeof msg.job_id === 'string' && msg.job_id !== '') {
+                        this.jobs.onAgentFrame(ws, hostId, msg, messageBuffer.length);
+                    } else if (hostId) {
+                        await this.onAgentAlert(hostId, msg);
+                    }
+                } else if (msg.type === 'sysscript_job_status' || msg.type === 'sysscript_job_result' || msg.type === 'sysscript_job_sync') {
+                    // Dropped before enroll, as every other agent frame.
+                    if (hostId) this.jobs.onAgentFrame(ws, hostId, msg, messageBuffer.length);
                 } else if (msg.type === 'pty_status') {
                     const id = hostId;
                     if (id) inOrder(() => this.onAgentPtyStatus(ws, id, msg));
@@ -878,6 +892,7 @@ class FleetManager {
             // replaced does not mark the host offline.
             if (this.connectedAgents.get(hostId) !== ws) return;
             this.connectedAgents.delete(hostId);
+            this.jobs.onClose(hostId);
             if (this.registry) {
                 try { await this.registry.setHostStatus(hostId, 'offline'); } catch (err) {
                     console.error('[Fleet] status update failed:', err.message);
@@ -954,6 +969,7 @@ class FleetManager {
             this.agentCaps.set(ws, request.systemapiCapabilities || new Set());
             this.agentKeys.set(ws, keyId);
             this.connectedAgents.set(hostId, ws);
+            this.jobs.onEnroll(ws, hostId, this.agentCaps.get(ws));
             ws.send(JSON.stringify({
                 type: 'enrolled',
                 host_id: hostId,
@@ -1331,6 +1347,12 @@ class FleetManager {
                 payload: { script_sha256: hash }
             });
         }
+        await this.putDarkStorageAudit(hostId, hash);
+    }
+
+    // The DarkStorage copy of an execution record: host, time and script
+    // hash. Async jobs call it on end with the hash stored on the row.
+    async putDarkStorageAudit(hostId, hash) {
         if (!this.darkStorage || !hostId) return;
         const timestamp = new Date().toISOString();
         const command = new PutObjectCommand({

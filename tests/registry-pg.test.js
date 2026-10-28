@@ -4,7 +4,8 @@
 // agent-key lookup (expiry and the optional tenant binding), and the
 // channel-policy CLI's single-transaction write, and the sysscript job methods (cross-tenant
 // getJob/listJobs/requestJobCancel/transitionJob, atomic caps, NOTIFY only after COMMIT, a
-// two-registry dispatch claim). A fresh database per run with the schema applied by
+// two-registry dispatch claim, and two FleetManagers dispatching, waiting and cancelling across
+// instances through LISTEN/NOTIFY). A fresh database per run with the schema applied by
 // createRegistry. Needs SYSTEMAPI_TEST_DATABASE_URL (a role that may CREATE DATABASE); it fails,
 // not skips, without it. Not part of npm test.
 //
@@ -609,4 +610,65 @@ test('jobs: one sweep ends at most 500 rows; the next tick ends the rest', async
   await registry.sweepJobs();
   assert.equal(await mine(), 0);
   assert.equal((await registry.verifyAudit()).ok, true);
+});
+
+test('jobs: two FleetManagers on one database: submit on one, the agent on the other; result, wait and cancel cross instances', async () => {
+  const { rig, connectAgent, waitUntil } = require('./job-agent-rig');
+  const tag = crypto.randomBytes(4).toString('hex');
+  const tenant = `j${tag}`;
+  const hostId = crypto.randomUUID();
+  const keys = {
+    'pg-agent': { key_id: `ka${tag}`, user_id: `u${tag}` },
+    'pg-op': { key_id: `ko${tag}`, user_id: `u${tag}` }
+  };
+  const regOne = new PgRegistry(pool, { NODE_ENV: 'production' });
+  const regTwo = new PgRegistry(pool, { NODE_ENV: 'production' });
+  listeners.push(regOne, regTwo);
+  // The test keys have no playground_api_keys row; the agent's key check
+  // would close its socket.
+  regTwo.keyActive = async () => true;
+  const one = await rig({ registry: regOne, keys });
+  const two = await rig({ registry: regTwo, keys });
+  try {
+    await regOne.setScopes(`ko${tag}`, ['exec:run', 'hosts:read']);
+    const a = await connectAgent(two, hostId, { tenant, key: 'pg-agent' });
+    assert.ok(a.frames.some((f) => f.type === 'enrolled'));
+    assert.deepEqual(await regOne.hostAgent(hostId), { instance: two.fm.jobs.instanceId, caps: ['sysscript_jobs'] });
+    await one.fm.jobs.listen();
+    await two.fm.jobs.listen();
+
+    const p = one.api('POST', `/api/v1/fleet/${hostId}/jobs`, 'pg-op', { script: 'print(1)', entitlements: { allow_exec: true }, wait_s: 10 });
+    const { frame, lease } = await a.waitJob(undefined, 8000);
+    assert.equal(lease.ok, true, lease.error);
+    assert.equal(frame.entitlements.allow_exec, true);
+    a.status(frame.job_id, { status: 'accepted' });
+    a.result(frame.job_id, { status: 'succeeded', output: 'one' });
+    const res = await p;
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.equal(res.body.job.status, 'succeeded');
+    assert.equal(res.body.job.output, 'one');
+    await a.waitFor('sysscript_job_ack', frame.job_id, 8000);
+
+    const c = await one.api('POST', `/api/v1/fleet/${hostId}/jobs`, 'pg-op', { script: 'print(2)' });
+    assert.equal(c.status, 202);
+    await a.waitJob(c.body.job_id, 8000);
+    a.status(c.body.job_id, { status: 'running' });
+    await waitUntil('running', async () => (await regOne.getJob([tenant], c.body.job_id)).status === 'running', 8000);
+    assert.equal((await one.api('POST', `/api/v1/jobs/${c.body.job_id}/cancel`, 'pg-op')).status, 202);
+    assert.equal((await a.waitFor('sysscript_job_cancel', c.body.job_id, 8000)).reason, 'user');
+    a.result(c.body.job_id, { status: 'cancelled', error: 'script cancelled' });
+    await a.waitFor('sysscript_job_ack', c.body.job_id, 8000);
+    const audit = await pool.query(
+      "SELECT action FROM cp_audit WHERE tenant_id = $1 AND payload->>'job_id' = $2 ORDER BY seq",
+      [tenant, c.body.job_id]
+    );
+    assert.deepEqual(audit.rows.map((x) => x.action), ['sysscript_job_submit', 'sysscript_job_cancel', 'sysscript_job_end']);
+
+    a.ws.terminate();
+    await waitUntil('presence cleared', async () => (await regOne.hostAgent(hostId)) === null, 8000);
+    assert.equal((await registry.verifyAudit()).ok, true);
+  } finally {
+    await one.close();
+    await two.close();
+  }
 });

@@ -459,6 +459,12 @@ function publicJob(row, { withOutput = true } = {}) {
   return out;
 }
 
+// Capability tokens as parseCapabilities (channels.js) accepts them, at
+// most 16.
+function agentCapList(caps) {
+  return [...(caps || [])].filter((c) => typeof c === 'string' && /^[a-z][a-z0-9_]{0,15}$/.test(c)).slice(0, 16);
+}
+
 function jobRetentionDays(env) {
   const n = Number(env && env.SYSTEMAPI_JOB_RETENTION_DAYS);
   if (!Number.isInteger(n) || n < 1 || n > 3650) return 30;
@@ -713,6 +719,31 @@ class MemoryRegistry {
   async setHostStatus(hostId, status) {
     const row = this.hosts.get(hostId);
     if (row) row.status = status;
+  }
+
+  // The live agent of a host (cp_hosts.agent_caps/agent_instance): written
+  // by the instance holding its socket on enroll, cleared on close only by
+  // that instance, so a newer enroll elsewhere is never undone.
+  async setAgentPresence(hostId, caps, instance) {
+    const row = this.hosts.get(hostId);
+    if (!row) return;
+    row.agent_caps = agentCapList(caps);
+    row.agent_instance = String(instance);
+  }
+
+  async clearAgentPresence(hostId, instance) {
+    const row = this.hosts.get(hostId);
+    if (!row || row.agent_instance !== instance) return;
+    row.agent_caps = null;
+    row.agent_instance = null;
+  }
+
+  // {instance, caps} of the host's live agent, or null when none is
+  // recorded (or the host is retired).
+  async hostAgent(hostId) {
+    const row = this.hosts.get(hostId);
+    if (!row || row.retired_at || !row.agent_instance) return null;
+    return { instance: row.agent_instance, caps: [...(row.agent_caps || [])] };
   }
 
   // Stamps retired_at and appends the host_retired audit row (written
@@ -1639,6 +1670,31 @@ class PgRegistry {
 
   async setHostStatus(hostId, status) {
     await this.pool.query('UPDATE cp_hosts SET status = $2 WHERE host_id = $1', [hostId, status]);
+  }
+
+  async setAgentPresence(hostId, caps, instance) {
+    await this.pool.query(
+      'UPDATE cp_hosts SET agent_caps = $2::text[], agent_instance = $3 WHERE host_id = $1',
+      [hostId, agentCapList(caps), String(instance)]
+    );
+  }
+
+  async clearAgentPresence(hostId, instance) {
+    await this.pool.query(
+      'UPDATE cp_hosts SET agent_caps = NULL, agent_instance = NULL WHERE host_id = $1 AND agent_instance = $2',
+      [hostId, String(instance)]
+    );
+  }
+
+  async hostAgent(hostId) {
+    const res = await this.pool.query(
+      `SELECT agent_caps, agent_instance FROM cp_hosts
+       WHERE host_id = $1 AND retired_at IS NULL AND agent_instance IS NOT NULL`,
+      [hostId]
+    );
+    const row = res.rows[0];
+    if (!row) return null;
+    return { instance: row.agent_instance, caps: [...(row.agent_caps || [])] };
   }
 
   // One transaction: lock the host row (it must belong to tenantId), stamp

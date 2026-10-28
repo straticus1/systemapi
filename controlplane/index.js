@@ -31,9 +31,13 @@ async function boot(fleet, env = process.env, logger = console) {
       logger.error('[control] redis unavailable:', err.message);
     }
   }
+  // Async sysscript jobs: this instance listens for dispatch, cancel and
+  // state events; every tick sweeps overdue jobs and runs the fallback scan.
+  if (fleet.jobs) fleet.jobs.listen();
   const timer = setInterval(() => {
     tickSchedules(fleet, logger).catch((err) => logger.error('[control] schedule tick failed:', err.message));
     refreshGauges(fleet).catch((err) => logger.error('[control] gauge refresh failed:', err.message));
+    if (fleet.jobs) fleet.jobs.tick().catch((err) => logger.error('[control] job tick failed:', err.message));
   }, 30000);
   if (typeof timer.unref === 'function') timer.unref();
   fleet.scheduleTimer = timer;

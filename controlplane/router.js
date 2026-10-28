@@ -23,8 +23,14 @@ const { bucketName, linearForecast, toCSV, cronValid, zscore } = require('./stat
 const { listPlaybooks, readPlaybook } = require('./playbooks');
 const xfer = require('../playground/xfer');
 const { WATCH_PURPOSES, watchScopes } = require('../playground/watch');
+const { jobView, TERMINAL_JOB_STATUSES } = require('../playground/jobs');
+const { entitlementsSha256 } = require('./entitlements');
 
 const SCRIPT_MAX = 64 * 1024;
+const JOB_TIMEOUT_DEFAULT_S = 300;
+const JOB_MAX_DEFAULT_S = 1800;
+const JOB_MAX_CAP_S = 3600;
+const JOB_WAIT_MAX_S = 25;
 const COOLDOWN_MS = 5 * 60 * 1000;
 const USER_RE = /^[a-zA-Z0-9][a-zA-Z0-9._@-]{0,128}$/;
 const RESOLVE_NAME_RE = /^[A-Za-z0-9._-]{1,253}$/;
@@ -521,6 +527,53 @@ async function watchTicket(fleet, principal, purpose, body, res) {
   return { ...out, session_id: session.id, watch_id: w.id, mode, consent: w.consent };
 }
 
+// SYSTEMAPI_SYSSCRIPT_JOBS=0 turns the /jobs routes off (503 jobs_disabled).
+function requireJobs(fleet) {
+  const raw = fleet.env && fleet.env.SYSTEMAPI_SYSSCRIPT_JOBS;
+  if (String(raw === undefined || raw === null || raw === '' ? '1' : raw).trim() === '0' || !fleet.jobs) {
+    throw http(503, 'jobs_disabled');
+  }
+}
+
+// SYSTEMAPI_SYSSCRIPT_JOB_MAX_S: the largest timeout_s a job may ask for.
+// Default 1800; a value that is not an integer from 1 to 3600 falls back to
+// the default.
+function jobMaxSeconds(env) {
+  const raw = env && env.SYSTEMAPI_SYSSCRIPT_JOB_MAX_S;
+  const n = raw === undefined || raw === '' ? NaN : Number(raw);
+  return Number.isInteger(n) && n >= 1 && n <= JOB_MAX_CAP_S ? n : JOB_MAX_DEFAULT_S;
+}
+
+function intField(body, name, fallback, min, max, code) {
+  const value = body[name] === undefined || body[name] === null ? fallback : body[name];
+  if (!Number.isInteger(value) || value < min || value > max) throw http(400, code);
+  return value;
+}
+
+// A job's output, and its cancel, belong to its submitter and the admins
+// of its tenant.
+function jobOwnerOrAdmin(principal, job) {
+  return job.actor === String(principal.userId) || hasScope(scopesFor(principal, job.tenant_id), 'admin');
+}
+
+// A job of the principal's tenants with exec:run in the job's tenant. A
+// missing job, or one in another tenant, is the same 404 with an idor
+// event (as requireHost).
+async function requireJob(fleet, principal, jobId) {
+  const job = typeof jobId === 'string' ? await fleet.registry.getJob(tenantIds(principal), jobId) : null;
+  if (!job) {
+    await safeSecurity(fleet, {
+      kind: 'idor',
+      tenant_id: null,
+      actor_fingerprint: principal.keyId ? fingerprint(principal.keyId) : fingerprint(principal.userId),
+      detail: { job_id: typeof jobId === 'string' ? jobId.slice(0, 64) : null }
+    });
+    throw http(404, 'not_found');
+  }
+  requireScope(fleet, principal, job.tenant_id, 'exec:run');
+  return job;
+}
+
 function mount(app, fleet) {
   const wrap = (fn) => async (req, res) => {
     try {
@@ -893,6 +946,104 @@ function mount(app, fleet) {
     const host = await requireHost(fleet, principal, req.params.hostId);
     const out = await runScript(fleet, principal, host, req.body && req.body.script, req.body && req.body.entitlements);
     res.json({ success: true, ...out, executed_by: principal.email || principal.userId });
+  }));
+
+  // Async sysscript jobs (.omc/plans/async-sysscript-jobs.md §8). 202 with
+  // the job id; wait_s (0..25) waits for the end and answers 200 {job} if
+  // it ends in time.
+  app.post('/api/v1/fleet/:hostId/jobs', wrap(async (req, res) => {
+    noStore(res);
+    const principal = await authenticate(req, fleet);
+    requireJobs(fleet);
+    requireScopeAnywhere(fleet, principal, ['exec:run']);
+    const host = await requireHost(fleet, principal, req.params.hostId);
+    requireScope(fleet, principal, host.tenant_id, 'exec:run');
+    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+    const script = body.script;
+    if (typeof script !== 'string' || script.length === 0 || !script.isWellFormed()
+      || Buffer.byteLength(script, 'utf8') > SCRIPT_MAX) {
+      throw http(400, 'bad_script');
+    }
+    const requested = body.entitlements;
+    if (requested !== undefined && requested !== null && (typeof requested !== 'object' || Array.isArray(requested))) {
+      throw http(400, 'bad_entitlements');
+    }
+    const maxS = jobMaxSeconds(fleet.env);
+    const timeoutS = intField(body, 'timeout_s', Math.min(JOB_TIMEOUT_DEFAULT_S, maxS), 1, maxS, 'bad_timeout');
+    const waitS = intField(body, 'wait_s', 0, 0, JOB_WAIT_MAX_S, 'bad_wait');
+    const entitlements = clampEntitlements(requested, scopesFor(principal, host.tenant_id));
+    try {
+      entitlementsSha256(entitlements);
+    } catch {
+      throw http(400, 'bad_entitlements');
+    }
+    await fleet.jobs.requireAgent(host.host_id);
+    const { job, deadlineUnix } = await fleet.jobs.submit({
+      host,
+      actor: principal.userId,
+      source: 'api',
+      script,
+      entitlements,
+      timeoutS
+    });
+    let latest = job;
+    if (waitS > 0) {
+      latest = (await fleet.jobs.waitFor([host.tenant_id], job.job_id, waitS * 1000)) || job;
+      if (TERMINAL_JOB_STATUSES.has(latest.status)) {
+        res.status(200).json({ job: jobView(latest, { visible: true }) });
+        return;
+      }
+    }
+    res.status(202).json({ job_id: job.job_id, status: latest.status, deadline_unix: deadlineUnix });
+  }));
+
+  app.get('/api/v1/jobs/:jobId', wrap(async (req, res) => {
+    noStore(res);
+    const principal = await authenticate(req, fleet);
+    requireJobs(fleet);
+    const job = await requireJob(fleet, principal, req.params.jobId);
+    res.json({ job: jobView(job, { visible: jobOwnerOrAdmin(principal, job) }) });
+  }));
+
+  // Jobs of the tenants where the principal holds exec:run, never output.
+  app.get('/api/v1/jobs', wrap(async (req, res) => {
+    noStore(res);
+    const principal = await authenticate(req, fleet);
+    requireJobs(fleet);
+    requireScopeAnywhere(fleet, principal, ['exec:run']);
+    const ids = tenantIds(principal).filter((id) => hasScope(scopesFor(principal, id), 'exec:run'));
+    const q = req.query || {};
+    for (const name of ['host_id', 'status', 'limit']) {
+      if (q[name] !== undefined && typeof q[name] !== 'string') throw http(400, `bad_${name}`);
+    }
+    let limit;
+    if (q.limit !== undefined) {
+      if (!/^[0-9]{1,3}$/.test(q.limit)) throw http(400, 'bad_limit');
+      limit = Number(q.limit);
+    }
+    const jobs = await fleet.registry.listJobs(ids, { hostId: q.host_id || null, status: q.status || null, limit });
+    res.json({ jobs: jobs.map((job) => jobView(job, { output: false })) });
+  }));
+
+  // Submitter or tenant admin. 202 {job}, or 409 job_finished.
+  app.post('/api/v1/jobs/:jobId/cancel', wrap(async (req, res) => {
+    noStore(res);
+    const principal = await authenticate(req, fleet);
+    requireJobs(fleet);
+    const job = await requireJob(fleet, principal, req.params.jobId);
+    if (!jobOwnerOrAdmin(principal, job)) {
+      safeSecurity(fleet, {
+        kind: 'scope_deny',
+        tenant_id: job.tenant_id,
+        actor_fingerprint: fingerprint(principal.userId),
+        detail: { scope: 'job:cancel' }
+      });
+      throw http(403, 'scope_denied');
+    }
+    const row = await fleet.registry.requestJobCancel([job.tenant_id], job.job_id, String(principal.userId), 'user');
+    if (!row) throw http(404, 'not_found');
+    fleet.jobs.cancelRequested(row);
+    res.status(202).json({ job: jobView(row, { visible: true }) });
   }));
 
   app.post('/api/v1/fleet/:hostId/breakglass', wrap(async (req, res) => {
