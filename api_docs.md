@@ -237,7 +237,7 @@ host's agent must advertise `sysscript_jobs` (see `cli_docs.md`,
 | POST | `/api/v1/fleet/:hostId/jobs` | `exec:run` in the host's tenant |
 | GET | `/api/v1/jobs/:jobId` | `exec:run` in the job's tenant |
 | GET | `/api/v1/jobs?host_id=&status=&limit=` | `exec:run` in at least one tenant |
-| POST | `/api/v1/jobs/:jobId/cancel` | the submitter, or `admin` in the job's tenant |
+| POST | `/api/v1/jobs/:jobId/cancel` | `exec:run` in the job's tenant, and either the submitter or `admin` there |
 
 Every answer carries `Cache-Control: no-store`.
 
@@ -300,8 +300,8 @@ A job that ends within `wait_s` answers `200 {"job": {...}}` instead.
 
 **List.** `GET /api/v1/jobs` answers `200 {"jobs": [...]}`: newest first, the
 jobs of every tenant where the caller holds `exec:run`, without `output` or
-`output_visible`. `host_id` and `status` filter; `limit` is 1 to 200
-(default 50).
+`output_visible`. `host_id` and `status` filter. `limit` is 1 to 3 digits:
+0 means the default 50, and anything above 200 is cut to 200.
 
 **Cancel.** Answers `202 {"job": {...}}` with `cancel_requested_at` set. The
 job ends `cancelled` once the agent has stopped it: SIGTERM to the script's

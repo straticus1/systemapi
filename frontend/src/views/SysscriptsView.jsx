@@ -139,7 +139,7 @@ const SysscriptsView = () => {
       if (timedOut(e)) {
         setResult({
           success: false,
-          data: 'The submit request timed out. The job may still have been created: check the jobs list before running it again.'
+          data: 'The submit request timed out. The job may still have been created: check `systemapi.js jobs list --host <host>` (GET /api/v1/jobs) before running it again.'
         });
       } else if (!code501 && !code503) {
         setResult({ success: false, data: errorOf(e) });

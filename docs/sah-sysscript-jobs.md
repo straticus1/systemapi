@@ -37,26 +37,55 @@ switch off).
 
 ## Rollback
 
-From the narrowest to the widest:
+**Before any agent restart** (a flag change, an upgrade or a rollback):
+stopping the agent kills the scripts it is running. Each one's process
+group gets SIGTERM, then SIGKILL 10 s later, including an `apt` or `dpkg`
+in the middle of an install. So first look for running jobs on that host:
 
-- **One host.** Restart its agent with `--sysscript-jobs=false`. It stops
-  advertising the capability, and the server sends its scripts the legacy
-  way. The agent's worker pool and deadlines still apply.
+```bash
+node cli/systemapi.js jobs list --host <host_id> --status running
+node cli/systemapi.js jobs list --host <host_id> --status accepted
+```
+
+Wait for them (`jobs wait <id>`) or cancel them (`jobs cancel <id>`), then
+restart. If a package install was killed anyway, see "After a killed
+package install" below.
+
+How the jobs of a stopped agent end:
+
+- **A graceful stop** (SIGTERM or SIGINT, as `systemctl stop` sends): the
+  agent kills its running jobs' process groups and reports each one
+  `failed` with error `agent_stopped` before it disconnects.
+- **A crash, `kill -9`, or a report lost with the connection:** the server
+  never hears. It ends each job `failed`/`result_lost` at its deadline +
+  60 s (the sweep runs every 30 s). If the next agent to connect is a jobs
+  build, its first sync ends them `agent_lost_job` sooner.
+
+From the narrowest rollback to the widest:
+
+- **One host.** Restart its agent with `--sysscript-jobs=false` (after the
+  check above). It stops advertising the capability, and the server sends
+  its scripts the legacy way. The agent's worker pool and deadlines still
+  apply.
 - **Every host.** Set `SYSTEMAPI_SYSSCRIPT_JOBS=0` on every server instance
-  and restart them. Every caller goes legacy and `/jobs` answers 503. Jobs
-  already submitted still run, end, and are stored and audited. While the
-  switch is off, read them in the audit log; `GET /api/v1/jobs` answers 503.
-- **An agent binary.** Rolling an agent back to a build without jobs ends
-  the jobs it was running when it stopped. The old build never reports
-  them, so the server ends each one `failed`/`result_lost` at its deadline +
-  60 s (the sweep runs every 30 s). Rolling forward again instead ends them
-  `agent_lost_job` at the new agent's first sync.
+  and restart them. Every caller goes legacy and `/jobs` answers 503.
+  - Jobs already submitted still run, end, and are stored and audited.
+  - While the switch is off, `GET /api/v1/jobs` answers 503, so read them
+    in the audit log.
+  - The tick keeps expiring output after
+    `SYSTEMAPI_JOB_OUTPUT_RETENTION_HOURS` (default 72), so output of jobs
+    that end while the switch is off may be gone before it is turned back
+    on.
+- **An agent binary.** Rolling an agent back to a build without jobs stops
+  the old agent first (see above), and the old build never reports jobs.
 
 ## After a killed package install
 
 A job that times out or is cancelled kills its whole process group: SIGTERM,
-then SIGKILL 10 s later. If that group was running `apt` or `dpkg`, the
-package database may be left half-configured. On that host, run:
+then SIGKILL 10 s later. So does any agent stop or restart while the job
+runs (an upgrade, a rollback, a flag change). If that group was running
+`apt` or `dpkg`, the package database may be left half-configured. On that
+host, run:
 
 ```bash
 sudo dpkg --configure -a

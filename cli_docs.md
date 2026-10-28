@@ -139,7 +139,7 @@ otherwise use `exec`.
 | 0 | job created | `succeeded` | done |
 | 1 | request refused or failed | `failed`, `timed_out`, `cancelled`, or the request refused or failed | request refused or failed (for example 409 `job_finished`) |
 | 2 | bad arguments or missing `SYSTEMAPI_URL`/`SYSTEMAPI_API_KEY` | same | same |
-| 3 | - | still running when the wait ended (the job id is printed on stdout) | - |
+| 3 | - | still running: for `submit --wait` and `wait`, when the wait ended (the job id is on stdout); for `status`, the job's JSON line is on stdout as always | - |
 
 ## Sysscript
 

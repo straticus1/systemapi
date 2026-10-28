@@ -33,6 +33,8 @@ const JOB_POLL_MS = 2000;
 // GET /api/v1/jobs/<id> ends a lost job at its deadline + 60 s, swept every
 // 30 s: a wait with no --wait gives up after deadline + 90 s.
 const JOB_DEADLINE_SLACK_S = 90;
+// The server's largest timeout_s (SYSTEMAPI_SYSSCRIPT_JOB_MAX_S cap).
+const JOB_TIMEOUT_MAX_S = 3600;
 const SECONDS_MAX = 86400;
 
 class Exit extends Error {
@@ -429,34 +431,45 @@ async function getJob(cfg, id) {
   return { job: jobFrom(parsed), date };
 }
 
-// Polls until the job ends or untilMs passes; returns the last view. A
-// network failure, timeout, 429 or 5xx is retried until untilMs. Each GET
-// waits at most the time left (at least 1 s, at most 20 s).
+// Polls until the job ends or untilMs passes; returns {job, lastError}:
+// the last view, and the last transient failure if the latest poll failed.
+// A network failure, timeout, 429 or 5xx is retried until untilMs, except
+// 501 and 503 jobs_disabled, which will not get better. Each GET waits at
+// most the time left (at least 1 s, at most 20 s).
 async function pollJob(cfg, job, untilMs) {
   let latest = job;
+  let lastError = '';
   while (!JOB_TERMINAL.has(latest.status)) {
     const left = untilMs - Date.now();
     if (left <= 0) break;
     await sleep(Math.min(JOB_POLL_MS, left));
     const timeoutMs = Math.min(20000, Math.max(1000, untilMs - Date.now()));
     const { status, parsed } = await request(cfg, 'GET', jobPath(latest.job_id), undefined, { timeoutMs, transient: true });
-    if (retryable(status)) continue;
+    const code = parsed && typeof parsed.error === 'string' ? parsed.error : '';
+    if (status === 501 || (status === 503 && code === 'jobs_disabled')) fail(1, errorText(parsed, cfg.key));
+    if (retryable(status)) {
+      lastError = status === 0 ? 'request_failed' : (code ? visible(code, cfg.key) : 'http_' + status);
+      continue;
+    }
     if (status >= 400) fail(1, errorText(parsed, cfg.key));
     latest = jobFrom(parsed);
+    lastError = '';
   }
-  return latest;
+  return { job: latest, lastError };
 }
 
 // Default end of a wait with no --wait: the job's deadline + 90 s, counted
 // on the server's clock (its Date header) so client skew does not matter;
-// with no usable Date, timeout_s + 90 s from now.
+// with no usable Date, timeout_s + 90 s from now. Never more than the
+// longest job (3600 s) + 90 s from now.
 function defaultWaitUntil(job, date, startedMs) {
+  const maxMs = startedMs + (JOB_TIMEOUT_MAX_S + JOB_DEADLINE_SLACK_S) * 1000;
   const serverNowS = date ? Date.parse(date) / 1000 : NaN;
   if (typeof job.deadline_unix === 'number' && Number.isFinite(serverNowS)) {
-    return startedMs + (job.deadline_unix - serverNowS + JOB_DEADLINE_SLACK_S) * 1000;
+    return Math.min(maxMs, startedMs + (job.deadline_unix - serverNowS + JOB_DEADLINE_SLACK_S) * 1000);
   }
   const timeoutS = typeof job.timeout_s === 'number' && job.timeout_s > 0 ? job.timeout_s : 0;
-  return startedMs + (timeoutS + JOB_DEADLINE_SLACK_S) * 1000;
+  return Math.min(maxMs, startedMs + (timeoutS + JOB_DEADLINE_SLACK_S) * 1000);
 }
 
 function jobExitCode(job) {
@@ -465,11 +478,12 @@ function jobExitCode(job) {
 }
 
 // A finished job prints its output on stdout and, when it did not succeed,
-// "<status> <error>" on stderr. A running one prints its id.
-async function reportJob(job, key) {
+// "<status> <error>" on stderr. A running one prints its id, and the last
+// transient error when the last poll failed.
+async function reportJob({ job, lastError }, key) {
   if (!JOB_TERMINAL.has(job.status)) {
     await emit(job.job_id + '\n', key);
-    await note('still running', key);
+    await note(lastError ? 'still running (last poll: ' + lastError + ')' : 'still running', key);
     process.exitCode = 3;
     return;
   }
@@ -675,15 +689,20 @@ async function main() {
   await emit(JSON.stringify(out) + '\n', cfg.key);
 }
 
-main().catch(async (err) => {
-  const code = err instanceof Exit ? err.exitCode : 1;
-  const message = err instanceof Exit ? err.message : 'request_failed';
-  const text = message.endsWith('\n') ? message : message + '\n';
-  try {
-    await write(process.stderr, text);
-  } catch {
+if (require.main === module) {
+  main().catch(async (err) => {
+    const code = err instanceof Exit ? err.exitCode : 1;
+    const message = err instanceof Exit ? err.message : 'request_failed';
+    const text = message.endsWith('\n') ? message : message + '\n';
+    try {
+      await write(process.stderr, text);
+    } catch {
+      process.exitCode = code;
+      return;
+    }
     process.exitCode = code;
-    return;
-  }
-  process.exitCode = code;
-});
+  });
+}
+
+// For tests.
+module.exports = { defaultWaitUntil };

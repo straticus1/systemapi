@@ -386,6 +386,8 @@ const JOB_FLAKY = 'sjb_' + 'k'.repeat(22);
 const JOB_DOWN = 'sjb_' + 'w'.repeat(22);
 const JOB_HANG = 'sjb_' + 'g'.repeat(22);
 const JOB_SKEW = 'sjb_' + 'z'.repeat(22);
+const JOB_OFF = 'sjb_' + 'q'.repeat(22);
+const JOB_UNSUP = 'sjb_' + 'u'.repeat(22);
 
 function jobRow(id, status, extra) {
   return {
@@ -420,7 +422,7 @@ function jobServer() {
         reply(200, { job: jobRow(JOB_DONE, 'succeeded', { output: 'hi\n', duration_ms: 5 }) });
         return;
       }
-      const id = { slow: JOB_SLOW, fail: JOB_FAIL, stuck: JOB_STUCK, flaky: JOB_FLAKY, down: JOB_DOWN, hang: JOB_HANG }[sent.script] || JOB_DONE;
+      const id = { slow: JOB_SLOW, fail: JOB_FAIL, stuck: JOB_STUCK, flaky: JOB_FLAKY, down: JOB_DOWN, hang: JOB_HANG, off: JOB_OFF, unsup: JOB_UNSUP }[sent.script] || JOB_DONE;
       const accept = () => reply(202, { job_id: id, status: 'submitted', deadline_unix: Math.floor(Date.now() / 1000) + 300 });
       if (sent.script === 'slowpost') setTimeout(accept, 11000);
       else accept();
@@ -458,6 +460,14 @@ function jobServer() {
       }
       if (id === JOB_DOWN) {
         reply(429, { error: 'rate_limited' });
+        return;
+      }
+      if (id === JOB_OFF) {
+        reply(503, { error: 'jobs_disabled' });
+        return;
+      }
+      if (id === JOB_UNSUP) {
+        reply(501, { error: 'agent_unsupported' });
         return;
       }
       if (id === JOB_HANG) {
@@ -591,7 +601,7 @@ test('jobs submit --wait retries network errors, 5xx and 429 until the wait ends
   const down = await run(['jobs', 'submit', 'host-1', script, '--wait', '3'], env(base));
   assert.equal(down.status, 3, down.stderr);
   assert.equal(down.stdout, JOB_DOWN + '\n');
-  assert.match(down.stderr, /still running/);
+  assert.match(down.stderr, /still running \(last poll: rate_limited\)/);
 
   // A GET that never answers is cut at the time left, not 20 s.
   fs.writeFileSync(script, 'hang');
@@ -599,7 +609,19 @@ test('jobs submit --wait retries network errors, 5xx and 429 until the wait ends
   const hang = await run(['jobs', 'submit', 'host-1', script, '--wait', '3'], env(base));
   assert.equal(hang.status, 3, hang.stderr);
   assert.equal(hang.stdout, JOB_HANG + '\n');
+  assert.match(hang.stderr, /last poll: request_failed/);
   assert.ok(Date.now() - t0 < 8000, 'hung GET held the wait');
+
+  // 503 jobs_disabled and 501 will not get better: exit 1 at the first poll.
+  for (const [name, id, code] of [['off', JOB_OFF, 'jobs_disabled'], ['unsup', JOB_UNSUP, 'agent_unsupported']]) {
+    fs.writeFileSync(script, name);
+    const t1 = Date.now();
+    const out = await run(['jobs', 'submit', 'host-1', script, '--wait', '30'], env(base));
+    assert.equal(out.status, 1, name);
+    assert.equal(out.stdout, '');
+    assert.equal(out.stderr, 'job ' + id + '\n' + code + '\n');
+    assert.ok(Date.now() - t1 < 8000, name + ' was retried');
+  }
 });
 
 test('jobs wait with no --wait counts the deadline on the server clock', async (t) => {
@@ -611,6 +633,17 @@ test('jobs wait with no --wait counts the deadline on the server clock', async (
   assert.equal(skew.status, 3, skew.stderr);
   assert.equal(skew.stdout, JOB_SKEW + '\n');
   assert.ok(Date.now() - t0 < 10000, 'waited on the client clock');
+});
+
+test('the default wait is never longer than 3600 + 90 s', () => {
+  const { defaultWaitUntil } = require(CLI);
+  const start = 1_000_000;
+  const date = new Date(1_700_000_000_000).toUTCString();
+  const nowS = 1_700_000_000;
+  assert.equal(defaultWaitUntil({ deadline_unix: nowS + 300 }, date, start), start + 390000);
+  assert.equal(defaultWaitUntil({ deadline_unix: nowS + 100000 }, date, start), start + 3690000);
+  assert.equal(defaultWaitUntil({ timeout_s: 600 }, null, start), start + 690000);
+  assert.equal(defaultWaitUntil({ timeout_s: 99999 }, null, start), start + 3690000);
 });
 
 test('jobs submit without --wait allows the POST 20 s', async (t) => {
