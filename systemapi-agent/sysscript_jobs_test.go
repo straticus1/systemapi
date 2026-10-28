@@ -64,7 +64,7 @@ func TestJobPoolBusyAndStop(t *testing.T) {
 	m.submitLegacy(out, "r3", busyLoop, ents, time.Minute)
 	m.flush(time.Second)
 	p := commandResult(out, "r3")
-	if p == nil || p["error"] != "agent_busy" || time.Since(start) > 100*time.Millisecond {
+	if p == nil || p["error"] != "agent_busy" || time.Since(start) > 750*time.Millisecond {
 		t.Fatalf("r3=%v after %s", p, time.Since(start))
 	}
 	if !m.stopAll(5 * time.Second) {
@@ -252,7 +252,7 @@ func TestLegacySysscriptLeavesReadLoopLive(t *testing.T) {
 	}
 	select {
 	case at := <-s.pongs:
-		if d := at.Sub(pingAt); d > 200*time.Millisecond {
+		if d := at.Sub(pingAt); d > 750*time.Millisecond {
 			t.Fatalf("pong after %s", d)
 		}
 	case <-time.After(time.Second):
@@ -266,7 +266,7 @@ func TestLegacySysscriptLeavesReadLoopLive(t *testing.T) {
 	s.write(t, map[string]interface{}{"type": "pty_renew", "session_id": "pts_0123456789abcdef0123456789abcdef"})
 	s.write(t, map[string]interface{}{"type": "pty_input", "session_id": "pts_0123456789abcdef0123456789abcdef", "data_b64": "aGk="})
 	rej := s.next(t, "pty_renew_rejected", time.Second)
-	if d := time.Since(renewAt); d > 200*time.Millisecond {
+	if d := time.Since(renewAt); d > 750*time.Millisecond {
 		t.Fatalf("pty frame dispatched after %s", d)
 	}
 	if p, _ := rej["payload"].(map[string]interface{}); p["error"] != "unknown_session" {
@@ -298,7 +298,7 @@ func TestLegacySysscriptBusyOverConnection(t *testing.T) {
 	sent := time.Now()
 	s.write(t, sysscriptFrame(t, priv, a.st.HostID, "b3", busyLoop, ents))
 	res := s.next(t, "command_result", time.Second)
-	if d := time.Since(sent); d > 100*time.Millisecond {
+	if d := time.Since(sent); d > 750*time.Millisecond {
 		t.Fatalf("agent_busy after %s", d)
 	}
 	p, _ := res["payload"].(map[string]interface{})

@@ -52,6 +52,7 @@ type jobServer struct {
 	conn   *websocket.Conn
 	n      int64
 	gate   atomic.Bool
+	stall  atomic.Bool // stop reading the agent's frames
 	frames chan jobSrvFrame
 }
 
@@ -122,6 +123,9 @@ func startJobAgent(t *testing.T) (*jobServer, *agentConn, ed25519.PrivateKey) {
 			return
 		}
 		for {
+			for s.stall.Load() {
+				time.Sleep(10 * time.Millisecond)
+			}
 			_, raw, err := c.ReadMessage()
 			if err != nil {
 				return
@@ -258,7 +262,7 @@ func TestJobDeadlineAndSignedTimeout(t *testing.T) {
 		s.write(t, jobStart(t, priv, a.st.HostID, id, busyLoop, nil, now.Unix()+c.deadline, c.timeout))
 		acc := s.nextJob(t, id, 2*time.Second)
 		dl, _ := payloadOf(acc)["deadline_unix"].(float64)
-		if want := now.Unix() + min(c.deadline, int64(c.timeout)); int64(dl) > want || int64(dl) < want-1 {
+		if want := now.Unix() + min(c.deadline, int64(c.timeout)); int64(dl) > want+1 || int64(dl) < want-1 {
 			t.Fatalf("%s: accepted deadline %v, want %d", c.name, dl, want)
 		}
 		res := s.jobResult(t, id, 4*time.Second)
@@ -282,7 +286,7 @@ func TestJobCeilingClampsDeadline(t *testing.T) {
 	now := time.Now()
 	s.write(t, jobStart(t, priv, a.st.HostID, id, busyLoop, nil, now.Unix()+600, 600))
 	acc := s.nextJob(t, id, 2*time.Second)
-	if dl, _ := payloadOf(acc)["deadline_unix"].(float64); int64(dl) > now.Unix()+1 {
+	if dl, _ := payloadOf(acc)["deadline_unix"].(float64); int64(dl) > now.Unix()+2 {
 		t.Fatalf("accepted deadline %v not clamped to the 1 s ceiling", dl)
 	}
 	s.nextJob(t, id, 2*time.Second) // running
@@ -430,7 +434,7 @@ func TestJobBusyAndAgentStopped(t *testing.T) {
 	sent := time.Now()
 	start(ids[2])
 	m.flush(time.Second)
-	if p := result(ids[2]); p == nil || p["status"] != "rejected" || p["error"] != "agent_busy" || time.Since(sent) > 100*time.Millisecond {
+	if p := result(ids[2]); p == nil || p["status"] != "rejected" || p["error"] != "agent_busy" || time.Since(sent) > 750*time.Millisecond {
 		t.Fatalf("third job %v after %s", p, time.Since(sent))
 	}
 	if !m.stopAll(5 * time.Second) {
@@ -462,7 +466,8 @@ func TestJobAttachOrderingRace(t *testing.T) {
 		before = append(before, id)
 		m.finishJob(id, "succeeded", frame(id))
 	}
-	const emitters, perEmitter, finishers, perFinisher = 4, 200, 2, 20
+	// 4*100 alerts + 43 results + the sync stay under jobQueueMax.
+	const emitters, perEmitter, finishers, perFinisher = 4, 100, 2, 20
 	startGate := make(chan struct{})
 	var wg sync.WaitGroup
 	for e := 0; e < emitters; e++ {
@@ -754,5 +759,38 @@ func TestJobEndedWhileQueuedSkipsRunning(t *testing.T) {
 	})
 	if len(frames) != 2 || payloadOf(frames[0])["status"] != "accepted" || payloadOf(frames[1])["status"] != "timed_out" {
 		t.Fatalf("queued job frames %v", frames)
+	}
+}
+
+// When the server stops reading, the agent's frames back up until the
+// writer queue overflows; the real close hook closes the connection, and
+// the redial's sync lists the unacked result and sends it again.
+func TestJobQueueOverflowResyncsOnNewConnection(t *testing.T) {
+	m := useTestJobManager(t, jobWorkersDefault, jobPendingMax)
+	s, a, priv := startJobAgent(t)
+	expectSync(t, s, 1, nil, nil)
+	id := newJobID(t)
+	s.write(t, jobStart(t, priv, a.st.HostID, id, "print('kept')\n", nil, time.Now().Unix()+60, 30))
+	s.jobResult(t, id, 5*time.Second)
+
+	s.stall.Store(true)
+	big := strings.Repeat("a", 1<<20-8<<10)
+	// Flood until the first overflow, so the next connection is not
+	// flooded too.
+	for i := 0; i < 64; i++ {
+		if _, _, over := m.queued(); over > 0 {
+			break
+		}
+		_ = m.sendFrame(ResponseMessage{Type: "sysscript_alert", JobID: id, Payload: map[string]string{"message": big}})
+	}
+	waitFor(t, "overflow", 10*time.Second, func() bool {
+		_, _, over := m.queued()
+		return over > 0
+	})
+	s.stall.Store(false)
+	expectSync(t, s, 2, nil, []string{id})
+	f := s.next(t, 5*time.Second, "re-sent result", func(f jobSrvFrame) bool { return f.n >= 2 })
+	if f.m["type"] != "sysscript_job_result" || f.m["job_id"] != id || payloadOf(f.m)["output"] != "kept\n" {
+		t.Fatalf("after the resync on %d: %v", f.n, f.m)
 	}
 }

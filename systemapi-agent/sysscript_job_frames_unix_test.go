@@ -57,10 +57,14 @@ func TestJobSurvivesDropAndResendsUntilAcked(t *testing.T) {
 	short, long := newJobID(t), newJobID(t)
 	s.write(t, jobStart(t, priv, a.st.HostID, short, `sys.exec.run("sleep", "1")`+"\n", ents, dl, 60))
 	s.write(t, jobStart(t, priv, a.st.HostID, long, `sys.exec.run("sleep", "8")`+"\n", ents, dl, 60))
-	for _, id := range []string{short, long} {
-		s.next(t, 3*time.Second, id+" running", func(f jobSrvFrame) bool {
-			return f.m["job_id"] == id && payloadOf(f.m)["status"] == "running"
+	// The two jobs run on different workers, so their running frames come
+	// in either order.
+	running := map[interface{}]bool{}
+	for len(running) < 2 {
+		f := s.next(t, 3*time.Second, "both jobs running", func(f jobSrvFrame) bool {
+			return (f.m["job_id"] == short || f.m["job_id"] == long) && payloadOf(f.m)["status"] == "running"
 		})
+		running[f.m["job_id"]] = true
 	}
 
 	// Down while the short job finishes.
