@@ -221,14 +221,16 @@ test('PgRegistry writes the policy and its audit row in one transaction on one c
   assert.match(qs[1], /^SELECT tcp_policy, file_policy FROM cp_hosts WHERE host_id = \$1 AND tenant_id = \$2 FOR UPDATE$/);
   assert.deepEqual(pool.log[1].params, [HOST_A, 'afterdark']);
   assert.match(qs[2], /^UPDATE cp_hosts SET tcp_policy = \$2::jsonb, file_policy = \$3::jsonb WHERE host_id = \$1$/);
-  assert.match(qs[3], /^SELECT row_hash FROM cp_audit .*FOR UPDATE$/);
-  assert.match(qs[4], /^INSERT INTO cp_audit/);
-  const audit = JSON.parse(pool.log[4].params[6]);
+  // The audit chain lock, then the tail read under it (registry.js auditInsert).
+  assert.match(qs[3], /^SELECT pg_advisory_xact_lock\(\$1::int, \$2::int\)$/);
+  assert.match(qs[4], /^SELECT row_hash FROM cp_audit ORDER BY seq DESC LIMIT 1$/);
+  assert.match(qs[5], /^INSERT INTO cp_audit/);
+  const audit = JSON.parse(pool.log[5].params[6]);
   assert.deepEqual(audit.previous_tcp_policy, { allow: [{ local: true, ports: [3003] }] });
   assert.deepEqual(audit.tcp_policy, { allow: [] });
   assert.equal(audit.reason, 'why');
-  assert.equal(pool.log[4].params[4], ACTOR);
-  assert.deepEqual(qs.slice(5), ['COMMIT', 'RELEASE']);
+  assert.equal(pool.log[5].params[4], ACTOR);
+  assert.deepEqual(qs.slice(6), ['COMMIT', 'RELEASE']);
 });
 
 test('PgRegistry rolls the policy back when its audit row fails', async () => {

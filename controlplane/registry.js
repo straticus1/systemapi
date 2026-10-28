@@ -14,6 +14,7 @@
 // tenant_id is in the caller's set. Does NOT authenticate the caller.
 'use strict';
 
+const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const path = require('node:path');
 const { GENESIS, canonicalJSON, rowHash, verifyRows } = require('./chain');
@@ -71,9 +72,20 @@ function publicWebhook(row) {
   };
 }
 
-// Appends one chained audit row inside the caller's transaction.
+// The chain-wide audit lock: the two-int advisory form (its own key space,
+// apart from the hashtext single-key locks), namespace 'SAPI', key 1.
+const AUDIT_LOCK_NS = 0x53415049;
+const AUDIT_LOCK_KEY = 1;
+
+// Appends one chained audit row inside the caller's transaction. The tail is
+// read only under the chain-wide transaction lock: a row lock alone (FOR
+// UPDATE on the tail) lets a READ COMMITTED waiter wake up on the old tail
+// after the holder commits a newer row, and the chain forks. Lock order:
+// callers take every other lock (rows, sjob:*, cp_members.sso_sub) before
+// their first audit row, so the chain lock is always the last one taken.
 async function auditInsert(client, entry) {
-  const prevRes = await client.query('SELECT row_hash FROM cp_audit ORDER BY seq DESC LIMIT 1 FOR UPDATE');
+  await client.query('SELECT pg_advisory_xact_lock($1::int, $2::int)', [AUDIT_LOCK_NS, AUDIT_LOCK_KEY]);
+  const prevRes = await client.query('SELECT row_hash FROM cp_audit ORDER BY seq DESC LIMIT 1');
   const prev = prevRes.rows[0] ? prevRes.rows[0].row_hash : GENESIS;
   const payload = JSON.parse(canonicalJSON(entry.payload || {}));
   const cols = {
@@ -180,6 +192,299 @@ function retireReason(reason) {
   return reason.trim();
 }
 
+// Async sysscript jobs (cp_sysscript_jobs; .omc/plans/async-sysscript-jobs.md
+// §6-§7). Threats: a job read or cancelled from another tenant (every read
+// and user write carries a tenant predicate), an agent frame for another
+// host's job (every agent-driven write carries host_id, and conn_id where it
+// applies, in the WHERE), a terminal row rewritten (transitions only leave
+// non-terminal statuses), the job caps raced past (advisory locks, then count
+// and insert in one transaction), and the script kept at rest (dispatch is
+// nulled when it is claimed or the job ends; reads never return it). Does NOT
+// decide who may see output or cancel: the routes do.
+const JOB_STATUSES = new Set(['submitted', 'accepted', 'running', 'succeeded', 'failed', 'cancelled', 'timed_out']);
+const JOB_ACTIVE = ['submitted', 'accepted', 'running'];
+const JOB_SOURCES = new Set(['api', 'execute', 'fleet_execute', 'playbook', 'schedule', 'rule']);
+const JOB_ID_RE = /^sjb_[A-Za-z0-9_-]{22}$/;
+const SHA256_RE = /^[0-9a-f]{64}$/;
+const NONCE_RE = /^[0-9a-f]{32}$/;
+const JOB_CHANNEL = 'cp_sysscript_jobs';
+const JOB_EVENT_KINDS = new Set(['dispatch', 'cancel', 'state']);
+const JOB_LIST_MAX = 200;
+const JOB_SYNC_MAX = 1024;
+// Rows one sweep ends: it holds the audit chain lock for one end row each,
+// so the batch is bounded; the next tick takes the rest.
+const JOB_SWEEP_BATCH = 500;
+const JOB_ERROR_MAX = 1024;
+// Stored output cap, in UTF-8 bytes (the agent's own cap, plan §4.2).
+const JOB_OUTPUT_MAX = 1024 * 1024;
+const ERROR_CODE_RE = /^[a-z_]{1,64}$/;
+const JOB_COLS = ['job_id', 'tenant_id', 'host_id', 'actor', 'source', 'script_sha256', 'entitlements_sha256',
+  'entitlements', 'status', 'error', 'output', 'output_truncated', 'output_expired', 'timeout_s', 'deadline_at',
+  'lease_nonce', 'conn_id', 'sent_at', 'alert_count', 'cancel_requested_at', 'cancel_sent_at', 'cancel_actor',
+  'created_at', 'accepted_at', 'started_at', 'finished_at', 'duration_ms'];
+
+// The column list interpolated into job SQL. SECURITY-RULES rule 7: it is
+// built only from the JOB_COLS constant and a constant prefix ('' or 'j.'),
+// never from input; every value is a bound parameter.
+function jobCols(prefix = '', { output = true } = {}) {
+  return JOB_COLS.filter((c) => output || c !== 'output').map((c) => prefix + c).join(', ');
+}
+
+function isTerminal(status) {
+  return JOB_STATUSES.has(status) && !JOB_ACTIVE.includes(status);
+}
+
+function nonEmpty(value) {
+  return typeof value === 'string' && value.length > 0 && value.length <= 256;
+}
+
+function toDate(value) {
+  const d = value instanceof Date ? new Date(value.getTime()) : new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+// The checked insert row of createJob. Anything malformed is 400 bad_job.
+function jobInsertRow(row) {
+  const r = row || {};
+  const deadline = r.deadline_at == null ? null : toDate(r.deadline_at);
+  const ent = r.entitlements === undefined ? {} : r.entitlements;
+  const ok = JOB_ID_RE.test(String(r.job_id))
+    && nonEmpty(r.tenant_id) && nonEmpty(r.host_id) && nonEmpty(r.actor)
+    && JOB_SOURCES.has(r.source)
+    && SHA256_RE.test(String(r.script_sha256)) && SHA256_RE.test(String(r.entitlements_sha256))
+    && ent !== null && typeof ent === 'object' && !Array.isArray(ent)
+    && Number.isInteger(r.timeout_s) && r.timeout_s >= 1 && r.timeout_s <= 3600
+    && deadline !== null && deadline.getTime() > Date.now()
+    && NONCE_RE.test(String(r.lease_nonce))
+    && r.dispatch !== null && typeof r.dispatch === 'object' && !Array.isArray(r.dispatch);
+  if (!ok) throw http(400, 'bad_job');
+  return {
+    job_id: r.job_id,
+    tenant_id: r.tenant_id,
+    host_id: r.host_id,
+    actor: r.actor,
+    source: r.source,
+    script_sha256: r.script_sha256,
+    entitlements_sha256: r.entitlements_sha256,
+    entitlements: JSON.parse(JSON.stringify(ent)),
+    timeout_s: r.timeout_s,
+    deadline_at: deadline,
+    lease_nonce: r.lease_nonce,
+    dispatch: JSON.parse(JSON.stringify(r.dispatch))
+  };
+}
+
+function jobCaps(opts = {}) {
+  const hostCap = opts.hostCap === undefined ? 8 : opts.hostCap;
+  const tenantCap = opts.tenantCap === undefined ? 64 : opts.tenantCap;
+  if (!Number.isInteger(hostCap) || hostCap < 1 || !Number.isInteger(tenantCap) || tenantCap < 1) {
+    throw http(500, 'bad_job_caps');
+  }
+  return { hostCap, tenantCap };
+}
+
+// fromStatuses must be non-terminal and the target a different, later
+// status: terminal rows never change.
+function jobTransition(fromStatuses, fields) {
+  const from = Array.isArray(fromStatuses) ? [...new Set(fromStatuses)] : [];
+  const to = fields && fields.status;
+  if (from.length === 0 || !from.every((s) => JOB_ACTIVE.includes(s))
+    || !JOB_STATUSES.has(to) || to === 'submitted' || from.includes(to)) {
+    throw http(500, 'bad_job_transition');
+  }
+  const set = { status: to };
+  if ('error' in fields) set.error = fields.error == null ? null : String(fields.error).slice(0, JOB_ERROR_MAX);
+  if ('output' in fields) {
+    if (fields.output !== null && typeof fields.output !== 'string') throw http(400, 'bad_job_output');
+    set.output = fields.output;
+  }
+  if ('output_truncated' in fields) set.output_truncated = fields.output_truncated === true;
+  if (typeof set.output === 'string' && Buffer.byteLength(set.output, 'utf8') > JOB_OUTPUT_MAX) {
+    set.output = truncateUtf8(set.output, JOB_OUTPUT_MAX);
+    set.output_truncated = true;
+  }
+  if ('duration_ms' in fields) {
+    const n = fields.duration_ms;
+    set.duration_ms = Number.isInteger(n) && n >= 0 && n <= 2147483647 ? n : null;
+  }
+  return { from, set };
+}
+
+// At most max UTF-8 bytes, cut on a character boundary.
+function truncateUtf8(text, max) {
+  const buf = Buffer.from(text, 'utf8');
+  if (buf.length <= max) return text;
+  let end = max;
+  while (end > 0 && (buf[end] & 0xc0) === 0x80) end -= 1;
+  return buf.subarray(0, end).toString('utf8');
+}
+
+// The memory mirror of the SET clause PgRegistry.transitionJob builds.
+function applyJobSet(row, set, now) {
+  Object.assign(row, set);
+  if (set.status === 'accepted' || set.status === 'running') row.accepted_at = row.accepted_at || now;
+  if (set.status === 'running') row.started_at = row.started_at || now;
+  if (isTerminal(set.status)) {
+    row.finished_at = now;
+    row.dispatch = null;
+  }
+}
+
+function jobAlertCap(max) {
+  if (!Number.isInteger(max) || max < 1 || max > 1000) throw http(500, 'bad_alert_cap');
+  return max;
+}
+
+// sweepJobs inputs: ack timeout (default 15 s), dispatch timeout (60 s, the
+// lease TTL) and the grace after the deadline (60 s). The cutoff dates are
+// for MemoryRegistry; PgRegistry computes them from now() in SQL.
+function jobSweep(now, opts = {}) {
+  const at = toDate(now);
+  const ms = (v, d) => (v === undefined ? d : v);
+  const ackMs = ms(opts.ackMs, 15000);
+  const dispatchMs = ms(opts.dispatchMs, 60000);
+  const graceMs = ms(opts.graceMs, 60000);
+  if (!at || ![ackMs, dispatchMs, graceMs].every((v) => Number.isInteger(v) && v >= 0)) throw http(500, 'bad_job_sweep');
+  return {
+    ackMs,
+    dispatchMs,
+    graceMs,
+    ackCutoff: new Date(at.getTime() - ackMs),
+    dispatchCutoff: new Date(at.getTime() - dispatchMs),
+    deadlineCutoff: new Date(at.getTime() - graceMs),
+    connIds: connIdList(opts.connectedConnIds)
+  };
+}
+
+function jobListQuery(opts = {}) {
+  const hostId = opts.hostId == null ? null : String(opts.hostId);
+  const status = opts.status == null ? null : opts.status;
+  if (status !== null && !JOB_STATUSES.has(status)) throw http(400, 'bad_status');
+  const n = opts.limit === undefined ? 50 : Number(opts.limit);
+  const limit = Number.isInteger(n) && n >= 1 ? Math.min(n, JOB_LIST_MAX) : 50;
+  return { hostId, status, limit };
+}
+
+function syncIds(listedIds) {
+  if (!Array.isArray(listedIds) || listedIds.length > JOB_SYNC_MAX) throw http(400, 'bad_job_sync');
+  return [...new Set(listedIds.filter((id) => typeof id === 'string' && JOB_ID_RE.test(id)))];
+}
+
+function connIdList(ids) {
+  return Array.isArray(ids) ? ids.filter((id) => typeof id === 'string' && id.length > 0) : [];
+}
+
+// The NOTIFY payload, also what onJobEvent handlers receive. Anything else
+// is dropped.
+function jobEvent(evt) {
+  if (!evt || !JOB_EVENT_KINDS.has(evt.k) || !JOB_ID_RE.test(String(evt.job_id)) || !nonEmpty(evt.host_id)) return null;
+  return { k: evt.k, job_id: evt.job_id, host_id: evt.host_id, status: JOB_STATUSES.has(evt.status) ? evt.status : null };
+}
+
+function stateEvent(row, k = 'state') {
+  return { k, job_id: row.job_id, host_id: row.host_id, status: row.status };
+}
+
+function jobSubmitAuditEntry(row) {
+  return {
+    tenant_id: row.tenant_id,
+    host_id: row.host_id,
+    actor: row.actor,
+    action: 'sysscript_job_submit',
+    payload: {
+      job_id: row.job_id,
+      script_sha256: row.script_sha256,
+      entitlements_sha256: row.entitlements_sha256,
+      timeout_s: row.timeout_s,
+      lease_nonce: row.lease_nonce,
+      source: row.source
+    }
+  };
+}
+
+function jobCancelAuditEntry(row, actor, reason) {
+  return {
+    tenant_id: row.tenant_id,
+    host_id: row.host_id,
+    actor,
+    action: 'sysscript_job_cancel',
+    payload: { job_id: row.job_id, reason }
+  };
+}
+
+function jobEndAuditEntry(row, actor) {
+  return {
+    tenant_id: row.tenant_id,
+    host_id: row.host_id,
+    actor,
+    action: 'sysscript_job_end',
+    payload: {
+      job_id: row.job_id,
+      status: row.status,
+      // Only a code-shaped error goes into the audit chain; free text from
+      // the agent stays on the row.
+      error_code: row.error == null ? null : (ERROR_CODE_RE.test(String(row.error)) ? String(row.error) : 'agent_error'),
+      duration_ms: row.duration_ms == null ? null : row.duration_ms,
+      alerts: row.alert_count || 0
+    }
+  };
+}
+
+// transitionJob's opts.audit: {actor} writes the end row for a terminal
+// status; {actor, action, payload} writes that row instead.
+function transitionAuditEntry(row, audit) {
+  if (!audit) return null;
+  if (audit.action) return { tenant_id: row.tenant_id, host_id: row.host_id, actor: audit.actor || null, action: audit.action, payload: audit.payload || {} };
+  if (!isTerminal(row.status)) throw http(500, 'bad_job_audit');
+  return jobEndAuditEntry(row, audit.actor || 'system');
+}
+
+function transitionNotify(row, notify) {
+  if (!notify) return null;
+  return stateEvent(row, notify === true ? 'state' : notify);
+}
+
+// A copy of a row without dispatch (the script and lease never leave the
+// registry through a read), and without output when withOutput is false.
+function publicJob(row, { withOutput = true } = {}) {
+  if (!row) return null;
+  const out = {};
+  for (const c of JOB_COLS) {
+    if (c === 'output' && !withOutput) continue;
+    const v = row[c];
+    if (v instanceof Date) out[c] = new Date(v.getTime());
+    else if (c === 'entitlements') out[c] = v == null ? {} : JSON.parse(JSON.stringify(v));
+    else out[c] = v === undefined ? null : v;
+  }
+  return out;
+}
+
+function jobRetentionDays(env) {
+  const n = Number(env && env.SYSTEMAPI_JOB_RETENTION_DAYS);
+  if (!Number.isInteger(n) || n < 1 || n > 3650) return 30;
+  return n;
+}
+
+function jobOutputRetentionHours(env) {
+  const n = Number(env && env.SYSTEMAPI_JOB_OUTPUT_RETENTION_HOURS);
+  if (!Number.isInteger(n) || n < 1 || n > 8760) return 72;
+  return n;
+}
+
+// Delivers one event to every handler; a handler that throws, or whose
+// promise rejects, is logged and does not stop the others.
+function deliverJobEvent(emitter, evt) {
+  const failed = (err) => console.error(`[control] job event handler failed: ${err && err.message}`);
+  for (const fn of emitter.listeners('event')) {
+    try {
+      const out = fn(evt);
+      if (out && typeof out.then === 'function') out.then(undefined, failed);
+    } catch (err) {
+      failed(err);
+    }
+  }
+}
+
 class MemoryRegistry {
   constructor(env = {}) {
     this.env = env;
@@ -206,6 +511,8 @@ class MemoryRegistry {
     // Channel policies live apart from host rows so publicHost never sees them.
     this.hostPolicies = new Map();
     this.tenantPolicies = new Map();
+    this.jobs = new Map();
+    this.jobBus = new EventEmitter();
   }
 
   async enroll({ tenantId, userId, keyId, hostId, hostname, os, platform, sshPubkey }) {
@@ -686,6 +993,291 @@ class MemoryRegistry {
     return this.cves.filter((c) => c.host_id === hostId);
   }
 
+  // The caps are counted and the row inserted before the first await, so
+  // concurrent calls cannot both pass the count. The row is removed again
+  // if the submit audit row fails (the Pg transaction rolls back).
+  async createJob(row, opts = {}) {
+    const r = jobInsertRow(row);
+    const { hostCap, tenantCap } = jobCaps(opts);
+    const host = this.hosts.get(r.host_id);
+    if (!host || host.tenant_id !== r.tenant_id || host.retired_at) throw http(404, 'not_found');
+    if (this.jobs.has(r.job_id)) throw http(409, 'conflict');
+    let onHost = 0;
+    let onTenant = 0;
+    for (const j of this.jobs.values()) {
+      if (!JOB_ACTIVE.includes(j.status)) continue;
+      if (j.host_id === r.host_id) onHost += 1;
+      if (j.tenant_id === r.tenant_id) onTenant += 1;
+    }
+    if (onHost >= hostCap || onTenant >= tenantCap) throw http(429, 'too_many_jobs');
+    const stored = {
+      ...r,
+      status: 'submitted',
+      error: null,
+      output: null,
+      output_truncated: false,
+      output_expired: false,
+      conn_id: null,
+      sent_at: null,
+      alert_count: 0,
+      cancel_requested_at: null,
+      cancel_sent_at: null,
+      cancel_actor: null,
+      created_at: new Date(),
+      accepted_at: null,
+      started_at: null,
+      finished_at: null,
+      duration_ms: null
+    };
+    this.jobs.set(r.job_id, stored);
+    try {
+      await this.appendAudit(jobSubmitAuditEntry(stored));
+    } catch (err) {
+      this.jobs.delete(r.job_id);
+      throw err;
+    }
+    this.publishJobEvent(stateEvent(stored, 'dispatch'));
+    return publicJob(stored);
+  }
+
+  // Applies change, then writes the audit rows auditOf returns; if either
+  // fails, only the fields change wrote are put back (a concurrent write to
+  // another field, such as alert_count, survives). The event is published
+  // only once both are in. change runs before the first await, so a guard
+  // checked by the caller in the same turn still holds when it runs.
+  async jobWrite(row, change, auditOf, eventOf) {
+    const before = { ...row };
+    let written = [];
+    try {
+      change(row);
+      written = Object.keys(row).filter((k) => row[k] !== before[k]);
+      for (const entry of auditOf ? auditOf(row) : []) await this.appendAudit(entry);
+    } catch (err) {
+      if (written.length === 0) written = Object.keys(row).filter((k) => row[k] !== before[k]);
+      for (const k of written) row[k] = before[k];
+      throw err;
+    }
+    if (eventOf) this.publishJobEvent(eventOf(row));
+  }
+
+  async getJob(tenantIds, jobId) {
+    const row = this.jobs.get(jobId);
+    if (!row || !(tenantIds || []).includes(row.tenant_id)) return null;
+    return publicJob(row);
+  }
+
+  // Never returns output.
+  async listJobs(tenantIds, opts = {}) {
+    const { hostId, status, limit } = jobListQuery(opts);
+    const allow = new Set(tenantIds || []);
+    return [...this.jobs.values()]
+      .filter((j) => allow.has(j.tenant_id) && (hostId === null || j.host_id === hostId) && (status === null || j.status === status))
+      .sort((a, b) => b.created_at - a.created_at || (a.job_id < b.job_id ? 1 : -1))
+      .slice(0, limit)
+      .map((j) => publicJob(j, { withOutput: false }));
+  }
+
+  // Guarded: the row must be this host's, in one of fromStatuses, and (with
+  // opts.connId) sent on that connection. Null when the guard does not hold.
+  async transitionJob(jobId, hostId, fromStatuses, fields, opts = {}) {
+    const { from, set } = jobTransition(fromStatuses, fields);
+    const guardConn = 'connId' in opts;
+    if (guardConn && !nonEmpty(opts.connId)) throw http(500, 'bad_conn_id');
+    const row = this.jobs.get(jobId);
+    if (!row || row.host_id !== hostId || !from.includes(row.status)) return null;
+    if (guardConn && row.conn_id !== opts.connId) return null;
+    await this.jobWrite(
+      row,
+      (r) => applyJobSet(r, set, new Date()),
+      (r) => [transitionAuditEntry(r, opts.audit)].filter(Boolean),
+      opts.notify ? (r) => transitionNotify(r, opts.notify) : null
+    );
+    return publicJob(row);
+  }
+
+  // Claims the dispatch payload once: it is returned to this caller and
+  // nulled on the row, with conn_id and sent_at set.
+  async markDispatched(jobId, hostId, connId) {
+    if (!nonEmpty(connId)) throw http(500, 'bad_conn_id');
+    const row = this.jobs.get(jobId);
+    if (!row || row.host_id !== hostId || row.status !== 'submitted' || row.dispatch == null) return null;
+    const dispatch = row.dispatch;
+    row.dispatch = null;
+    row.conn_id = connId;
+    row.sent_at = new Date();
+    return { ...publicJob(row), dispatch };
+  }
+
+  // Null when the job is not in tenantIds; 409 job_finished when terminal.
+  // A second request returns the row unchanged. A job never sent to the
+  // agent ends cancelled right here.
+  async requestJobCancel(tenantIds, jobId, actor, reason = 'user') {
+    if (!nonEmpty(actor) || !nonEmpty(reason)) throw http(400, 'bad_cancel');
+    const row = this.jobs.get(jobId);
+    if (!row || !(tenantIds || []).includes(row.tenant_id)) return null;
+    if (isTerminal(row.status)) throw http(409, 'job_finished');
+    if (row.cancel_requested_at) return publicJob(row);
+    const never = row.status === 'submitted' && row.dispatch != null;
+    await this.jobWrite(
+      row,
+      (r) => {
+        const now = new Date();
+        r.cancel_requested_at = now;
+        r.cancel_actor = actor;
+        if (never) applyJobSet(r, { status: 'cancelled', error: 'cancelled_before_dispatch' }, now);
+      },
+      (r) => [jobCancelAuditEntry(r, actor, reason), ...(never ? [jobEndAuditEntry(r, 'system')] : [])],
+      (r) => stateEvent(r, never ? 'state' : 'cancel')
+    );
+    return publicJob(row);
+  }
+
+  async markCancelSent(jobId, hostId) {
+    const row = this.jobs.get(jobId);
+    if (!row || row.host_id !== hostId || !row.cancel_requested_at || isTerminal(row.status)) return null;
+    row.cancel_sent_at = new Date();
+    return publicJob(row);
+  }
+
+  // {ok:true, tenant_id, alert_count} or {ok:false, reason}.
+  async bumpJobAlert(jobId, hostId, max = 20) {
+    const cap = jobAlertCap(max);
+    const row = this.jobs.get(jobId);
+    if (!row || row.host_id !== hostId || !['accepted', 'running'].includes(row.status)) {
+      return { ok: false, reason: 'unknown_execution' };
+    }
+    if (row.alert_count >= cap) return { ok: false, reason: 'rate_limited' };
+    row.alert_count += 1;
+    return { ok: true, tenant_id: row.tenant_id, alert_count: row.alert_count };
+  }
+
+  // Sync step 3: this host's non-terminal rows sent on another connection
+  // and absent from listedIds end failed[agent_lost_job]. Returns them.
+  // Listed non-terminal rows of this host move to connId (the agent holds
+  // them on this socket now), and a listed 'submitted' row counts as acked:
+  // it becomes 'accepted', so the ack timeout cannot end a job the agent has.
+  async reconcileHostJobs(hostId, connId, listedIds) {
+    if (!nonEmpty(connId)) throw http(500, 'bad_conn_id');
+    const listed = new Set(syncIds(listedIds));
+    const ended = [];
+    const lost = (j) => j.host_id === hostId && JOB_ACTIVE.includes(j.status) && j.conn_id != null
+      && j.conn_id !== connId && !listed.has(j.job_id);
+    for (const j of this.jobs.values()) {
+      if (j.host_id === hostId && JOB_ACTIVE.includes(j.status) && j.conn_id != null && listed.has(j.job_id)) {
+        j.conn_id = connId;
+        if (j.status === 'submitted') j.status = 'accepted';
+        j.accepted_at = j.accepted_at || new Date();
+      }
+    }
+    const rows = [...this.jobs.values()].filter(lost).sort((a, b) => (a.job_id < b.job_id ? -1 : 1));
+    for (const row of rows) {
+      if (!lost(row)) continue;
+      await this.jobWrite(
+        row,
+        (r) => applyJobSet(r, { status: 'failed', error: 'agent_lost_job' }, new Date()),
+        (r) => [jobEndAuditEntry(r, 'system')],
+        (r) => stateEvent(r)
+      );
+      ended.push(publicJob(row));
+    }
+    return ended;
+  }
+
+  // The fallback scan: rows of these hosts with a dispatch to claim or a
+  // cancel not yet sent.
+  async pendingForHosts(hostIds) {
+    const allow = new Set(connIdList(hostIds));
+    return [...this.jobs.values()]
+      .filter((j) => allow.has(j.host_id) && JOB_ACTIVE.includes(j.status)
+        && (j.dispatch != null || (j.cancel_requested_at && !j.cancel_sent_at)))
+      .sort((a, b) => a.created_at - b.created_at || (a.job_id < b.job_id ? -1 : 1))
+      .slice(0, 1000)
+      .map((j) => ({
+        job_id: j.job_id,
+        host_id: j.host_id,
+        status: j.status,
+        dispatch_pending: j.dispatch != null,
+        cancel_pending: Boolean(j.cancel_requested_at && !j.cancel_sent_at)
+      }));
+  }
+
+  // Ends failed[dispatch_timeout | agent_no_ack | result_lost] rows (§6.1),
+  // at most JOB_SWEEP_BATCH in job_id order, each with its end audit row.
+  // Returns them.
+  async sweepJobs(now = Date.now(), opts = {}) {
+    const s = jobSweep(now, opts);
+    const conns = new Set(s.connIds);
+    const ended = [];
+    const rows = [...this.jobs.values()].filter((j) => JOB_ACTIVE.includes(j.status))
+      .sort((a, b) => (a.job_id < b.job_id ? -1 : 1));
+    for (const row of rows) {
+      if (!JOB_ACTIVE.includes(row.status)) continue; // ended while an earlier audit row was written
+      let error = null;
+      if (row.status === 'submitted' && row.dispatch != null && row.created_at < s.dispatchCutoff) error = 'dispatch_timeout';
+      else if (row.status === 'submitted' && row.conn_id != null && conns.has(row.conn_id)
+        && row.sent_at && row.sent_at < s.ackCutoff) error = 'agent_no_ack';
+      else if (row.deadline_at < s.deadlineCutoff) error = 'result_lost';
+      if (!error) continue;
+      if (ended.length >= JOB_SWEEP_BATCH) break;
+      await this.jobWrite(
+        row,
+        (r) => applyJobSet(r, { status: 'failed', error }, new Date()),
+        (r) => [jobEndAuditEntry(r, 'system')],
+        (r) => stateEvent(r)
+      );
+      ended.push(publicJob(row));
+    }
+    return ended;
+  }
+
+  async expireOutput(hours) {
+    const n = jobOutputRetentionHours({ SYSTEMAPI_JOB_OUTPUT_RETENTION_HOURS: String(hours) });
+    const cutoff = Date.now() - n * 3600000;
+    let count = 0;
+    for (const row of this.jobs.values()) {
+      if (row.output != null && row.finished_at && row.finished_at.getTime() < cutoff) {
+        row.output = null;
+        row.output_expired = true;
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  async pruneJobs(days) {
+    const n = jobRetentionDays({ SYSTEMAPI_JOB_RETENTION_DAYS: String(days) });
+    const cutoff = Date.now() - n * 86400000;
+    let count = 0;
+    for (const [id, row] of this.jobs) {
+      if (isTerminal(row.status) && row.finished_at && row.finished_at.getTime() < cutoff) {
+        this.jobs.delete(id);
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  // In-process stand-in for NOTIFY: delivered after the current turn, as a
+  // notification arrives only after COMMIT.
+  publishJobEvent(evt) {
+    const e = jobEvent(evt);
+    if (!e) return false;
+    setImmediate(() => deliverJobEvent(this.jobBus, e));
+    return true;
+  }
+
+  // Returns the unsubscribe function; its .ready resolves once listening.
+  onJobEvent(fn) {
+    this.jobBus.on('event', fn);
+    const off = () => { this.jobBus.off('event', fn); };
+    off.ready = Promise.resolve();
+    return off;
+  }
+
+  async closeJobEvents() {
+    this.jobBus.removeAllListeners('event');
+  }
+
   async efficiency(tenantIds) {
     const hosts = [];
     for (const host of await this.listHosts(tenantIds)) {
@@ -825,6 +1417,9 @@ class PgRegistry {
     try {
       await client.query('BEGIN');
       await client.query("SELECT pg_advisory_xact_lock(hashtext('cp_bootstrap_admin'))");
+      // ssoBindInTx below takes this lock after the first audit row; taking
+      // it now keeps the audit chain lock last (see auditInsert).
+      if (typeof sub === 'string') await client.query("SELECT pg_advisory_xact_lock(hashtext('cp_members.sso_sub'))");
       const existing = await client.query(
         `SELECT (SELECT count(*) FROM cp_members WHERE role = 'admin')::int AS members,
                 (SELECT count(*) FROM cp_api_scopes WHERE scope = 'admin')::int AS keys`
@@ -1395,6 +1990,465 @@ class PgRegistry {
     return res.rows;
   }
 
+  // A client whose ROLLBACK fails is destroyed, never returned to the pool
+  // with a transaction possibly still open.
+  async inTx(fn) {
+    const client = await this.pool.connect();
+    let broken;
+    try {
+      await client.query('BEGIN');
+      const out = await fn(client);
+      await client.query('COMMIT');
+      return out;
+    } catch (err) {
+      try { await client.query('ROLLBACK'); } catch (rollbackErr) { broken = rollbackErr; }
+      throw err;
+    } finally {
+      client.release(broken);
+    }
+  }
+
+  // pg_notify inside the caller's transaction: delivered only on COMMIT.
+  async notifyInTx(client, evt) {
+    const e = jobEvent(evt);
+    if (!e) throw http(500, 'bad_job_event');
+    await client.query('SELECT pg_notify($1, $2)', [JOB_CHANNEL, JSON.stringify(e)]);
+  }
+
+  // Ends rows already updated in this transaction: end audit and state
+  // notify for each.
+  async endedInTx(client, rows) {
+    const sorted = [...rows].sort((a, b) => (a.job_id < b.job_id ? -1 : 1));
+    for (const row of sorted) {
+      await auditInsert(client, jobEndAuditEntry(row, 'system'));
+      await this.notifyInTx(client, stateEvent(row));
+    }
+    return sorted.map((row) => publicJob(row));
+  }
+
+  // One transaction: the tenant then the host advisory lock (fixed order),
+  // the host must be this tenant's and live, count the non-terminal rows,
+  // insert, the submit audit row, NOTIFY dispatch.
+  async createJob(row, opts = {}) {
+    const r = jobInsertRow(row);
+    const { hostCap, tenantCap } = jobCaps(opts);
+    try {
+      return await this.inTx(async (client) => {
+        await client.query("SELECT pg_advisory_xact_lock(hashtext('sjob:t:' || $1))", [r.tenant_id]);
+        await client.query("SELECT pg_advisory_xact_lock(hashtext('sjob:h:' || $1))", [r.host_id]);
+        const host = await client.query(
+          'SELECT 1 FROM cp_hosts WHERE host_id = $1 AND tenant_id = $2 AND retired_at IS NULL',
+          [r.host_id, r.tenant_id]
+        );
+        if (host.rowCount === 0) throw http(404, 'not_found');
+        // Same order as MemoryRegistry: a duplicate id is 409 even at the cap.
+        const dup = await client.query('SELECT 1 FROM cp_sysscript_jobs WHERE job_id = $1', [r.job_id]);
+        if (dup.rowCount > 0) throw http(409, 'conflict');
+        const counts = await client.query(
+          `SELECT count(*) FILTER (WHERE host_id = $1)::int AS on_host,
+                  count(*) FILTER (WHERE tenant_id = $2)::int AS on_tenant
+           FROM cp_sysscript_jobs
+           WHERE status = ANY($3::text[]) AND (host_id = $1 OR tenant_id = $2)`,
+          [r.host_id, r.tenant_id, JOB_ACTIVE]
+        );
+        const { on_host: onHost, on_tenant: onTenant } = counts.rows[0];
+        if (onHost >= hostCap || onTenant >= tenantCap) throw http(429, 'too_many_jobs');
+        const ins = await client.query(
+          `INSERT INTO cp_sysscript_jobs (job_id, tenant_id, host_id, actor, source, script_sha256, entitlements_sha256,
+             entitlements, status, timeout_s, deadline_at, lease_nonce, dispatch)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, 'submitted', $9, $10, $11, $12::jsonb)
+           RETURNING ${jobCols()}`,
+          [r.job_id, r.tenant_id, r.host_id, r.actor, r.source, r.script_sha256, r.entitlements_sha256,
+            JSON.stringify(r.entitlements), r.timeout_s, r.deadline_at, r.lease_nonce, JSON.stringify(r.dispatch)]
+        );
+        const stored = ins.rows[0];
+        await auditInsert(client, jobSubmitAuditEntry(stored));
+        await this.notifyInTx(client, stateEvent(stored, 'dispatch'));
+        return publicJob(stored);
+      });
+    } catch (err) {
+      if (err.code === '23505') throw http(409, 'conflict');
+      throw err;
+    }
+  }
+
+  async getJob(tenantIds, jobId) {
+    if (!tenantIds || tenantIds.length === 0 || typeof jobId !== 'string') return null;
+    const res = await this.pool.query(
+      `SELECT ${jobCols()} FROM cp_sysscript_jobs WHERE job_id = $1 AND tenant_id = ANY($2::text[])`,
+      [jobId, tenantIds]
+    );
+    return publicJob(res.rows[0] || null);
+  }
+
+  // Never returns output.
+  async listJobs(tenantIds, opts = {}) {
+    const { hostId, status, limit } = jobListQuery(opts);
+    if (!tenantIds || tenantIds.length === 0) return [];
+    const res = await this.pool.query(
+      `SELECT ${jobCols('', { output: false })} FROM cp_sysscript_jobs
+       WHERE tenant_id = ANY($1::text[])
+         AND ($2::text IS NULL OR host_id = $2)
+         AND ($3::text IS NULL OR status = $3)
+       ORDER BY created_at DESC, job_id DESC LIMIT $4`,
+      [tenantIds, hostId, status, limit]
+    );
+    return res.rows.map((row) => publicJob(row, { withOutput: false }));
+  }
+
+  // One guarded UPDATE (job_id, host_id, status in fromStatuses, and
+  // conn_id with opts.connId), with the optional audit row and NOTIFY in the
+  // same transaction. Null when the guard does not hold. SECURITY-RULES rule
+  // 7: the interpolated SET column names and $n placeholders come from the
+  // fixed key list below and a counter, never from input; values are bound.
+  async transitionJob(jobId, hostId, fromStatuses, fields, opts = {}) {
+    const { from, set } = jobTransition(fromStatuses, fields);
+    const guardConn = 'connId' in opts;
+    if (guardConn && !nonEmpty(opts.connId)) throw http(500, 'bad_conn_id');
+    if (typeof jobId !== 'string' || typeof hostId !== 'string') return null;
+    const values = [jobId, hostId, from, set.status];
+    const sets = ['status = $4'];
+    for (const key of ['error', 'output', 'output_truncated', 'duration_ms']) {
+      if (!(key in set)) continue;
+      values.push(set[key]);
+      sets.push(`${key} = $${values.length}`);
+    }
+    if (set.status === 'accepted' || set.status === 'running') sets.push('accepted_at = COALESCE(accepted_at, now())');
+    if (set.status === 'running') sets.push('started_at = COALESCE(started_at, now())');
+    if (isTerminal(set.status)) sets.push('finished_at = now()', 'dispatch = NULL');
+    let guard = '';
+    if (guardConn) {
+      values.push(opts.connId);
+      guard = ` AND conn_id = $${values.length}`;
+    }
+    return this.inTx(async (client) => {
+      const res = await client.query(
+        `UPDATE cp_sysscript_jobs SET ${sets.join(', ')}
+         WHERE job_id = $1 AND host_id = $2 AND status = ANY($3::text[])${guard}
+         RETURNING ${jobCols()}`,
+        values
+      );
+      const row = res.rows[0];
+      if (!row) return null;
+      const entry = transitionAuditEntry(row, opts.audit);
+      if (entry) await auditInsert(client, entry);
+      const evt = transitionNotify(row, opts.notify);
+      if (evt) await this.notifyInTx(client, evt);
+      return publicJob(row);
+    });
+  }
+
+  // Claims the dispatch payload once across instances: the row lock makes a
+  // second caller see dispatch already NULL.
+  async markDispatched(jobId, hostId, connId) {
+    if (!nonEmpty(connId)) throw http(500, 'bad_conn_id');
+    if (typeof jobId !== 'string' || typeof hostId !== 'string') return null;
+    const res = await this.pool.query(
+      `WITH cur AS (
+         SELECT job_id, dispatch FROM cp_sysscript_jobs
+         WHERE job_id = $1 AND host_id = $2 AND status = 'submitted' AND dispatch IS NOT NULL
+         FOR UPDATE
+       )
+       UPDATE cp_sysscript_jobs j SET conn_id = $3, sent_at = now(), dispatch = NULL
+       FROM cur WHERE j.job_id = cur.job_id
+       RETURNING cur.dispatch AS claimed_dispatch, ${jobCols('j.')}`,
+      [jobId, hostId, connId]
+    );
+    const row = res.rows[0];
+    if (!row) return null;
+    return { ...publicJob(row), dispatch: row.claimed_dispatch };
+  }
+
+  // Null when the job is not in tenantIds; 409 job_finished when terminal.
+  // A second request returns the row unchanged. A job never sent to the
+  // agent ends cancelled right here. Cancel audit (and end audit) and
+  // NOTIFY in the same transaction.
+  async requestJobCancel(tenantIds, jobId, actor, reason = 'user') {
+    if (!nonEmpty(actor) || !nonEmpty(reason)) throw http(400, 'bad_cancel');
+    if (!tenantIds || tenantIds.length === 0 || typeof jobId !== 'string') return null;
+    return this.inTx(async (client) => {
+      const cur = await client.query(
+        `SELECT ${jobCols()}, (dispatch IS NOT NULL) AS undispatched FROM cp_sysscript_jobs
+         WHERE job_id = $1 AND tenant_id = ANY($2::text[]) FOR UPDATE`,
+        [jobId, tenantIds]
+      );
+      const row = cur.rows[0];
+      if (!row) return null;
+      if (isTerminal(row.status)) throw http(409, 'job_finished');
+      if (row.cancel_requested_at) return publicJob(row);
+      const never = row.status === 'submitted' && row.undispatched;
+      const upd = await client.query(
+        never
+          ? `UPDATE cp_sysscript_jobs SET cancel_requested_at = now(), cancel_actor = $2, status = 'cancelled',
+               error = 'cancelled_before_dispatch', finished_at = now(), dispatch = NULL
+             WHERE job_id = $1 RETURNING ${jobCols()}`
+          : `UPDATE cp_sysscript_jobs SET cancel_requested_at = now(), cancel_actor = $2
+             WHERE job_id = $1 RETURNING ${jobCols()}`,
+        [jobId, actor]
+      );
+      const out = upd.rows[0];
+      await auditInsert(client, jobCancelAuditEntry(out, actor, reason));
+      if (never) await auditInsert(client, jobEndAuditEntry(out, 'system'));
+      await this.notifyInTx(client, stateEvent(out, never ? 'state' : 'cancel'));
+      return publicJob(out);
+    });
+  }
+
+  async markCancelSent(jobId, hostId) {
+    if (typeof jobId !== 'string' || typeof hostId !== 'string') return null;
+    const res = await this.pool.query(
+      `UPDATE cp_sysscript_jobs SET cancel_sent_at = now()
+       WHERE job_id = $1 AND host_id = $2 AND cancel_requested_at IS NOT NULL AND status = ANY($3::text[])
+       RETURNING ${jobCols()}`,
+      [jobId, hostId, JOB_ACTIVE]
+    );
+    return publicJob(res.rows[0] || null);
+  }
+
+  // {ok:true, tenant_id, alert_count} or {ok:false, reason}.
+  async bumpJobAlert(jobId, hostId, max = 20) {
+    const cap = jobAlertCap(max);
+    if (typeof jobId !== 'string' || typeof hostId !== 'string') return { ok: false, reason: 'unknown_execution' };
+    const res = await this.pool.query(
+      `UPDATE cp_sysscript_jobs SET alert_count = alert_count + 1
+       WHERE job_id = $1 AND host_id = $2 AND status IN ('accepted', 'running') AND alert_count < $3
+       RETURNING tenant_id, alert_count`,
+      [jobId, hostId, cap]
+    );
+    if (res.rows[0]) return { ok: true, tenant_id: res.rows[0].tenant_id, alert_count: res.rows[0].alert_count };
+    const live = await this.pool.query(
+      `SELECT 1 FROM cp_sysscript_jobs WHERE job_id = $1 AND host_id = $2 AND status IN ('accepted', 'running')`,
+      [jobId, hostId]
+    );
+    return { ok: false, reason: live.rowCount > 0 ? 'rate_limited' : 'unknown_execution' };
+  }
+
+  // Sync step 3 (§6.1), in one transaction with the end audit rows. The
+  // host's sent, non-terminal rows are locked first in job_id order (so two
+  // writers over the same rows cannot deadlock); the UPDATEs that follow are
+  // new statements and see every committed change. Listed rows move to
+  // connId: the agent holds them on this socket now.
+  async reconcileHostJobs(hostId, connId, listedIds) {
+    if (!nonEmpty(connId)) throw http(500, 'bad_conn_id');
+    const listed = syncIds(listedIds);
+    if (typeof hostId !== 'string') return [];
+    return this.inTx(async (client) => {
+      await client.query(
+        `SELECT job_id FROM cp_sysscript_jobs
+         WHERE host_id = $1 AND status = ANY($2::text[]) AND conn_id IS NOT NULL
+         ORDER BY job_id FOR UPDATE`,
+        [hostId, JOB_ACTIVE]
+      );
+      await client.query(
+        `UPDATE cp_sysscript_jobs SET conn_id = $3,
+           status = CASE WHEN status = 'submitted' THEN 'accepted' ELSE status END,
+           accepted_at = COALESCE(accepted_at, now())
+         WHERE host_id = $1 AND status = ANY($2::text[]) AND conn_id IS NOT NULL
+           AND job_id = ANY($4::text[])`,
+        [hostId, JOB_ACTIVE, connId, listed]
+      );
+      const res = await client.query(
+        `UPDATE cp_sysscript_jobs SET status = 'failed', error = 'agent_lost_job', finished_at = now(), dispatch = NULL
+         WHERE host_id = $1 AND status = ANY($2::text[]) AND conn_id IS NOT NULL AND conn_id <> $3
+           AND NOT (job_id = ANY($4::text[]))
+         RETURNING ${jobCols()}`,
+        [hostId, JOB_ACTIVE, connId, listed]
+      );
+      return this.endedInTx(client, res.rows);
+    });
+  }
+
+  async pendingForHosts(hostIds) {
+    const ids = connIdList(hostIds);
+    if (ids.length === 0) return [];
+    const res = await this.pool.query(
+      `SELECT job_id, host_id, status, (dispatch IS NOT NULL) AS dispatch_pending,
+              (cancel_requested_at IS NOT NULL AND cancel_sent_at IS NULL) AS cancel_pending
+       FROM cp_sysscript_jobs
+       WHERE host_id = ANY($1::text[]) AND status = ANY($2::text[])
+         AND (dispatch IS NOT NULL OR (cancel_requested_at IS NOT NULL AND cancel_sent_at IS NULL))
+       ORDER BY created_at, job_id LIMIT 1000`,
+      [ids, JOB_ACTIVE]
+    );
+    return res.rows;
+  }
+
+  // Ends overdue rows (§6.1), at most JOB_SWEEP_BATCH (a constant, the only
+  // interpolation besides the fixed condition text; SECURITY-RULES rule 7),
+  // with their error code, end audit rows and NOTIFYs, in one transaction. The cutoffs come from the
+  // database clock (now()), so replicas with skewed clocks agree; the now
+  // argument is used only by MemoryRegistry. Overdue rows are locked in
+  // job_id order with SKIP LOCKED (a row another writer holds is left for
+  // the next tick), then updated by id in a new statement.
+  async sweepJobs(now = Date.now(), opts = {}) {
+    const s = jobSweep(now, opts);
+    const overdue = `status = ANY($1::text[]) AND (
+           (status = 'submitted' AND dispatch IS NOT NULL
+             AND created_at < now() - make_interval(secs => $3::double precision / 1000))
+           OR (status = 'submitted' AND conn_id = ANY($2::text[])
+             AND sent_at < now() - make_interval(secs => $4::double precision / 1000))
+           OR deadline_at < now() - make_interval(secs => $5::double precision / 1000))`;
+    const params = [JOB_ACTIVE, s.connIds, s.dispatchMs, s.ackMs, s.graceMs];
+    return this.inTx(async (client) => {
+      const locked = await client.query(
+        `SELECT job_id FROM cp_sysscript_jobs WHERE ${overdue}
+         ORDER BY job_id LIMIT ${JOB_SWEEP_BATCH} FOR UPDATE SKIP LOCKED`,
+        params
+      );
+      if (locked.rowCount === 0) return [];
+      const res = await client.query(
+        `UPDATE cp_sysscript_jobs SET status = 'failed', finished_at = now(), dispatch = NULL,
+           error = CASE
+             WHEN status = 'submitted' AND dispatch IS NOT NULL
+               AND created_at < now() - make_interval(secs => $3::double precision / 1000) THEN 'dispatch_timeout'
+             WHEN status = 'submitted' AND conn_id = ANY($2::text[])
+               AND sent_at < now() - make_interval(secs => $4::double precision / 1000) THEN 'agent_no_ack'
+             ELSE 'result_lost' END
+         WHERE job_id = ANY($6::text[]) AND ${overdue}
+         RETURNING ${jobCols()}`,
+        [...params, locked.rows.map((r) => r.job_id)]
+      );
+      return this.endedInTx(client, res.rows);
+    });
+  }
+
+  async expireOutput(hours) {
+    const n = jobOutputRetentionHours({ SYSTEMAPI_JOB_OUTPUT_RETENTION_HOURS: String(hours) });
+    const res = await this.pool.query(
+      `UPDATE cp_sysscript_jobs SET output = NULL, output_expired = true
+       WHERE output IS NOT NULL AND finished_at < now() - make_interval(hours => $1::int)`,
+      [n]
+    );
+    return res.rowCount;
+  }
+
+  async pruneJobs(days) {
+    const n = jobRetentionDays({ SYSTEMAPI_JOB_RETENTION_DAYS: String(days) });
+    const res = await this.pool.query(
+      `DELETE FROM cp_sysscript_jobs
+       WHERE NOT (status = ANY($2::text[])) AND finished_at < now() - make_interval(days => $1::int)`,
+      [n, JOB_ACTIVE]
+    );
+    return res.rowCount;
+  }
+
+  // A NOTIFY outside any write (the writes above notify in their own
+  // transaction).
+  async publishJobEvent(evt) {
+    const e = jobEvent(evt);
+    if (!e) return false;
+    await this.pool.query('SELECT pg_notify($1, $2)', [JOB_CHANNEL, JSON.stringify(e)]);
+    return true;
+  }
+
+  // Returns the unsubscribe function. Its .ready never rejects: it resolves
+  // true once LISTEN is in, or false when the first attempt failed (degraded:
+  // reconnects go on in the background, and the pendingForHosts scan covers
+  // the gap) or the listener was closed first.
+  onJobEvent(fn) {
+    if (!this.jobBus) this.jobBus = new EventEmitter();
+    this.jobBus.on('event', fn);
+    const off = () => { this.jobBus.off('event', fn); };
+    off.ready = this.listenJobEvents();
+    return off;
+  }
+
+  // One dedicated client per registry runs LISTEN. On an error or end it is
+  // dropped and reconnected with backoff (250 ms doubling to 10 s); events
+  // lost in the gap are found by the pendingForHosts scan. A payload that is
+  // not a well-formed job event is dropped. The channel is a constant.
+  listenJobEvents() {
+    if (this.jobListen) return this.jobListen.ready;
+    const state = { stopped: false, client: null, detach: null, timer: null, backoff: 250 };
+    let resolveReady;
+    state.ready = new Promise((resolve) => { resolveReady = resolve; });
+    state.settle = (ok) => { resolveReady(ok); };
+    this.jobListen = state;
+    const retry = (err) => {
+      state.settle(false);
+      if (state.stopped) return;
+      console.warn(`[control] job LISTEN lost (${err && err.message}); retrying`);
+      state.timer = setTimeout(connect, state.backoff);
+      state.timer.unref();
+      state.backoff = Math.min(state.backoff * 2, 10000);
+    };
+    const connect = async () => {
+      state.timer = null;
+      if (state.stopped) return;
+      let client;
+      try {
+        client = await this.pool.connect();
+      } catch (err) {
+        retry(err);
+        return;
+      }
+      let failed = false;
+      const onNote = (msg) => {
+        if (msg.channel !== JOB_CHANNEL) return;
+        let parsed = null;
+        try { parsed = JSON.parse(msg.payload); } catch { parsed = null; /* malformed: dropped below */ }
+        const e = jobEvent(parsed);
+        if (e && this.jobBus) deliverJobEvent(this.jobBus, e);
+      };
+      const detach = () => {
+        client.removeListener('notification', onNote);
+        client.removeListener('error', fail);
+        client.removeListener('end', onEnd);
+      };
+      function fail(err) {
+        if (failed) return;
+        failed = true;
+        detach();
+        if (state.client === client) {
+          state.client = null;
+          state.detach = null;
+        }
+        client.release(err instanceof Error ? err : new Error('listen client failed'));
+        retry(err);
+      }
+      function onEnd() { fail(new Error('listen client ended')); }
+      client.on('notification', onNote);
+      client.on('error', fail);
+      client.on('end', onEnd);
+      try {
+        // SECURITY-RULES rule 7: an identifier cannot be bound; JOB_CHANNEL is
+        // a constant.
+        await client.query(`LISTEN ${JOB_CHANNEL}`);
+      } catch (err) {
+        fail(err);
+        return;
+      }
+      if (state.stopped) {
+        failed = true;
+        detach();
+        client.release(true);
+        return;
+      }
+      state.client = client;
+      state.detach = detach;
+      state.backoff = 250;
+      state.settle(true);
+    };
+    connect();
+    return state.ready;
+  }
+
+  async closeJobEvents() {
+    const state = this.jobListen;
+    this.jobListen = null;
+    if (this.jobBus) this.jobBus.removeAllListeners('event');
+    if (!state) return;
+    state.stopped = true;
+    state.settle(false);
+    if (state.timer) clearTimeout(state.timer);
+    const { client, detach } = state;
+    state.client = null;
+    if (!client) return;
+    detach();
+    // Destroyed, not returned to the pool: it is still LISTENing.
+    client.release(true);
+  }
+
   async efficiency(tenantIds) {
     if (!tenantIds || tenantIds.length === 0) return efficiencyOf([]);
     const res = await this.pool.query(
@@ -1469,5 +2523,7 @@ module.exports = {
   MemoryRegistry,
   PgRegistry,
   createRegistry,
-  fingerprint
+  fingerprint,
+  jobRetentionDays,
+  jobOutputRetentionHours
 };

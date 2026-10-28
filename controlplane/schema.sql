@@ -198,3 +198,53 @@ CREATE TABLE IF NOT EXISTS cp_oauth_links (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (user_id, provider)
 );
+
+-- Async sysscript jobs (playground/fleet.js, controlplane/router.js
+-- /api/v1/jobs). The script is held in dispatch only until it is sent, then
+-- only its hash remains. Output is nulled after
+-- SYSTEMAPI_JOB_OUTPUT_RETENTION_HOURS; terminal rows are deleted after
+-- SYSTEMAPI_JOB_RETENTION_DAYS. Reads always carry a tenant predicate; agent
+-- frames are matched on host_id (and conn_id where it applies) in the WHERE.
+-- Writes NOTIFY cp_sysscript_jobs inside their transaction.
+CREATE TABLE IF NOT EXISTS cp_sysscript_jobs (
+  job_id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+  host_id TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  source TEXT NOT NULL CHECK (source IN ('api', 'execute', 'fleet_execute', 'playbook', 'schedule', 'rule')),
+  script_sha256 TEXT NOT NULL,
+  entitlements_sha256 TEXT NOT NULL,
+  entitlements JSONB NOT NULL DEFAULT '{}'::jsonb,
+  status TEXT NOT NULL CHECK (status IN ('submitted', 'accepted', 'running', 'succeeded', 'failed', 'cancelled', 'timed_out')),
+  error TEXT,
+  output TEXT,
+  output_truncated BOOLEAN NOT NULL DEFAULT false,
+  output_expired BOOLEAN NOT NULL DEFAULT false,
+  timeout_s INTEGER NOT NULL CHECK (timeout_s BETWEEN 1 AND 3600),
+  deadline_at TIMESTAMPTZ NOT NULL,
+  lease_nonce TEXT NOT NULL,
+  dispatch JSONB,
+  conn_id TEXT,
+  sent_at TIMESTAMPTZ,
+  alert_count INTEGER NOT NULL DEFAULT 0,
+  cancel_requested_at TIMESTAMPTZ,
+  cancel_sent_at TIMESTAMPTZ,
+  cancel_actor TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  accepted_at TIMESTAMPTZ,
+  started_at TIMESTAMPTZ,
+  finished_at TIMESTAMPTZ,
+  duration_ms INTEGER
+);
+CREATE INDEX IF NOT EXISTS cp_sysscript_jobs_tenant_created_idx ON cp_sysscript_jobs (tenant_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS cp_sysscript_jobs_host_active_idx ON cp_sysscript_jobs (host_id)
+  WHERE status IN ('submitted', 'accepted', 'running');
+CREATE INDEX IF NOT EXISTS cp_sysscript_jobs_output_idx ON cp_sysscript_jobs (finished_at)
+  WHERE output IS NOT NULL;
+
+-- Which instance holds a host's agent socket and the capabilities that agent
+-- advertised (written on enroll, cleared on close). Used for the online and
+-- capability check at job submit across replicas; a crashed instance can
+-- leave a stale value, overwritten on the next enroll.
+ALTER TABLE cp_hosts ADD COLUMN IF NOT EXISTS agent_caps TEXT[];
+ALTER TABLE cp_hosts ADD COLUMN IF NOT EXISTS agent_instance TEXT;
