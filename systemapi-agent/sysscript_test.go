@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -9,6 +10,7 @@ import (
 // Used for tests that don't need real client connections.
 func newTestEngine(entitlements *Entitlements) *SysscriptEngine {
 	return &SysscriptEngine{
+		ctx:          context.Background(),
 		Entitlements: entitlements,
 		cm:           &ConfigManager{},
 	}

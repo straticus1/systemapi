@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func restorePackageQueryHook(t *testing.T) {
@@ -123,16 +124,16 @@ func TestPackageVerbsDenyBeforeLookup(t *testing.T) {
 	runPackageQuery = func(context.Context, []string) (string, int, error) { called = true; return "", 0, nil }
 	for _, allow := range [][]string{{"*"}, nil, {}, {"curl"}} {
 		for _, verb := range []string{"remove", "upgrade"} {
-			if err := changePackage(verb, "nginx", allow); err == nil || !strings.Contains(err.Error(), "package not allowed") {
+			if err := changePackage(context.Background(), verb, "nginx", allow); err == nil || !strings.Contains(err.Error(), "package not allowed") {
 				t.Fatalf("%s %v: %v", verb, allow, err)
 			}
 		}
-		if _, _, err := queryPackage("nginx", allow); err == nil || !strings.Contains(err.Error(), "package not allowed") {
+		if _, _, err := queryPackage(context.Background(), "nginx", allow); err == nil || !strings.Contains(err.Error(), "package not allowed") {
 			t.Fatalf("query %v: %v", allow, err)
 		}
 	}
 	for _, allow := range [][]string{{"*"}, nil, {}, {"bad name"}} {
-		if _, err := listPackages(allow); err == nil || !strings.Contains(err.Error(), "package not allowed") {
+		if _, err := listPackages(context.Background(), allow); err == nil || !strings.Contains(err.Error(), "package not allowed") {
 			t.Fatalf("list %v: %v", allow, err)
 		}
 	}
@@ -160,10 +161,10 @@ func TestPackageVerbsHostGate(t *testing.T) {
 		return "nginx-1.20.1-14.el9.x86_64\n", 0, nil
 	}
 	allow := []string{"nginx"}
-	errRemove := changePackage("remove", "nginx", allow)
-	errUpgrade := changePackage("upgrade", "nginx", allow)
-	inst, ver, errQuery := queryPackage("nginx", allow)
-	list, errList := listPackages(allow)
+	errRemove := changePackage(context.Background(), "remove", "nginx", allow)
+	errUpgrade := changePackage(context.Background(), "upgrade", "nginx", allow)
+	inst, ver, errQuery := queryPackage(context.Background(), "nginx", allow)
+	list, errList := listPackages(context.Background(), allow)
 	if !hostLinux() {
 		for _, err := range []error{errRemove, errUpgrade, errQuery, errList} {
 			if err == nil || !strings.Contains(err.Error(), "requires linux") {
@@ -198,14 +199,14 @@ func TestPackageQueryExitCodes(t *testing.T) {
 	runPackageQuery = func(context.Context, []string) (string, int, error) {
 		return "package nginx is not installed\n", 1, nil
 	}
-	if inst, _, err := queryPackage("nginx", []string{"nginx"}); err != nil || inst {
+	if inst, _, err := queryPackage(context.Background(), "nginx", []string{"nginx"}); err != nil || inst {
 		t.Fatalf("exit 1 must be not installed: %v %v", inst, err)
 	}
 	runPackageQuery = func(context.Context, []string) (string, int, error) { return "", 2, nil }
-	if _, _, err := queryPackage("nginx", []string{"nginx"}); err == nil {
+	if _, _, err := queryPackage(context.Background(), "nginx", []string{"nginx"}); err == nil {
 		t.Fatal("exit 2 must be an error")
 	}
-	if _, err := listPackages([]string{"nginx"}); err == nil {
+	if _, err := listPackages(context.Background(), []string{"nginx"}); err == nil {
 		t.Fatal("list with non-zero exit must be an error")
 	}
 }
@@ -393,7 +394,7 @@ func TestPackageRemoveRefusesExtraRemovals(t *testing.T) {
 		lookupPackageManager = func() (string, error) { return c.mgr, nil }
 		runPackageQuery = func(context.Context, []string) (string, int, error) { return c.out, c.code, nil }
 		runPackageInstall = func(context.Context, []string) error { removed = true; return nil }
-		err := changePackage("remove", "nginx", []string{"nginx"})
+		err := changePackage(context.Background(), "remove", "nginx", []string{"nginx"})
 		if c.wantErr == "" {
 			if err != nil || !removed {
 				t.Errorf("%s: err=%v removed=%v", c.name, err, removed)
@@ -409,7 +410,7 @@ func TestPackageRemoveRefusesExtraRemovals(t *testing.T) {
 	lookupPackageManager = func() (string, error) { return "dnf", nil }
 	runPackageQuery = func(context.Context, []string) (string, int, error) { return "", 0, errors.New("exec failed") }
 	runPackageInstall = func(context.Context, []string) error { removed = true; return nil }
-	if err := changePackage("remove", "nginx", []string{"nginx"}); err == nil || removed {
+	if err := changePackage(context.Background(), "remove", "nginx", []string{"nginx"}); err == nil || removed {
 		t.Fatalf("failed dry run: err=%v removed=%v", err, removed)
 	}
 }
@@ -430,5 +431,43 @@ func TestRemoveSimArgv(t *testing.T) {
 		if _, err := packageManagerByName(mgr).RemoveSimArgv("-rf"); err == nil {
 			t.Errorf("%s: bad name accepted", mgr)
 		}
+	}
+}
+
+// TestPackageVerbsUseScriptContext: the package verbs run under the
+// script's own context (no 25 s cap of their own) and report its end; an
+// interrupted apt install says how to repair dpkg.
+func TestPackageVerbsUseScriptContext(t *testing.T) {
+	restorePackageQueryHook(t)
+	lookupPackageManager = func() (string, error) { return "apt-get", nil }
+	deadline := time.Now().Add(time.Hour)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	var sawDeadline bool
+	runPackageInstall = func(c context.Context, argv []string) error {
+		d, ok := c.Deadline()
+		sawDeadline = ok && d.Equal(deadline)
+		cancel()
+		<-c.Done()
+		return errors.New("signal: terminated")
+	}
+	err := changePackage(ctx, "install", "nginx", []string{"nginx"})
+	if !hostLinux() {
+		if err == nil || !strings.Contains(err.Error(), "requires linux") {
+			t.Fatalf("non-linux must refuse: %v", err)
+		}
+		return
+	}
+	if !sawDeadline {
+		t.Fatal("install did not run under the script's context")
+	}
+	if err == nil || !strings.Contains(err.Error(), "cancelled") || !strings.Contains(err.Error(), "dpkg --configure -a") {
+		t.Fatalf("err=%v", err)
+	}
+	expired, cancel2 := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel2()
+	runPackageQuery = func(c context.Context, argv []string) (string, int, error) { return "", -1, c.Err() }
+	if _, _, err := queryPackage(expired, "nginx", []string{"nginx"}); err == nil || !strings.Contains(err.Error(), "timed out (script deadline)") || strings.Contains(err.Error(), "dpkg") {
+		t.Fatalf("query err=%v", err)
 	}
 }

@@ -14,8 +14,8 @@ package main
 // platform's reload returns an error, never a silent success.
 
 import (
+	"context"
 	"fmt"
-	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -42,7 +42,7 @@ func (c *configStore) AtomicWrite(path, content string) error {
 // Validate runs the config checker for a service, if one is known. An unknown
 // service is not an error: it returns a clear "no validator" note so a script
 // never mistakes a missing checker for a passing check.
-func (c *configStore) Validate(service, path string) (string, error) {
+func (c *configStore) Validate(ctx context.Context, service, path string) (string, error) {
 	argv, err := configCheckArgv(service, path)
 	if err != nil {
 		return "", err
@@ -50,7 +50,7 @@ func (c *configStore) Validate(service, path string) (string, error) {
 	if argv == nil {
 		return "no validator for service", nil
 	}
-	out, err := exec.Command(argv[0], argv[1:]...).CombinedOutput()
+	out, err := jobCommand(ctx, argv[0], argv[1:]...).CombinedOutput()
 	return string(out), err
 }
 
@@ -76,18 +76,18 @@ func configCheckArgv(service, path string) ([]string, error) {
 }
 
 // Reload reloads a service through the family's init system.
-func (c *configStore) Reload(service string) (string, error) {
+func (c *configStore) Reload(ctx context.Context, service string) (string, error) {
 	if !serviceNameRE.MatchString(service) {
 		return "", fmt.Errorf("service not allowed")
 	}
-	var cmd *exec.Cmd
+	var cmd *jobCmd
 	switch c.fam {
 	case familyDarwin:
-		cmd = exec.Command("launchctl", "kickstart", "-k", "system/"+service)
+		cmd = jobCommand(ctx, "launchctl", "kickstart", "-k", "system/"+service)
 	case familyWindows:
 		return "", fmt.Errorf("service reload not supported on windows")
 	default:
-		cmd = exec.Command("systemctl", "reload", service)
+		cmd = jobCommand(ctx, "systemctl", "reload", service)
 	}
 	out, err := cmd.CombinedOutput()
 	return string(out), err

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -30,6 +31,7 @@ import (
 func newTestK3sClient(handler http.Handler) (*K3sClient, *httptest.Server) {
 	srv := httptest.NewServer(handler)
 	kc := &K3sClient{
+		ctx:       context.Background(),
 		client:    srv.Client(),
 		serverURL: srv.URL,
 	}
@@ -39,6 +41,7 @@ func newTestK3sClient(handler http.Handler) (*K3sClient, *httptest.Server) {
 // newTestEngineWithK3s creates a SysscriptEngine with the given K3sClient wired in.
 func newTestEngineWithK3s(kc *K3sClient) *SysscriptEngine {
 	return &SysscriptEngine{
+		ctx:          context.Background(),
 		Entitlements: &Entitlements{AllowK3s: true},
 		cm:           &ConfigManager{},
 		k3sClient:    kc,
@@ -559,7 +562,7 @@ func TestK3sPodsDownAndGetDown(t *testing.T) {
 }
 
 func TestKubeListResourceBounds(t *testing.T) {
-	dead := &K3sClient{client: &http.Client{}, serverURL: "http://127.0.0.1:1"}
+	dead := &K3sClient{ctx: context.Background(), client: &http.Client{}, serverURL: "http://127.0.0.1:1"}
 	if _, err := dead.ListResource("Pod", ""); err == nil || !strings.Contains(err.Error(), "namespace required") {
 		t.Fatal(err)
 	}
@@ -682,7 +685,7 @@ func TestNewK3sClientIgnoresKubeconfig(t *testing.T) {
 		t.Skip("k3s kubeconfig present")
 	}
 	t.Setenv("KUBECONFIG", filepath.Join(t.TempDir(), "ignored"))
-	_, err := NewK3sClient()
+	_, err := NewK3sClient(context.Background())
 	if err == nil || !strings.Contains(err.Error(), k3sKubeconfigPath) {
 		t.Fatal(err)
 	}
@@ -690,7 +693,7 @@ func TestNewK3sClientIgnoresKubeconfig(t *testing.T) {
 
 func TestNewK8sClientRequiresTLS13(t *testing.T) {
 	t.Setenv("KUBECONFIG", "")
-	if _, err := NewK8sClient(); err == nil || !strings.Contains(err.Error(), "KUBECONFIG not set") {
+	if _, err := NewK8sClient(context.Background()); err == nil || !strings.Contains(err.Error(), "KUBECONFIG not set") {
 		t.Fatal(err)
 	}
 
@@ -752,7 +755,7 @@ users:
 		t.Fatal(err)
 	}
 	t.Setenv("KUBECONFIG", path)
-	kc, err := NewK8sClient()
+	kc, err := NewK8sClient(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}

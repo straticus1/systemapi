@@ -89,7 +89,7 @@ func (engine *SysscriptEngine) configValidate(thread *starlark.Thread, b *starla
 		return result, nil
 	}
 
-	out, err := currentPlatform().Config.Validate(service, resolved)
+	out, err := currentPlatform().Config.Validate(engine.ctx, service, resolved)
 	result := starlark.NewDict(3)
 	if err != nil {
 		result.SetKey(starlark.String("success"), starlark.False)
@@ -126,7 +126,7 @@ func (engine *SysscriptEngine) configReload(thread *starlark.Thread, b *starlark
 		return result, nil
 	}
 
-	out, err := currentPlatform().Config.Reload(service)
+	out, err := currentPlatform().Config.Reload(engine.ctx, service)
 	result := starlark.NewDict(3)
 	if err != nil {
 		result.SetKey(starlark.String("success"), starlark.False)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -62,10 +63,10 @@ func TestNoneServiceManagerFailsClosed(t *testing.T) {
 	if n.Available() {
 		t.Fatal("windows service manager must not be available")
 	}
-	if _, err := n.Action("start", "nginx"); err == nil {
+	if _, err := n.Action(context.Background(), "start", "nginx"); err == nil {
 		t.Fatal("none manager Action must return an error, not a silent success")
 	}
-	if _, err := n.Status("nginx"); err == nil {
+	if _, err := n.Status(context.Background(), "nginx"); err == nil {
 		t.Fatal("none manager Status must return an error")
 	}
 }
@@ -147,16 +148,16 @@ func TestPackageManagerOrderPrefersFamily(t *testing.T) {
 
 func TestConfigStoreValidateAndReload(t *testing.T) {
 	cs := newConfigStore(familyDebian)
-	out, err := cs.Validate("mystery-service", "/etc/mystery.conf")
+	out, err := cs.Validate(context.Background(), "mystery-service", "/etc/mystery.conf")
 	if err != nil || out != "no validator for service" {
 		t.Fatalf("unknown validator should be a clean no-op, got out=%q err=%v", out, err)
 	}
 	// reload rejects an unsafe service name before any exec
-	if _, err := cs.Reload("a;b"); err == nil {
+	if _, err := cs.Reload(context.Background(), "a;b"); err == nil {
 		t.Fatal("reload must reject an unsafe service name")
 	}
 	// windows config reload is unsupported, not a silent success
-	if _, err := newConfigStore(familyWindows).Reload("nginx"); err == nil {
+	if _, err := newConfigStore(familyWindows).Reload(context.Background(), "nginx"); err == nil {
 		t.Fatal("windows reload must fail closed")
 	}
 	if !cs.Available() {

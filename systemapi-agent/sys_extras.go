@@ -305,7 +305,7 @@ func (engine *SysscriptEngine) svcAction(action, service string) (starlark.Value
 	if !allowed {
 		return starlark.None, fmt.Errorf("security exception: service %q not in allow_service_reload", service)
 	}
-	out, err := currentPlatform().Services.Action(action, service)
+	out, err := currentPlatform().Services.Action(engine.ctx, action, service)
 	d := starlark.NewDict(3)
 	d.SetKey(starlark.String("success"), starlark.Bool(err == nil))
 	d.SetKey(starlark.String("output"), starlark.String(strings.TrimSpace(out)))
@@ -364,7 +364,7 @@ func (engine *SysscriptEngine) svcStatus(thread *starlark.Thread, b *starlark.Bu
 		return starlark.None, err
 	}
 	// status doesn't modify - no entitlement required
-	st, _ := currentPlatform().Services.Status(service)
+	st, _ := currentPlatform().Services.Status(engine.ctx, service)
 	d := starlark.NewDict(3)
 	d.SetKey(starlark.String("active"), starlark.Bool(st.Active))
 	d.SetKey(starlark.String("state"), starlark.String(st.State))

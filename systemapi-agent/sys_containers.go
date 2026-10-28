@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	"go.starlark.net/starlark"
 	"go.starlark.net/starlarkstruct"
@@ -292,7 +291,7 @@ func (engine *SysscriptEngine) containersPull(thread *starlark.Thread, b *starla
 	if err := engine.requireDocker(); err != nil {
 		return starlark.None, err
 	}
-	status, err := engine.dockerClient.PullImage(ref)
+	status, err := engine.dockerClient.PullImage(engine.ctx, ref)
 	if err != nil {
 		return starlark.None, err
 	}
@@ -452,11 +451,8 @@ func (engine *SysscriptEngine) containersRemoveNetwork(thread *starlark.Thread, 
 // binds into the project dir must be read-only so a container cannot
 // rewrite them. Does NOT inspect a .env file in the project
 // dir (it is not script-writable) or what the images themselves do. The
-// whole call stops at sysscriptOpTimeout. Output is truncated at outputCap.
-
-// composeTimeout bounds one compose call (config check and action together).
-// A var so tests can shorten it.
-var composeTimeout = sysscriptOpTimeout
+// whole call stops at the script's deadline or cancel, which kills the
+// compose process group (jobCommand). Output is truncated at outputCap.
 
 const (
 	composePathMax = 4096
@@ -491,13 +487,12 @@ func composeEnv() []string {
 // (stderr is dropped), for output that is parsed (capped at hostFileCap).
 // Tests replace it.
 var composeExec = func(ctx context.Context, dir string, argv []string, stdin string, stdoutOnly bool) (int, string, error) {
-	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd := jobCommand(ctx, argv[0], argv[1:]...)
 	cmd.Dir = dir
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}
 	cmd.Env = composeEnv()
-	cmd.WaitDelay = 2 * time.Second
 	out := &capWriter{max: outputCap}
 	if stdoutOnly {
 		// Parsed output gets a larger cap; a truncated document fails to parse.
@@ -523,17 +518,21 @@ var composeExec = func(ctx context.Context, dir string, argv []string, stdin str
 // capWriter keeps the first max bytes and drops the rest so the child
 // never blocks or dies on a closed pipe.
 type capWriter struct {
-	buf bytes.Buffer
-	max int
+	buf       bytes.Buffer
+	max       int
+	truncated bool // bytes past max were dropped
 }
 
 func (w *capWriter) Write(p []byte) (int, error) {
-	if room := w.max - w.buf.Len(); room > 0 {
-		if len(p) > room {
-			w.buf.Write(p[:room])
-		} else {
-			w.buf.Write(p)
-		}
+	room := w.max - w.buf.Len()
+	if room < 0 {
+		room = 0
+	}
+	if len(p) > room {
+		w.truncated = true
+		w.buf.Write(p[:room])
+	} else {
+		w.buf.Write(p)
 	}
 	return len(p), nil
 }
@@ -1081,12 +1080,11 @@ func (engine *SysscriptEngine) containersCompose(thread *starlark.Thread, b *sta
 	if err != nil {
 		return starlark.None, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), composeTimeout)
-	defer cancel()
+	ctx := engine.ctx
 	var stdin string
 	timedOut := func() error {
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return fmt.Errorf("docker compose: timed out after %s", composeTimeout)
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("docker compose: %s", jobCtxReason(ctx))
 		}
 		return nil
 	}

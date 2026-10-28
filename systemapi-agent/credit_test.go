@@ -25,6 +25,17 @@ func (r *recordingOut) WriteJSON(v interface{}) error {
 	return nil
 }
 
+func (r *recordingOut) WriteText(b []byte) error {
+	var m map[string]interface{}
+	if err := json.Unmarshal(b, &m); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.json = append(r.json, m)
+	r.mu.Unlock()
+	return nil
+}
+
 func (r *recordingOut) WriteBinary(b []byte) error {
 	r.mu.Lock()
 	r.binary = append(r.binary, append([]byte(nil), b...))

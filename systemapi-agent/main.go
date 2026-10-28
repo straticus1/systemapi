@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -250,23 +251,25 @@ func processIncomingMessage(out ptyOut, hostID, stateDir string, message []byte)
 	switch cmd.Type {
 	case "sysscript":
 		if len(cmd.Script) > scriptMaxBytes {
-			writeCommandResult(out, cmd.RequestID, "script_too_large", "")
+			writeCommandResult(out, cmd.RequestID, "script_too_large", "", false)
 			return
 		}
 		if err := authorizeCommand(hostID, "sysscript", cmd.Script, cmd.Lease, time.Now()); err != nil {
 			log.Printf("sysscript refused: %s", err.Error())
-			writeCommandResult(out, cmd.RequestID, err.Error(), "")
+			writeCommandResult(out, cmd.RequestID, err.Error(), "", false)
 			return
 		}
 		log.Printf("sysscript %s", cmd.RequestID)
-		engine := NewSysscriptEngine(cmd.Entitlements)
+		ctx, cancel := context.WithTimeout(context.Background(), legacyScriptTimeout)
+		engine := NewSysscriptEngine(ctx, cmd.Entitlements)
 		engine.alerts = &alertSink{send: out.WriteJSON, scriptID: cmd.RequestID}
 		output, err := engine.Execute(cmd.Script)
+		cancel()
 		errText := ""
 		if err != nil {
 			errText = err.Error()
 		}
-		writeCommandResult(out, cmd.RequestID, errText, output)
+		writeCommandResult(out, cmd.RequestID, errText, output, engine.outputTruncated)
 
 	case "pty_start":
 		log.Printf("pty_start %s action=%s", cmd.SessionID, cmd.Action)
@@ -329,12 +332,29 @@ func processIncomingMessage(out ptyOut, hostID, stateDir string, message []byte)
 	}
 }
 
-func writeCommandResult(out ptyOut, requestID, errText, output string) {
-	_ = out.WriteJSON(ResponseMessage{
-		Type:      "command_result",
-		RequestID: requestID,
-		Payload:   map[string]string{"error": errText, "output": output},
-	})
+// legacyScriptTimeout is the whole-script deadline of a legacy "sysscript"
+// frame. The server stops waiting at 30 s; the script keeps running until
+// it ends or this deadline passes.
+const legacyScriptTimeout = 300 * time.Second
+
+// writeCommandResult sends the legacy command_result frame, its encoded size
+// capped at jobFrameMax (encodeOutputFrame).
+func writeCommandResult(out ptyOut, requestID, errText, output string, truncated bool) {
+	errText, _ = frameText(errText, frameErrMax)
+	b, err := encodeOutputFrame(func(o string, tr bool) interface{} {
+		return ResponseMessage{
+			Type:      "command_result",
+			RequestID: requestID,
+			Payload:   commandResultPayload{Error: errText, Output: o, OutputTruncated: tr},
+		}
+	}, output, truncated)
+	if err != nil {
+		log.Printf("command_result %s not encoded: %v", requestID, err)
+		return
+	}
+	if err := out.WriteText(b); err != nil {
+		log.Printf("command_result %s not sent: %v", requestID, err)
+	}
 }
 
 // resolveAPIKey takes the key from --api-key-file, then SYSTEMAPI_API_KEY,

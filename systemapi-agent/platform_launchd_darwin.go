@@ -13,7 +13,7 @@ package main
 // grant still applies.
 
 import (
-	"os/exec"
+	"context"
 	"strings"
 )
 
@@ -28,12 +28,12 @@ func (launchdServiceManager) Available() bool {
 	return ok
 }
 
-func (m launchdServiceManager) Action(verb, service string) (string, error) {
+func (m launchdServiceManager) Action(ctx context.Context, verb, service string) (string, error) {
 	if err := validService(verb, service); err != nil {
 		return "", err
 	}
 	run := func(args ...string) (string, error) {
-		out, err := exec.Command("launchctl", args...).CombinedOutput()
+		out, err := jobCommand(ctx, "launchctl", args...).CombinedOutput()
 		return string(out), err
 	}
 	switch verb {
@@ -54,11 +54,11 @@ func (m launchdServiceManager) Action(verb, service string) (string, error) {
 	}
 }
 
-func (m launchdServiceManager) Status(service string) (ServiceStatus, error) {
+func (m launchdServiceManager) Status(ctx context.Context, service string) (ServiceStatus, error) {
 	if !serviceNameRE.MatchString(service) {
 		return ServiceStatus{}, nil
 	}
-	out, err := exec.Command("launchctl", "list", service).CombinedOutput()
+	out, err := jobCommand(ctx, "launchctl", "list", service).CombinedOutput()
 	text := strings.TrimSpace(string(out))
 	state := "inactive"
 	if err == nil {

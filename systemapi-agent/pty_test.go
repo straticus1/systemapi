@@ -47,6 +47,17 @@ func (f *fakeOut) WriteJSON(v interface{}) error {
 	return nil
 }
 
+func (f *fakeOut) WriteText(b []byte) error {
+	var m map[string]interface{}
+	if err := json.Unmarshal(b, &m); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	f.jsons = append(f.jsons, m)
+	f.mu.Unlock()
+	return nil
+}
+
 func (f *fakeOut) WriteBinary(b []byte) error {
 	n := int(b[0])
 	sid := string(b[1 : 1+n])

@@ -1,29 +1,60 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"go.starlark.net/starlark"
 	"go.starlark.net/starlarkstruct"
 )
 
-// sysscriptOpTimeout caps one long sys.* operation (image pull, compose,
-// package remove/upgrade/query/list). The server gives up on a whole script
-// after 30 s (pushSysscript in playground/fleet.js) and the agent runs the
-// script inline on its read loop, so an operation must end, with a clear
-// "timed out" error, before that. Keep it below the server timeout.
-const sysscriptOpTimeout = 25 * time.Second
+// A script runs under one context (SysscriptEngine.ctx) that carries its
+// whole-script deadline and its cancel. Every blocking builtin derives from
+// it, so a long operation (package install, image pull, compose) may use the
+// rest of the script's time and no more; there is no per-operation timeout.
+
+// scriptOutputMax caps the printed output a script keeps; the rest is
+// dropped and the result says output_truncated.
+const scriptOutputMax = 1 << 20
+
+var (
+	// errScriptTimedOut ends a script whose deadline passed.
+	errScriptTimedOut = errors.New("timed_out")
+	// errScriptCancelled ends a script whose context was cancelled.
+	errScriptCancelled = errors.New("cancelled")
+)
+
+// jobCtxReason says why ctx ended, for builtin error text.
+func jobCtxReason(ctx context.Context) string {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return "timed out (script deadline)"
+	}
+	if cause := context.Cause(ctx); cause != nil && !errors.Is(cause, context.Canceled) {
+		return "cancelled (" + cause.Error() + ")"
+	}
+	return "cancelled"
+}
+
+// scriptCtxErr is the script error once ctx has ended.
+func scriptCtxErr(ctx context.Context) error {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("%w: script deadline exceeded", errScriptTimedOut)
+	}
+	if cause := context.Cause(ctx); cause != nil && !errors.Is(cause, context.Canceled) {
+		return fmt.Errorf("%w: %s", errScriptCancelled, cause.Error())
+	}
+	return errScriptCancelled
+}
 
 // Entitlements define what the current script is permitted to do
 type Entitlements struct {
@@ -134,32 +165,38 @@ func entitlementExactList(raw json.RawMessage) []string {
 
 // SysscriptEngine wraps the Starlark execution
 type SysscriptEngine struct {
+	// ctx is the script's context: its deadline and cancel. Execute refuses
+	// to run without one.
+	ctx          context.Context
 	Entitlements *Entitlements
 	cm           *ConfigManager
 	dockerClient *DockerClient
 	k3sClient    *K3sClient
 	k8sClient    *K3sClient
 	alerts       *alertSink // sys.alerts.push delivery; nil means not connected
+	// outputTruncated is set by Execute when printed output passed
+	// scriptOutputMax.
+	outputTruncated bool
 }
 
-func NewSysscriptEngine(perms *Entitlements) *SysscriptEngine {
+func NewSysscriptEngine(ctx context.Context, perms *Entitlements) *SysscriptEngine {
 	if perms == nil {
 		perms = &Entitlements{} // default deny all
 	}
-	engine := &SysscriptEngine{Entitlements: perms, cm: &ConfigManager{}}
+	engine := &SysscriptEngine{ctx: ctx, Entitlements: perms, cm: &ConfigManager{}}
 	if perms.AllowContainers {
 		engine.dockerClient = NewDockerClient()
 	}
 	if perms.AllowK3s {
 		var err error
-		engine.k3sClient, err = NewK3sClient()
+		engine.k3sClient, err = NewK3sClient(ctx)
 		if err != nil {
 			log.Printf("[sysscript] k3s client init failed: %v", err)
 		}
 	}
 	if perms.AllowK8s {
 		var err error
-		engine.k8sClient, err = NewK8sClient()
+		engine.k8sClient, err = NewK8sClient(ctx)
 		if err != nil {
 			log.Printf("[sysscript] k8s client init failed: %v", err)
 		}
@@ -167,11 +204,56 @@ func NewSysscriptEngine(perms *Entitlements) *SysscriptEngine {
 	return engine
 }
 
-// Execute runs a snippet of Starlark code to completion and returns its printed output and return value
-func (engine *SysscriptEngine) Execute(scriptSource string) (string, error) {
-	var outBuffer bytes.Buffer
+// sysscriptLoadBase is the only directory load() reads modules from. A var
+// so tests can point it at a temp dir.
+var sysscriptLoadBase = "/etc/systemapi/scripts"
 
-	const scriptsBase = "/etc/systemapi/scripts"
+// threadSet tracks a script's Starlark threads (the main one and every
+// load() sub-thread) so a deadline or cancel reaches all of them. A thread
+// added after cancellation is cancelled at once.
+type threadSet struct {
+	mu      sync.Mutex
+	threads []*starlark.Thread
+	reason  string
+}
+
+func (s *threadSet) add(t *starlark.Thread) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reason != "" {
+		t.Cancel(s.reason)
+	}
+	s.threads = append(s.threads, t)
+}
+
+func (s *threadSet) cancelAll(reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reason = reason
+	for _, t := range s.threads {
+		t.Cancel(reason)
+	}
+}
+
+// Execute runs a snippet of Starlark code to completion and returns its
+// printed output (capped at scriptOutputMax; see outputTruncated). When the
+// engine's context ends, every thread is cancelled and the error wraps
+// errScriptTimedOut or errScriptCancelled.
+func (engine *SysscriptEngine) Execute(scriptSource string) (string, error) {
+	ctx := engine.ctx
+	if ctx == nil {
+		return "", errors.New("sysscript: no script context")
+	}
+	if ctx.Err() != nil {
+		return "", scriptCtxErr(ctx)
+	}
+	outBuffer := &capWriter{max: scriptOutputMax}
+	threads := &threadSet{}
+	stopWatch := context.AfterFunc(ctx, func() { threads.cancelAll(jobCtxReason(ctx)) })
+	defer stopWatch()
+	defer func() { engine.outputTruncated = outBuffer.truncated }()
+
+	scriptsBase := sysscriptLoadBase
 	cache := make(map[string]starlark.StringDict)
 	var loadFn func(*starlark.Thread, string) (starlark.StringDict, error)
 	loadFn = func(thread *starlark.Thread, module string) (starlark.StringDict, error) {
@@ -188,6 +270,7 @@ func (engine *SysscriptEngine) Execute(scriptSource string) (string, error) {
 			return nil, fmt.Errorf("load(%q): %w", module, err) // D-09: fail fast
 		}
 		mt := &starlark.Thread{Name: "load " + module, Load: loadFn} // Pitfall 5: sub-thread needs Load too
+		threads.add(mt)
 		g, err := starlark.ExecFile(mt, module, src, nil)
 		if err != nil {
 			return nil, err
@@ -198,17 +281,21 @@ func (engine *SysscriptEngine) Execute(scriptSource string) (string, error) {
 
 	thread := &starlark.Thread{
 		Name:  "Sysscript",
-		Print: func(_ *starlark.Thread, msg string) { outBuffer.WriteString(msg + "\n") },
+		Print: func(_ *starlark.Thread, msg string) { _, _ = outBuffer.Write([]byte(msg + "\n")) },
 		Load:  loadFn,
 	}
+	threads.add(thread)
 
 	sysModule := engine.buildSysModule()
 	predeclared := starlark.StringDict{"sys": sysModule}
 	_, err := starlark.ExecFile(thread, "sysscript.star", scriptSource, predeclared)
 	if err != nil {
-		return outBuffer.String(), err
+		if ctx.Err() != nil {
+			return outBuffer.buf.String(), scriptCtxErr(ctx)
+		}
+		return outBuffer.buf.String(), err
 	}
-	return outBuffer.String(), nil
+	return outBuffer.buf.String(), nil
 }
 
 // buildSysModule assembles the `sys` object with nested `sys.fs`, `sys.net`, etc.
@@ -414,8 +501,14 @@ func (engine *SysscriptEngine) execRun(thread *starlark.Thread, b *starlark.Buil
 		cmdArgs = expandExecArg(cmdArgs, args.Index(i))
 	}
 
-	cmd := exec.Command(string(cmdStr), cmdArgs...)
-	out, err := cmd.CombinedOutput()
+	cmd := jobCommand(engine.ctx, string(cmdStr), cmdArgs...)
+	out := &capWriter{max: outputCap}
+	cmd.Stdout = out
+	cmd.Stderr = out
+	err := cmd.Run()
+	if engine.ctx.Err() != nil {
+		err = fmt.Errorf("%s: %s", string(cmdStr), jobCtxReason(engine.ctx))
+	}
 
 	resultDict := starlark.NewDict(0)
 
@@ -425,7 +518,8 @@ func (engine *SysscriptEngine) execRun(thread *starlark.Thread, b *starlark.Buil
 		resultDict.SetKey(starlark.String("error"), starlark.None)
 	}
 
-	resultDict.SetKey(starlark.String("output"), starlark.String(string(out)))
+	resultDict.SetKey(starlark.String("output"), starlark.String(out.buf.String()))
+	resultDict.SetKey(starlark.String("truncated"), starlark.Bool(out.truncated))
 
 	return resultDict, nil
 }
@@ -478,14 +572,21 @@ func (engine *SysscriptEngine) netHTTPGet(thread *starlark.Thread, b *starlark.B
 		return starlark.None, fmt.Errorf("security exception: outbound to %s not granted", u.Hostname())
 	}
 
+	req, err := http.NewRequestWithContext(engine.ctx, http.MethodGet, reqUrl, nil)
+	if err != nil {
+		return starlark.None, fmt.Errorf("invalid url: %v", err)
+	}
 	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(reqUrl)
+	resp, err := client.Do(req)
 	if err != nil {
 		return starlark.None, err
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := readLimited(resp.Body, hostFileCap)
+	if err != nil {
+		return starlark.None, fmt.Errorf("http_get: %w", err)
+	}
 
 	resultDict := starlark.NewDict(0)
 	resultDict.SetKey(starlark.String("status_code"), starlark.MakeInt(resp.StatusCode))

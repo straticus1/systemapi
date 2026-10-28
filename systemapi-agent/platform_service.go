@@ -13,9 +13,9 @@ package main
 // caller, which caps and does not log it.
 
 import (
+	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -90,21 +90,21 @@ func (systemdServiceManager) Available() bool {
 	return ok
 }
 
-func (m systemdServiceManager) Action(verb, service string) (string, error) {
+func (m systemdServiceManager) Action(ctx context.Context, verb, service string) (string, error) {
 	if err := validService(verb, service); err != nil {
 		return "", err
 	}
-	out, err := exec.Command("systemctl", verb, service).CombinedOutput()
+	out, err := jobCommand(ctx, "systemctl", verb, service).CombinedOutput()
 	return string(out), err
 }
 
-func (m systemdServiceManager) Status(service string) (ServiceStatus, error) {
+func (m systemdServiceManager) Status(ctx context.Context, service string) (ServiceStatus, error) {
 	if !serviceNameRE.MatchString(service) {
 		return ServiceStatus{}, fmt.Errorf("service not allowed")
 	}
-	out, err := exec.Command("systemctl", "is-active", service).Output()
+	out, err := jobCommand(ctx, "systemctl", "is-active", service).Output()
 	state := strings.TrimSpace(string(out))
-	full, _ := exec.Command("systemctl", "status", "--no-pager", "-n", "0", service).CombinedOutput()
+	full, _ := jobCommand(ctx, "systemctl", "status", "--no-pager", "-n", "0", service).CombinedOutput()
 	return ServiceStatus{
 		Active: err == nil && state == "active",
 		State:  state,
@@ -123,29 +123,29 @@ func (openrcServiceManager) Available() bool {
 	return ok
 }
 
-func (m openrcServiceManager) Action(verb, service string) (string, error) {
+func (m openrcServiceManager) Action(ctx context.Context, verb, service string) (string, error) {
 	if err := validService(verb, service); err != nil {
 		return "", err
 	}
 	// enable/disable are rc-update; the rest are rc-service verbs.
-	var cmd *exec.Cmd
+	var cmd *jobCmd
 	switch verb {
 	case "enable":
-		cmd = exec.Command("rc-update", "add", service)
+		cmd = jobCommand(ctx, "rc-update", "add", service)
 	case "disable":
-		cmd = exec.Command("rc-update", "del", service)
+		cmd = jobCommand(ctx, "rc-update", "del", service)
 	default:
-		cmd = exec.Command("rc-service", service, verb)
+		cmd = jobCommand(ctx, "rc-service", service, verb)
 	}
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
 
-func (m openrcServiceManager) Status(service string) (ServiceStatus, error) {
+func (m openrcServiceManager) Status(ctx context.Context, service string) (ServiceStatus, error) {
 	if !serviceNameRE.MatchString(service) {
 		return ServiceStatus{}, fmt.Errorf("service not allowed")
 	}
-	out, err := exec.Command("rc-service", service, "status").CombinedOutput()
+	out, err := jobCommand(ctx, "rc-service", service, "status").CombinedOutput()
 	text := strings.TrimSpace(string(out))
 	active := err == nil && strings.Contains(text, "started")
 	state := "stopped"
@@ -167,9 +167,9 @@ func (n noneServiceManager) errReason() error {
 	}
 	return fmt.Errorf("no service manager on this host")
 }
-func (n noneServiceManager) Action(verb, service string) (string, error) {
+func (n noneServiceManager) Action(ctx context.Context, verb, service string) (string, error) {
 	return "", n.errReason()
 }
-func (n noneServiceManager) Status(service string) (ServiceStatus, error) {
+func (n noneServiceManager) Status(ctx context.Context, service string) (ServiceStatus, error) {
 	return ServiceStatus{}, n.errReason()
 }

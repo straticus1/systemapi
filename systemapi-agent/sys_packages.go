@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"strings"
 
 	"go.starlark.net/starlark"
 )
@@ -19,13 +20,9 @@ import (
 // only one it would take out (for brew: unless nothing installed depends on
 // it); output it cannot parse refuses.
 
-// packageInstallTimeout is sysscriptOpTimeout: the server stops waiting for
-// the script at 30 s, so a longer install would finish unseen.
-const packageInstallTimeout = sysscriptOpTimeout
-
-// packageQueryTimeout also bounds remove (dry run plus remove together) and
-// upgrade; see sysscriptOpTimeout.
-const packageQueryTimeout = sysscriptOpTimeout
+// Every verb runs under the script's context (its deadline and cancel), and
+// the package manager's whole process group is stopped when it ends
+// (jobCommand: SIGTERM, a grace, then SIGKILL).
 
 // packageListMax caps inventory rows. A large host carries a few thousand.
 const packageListMax = 20000
@@ -40,7 +37,7 @@ func runFixedPackageInstall(ctx context.Context, argv []string) error {
 	if len(argv) < 2 {
 		return fmt.Errorf("package install failed")
 	}
-	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd := jobCommand(ctx, argv[0], argv[1:]...)
 	cmd.Env = []string{
 		"PATH=" + packagePATH,
 		"DEBIAN_FRONTEND=noninteractive",
@@ -60,7 +57,7 @@ func runFixedPackageQuery(ctx context.Context, argv []string) (string, int, erro
 	if len(argv) < 1 {
 		return "", 0, fmt.Errorf("package query failed")
 	}
-	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd := jobCommand(ctx, argv[0], argv[1:]...)
 	cmd.Env = []string{
 		"PATH=" + packagePATH,
 		"LC_ALL=C",
@@ -91,13 +88,24 @@ func runFixedPackageQuery(ctx context.Context, argv []string) (string, int, erro
 	return string(out), 0, nil
 }
 
-func installPackage(name string, allow []string) error {
-	return changePackage("install", name, allow)
+func installPackage(ctx context.Context, name string, allow []string) error {
+	return changePackage(ctx, "install", name, allow)
+}
+
+// packageCtxErr is the error for a verb stopped by the script's deadline or
+// cancel. An interrupted apt/dpkg can leave the package database half
+// configured, so a mutating apt verb says how to repair it.
+func packageCtxErr(ctx context.Context, mgr, what string, mutating bool) error {
+	msg := fmt.Sprintf("%s %s", what, jobCtxReason(ctx))
+	if mutating && (mgr == "apt-get" || strings.HasPrefix(mgr, "dpkg")) {
+		msg += "; dpkg may need 'dpkg --configure -a'"
+	}
+	return errors.New(msg)
 }
 
 // changePackage runs one mutating verb (install, remove, upgrade) after the
 // grant and host checks.
-func changePackage(verb, name string, allow []string) error {
+func changePackage(ctx context.Context, verb, name string, allow []string) error {
 	if !packageNameRE.MatchString(name) || !exactGrant(allow, name) {
 		return fmt.Errorf("package not allowed")
 	}
@@ -116,20 +124,14 @@ func changePackage(verb, name string, allow []string) error {
 	if err != nil {
 		return err
 	}
-	timeout := packageInstallTimeout
-	if verb != "install" {
-		timeout = packageQueryTimeout
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
 	if verb == "remove" {
 		if err := checkRemoveOnly(ctx, mgr, m, name); err != nil {
 			return err
 		}
 	}
 	if err := runPackageInstall(ctx, argv); err != nil {
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return fmt.Errorf("package %s timed out after %s", verb, timeout)
+		if ctx.Err() != nil {
+			return packageCtxErr(ctx, mgr, "package "+verb, true)
 		}
 		return err
 	}
@@ -145,8 +147,8 @@ func checkRemoveOnly(ctx context.Context, mgr string, m *pkgManager, name string
 	}
 	out, code, err := runPackageQuery(ctx, argv)
 	if err != nil {
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return fmt.Errorf("package remove dry run timed out after %s", packageQueryTimeout)
+		if ctx.Err() != nil {
+			return packageCtxErr(ctx, mgr, "package remove dry run", false)
 		}
 		return fmt.Errorf("package remove refused: dry run failed")
 	}
@@ -169,7 +171,7 @@ func checkRemoveOnly(ctx context.Context, mgr string, m *pkgManager, name string
 // queryPackage reports whether one granted package is installed. Exit 1 is
 // how dpkg-query, rpm and brew say "not installed"; any other non-zero exit
 // is an error.
-func queryPackage(name string, allow []string) (bool, string, error) {
+func queryPackage(ctx context.Context, name string, allow []string) (bool, string, error) {
 	if !packageNameRE.MatchString(name) || !exactGrant(allow, name) {
 		return false, "", fmt.Errorf("package not allowed")
 	}
@@ -188,11 +190,9 @@ func queryPackage(name string, allow []string) (bool, string, error) {
 	if err != nil {
 		return false, "", err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), packageQueryTimeout)
-	defer cancel()
 	out, code, err := runPackageQuery(ctx, argv)
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return false, "", fmt.Errorf("package query timed out after %s", packageQueryTimeout)
+	if ctx.Err() != nil {
+		return false, "", packageCtxErr(ctx, mgr, "package query", false)
 	}
 	if err != nil {
 		return false, "", err
@@ -206,7 +206,7 @@ func queryPackage(name string, allow []string) (bool, string, error) {
 
 // listPackages returns the installed package inventory. It needs at least one
 // exact package grant, since it names no package to check.
-func listPackages(allow []string) ([]pkgEntry, error) {
+func listPackages(ctx context.Context, allow []string) ([]pkgEntry, error) {
 	granted := false
 	for _, item := range allow {
 		if exactItemOK(item) && packageNameRE.MatchString(item) {
@@ -232,11 +232,9 @@ func listPackages(allow []string) ([]pkgEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), packageQueryTimeout)
-	defer cancel()
 	out, code, err := runPackageQuery(ctx, argv)
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return nil, fmt.Errorf("package list timed out after %s", packageQueryTimeout)
+	if ctx.Err() != nil {
+		return nil, packageCtxErr(ctx, mgr, "package list", false)
 	}
 	if err != nil {
 		return nil, err
@@ -255,7 +253,7 @@ func (engine *SysscriptEngine) packagesInstall(thread *starlark.Thread, b *starl
 	if !packageNameRE.MatchString(name) || !exactGrant(engine.Entitlements.AllowPackages, name) {
 		return starlark.None, fmt.Errorf("package not allowed")
 	}
-	if err := installPackage(name, engine.Entitlements.AllowPackages); err != nil {
+	if err := installPackage(engine.ctx, name, engine.Entitlements.AllowPackages); err != nil {
 		return starlark.None, err
 	}
 	return starlark.True, nil
@@ -269,7 +267,7 @@ func (engine *SysscriptEngine) packagesChange(verb string, args starlark.Tuple, 
 	if !packageNameRE.MatchString(name) || !exactGrant(engine.Entitlements.AllowPackages, name) {
 		return starlark.None, fmt.Errorf("package not allowed")
 	}
-	if err := changePackage(verb, name, engine.Entitlements.AllowPackages); err != nil {
+	if err := changePackage(engine.ctx, verb, name, engine.Entitlements.AllowPackages); err != nil {
 		return starlark.None, err
 	}
 	return starlark.True, nil
@@ -291,7 +289,7 @@ func (engine *SysscriptEngine) packagesQuery(thread *starlark.Thread, b *starlar
 	if err := starlark.UnpackArgs("query", args, kwargs, "name", &name); err != nil {
 		return starlark.None, err
 	}
-	installed, version, err := queryPackage(name, engine.Entitlements.AllowPackages)
+	installed, version, err := queryPackage(engine.ctx, name, engine.Entitlements.AllowPackages)
 	if err != nil {
 		return starlark.None, err
 	}
@@ -306,7 +304,7 @@ func (engine *SysscriptEngine) packagesList(thread *starlark.Thread, b *starlark
 	if err := starlark.UnpackArgs("list", args, kwargs); err != nil {
 		return starlark.None, err
 	}
-	entries, err := listPackages(engine.Entitlements.AllowPackages)
+	entries, err := listPackages(engine.ctx, engine.Entitlements.AllowPackages)
 	if err != nil {
 		return starlark.None, err
 	}

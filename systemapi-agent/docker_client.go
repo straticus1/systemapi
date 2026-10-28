@@ -534,7 +534,7 @@ func demuxDocker(body []byte) (string, error) {
 // before it reaches a URL. Image refs follow the distribution grammar and
 // a pull with no tag pulls ":latest", never all tags. sys.containers.pull
 // and remove_image also need an exact allow_images grant (imageGranted). A
-// pull stops at sysscriptOpTimeout. This code does not
+// pull stops at the script's deadline or cancel. This code does not
 // send registry auth (no X-Registry-Auth); a pull uses only what the daemon
 // already has. Volumes are created with the local driver and no options, so
 // no bind of a host path. Networks take a fixed driver list and no options.
@@ -542,7 +542,6 @@ func demuxDocker(body []byte) (string, error) {
 
 const (
 	pullStreamCap = 32 << 20
-	pullTimeout   = sysscriptOpTimeout
 	imageRefMax   = 255
 )
 
@@ -649,9 +648,9 @@ func (dc *DockerClient) ListImages() ([]DockerImage, error) {
 	return images, nil
 }
 
-// PullImage pulls ref with the daemon's own credentials, if any.
-// It returns the last status line of the progress stream.
-func (dc *DockerClient) PullImage(ref string) (string, error) {
+// PullImage pulls ref with the daemon's own credentials, if any, until ctx
+// ends. It returns the last status line of the progress stream.
+func (dc *DockerClient) PullImage(ctx context.Context, ref string) (string, error) {
 	if dc == nil || dc.client == nil {
 		return "", fmt.Errorf("docker client not initialized")
 	}
@@ -662,10 +661,16 @@ func (dc *DockerClient) PullImage(ref string) (string, error) {
 	q := url.Values{}
 	q.Set("fromImage", repo)
 	q.Set("tag", tag)
-	client := &http.Client{Transport: dc.client.Transport, Timeout: pullTimeout}
-	resp, err := client.Post(dc.apiURL("/images/create?"+q.Encode()), "application/json", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, dc.apiURL("/images/create?"+q.Encode()), nil)
 	if err != nil {
-		return "", pullErr(err)
+		return "", fmt.Errorf("docker pull: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	// No client Timeout: the pull may take the rest of the script's time.
+	client := &http.Client{Transport: dc.client.Transport}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", pullErr(ctx, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -685,8 +690,8 @@ func (dc *DockerClient) PullImage(ref string) (string, error) {
 			if lr.N <= 0 {
 				return "", fmt.Errorf("body exceeds cap")
 			}
-			if isTimeout(err) {
-				return "", pullErr(err)
+			if ctx.Err() != nil || isTimeout(err) {
+				return "", pullErr(ctx, err)
 			}
 			return "", fmt.Errorf("docker pull: decode: %w", err)
 		}
@@ -703,10 +708,14 @@ func (dc *DockerClient) PullImage(ref string) (string, error) {
 	return last, nil
 }
 
-// pullErr reports a client timeout as "timed out" so a script sees why.
-func pullErr(err error) error {
+// pullErr reports the script's deadline or cancel, or a network timeout,
+// so a script sees why the pull stopped.
+func pullErr(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return fmt.Errorf("docker pull: %s", jobCtxReason(ctx))
+	}
 	if isTimeout(err) {
-		return fmt.Errorf("docker pull: timed out after %s", pullTimeout)
+		return fmt.Errorf("docker pull: timed out")
 	}
 	return fmt.Errorf("docker pull: %w", err)
 }

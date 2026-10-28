@@ -31,6 +31,7 @@ func newTestDockerClient(handler http.Handler) (*DockerClient, *httptest.Server)
 // newTestEngineWithDocker creates a SysscriptEngine with the given DockerClient wired in.
 func newTestEngineWithDocker(dc *DockerClient) *SysscriptEngine {
 	return &SysscriptEngine{
+		ctx:          context.Background(),
 		Entitlements: &Entitlements{AllowContainers: true},
 		cm:           &ConfigManager{},
 		dockerClient: dc,
@@ -1029,6 +1030,7 @@ func TestContainersCompose(t *testing.T) {
 	orig := composeExec
 	defer func() { composeExec = orig }()
 	const checkedCfg = `{"name":"proj","services":{"web":{"image":"nginx"}}}`
+	scriptDeadline := time.Now().Add(time.Minute)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var gotArgv []string
@@ -1036,8 +1038,9 @@ func TestContainersCompose(t *testing.T) {
 			calls := 0
 			composeExec = func(ctx context.Context, dir string, argv []string, stdin string, stdoutOnly bool) (int, string, error) {
 				calls++
-				if _, ok := ctx.Deadline(); !ok {
-					t.Error("no deadline")
+				// compose runs under the script's own context.
+				if d, ok := ctx.Deadline(); !ok || !d.Equal(scriptDeadline) {
+					t.Error("not the script's deadline")
 				}
 				if len(argv) > 4 && argv[4] == "config" {
 					want := []string{"docker", "compose", "--project-directory", proj, "config", "--format", "json"}
@@ -1058,6 +1061,9 @@ func TestContainersCompose(t *testing.T) {
 				return tc.code, "out:" + argv[len(argv)-1], tc.execErr
 			}
 			engine := newTestEngine(&Entitlements{AllowContainers: true, AllowImages: []string{"nginx"}, AllowFSRead: tc.read, AllowFSWrite: tc.write, AllowConfigWrite: tc.config})
+			ctx, cancel := context.WithDeadline(context.Background(), scriptDeadline)
+			defer cancel()
+			engine.ctx = ctx
 			out, err := engine.Execute("r = sys.containers.compose(" + strconvQuote(tc.action) + ", " + strconvQuote(tc.dir) + ")\nprint(r['exit_code'], r['output'])\n")
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
@@ -1331,11 +1337,10 @@ func TestComposeRawFilesRefused(t *testing.T) {
 	}
 }
 
-func TestComposeTimesOut(t *testing.T) {
+// TestComposeStopsAtScriptDeadline: compose has no timeout of its own; it
+// ends with the script's context.
+func TestComposeStopsAtScriptDeadline(t *testing.T) {
 	_, proj := composeProject(t, map[string]string{"compose.yaml": "services: {}\n"})
-	origTimeout := composeTimeout
-	composeTimeout = 50 * time.Millisecond
-	t.Cleanup(func() { composeTimeout = origTimeout })
 	orig := composeExec
 	t.Cleanup(func() { composeExec = orig })
 	composeExec = func(ctx context.Context, dir string, argv []string, stdin string, stdoutOnly bool) (int, string, error) {
@@ -1343,24 +1348,41 @@ func TestComposeTimesOut(t *testing.T) {
 		return -1, "", nil // a killed child reports an exit code, not an error
 	}
 	for _, action := range []string{"up", "ps"} {
-		if err := runCompose(proj, action); err == nil || !strings.Contains(err.Error(), "timed out") {
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		engine := newTestEngine(&Entitlements{AllowContainers: true, AllowImages: []string{"nginx", "app:v1"}, AllowFSRead: []string{proj}})
+		engine.ctx = ctx
+		_, err := engine.Execute("sys.containers.compose(" + strconvQuote(action) + ", " + strconvQuote(proj) + ")\n")
+		cancel()
+		if err == nil || !errors.Is(err, errScriptTimedOut) {
 			t.Fatalf("%s: err=%v", action, err)
 		}
 	}
-}
-
-func TestSysscriptOpTimeoutBelowServer(t *testing.T) {
-	// playground/fleet.js pushSysscript gives a script 30 s.
-	if sysscriptOpTimeout >= 30*time.Second || composeTimeout > sysscriptOpTimeout || pullTimeout > sysscriptOpTimeout || packageQueryTimeout > sysscriptOpTimeout {
-		t.Fatalf("long ops must end before the server's 30 s script timeout")
+	// A cancel (not a deadline) inside the builtin is reported as cancelled.
+	ctx, cancel := context.WithCancelCause(context.Background())
+	composeExec = func(ctx context.Context, dir string, argv []string, stdin string, stdoutOnly bool) (int, string, error) {
+		cancel(errors.New("user"))
+		<-ctx.Done()
+		return -1, "", nil
+	}
+	engine := newTestEngine(&Entitlements{AllowContainers: true, AllowFSRead: []string{proj}})
+	engine.ctx = ctx
+	if _, err := engine.Execute("sys.containers.compose(\"ps\", " + strconvQuote(proj) + ")\n"); err == nil || !errors.Is(err, errScriptCancelled) || !strings.Contains(err.Error(), "user") {
+		t.Fatalf("cancel: err=%v", err)
 	}
 }
 
 func TestPullTimeoutError(t *testing.T) {
-	if err := pullErr(timeoutErr{}); !strings.Contains(err.Error(), "timed out after") {
+	bg := context.Background()
+	if err := pullErr(bg, timeoutErr{}); !strings.Contains(err.Error(), "timed out") {
 		t.Fatalf("err=%v", err)
 	}
-	if err := pullErr(errors.New("refused")); strings.Contains(err.Error(), "timed out") {
+	if err := pullErr(bg, errors.New("refused")); strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("err=%v", err)
+	}
+	ctx, cancel := context.WithTimeout(bg, time.Nanosecond)
+	defer cancel()
+	<-ctx.Done()
+	if err := pullErr(ctx, errors.New("context deadline exceeded")); !strings.Contains(err.Error(), "script deadline") {
 		t.Fatalf("err=%v", err)
 	}
 }
