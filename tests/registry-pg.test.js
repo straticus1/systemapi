@@ -698,7 +698,16 @@ test('jobs: two FleetManagers on one database: submit on one, the agent on the o
 
     a.ws.terminate();
     await waitUntil('presence cleared', async () => (await regOne.hostAgent(hostId)) === null, 8000);
-    assert.equal(await regOne.setAgentPresence(hostId, older), false);
+    // Skew: a stale owner whose clock ran ahead holds the row and refuses
+    // the live socket's write; once it closes, the live socket's re-assert
+    // wins.
+    const ahead = { caps: ['sysscript_jobs'], instance: 'ahead', connId: 'ahead:1', enrolledAt: new Date(Date.now() + 600000) };
+    const liveSock = { caps: ['sysscript_jobs'], instance: 'live', connId: 'live:1', enrolledAt: new Date() };
+    assert.equal(await regOne.setAgentPresence(hostId, ahead), true);
+    assert.equal(await regOne.setAgentPresence(hostId, liveSock), false);
+    assert.equal(await regOne.clearAgentPresence(hostId, ahead.connId), true);
+    assert.equal(await regOne.setAgentPresence(hostId, liveSock), true);
+    assert.equal((await regOne.hostAgent(hostId)).conn_id, liveSock.connId);
     assert.equal((await registry.verifyAudit()).ok, true);
   } finally {
     await one.close();

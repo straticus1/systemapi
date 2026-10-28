@@ -30,7 +30,7 @@
 const WebSocket = require('ws');
 const { issueLease, sysscriptJobPayload, sha256Hex, SYSSCRIPT_JOB_RE } = require('../controlplane/lease');
 const { entitlementsSha256 } = require('../controlplane/entitlements');
-const { jobRetentionDays, jobOutputRetentionHours, noNul } = require('../controlplane/registry');
+const { jobRetentionDays, jobOutputRetentionHours, noNul, truncateUtf8 } = require('../controlplane/registry');
 const { randomToken } = require('../controlplane/token');
 
 const JOB_CAPABILITY = 'sysscript_jobs';
@@ -46,6 +46,11 @@ const JOB_LEASE_TTL_S = 60;
 // Security events from job frames, per host: at most this many a minute;
 // the next event that gets through carries the suppressed count.
 const JOB_SECURITY_PER_MIN = 10;
+// Never rate limited: a frame for another host's job.
+const JOB_SECURITY_UNLIMITED = new Set(['job_frame_host_mismatch']);
+// A host whose job chain has been busy this long no longer holds off the
+// ack-timeout sweep.
+const JOB_CHAIN_BUSY_GRACE_MS = 15000;
 const SYNC_EVENT_IDS_MAX = 16;
 
 function http(status, code) {
@@ -129,7 +134,7 @@ class SysscriptJobs {
         // enrolled (cp_hosts.agent_enrolled_at).
         this.connIds = new WeakMap();
         this.enrolledAt = new WeakMap();
-        // Per host: the security event rate window.
+        // Per host, per kind: the security event rate window.
         this.securityRate = new Map();
         // Per host: the ordered chain of job frames and job deliveries.
         this.chains = new Map();
@@ -170,14 +175,21 @@ class SysscriptJobs {
         this.metric('jobFrameRejectedTotal', { reason });
     }
 
-    // Null when hostId is over JOB_SECURITY_PER_MIN this minute (counted as
-    // suppressed), else the count suppressed since the last event written.
-    securityAllowed(hostId) {
+    // Null when hostId is over JOB_SECURITY_PER_MIN of kind this minute
+    // (counted as suppressed), else the count suppressed since the last
+    // event of that kind written.
+    securityAllowed(hostId, kind) {
+        if (JOB_SECURITY_UNLIMITED.has(kind)) return 0;
         const now = Date.now();
-        let s = this.securityRate.get(hostId);
+        let kinds = this.securityRate.get(hostId);
+        if (!kinds) {
+            kinds = new Map();
+            this.securityRate.set(hostId, kinds);
+        }
+        let s = kinds.get(kind);
         if (!s || now - s.start >= 60000) {
             s = { start: now, n: 0, suppressed: s ? s.suppressed : 0 };
-            this.securityRate.set(hostId, s);
+            kinds.set(kind, s);
         }
         if (s.n >= JOB_SECURITY_PER_MIN) {
             s.suppressed += 1;
@@ -191,7 +203,7 @@ class SysscriptJobs {
 
     async security(hostId, kind, detail) {
         if (!this.fleet.registry) return;
-        const suppressed = this.securityAllowed(hostId);
+        const suppressed = this.securityAllowed(hostId, kind);
         if (suppressed === null) return;
         try {
             await this.fleet.registry.recordSecurity({
@@ -216,14 +228,17 @@ class SysscriptJobs {
         return !!this.localSocket(hostId) && this.fleet.agentSupports(hostId, JOB_CAPABILITY);
     }
 
-    // The conn_ids of sockets held here whose job chain is idle: a host with
-    // frames still queued may hold the ack the sweep would time out.
-    localConnIds() {
+    // The conn_ids of sockets held here, except a host whose job chain has
+    // been busy for less than JOB_CHAIN_BUSY_GRACE_MS: its queued frames may
+    // hold the ack the sweep would time out. A chain busy longer than that
+    // no longer holds the sweep off.
+    localConnIds(now = Date.now()) {
         const out = [];
         for (const [hostId, ws] of this.fleet.connectedAgents) {
             const id = this.connIds.get(ws);
             const c = this.chains.get(hostId);
-            if (id && ws.readyState === WebSocket.OPEN && !(c && c.queued > 0)) out.push(id);
+            const busy = c && c.queued > 0 && now - c.busySince < JOB_CHAIN_BUSY_GRACE_MS;
+            if (id && ws.readyState === WebSocket.OPEN && !busy) out.push(id);
         }
         return out;
     }
@@ -246,7 +261,7 @@ class SysscriptJobs {
     enqueue(hostId, fn, bytes = 0, ws = null) {
         let c = this.chains.get(hostId);
         if (!c) {
-            c = { chain: Promise.resolve(), queued: 0, bytes: 0 };
+            c = { chain: Promise.resolve(), queued: 0, bytes: 0, busySince: 0 };
             this.chains.set(hostId, c);
         }
         if (ws && (c.queued >= this.fleet.agentQueueMaxItems || c.bytes + bytes > this.fleet.agentQueueMaxBytes)) {
@@ -255,6 +270,7 @@ class SysscriptJobs {
             ws.terminate();
             return;
         }
+        if (c.queued === 0) c.busySince = Date.now();
         c.queued += 1;
         c.bytes += bytes;
         c.chain = c.chain.then(fn).catch((err) => console.error('[Fleet] job frame error:', err.message)).finally(() => {
@@ -281,6 +297,7 @@ class SysscriptJobs {
     // The host's current socket closed on this instance: its presence row is
     // cleared if it is still this socket's.
     onClose(ws, hostId) {
+        this.securityRate.delete(hostId);
         const reg = this.fleet.registry;
         const connId = this.connIds.get(ws);
         if (!reg || typeof reg.clearAgentPresence !== 'function' || !connId) return;
@@ -445,7 +462,7 @@ class SysscriptJobs {
         if (typeof raw !== 'string' || Buffer.byteLength(raw, 'utf8') > ALERT_MESSAGE_MAX_BYTES) {
             return this.rejected(hostId, 'bad_message');
         }
-        const message = noNul(raw);
+        const message = truncateUtf8(noNul(raw), ALERT_MESSAGE_MAX_BYTES);
         const reg = this.fleet.registry;
         const bump = await reg.bumpJobAlert(jobId, hostId, ALERTS_PER_JOB_MAX);
         if (!bump.ok) return this.rejected(hostId, bump.reason);
@@ -639,7 +656,7 @@ class SysscriptJobs {
         const reg = this.fleet.registry;
         if (!reg || typeof reg.sweepJobs !== 'function') return;
         this.listen();
-        const ended = await reg.sweepJobs(now, { connectedConnIds: this.localConnIds() });
+        const ended = await reg.sweepJobs(now, { connectedConnIds: this.localConnIds(Date.now()) });
         // Re-assert presence for the sockets held here (heals a row a lost
         // write left stale); an older enroll than the stored one is refused.
         // After the sweep, so this queued work does not hold off its ack check.

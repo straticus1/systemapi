@@ -379,10 +379,27 @@ test('alerts: 20 per job, then rate limited; an alert right before the result is
     const end = reg.audit.find((x) => x.action === 'sysscript_job_end' && x.payload.job_id === id2);
     assert.equal(end.payload.alerts, 1);
 
+    // A message within 4096 bytes that grows past them once U+0000 becomes
+    // U+FFFD is cut on a character boundary.
+    const id3 = await dispatched(r, a);
+    a.status(id3, { status: 'running' });
+    a.alert(id3, { severity: 'info', message: 'x' + '\u0000'.repeat(4000) });
+    const long = await waitUntil('long alert', async () => (await reg.listAlerts(['acme'])).find((x) => x.message.startsWith('x\uFFFD')));
+    assert.ok(Buffer.byteLength(long.message, 'utf8') <= 4096);
+    assert.equal(long.message, 'x' + '\uFFFD'.repeat(1365));
+    a.result(id3, { status: 'succeeded' });
+    await ended(reg, id3, 'succeeded');
+    // The legacy path too.
+    r.fm.pendingExecutions.set('req-long', { resolve() {}, reject() {}, script: 'x', hostId: HOST_A });
+    const legacy = await r.fm.onAgentAlert(HOST_A, { request_id: 'req-long', payload: { severity: 'info', message: '\u0000'.repeat(4096) } });
+    assert.equal(legacy.alert.message, '\uFFFD'.repeat(1365));
+    r.fm.pendingExecutions.delete('req-long');
+    const before = (await reg.listAlerts(['acme'])).length;
+
     a.alert(id2, { severity: 'critical', message: 'after the end' });
     a.alert('sjb_AAAAAAAAAAAAAAAAAAAAAA', { severity: 'critical', message: 'nobody' });
     await sleep(100);
-    assert.equal((await reg.listAlerts(['acme'])).length, 21);
+    assert.equal((await reg.listAlerts(['acme'])).length, before);
   } finally {
     await r.close();
   }
@@ -571,8 +588,16 @@ test('agent presence is recorded on enroll and cleared on close; an older enroll
     assert.equal(await reg.setAgentPresence(HOST_A, B), true);
     assert.equal(await reg.clearAgentPresence(HOST_A, B.connId), true);
     assert.equal(await reg.hostAgent(HOST_A), null);
-    // A late write from the cleared older enroll does not come back.
-    assert.equal(await reg.setAgentPresence(HOST_A, A), false);
+
+    // Skew: a stale owner C whose clock ran ahead holds the row, so the live
+    // socket D's write is refused; C closes, and D's next re-assert wins.
+    const C = { caps: ['sysscript_jobs'], instance: 'inst-c', connId: 'inst-c:1', enrolledAt: new Date(t + 600000) };
+    const D = { caps: ['sysscript_jobs'], instance: 'inst-d', connId: 'inst-d:1', enrolledAt: new Date(t + 3000) };
+    assert.equal(await reg.setAgentPresence(HOST_A, C), true);
+    assert.equal(await reg.setAgentPresence(HOST_A, D), false);
+    assert.equal(await reg.clearAgentPresence(HOST_A, C.connId), true);
+    assert.equal(await reg.setAgentPresence(HOST_A, D), true);
+    assert.equal((await reg.hostAgent(HOST_A)).conn_id, D.connId);
   } finally {
     await r.close();
   }
@@ -654,10 +679,22 @@ test('job frame security events are rate limited per host and carry the suppress
     await sleep(50);
     assert.equal(reg.securityEvents.filter((e) => e.kind === 'job_frame_unknown').length, 10);
     // Next window: the event that gets through says how many were dropped.
-    r.fm.jobs.securityRate.get(HOST_A).start -= 61000;
+    r.fm.jobs.securityRate.get(HOST_A).get('job_frame_unknown').start -= 61000;
     a.result('sjb_YYYYYYYYYYYYYYYYYYYYYY', { status: 'succeeded' });
     const ev = await waitUntil('next event', () => reg.securityEvents.filter((e) => e.kind === 'job_frame_unknown')[10]);
     assert.equal(ev.detail.suppressed, 5);
+
+    // Per kind, and a frame for another host's job is never suppressed.
+    const b = await connectAgent(r, HOST_B);
+    const id = await dispatched(r, a);
+    for (let i = 0; i < 15; i += 1) b.result(id, { status: 'succeeded' });
+    await waitUntil('15 mismatch events', () => reg.securityEvents.filter((e) => e.kind === 'job_frame_host_mismatch').length === 15);
+    b.result('sjb_XXXXXXXXXXXXXXXXXXXXXX', { status: 'succeeded' });
+    await waitUntil('B unknown', () => reg.securityEvents.some((e) => e.kind === 'job_frame_unknown' && e.detail.host_id === HOST_B));
+    // A host whose socket closed loses its rate state.
+    assert.ok(r.fm.jobs.securityRate.has(HOST_B));
+    b.ws.terminate();
+    await waitUntil('rate state gone', () => !r.fm.jobs.securityRate.has(HOST_B));
   } finally {
     await r.close();
   }
@@ -675,8 +712,11 @@ test('the ack-timeout sweep skips a host whose job frames are still queued', asy
     await waitUntil('queued', () => (r.fm.jobs.chains.get(HOST_A) || { queued: 0 }).queued > 0);
     await r.fm.jobs.tick(Date.now() + 16000);
     assert.equal((await row(reg, id)).status, 'submitted');
+    // Busy for more than 15 s: no longer held off.
+    r.fm.jobs.chains.get(HOST_A).busySince -= 16000;
+    await r.fm.jobs.tick(Date.now() + 16000);
+    assert.equal((await row(reg, id)).error, 'agent_no_ack');
     release();
-    await ended(reg, id, 'accepted');
   } finally {
     await r.close();
   }

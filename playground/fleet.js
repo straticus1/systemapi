@@ -63,7 +63,7 @@ const { FileChannels } = require('./file');
 const { XferGrants } = require('./xfer');
 const { TerminalWatches } = require('./watch');
 const { SysscriptJobs } = require('./jobs');
-const { noNul } = require('../controlplane/registry');
+const { noNul, truncateUtf8 } = require('../controlplane/registry');
 const { rejectUpgrade } = require('./channel');
 
 const PTY_FRAME_MAX = 64 * 1024;
@@ -1314,7 +1314,7 @@ class FleetManager {
         if (!ALERT_SEVERITIES.has(severity)) return reject('bad_severity');
         if (typeof payload.message !== 'string' || Buffer.byteLength(payload.message, 'utf8') > ALERT_MESSAGE_MAX_BYTES) return reject('bad_message');
         // Postgres TEXT cannot hold U+0000.
-        const message = noNul(payload.message);
+        const message = truncateUtf8(noNul(payload.message), ALERT_MESSAGE_MAX_BYTES);
         ctx.alerts = (ctx.alerts || 0) + 1;
         if (ctx.alerts > ALERTS_PER_RUN_MAX) return reject('rate_limited');
         const tenantId = this.hostTenants.get(hostId);

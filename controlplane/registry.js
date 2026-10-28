@@ -738,7 +738,9 @@ class MemoryRegistry {
   // socket. A write from an enroll older than the stored one is refused
   // (false), so a delayed write never undoes a newer enroll elsewhere; the
   // same enroll may write again (the tick re-asserts it). A close clears
-  // only its own conn_id. The enroll time is the enrolling instance's clock.
+  // only its own conn_id, and its enroll time too, so an owner whose clock
+  // ran ahead cannot lock out the live socket's next re-assert. The enroll
+  // time is the enrolling instance's clock.
   async setAgentPresence(hostId, { caps, instance, connId, enrolledAt }) {
     const p = agentPresence(caps, instance, connId, enrolledAt);
     const row = this.hosts.get(hostId);
@@ -756,6 +758,7 @@ class MemoryRegistry {
     row.agent_caps = null;
     row.agent_instance = null;
     row.agent_conn_id = null;
+    row.agent_enrolled_at = null;
     return true;
   }
 
@@ -1705,7 +1708,7 @@ class PgRegistry {
 
   async clearAgentPresence(hostId, connId) {
     const res = await this.pool.query(
-      `UPDATE cp_hosts SET agent_caps = NULL, agent_instance = NULL, agent_conn_id = NULL
+      `UPDATE cp_hosts SET agent_caps = NULL, agent_instance = NULL, agent_conn_id = NULL, agent_enrolled_at = NULL
        WHERE host_id = $1 AND agent_conn_id = $2`,
       [hostId, String(connId)]
     );
@@ -2603,6 +2606,7 @@ async function createRegistry({ pool, env, logger = console }) {
 
 module.exports = {
   noNul,
+  truncateUtf8,
   MemoryRegistry,
   PgRegistry,
   createRegistry,

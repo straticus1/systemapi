@@ -73,11 +73,13 @@ function http(status, code) {
 function sendError(res, err) {
   const status = err.status && err.status >= 400 && err.status < 600 ? err.status : 500;
   if (status >= 500) console.error('[control]', err.message);
-  // A 500 body carries only a deliberate API code (an error thrown with its
-  // status set and a lowercase code, such as xfer's "io"); anything else,
-  // such as a Postgres error and its SQLSTATE, is "internal".
-  const deliberate = Number.isInteger(err.status) && typeof err.code === 'string' && /^[a-z_]{1,64}$/.test(err.code);
-  res.status(status).json({ error: status === 500 && !deliberate ? 'internal' : (err.code || err.message || 'error') });
+  // A 5xx body carries only a deliberate API code (an error thrown with its
+  // status set and a lowercase code or message, such as xfer's "io",
+  // agent_timeout or lease.js's signer_unavailable);
+  // anything else, such as a Postgres error and its SQLSTATE, is "internal".
+  const code = err.code || err.message || 'error';
+  const deliberate = Number.isInteger(err.status) && typeof code === 'string' && /^[a-z_]{1,64}$/.test(code);
+  res.status(status).json({ error: status >= 500 && !deliberate ? 'internal' : code });
 }
 
 function noStore(res) {
