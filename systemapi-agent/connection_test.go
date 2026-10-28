@@ -87,8 +87,13 @@ func TestAgentReconnectsAfterDisconnect(t *testing.T) {
 				Host HostInfo `json:"host"`
 			} `json:"payload"`
 		}
-		if err := c.ReadJSON(&msg); err == nil && msg.Type == "telemetry" {
-			gotTelemetryHost <- msg.Payload.Host.Hostname
+		// The first frame after enroll is sysscript_job_sync; read on to
+		// the telemetry.
+		for c.ReadJSON(&msg) == nil {
+			if msg.Type == "telemetry" {
+				gotTelemetryHost <- msg.Payload.Host.Hostname
+				break
+			}
 		}
 		if n < 3 {
 			return // drop the connection

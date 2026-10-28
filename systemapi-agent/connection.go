@@ -8,7 +8,8 @@
 // per connection and end with it; a control plane that overruns a stream's
 // credit window gets its connection dropped. Xfer transfers (xfer.go) are
 // not: they survive a drop, and their results go out once the next
-// connection has enrolled.
+// connection has enrolled. Sysscript jobs (sysscript_jobs.go) survive a drop
+// too; the next connection gets sysscript_job_sync and every unacked result.
 package main
 
 import (
@@ -118,6 +119,8 @@ func (a *agentConn) runOnce(stop <-chan struct{}) (bool, error) {
 	c.SetReadLimit(256 * 1024)
 	out := &wsWriter{c: c}
 	defer xferMgr().detach(out)
+	// Sysscript jobs outlive the connection; their frames stop going here.
+	defer jobMgr().detach(out)
 	// Channel streams (TCP forward) live and die with this connection.
 	ch := newChannelConn(out, a.st.HostID)
 	ch.stateDir = filepath.Dir(a.statePath)
@@ -165,6 +168,10 @@ func (a *agentConn) runOnce(stop <-chan struct{}) (bool, error) {
 					signalEnroll(fatalError{err})
 					return
 				}
+				// Attach the job manager here, on the read goroutine, so the
+				// sync goes out before any job frame from this connection
+				// is handled. attach only queues; it never writes.
+				jobMgr().attach(out)
 				signalEnroll(nil)
 			case "enroll_error":
 				log.Printf("enroll rejected: %s", peek.Error)

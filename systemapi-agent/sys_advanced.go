@@ -23,12 +23,15 @@ const (
 // alertSeverities matches the server's accepted set (playground/fleet.js).
 var alertSeverities = map[string]bool{"info": true, "warning": true, "critical": true}
 
-// alertSink delivers sys.alerts.push frames for one script run. send writes a
-// frame on the agent's control-plane connection; scriptID is the run's
-// request id, which the server uses to tie the alert to the execution.
+// alertSink delivers sys.alerts.push frames for one script run. send hands a
+// frame to the job manager's writer (jobManager.sendFrame); scriptID is the
+// run's request id (legacy frame) or job id, which the server uses to tie
+// the alert to the execution. job says the frame carries job_id instead of
+// request_id.
 type alertSink struct {
 	send     func(v interface{}) error
 	scriptID string
+	job      bool
 	sent     int
 }
 
@@ -79,7 +82,11 @@ func (engine *SysscriptEngine) alertsPush(thread *starlark.Thread, b *starlark.B
 		return starlark.False, nil
 	}
 	sink.sent++
-	if err := sink.send(ResponseMessage{Type: "sysscript_alert", RequestID: sink.scriptID, Payload: payload}); err != nil {
+	frame := ResponseMessage{Type: "sysscript_alert", RequestID: sink.scriptID, Payload: payload}
+	if sink.job {
+		frame.RequestID, frame.JobID = "", sink.scriptID
+	}
+	if err := sink.send(frame); err != nil {
 		log.Printf("[sysscript alert, not forwarded: %v] script=%s severity=%s message=%q", err, sink.scriptID, severity, payload.Message)
 		return starlark.False, nil
 	}

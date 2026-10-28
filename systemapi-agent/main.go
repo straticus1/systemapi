@@ -25,6 +25,8 @@ type CommandMessage struct {
 	Script       string        `json:"script"`
 	Entitlements *Entitlements `json:"entitlements"`
 	RequestID    string        `json:"request_id"`
+	JobID        string        `json:"job_id,omitempty"`
+	TimeoutS     int           `json:"timeout_s,omitempty"`
 	Data         string        `json:"data,omitempty"`
 	DataB64      string        `json:"data_b64,omitempty"`
 	SessionID    string        `json:"session_id,omitempty"`
@@ -46,6 +48,7 @@ type ResponseMessage struct {
 	Payload   interface{} `json:"payload"`
 	RequestID string      `json:"request_id,omitempty"`
 	SessionID string      `json:"session_id,omitempty"`
+	JobID     string      `json:"job_id,omitempty"`
 }
 
 func main() {
@@ -279,6 +282,17 @@ func processIncomingMessage(out ptyOut, hostID, stateDir string, message []byte)
 		// Off the read loop: a worker runs it and writes command_result.
 		jobMgr().submitLegacy(out, cmd.RequestID, cmd.Script, cmd.Entitlements, jobCfg.Legacy)
 
+	case "sysscript_job":
+		// Checked here (id, size, entitlements, lease, nonce, duplicate,
+		// deadline) and queued; a worker runs it.
+		jobMgr().startJob(hostID, &cmd, time.Now())
+
+	case "sysscript_job_cancel":
+		jobMgr().cancelJob(cmd.JobID, cmd.Reason)
+
+	case "sysscript_job_ack":
+		jobMgr().ackJob(cmd.JobID)
+
 	case "pty_start":
 		log.Printf("pty_start %s action=%s", cmd.SessionID, cmd.Action)
 		startPTYSession(out, hostID, stateDir, ptyStartRequest{
@@ -347,14 +361,7 @@ const requestIDMaxBytes = 256
 // writeCommandResult sends the legacy command_result frame, its encoded size
 // capped at jobFrameMax (encodeOutputFrame).
 func writeCommandResult(out ptyOut, requestID, errText, output string, truncated bool) {
-	errText, _ = frameText(errText, frameErrMax)
-	b, err := encodeOutputFrame(func(o string, tr bool) interface{} {
-		return ResponseMessage{
-			Type:      "command_result",
-			RequestID: requestID,
-			Payload:   commandResultPayload{Error: errText, Output: o, OutputTruncated: tr},
-		}
-	}, output, truncated)
+	b, err := commandResultFrame(requestID, errText, output, truncated)
 	if err != nil {
 		log.Printf("command_result %s not encoded: %v", requestID, err)
 		return
@@ -362,6 +369,18 @@ func writeCommandResult(out ptyOut, requestID, errText, output string, truncated
 	if err := out.WriteText(b); err != nil {
 		log.Printf("command_result %s not sent: %v", requestID, err)
 	}
+}
+
+// commandResultFrame encodes the legacy command_result frame.
+func commandResultFrame(requestID, errText, output string, truncated bool) ([]byte, error) {
+	errText, _ = frameText(errText, frameErrMax)
+	return encodeOutputFrame(func(o string, tr bool) interface{} {
+		return ResponseMessage{
+			Type:      "command_result",
+			RequestID: requestID,
+			Payload:   commandResultPayload{Error: errText, Output: o, OutputTruncated: tr},
+		}
+	}, output, truncated)
 }
 
 // resolveAPIKey takes the key from --api-key-file, then SYSTEMAPI_API_KEY,
