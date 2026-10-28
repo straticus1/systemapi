@@ -28,7 +28,7 @@ SYSTEMAPI_API_KEY=<key> ./systemapi-agent \
 | `--pty-record-min-free` | 1 GiB | A session is refused (`recording_unavailable`) when the recording filesystem has less free space than this. |
 | `--sysscript-jobs` | `true` | Advertise the `sysscript_jobs` capability (Linux and macOS). `false` stops advertising it, so the server sends this host's scripts the legacy way. Windows agents never advertise it. |
 | `--sysscript-workers` | 4 | Scripts that run at once (1 to 16), jobs and legacy scripts together. 8 more may wait for a worker; beyond that a script is refused `agent_busy`. |
-| `--sysscript-legacy-seconds` | 300 | Whole-script deadline of a legacy (non-job) script, 1 to `--sysscript-max-seconds`. |
+| `--sysscript-legacy-seconds` | 300 | Whole-script deadline of a legacy (non-job) script, 1 to 3600, cut to `--sysscript-max-seconds`. |
 | `--sysscript-max-seconds` | 3600 | Ceiling for any script deadline (1 to 3600). A job deadline beyond it is cut to it. |
 
 `terminal:root` sessions use their own lease action (`pty_root`), run as root,
