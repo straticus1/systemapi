@@ -433,7 +433,9 @@ class XferGrants {
             g.ready = null;
         }
         if (g.state !== 'live') throw httpError(503, 'agent_offline');
-        g.renewTimer = unref(setInterval(() => { this.renew(g); }, this.renewMs));
+        g.renewTimer = unref(setInterval(() => {
+            this.renew(g).catch((err) => console.error('[Fleet] xfer lease renewal failed:', err.message));
+        }, this.renewMs));
         g.maxTimer = unref(setTimeout(() => this.cancel(g, 'max_duration'), maxSeconds * 1000));
         this.armIdle(g, this.firstPacketMs, 'first_packet_timeout');
         return doc;
@@ -464,7 +466,7 @@ class XferGrants {
         clearInterval(g.renewTimer);
         clearTimeout(g.maxTimer);
         clearTimeout(g.idleTimer);
-        g.tombTimer = unref(setTimeout(() => { this.end(g, 'unknown', { error: reason }); }, this.tombstoneMs));
+        g.tombTimer = unref(setTimeout(() => { this.endLogged(g, 'unknown', { error: reason }); }, this.tombstoneMs));
     }
 
     // Re-checks the actor's authority, then sends a fresh 60 s lease. A
@@ -539,7 +541,7 @@ class XferGrants {
             if (p.error !== undefined) {
                 // A failure after ready is terminal: the agent says it stopped.
                 const code = Object.prototype.hasOwnProperty.call(AGENT_ERRORS, p.error) ? p.error : 'internal';
-                this.end(g, 'aborted', { error: code, bytes: g.bytes });
+                this.endLogged(g, 'aborted', { error: code, bytes: g.bytes });
             }
             return;
         }
@@ -554,7 +556,7 @@ class XferGrants {
             const sha256 = typeof p.sha256 === 'string' && SHA256_RE.test(p.sha256) ? p.sha256 : null;
             const reason = typeof p.reason === 'string' && RESULT_REASONS.has(p.reason) ? p.reason : null;
             const committed = typeof p.committed === 'boolean' ? p.committed : null;
-            this.end(g, status, { bytes, sha256, error: g.retireReason, reason, committed });
+            this.endLogged(g, status, { bytes, sha256, error: g.retireReason, reason, committed });
         }
     }
 
@@ -566,6 +568,11 @@ class XferGrants {
             if (g.ready) g.ready.reject(httpError(503, 'agent_offline'));
             else this.retire(g, 'agent_disconnected');
         }
+    }
+
+    // end() from a timer or a frame handler, where nothing awaits it.
+    endLogged(g, status, opts) {
+        this.end(g, status, opts).catch((err) => console.error('[Fleet] xfer end failed:', err.message));
     }
 
     // Removes the grant and writes the xfer_result row (design §3.5). The

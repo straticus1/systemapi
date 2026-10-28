@@ -252,3 +252,7 @@ ALTER TABLE cp_hosts ADD COLUMN IF NOT EXISTS agent_instance TEXT;
 -- older enroll never overwrites a newer one, and a close clears only its own.
 ALTER TABLE cp_hosts ADD COLUMN IF NOT EXISTS agent_conn_id TEXT;
 ALTER TABLE cp_hosts ADD COLUMN IF NOT EXISTS agent_enrolled_at TIMESTAMPTZ;
+-- When the instance holding the socket last wrote its presence (enroll and
+-- every 30 s tick). Older than 90 s, a remote presence is treated as stale:
+-- the legacy callers do not send a job to it.
+ALTER TABLE cp_hosts ADD COLUMN IF NOT EXISTS agent_seen_at TIMESTAMPTZ;

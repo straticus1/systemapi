@@ -203,6 +203,13 @@ and keep the same answer:
 - A job still running after 28 s answers 504
   `{"error": "agent_timeout", "job_id": "sjb_..."}`. The job runs on; read
   it with `GET /api/v1/jobs/:job_id`.
+- New refusals on this path: 400 `bad_timeout`; 400 `bad_entitlements` (a
+  list item the canonical form refuses); 400 `bad_script` (a NUL, text that
+  is not well-formed, or over 64 KiB of UTF-8); 429 `too_many_jobs` (8 live
+  jobs on the host or 64 in the tenant). On `/fleet/execute` a 429 does not
+  end the request: that host's entry is `{"host_id": "...", "error":
+  "too_many_jobs"}` and the remaining hosts still run. Every other refusal
+  (409, 504, 400) still ends the request, as before.
 - The audit actions change. These calls write `sysscript_job_submit` and
   `sysscript_job_end` rows, not `sysscript` and `command_result`. Consumers
   that filter the audit log on the old actions must add the new ones.
@@ -212,7 +219,8 @@ and keep the same answer:
   `source: "rule"`.
 
 An agent without the capability keeps the old path, unchanged. So does every
-agent when the server runs with `SYSTEMAPI_SYSSCRIPT_JOBS=0`.
+agent when the server runs with `SYSTEMAPI_SYSSCRIPT_JOBS=0`, and an agent
+held by another server instance whose presence record is older than 90 s.
 
 Entitlements are clamped by the caller's scopes before they reach the agent:
 `allow_exec` needs `exec:run`; every other entitlement needs `admin`. The

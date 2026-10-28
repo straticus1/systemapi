@@ -51,6 +51,9 @@ const JOB_SECURITY_UNLIMITED = new Set(['job_frame_host_mismatch']);
 // A host whose job chain has been busy this long no longer holds off the
 // ack-timeout sweep.
 const JOB_CHAIN_BUSY_GRACE_MS = 15000;
+// A presence written by another instance longer ago than this (three
+// missed 30 s re-asserts) is stale for the legacy callers' job decision.
+const PRESENCE_FRESH_S = 90;
 const SYNC_EVENT_IDS_MAX = 16;
 // The agent's scriptMaxBytes (systemapi-agent/pty.go).
 const SCRIPT_MAX_BYTES = 64 * 1024;
@@ -610,15 +613,18 @@ class SysscriptJobs {
     // The legacy callers (/execute, /fleet/execute, playbooks, the scheduler
     // and rule playbooks) submit a job only when this is true: the kill
     // switch is on and hostId's agent advertised sysscript_jobs, on the
-    // socket held here or, for a socket on another instance, in cp_hosts.
+    // socket held here or, for a socket on another instance, in cp_hosts
+    // (written within PRESENCE_FRESH_S).
     // Anything else, an old agent or an offline one, stays on pushSysscript.
     async useJobs(hostId) {
         if (!jobsEnabled(this.fleet.env)) return false;
         if (this.localSocket(hostId)) {
             return typeof this.fleet.agentSupports === 'function' && this.fleet.agentSupports(hostId, JOB_CAPABILITY);
         }
+        // A stale presence (its instance may be gone) goes legacy: 409
+        // agent_offline here, as today, rather than a job nobody sends.
         const reg = this.fleet.registry;
-        const agent = reg && typeof reg.hostAgent === 'function' ? await reg.hostAgent(hostId) : null;
+        const agent = reg && typeof reg.hostAgent === 'function' ? await reg.hostAgent(hostId, { maxAgeS: PRESENCE_FRESH_S }) : null;
         return !!agent && agent.caps.includes(JOB_CAPABILITY);
     }
 

@@ -925,8 +925,17 @@ function mount(app, fleet) {
     const results = [];
     for (const hostId of hostIds) {
       const host = await requireHost(fleet, principal, hostId);
-      results.push({ host_id: hostId, ...(await runScript(fleet, principal, host, script, req.body.entitlements,
-        { source: 'fleet_execute', timeoutS: req.body.timeout_s })) });
+      let out;
+      try {
+        out = await runScript(fleet, principal, host, script, req.body.entitlements,
+          { source: 'fleet_execute', timeoutS: req.body.timeout_s });
+      } catch (err) {
+        // A host at its job cap is reported and the loop goes on; any
+        // other refusal ends the request, as before.
+        if (err.status !== 429 || err.code !== 'too_many_jobs') throw err;
+        out = { error: 'too_many_jobs' };
+      }
+      results.push({ host_id: hostId, ...out });
     }
     res.json({ results });
   }));

@@ -997,3 +997,109 @@ test('legacy /execute on another instance: a capable agent there gets a job, an 
     await one.r.close();
   }
 });
+
+// Collects unhandled rejections while fn runs (an unhandled rejection ends
+// the server process under Node 22).
+async function noUnhandled(fn) {
+  const seen = [];
+  const on = (err) => seen.push(err);
+  process.on('unhandledRejection', on);
+  try {
+    await fn();
+    await sleep(50);
+  } finally {
+    process.off('unhandledRejection', on);
+  }
+  assert.deepEqual(seen.map((e) => (e && e.message) || String(e)), []);
+}
+
+const RULE = { metric: 'cpu.usage_percent', operator: '>', threshold_value: '50', action_type: 'playbook', action_target: 'disk_report' };
+const HOT = { cpu: { usage_percent: 99 }, host: { hostname: 'a.example' } };
+
+test('a rule playbook at the host job cap, or an incident action that throws, is logged and never an unhandled rejection', async () => {
+  const { r, reg, a } = await world();
+  try {
+    for (let i = 0; i < 8; i += 1) assert.equal((await submit(r, 'op-key', HOST_A)).status, 202);
+    await noUnhandled(async () => {
+      await r.fm.dispatchPlaybook('disk_report', HOST_A);
+      r.fm.checkRule('user-1', HOST_A, HOT, { ...RULE, name: 'cap-rule' });
+      await sleep(50);
+      assert.equal(jobsOf(reg, 'rule').length, 0, 'the cap held');
+      r.fm.triggerIncident = async () => { throw Object.assign(new Error('boom'), { code: 'boom' }); };
+      r.fm.checkRule('user-1', HOST_A, HOT, { ...RULE, name: 'throw-rule' });
+    });
+    assert.equal(a.of('sysscript').length, 0);
+  } finally {
+    await r.close();
+  }
+});
+
+test('a legacy rule playbook whose agent never answers times out at 30 s without an unhandled rejection', async (t) => {
+  const { r, a } = await world({ caps: '' });
+  try {
+    await noUnhandled(async () => {
+      t.mock.timers.enable({ apis: ['setTimeout'] });
+      try {
+        r.fm.checkRule('user-1', HOST_A, HOT, { ...RULE, name: 'legacy-rule' });
+        for (let i = 0; i < 20 && r.fm.pendingExecutions.size === 0; i += 1) await new Promise(setImmediate);
+        assert.equal(r.fm.pendingExecutions.size, 1);
+        t.mock.timers.tick(30000);
+        for (let i = 0; i < 20; i += 1) await new Promise(setImmediate);
+      } finally {
+        t.mock.timers.reset();
+      }
+      assert.equal(r.fm.pendingExecutions.size, 0);
+    });
+    await a.waitFor('sysscript');
+  } finally {
+    await r.close();
+  }
+});
+
+test('/fleet/execute: a host at its job cap is a per-host too_many_jobs entry; the other hosts still run', async () => {
+  const { r, reg, a } = await world();
+  try {
+    const b = await connectAgent(r, HOST_B);
+    for (let i = 0; i < 8; i += 1) assert.equal((await submit(r, 'op-key', HOST_A)).status, 202);
+    const p = r.api('POST', '/api/v1/fleet/execute', 'op-key', { host_ids: [HOST_A, HOST_B], script: 'print(1)' });
+    const { frame } = await b.waitJob();
+    b.result(frame.job_id, { status: 'succeeded', output: 'b' });
+    const res = await p;
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.deepEqual(res.body.results, [
+      { host_id: HOST_A, error: 'too_many_jobs' },
+      { host_id: HOST_B, request_id: frame.job_id, job_id: frame.job_id, result: { error: '', output: 'b' } }
+    ]);
+    assert.equal(jobsOf(reg, 'fleet_execute').length, 1);
+    assert.equal(a.jobs.size, 8);
+  } finally {
+    await r.close();
+  }
+});
+
+test('a capable agent on another instance whose presence is older than 90 s goes legacy (409 here); a re-assert makes it fresh', async () => {
+  const registry = new MemoryRegistry({ NODE_ENV: 'test' });
+  const two = await rig({ registry, keys: KEYS });
+  const a = await connectAgent(two, HOST_A);
+  const one = await world({ registry, agent: false });
+  try {
+    await waitUntil('presence', async () => registry.hosts.get(HOST_A).agent_seen_at);
+    registry.hosts.get(HOST_A).agent_seen_at = new Date(Date.now() - 91000);
+    assert.equal(await registry.hostAgent(HOST_A, { maxAgeS: 90 }), null);
+    assert.ok(await registry.hostAgent(HOST_A));
+    const stale = await execute(one.r, {});
+    assert.equal(stale.status, 409);
+    assert.equal(stale.body.error, 'agent_offline');
+    assert.equal(registry.jobs.size, 0);
+
+    await two.fm.jobs.tick();
+    await waitUntil('fresh', () => registry.hostAgent(HOST_A, { maxAgeS: 90 }));
+    const p = execute(one.r, {});
+    const { frame } = await a.waitJob();
+    a.result(frame.job_id, { status: 'succeeded', output: 'x' });
+    assert.equal((await p).status, 200);
+  } finally {
+    await two.close();
+    await one.r.close();
+  }
+});

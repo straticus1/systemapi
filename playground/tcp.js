@@ -329,7 +329,9 @@ class TcpChannels {
                 max_bytes: maxBytes,
                 lease
             });
-            s.renewTimer = unref(setInterval(() => { this.renew(s); }, this.renewMs));
+            s.renewTimer = unref(setInterval(() => {
+            this.renew(s).catch((err) => console.error('[Fleet] tcp lease renewal failed:', err.message));
+        }, this.renewMs));
             s.maxTimer = unref(setTimeout(() => {
                 this.end(s, 'max_duration', { notifyClient: true, notifyAgent: true });
             }, maxSeconds * 1000));

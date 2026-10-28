@@ -63,6 +63,11 @@ const { FileChannels } = require('./file');
 const { XferGrants } = require('./xfer');
 const { TerminalWatches } = require('./watch');
 const { SysscriptJobs } = require('./jobs');
+// What a background failure logs: the error's code, never its message
+// (which may carry agent text).
+function errorCode(err) {
+    return err && typeof err.code === 'string' && /^[A-Za-z0-9_]{1,64}$/.test(err.code) ? err.code : 'internal';
+}
 // The whole-script deadline of a rule playbook sent as a job.
 const RULE_JOB_TIMEOUT_S = 300;
 const { noNul, truncateUtf8 } = require('../controlplane/registry');
@@ -1232,7 +1237,11 @@ class FleetManager {
         if (rule.operator === '=') triggered = valueToTest === threshold;
         if (triggered) {
             const hostname = telemetry.host && telemetry.host.hostname;
-            this.triggerIncident(rule, valueToTest, hostId, hostname);
+            // Not awaited (telemetry goes on); a failure is logged, never
+            // left as an unhandled rejection, which would end the process.
+            this.triggerIncident(rule, valueToTest, hostId, hostname).catch((err) => {
+                console.error(`[ALERT] incident action failed host=${hostId} error=${errorCode(err)}`);
+            });
         }
     }
 
@@ -1269,21 +1278,27 @@ class FleetManager {
             allow_k3s: false
         };
         // A sysscript_jobs agent gets a job (no waiting on the agent);
-        // otherwise, or with the kill switch off, the legacy push.
+        // otherwise, or with the kill switch off, the legacy push. Either
+        // can fail (too_many_jobs, agent_timeout, a registry error): logged
+        // by code only, never the script or its output.
         const tenantId = this.hostTenants.get(hostId);
-        if (tenantId && await this.jobs.useJobs(hostId)) {
-            await this.jobs.submit({
-                host: { host_id: hostId, tenant_id: tenantId },
-                actor: 'system:rule',
-                source: 'rule',
-                script,
-                entitlements,
-                timeoutS: RULE_JOB_TIMEOUT_S
-            });
-            return;
+        try {
+            if (tenantId && await this.jobs.useJobs(hostId)) {
+                await this.jobs.submit({
+                    host: { host_id: hostId, tenant_id: tenantId },
+                    actor: 'system:rule',
+                    source: 'rule',
+                    script,
+                    entitlements,
+                    timeoutS: RULE_JOB_TIMEOUT_S
+                });
+                return;
+            }
+            const lease = issueLease(this.signer, { hostId, action: 'sysscript', payload: script, ttl: 60 });
+            await this.pushSysscript(hostId, script, entitlements, randomToken(16), lease);
+        } catch (err) {
+            console.error(`[PLAYBOOK] run failed playbook=${playbookId} host=${hostId} error=${errorCode(err)}`);
         }
-        const lease = issueLease(this.signer, { hostId, action: 'sysscript', payload: script, ttl: 60 });
-        await this.pushSysscript(hostId, script, entitlements, randomToken(16), lease);
     }
 
     async sendAdstelcoSMS(toPhone, body) {

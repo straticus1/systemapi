@@ -211,7 +211,7 @@ class TerminalWatches {
         session.watchers.set(watchId, w);
         this.watches.set(watchId, w);
         // A ticket that is never opened ends the watch.
-        w.ticketTimer = unref(setTimeout(() => { if (!w.ws) this.stop(w, 'ticket_unused'); }, this.ticketTtlMs + 1000));
+        w.ticketTimer = unref(setTimeout(() => { if (!w.ws) this.stopLogged(w, 'ticket_unused'); }, this.ticketTtlMs + 1000));
         return w;
     }
 
@@ -248,7 +248,7 @@ class TerminalWatches {
         }
         w.ws = ws;
         clearTimeout(w.ticketTimer);
-        ws.on('close', () => this.stop(w, 'watcher_closed'));
+        ws.on('close', () => this.stopLogged(w, 'watcher_closed'));
         // The actor must still hold the scope the watch needed.
         if (!(await ticketScopesHeld(fm.registry, row, watchScopes(w.mode, !w.consent)))) {
             fm.failTerminalSocket(ws, 'scope_denied');
@@ -299,7 +299,7 @@ class TerminalWatches {
             if (w.stopped || !w.ws || w.ws.readyState !== WebSocket.OPEN) continue;
             if (w.ws.bufferedAmount > cap) {
                 console.warn(`[Fleet] watch ${w.id}: watcher too slow; closing it`);
-                this.stop(w, 'watcher_too_slow');
+                this.stopLogged(w, 'watcher_too_slow');
                 continue;
             }
             for (let off = 0; off < data.length; off += FRAME_MAX) w.ws.send(data.subarray(off, off + FRAME_MAX));
@@ -318,8 +318,13 @@ class TerminalWatches {
             if (w.ws && w.ws.readyState === WebSocket.OPEN) {
                 sendJSON(w.ws, { type: 'pty_exit', payload: { session_id: session.id, code, reason } });
             }
-            this.stop(w, 'session_ended', { notifyAgent: false });
+            this.stopLogged(w, 'session_ended', { notifyAgent: false });
         }
+    }
+
+    // stop() from a timer or a socket event, where nothing awaits it.
+    stopLogged(w, reason, opts) {
+        this.stop(w, reason, opts).catch((err) => console.error('[Fleet] watch stop failed:', err.message));
     }
 
     // Ends one watch once: tells the agent (unless the session is gone),

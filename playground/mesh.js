@@ -219,7 +219,9 @@ class MeshChannels {
         }
         session = m;
         sendJSON(ws, { type: 'mesh_ready', payload: { session_id: m.id, window: TCP_WINDOW } });
-        m.recheckTimer = unref(setInterval(() => { this.recheck(m); }, this.recheckMs));
+        m.recheckTimer = unref(setInterval(() => {
+            this.recheck(m).catch((err) => console.error('[Fleet] mesh re-check failed:', err.message));
+        }, this.recheckMs));
         m.maxTimer = unref(setTimeout(() => { this.endSession(m, 'max_duration'); }, maxSeconds * 1000));
         this.armIdle(m);
     }

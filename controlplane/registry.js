@@ -749,6 +749,7 @@ class MemoryRegistry {
     row.agent_instance = p.instance;
     row.agent_conn_id = p.connId;
     row.agent_enrolled_at = p.enrolledAt;
+    row.agent_seen_at = new Date();
     return true;
   }
 
@@ -759,14 +760,17 @@ class MemoryRegistry {
     row.agent_instance = null;
     row.agent_conn_id = null;
     row.agent_enrolled_at = null;
+    row.agent_seen_at = null;
     return true;
   }
 
   // {instance, conn_id, caps} of the host's live agent, or null when none
-  // is recorded (or the host is retired).
-  async hostAgent(hostId) {
+  // is recorded (or the host is retired). With maxAgeS, also null when the
+  // presence was last written more than maxAgeS seconds ago.
+  async hostAgent(hostId, { maxAgeS = null } = {}) {
     const row = this.hosts.get(hostId);
     if (!row || row.retired_at || !row.agent_conn_id) return null;
+    if (maxAgeS !== null && (!row.agent_seen_at || Date.now() - row.agent_seen_at.getTime() > maxAgeS * 1000)) return null;
     return { instance: row.agent_instance, conn_id: row.agent_conn_id, caps: [...(row.agent_caps || [])] };
   }
 
@@ -1699,7 +1703,8 @@ class PgRegistry {
   async setAgentPresence(hostId, { caps, instance, connId, enrolledAt }) {
     const p = agentPresence(caps, instance, connId, enrolledAt);
     const res = await this.pool.query(
-      `UPDATE cp_hosts SET agent_caps = $2::text[], agent_instance = $3, agent_conn_id = $4, agent_enrolled_at = $5
+      `UPDATE cp_hosts SET agent_caps = $2::text[], agent_instance = $3, agent_conn_id = $4, agent_enrolled_at = $5,
+       agent_seen_at = now()
        WHERE host_id = $1 AND (agent_enrolled_at IS NULL OR agent_enrolled_at <= $5)`,
       [hostId, p.caps, p.instance, p.connId, p.enrolledAt]
     );
@@ -1708,18 +1713,21 @@ class PgRegistry {
 
   async clearAgentPresence(hostId, connId) {
     const res = await this.pool.query(
-      `UPDATE cp_hosts SET agent_caps = NULL, agent_instance = NULL, agent_conn_id = NULL, agent_enrolled_at = NULL
+      `UPDATE cp_hosts SET agent_caps = NULL, agent_instance = NULL, agent_conn_id = NULL, agent_enrolled_at = NULL,
+       agent_seen_at = NULL
        WHERE host_id = $1 AND agent_conn_id = $2`,
       [hostId, String(connId)]
     );
     return res.rowCount > 0;
   }
 
-  async hostAgent(hostId) {
+  // The database clock decides the age, the same for every replica.
+  async hostAgent(hostId, { maxAgeS = null } = {}) {
     const res = await this.pool.query(
       `SELECT agent_caps, agent_instance, agent_conn_id FROM cp_hosts
-       WHERE host_id = $1 AND retired_at IS NULL AND agent_conn_id IS NOT NULL`,
-      [hostId]
+       WHERE host_id = $1 AND retired_at IS NULL AND agent_conn_id IS NOT NULL
+       AND ($2::int IS NULL OR agent_seen_at > now() - make_interval(secs => $2::int))`,
+      [hostId, maxAgeS]
     );
     const row = res.rows[0];
     if (!row) return null;

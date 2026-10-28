@@ -468,7 +468,9 @@ class FileChannels {
             actor: actor === null ? '' : String(actor),
             lease
         });
-        s.renewTimer = unref(setInterval(() => { this.renew(s); }, this.renewMs));
+        s.renewTimer = unref(setInterval(() => {
+            this.renew(s).catch((err) => console.error('[Fleet] file lease renewal failed:', err.message));
+        }, this.renewMs));
         s.maxTimer = unref(setTimeout(() => this.end(s, 'max_duration', { notifyClient: true, notifyAgent: true }), maxSeconds * 1000));
         s.startTimer = unref(setTimeout(() => {
             if (!s.ready) this.end(s, 'start_timeout', { error: 'internal', notifyAgent: true });

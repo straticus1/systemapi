@@ -708,6 +708,18 @@ test('jobs: two FleetManagers on one database: submit on one, the agent on the o
     assert.equal(await regOne.clearAgentPresence(hostId, ahead.connId), true);
     assert.equal(await regOne.setAgentPresence(hostId, liveSock), true);
     assert.equal((await regOne.hostAgent(hostId)).conn_id, liveSock.connId);
+    // Freshness by the database clock: a presence last written over maxAgeS
+    // ago is null with maxAgeS (still returned without it); a re-assert
+    // refreshes it; a close clears agent_seen_at.
+    assert.equal((await regOne.hostAgent(hostId, { maxAgeS: 90 })).conn_id, liveSock.connId);
+    await regOne.pool.query(`UPDATE cp_hosts SET agent_seen_at = now() - interval '91 seconds' WHERE host_id = $1`, [hostId]);
+    assert.equal(await regOne.hostAgent(hostId, { maxAgeS: 90 }), null);
+    assert.equal((await regOne.hostAgent(hostId)).conn_id, liveSock.connId);
+    assert.equal(await regOne.setAgentPresence(hostId, liveSock), true);
+    assert.equal((await regOne.hostAgent(hostId, { maxAgeS: 90 })).conn_id, liveSock.connId);
+    assert.equal(await regOne.clearAgentPresence(hostId, liveSock.connId), true);
+    const seen = await regOne.pool.query('SELECT agent_seen_at FROM cp_hosts WHERE host_id = $1', [hostId]);
+    assert.equal(seen.rows[0].agent_seen_at, null);
     assert.equal((await registry.verifyAudit()).ok, true);
   } finally {
     await one.close();
