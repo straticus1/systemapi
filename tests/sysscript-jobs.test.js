@@ -459,7 +459,11 @@ test('sync: a terminal job listed active gets a cancel; an unknown id gets a can
     assert.equal((await a2.waitFor('sysscript_job_cancel', fin)).reason, 'terminal');
     assert.equal((await a2.waitFor('sysscript_job_cancel', unknown)).reason, 'unknown');
     assert.equal((await a2.waitFor('sysscript_job_cancel', cancelMe)).reason, 'user');
-    await waitUntil('unknown on sync', () => reg.securityEvents.some((e) => e.kind === 'job_unknown_on_sync' && e.detail.job_id === unknown));
+    await waitUntil('unknown on sync', () => reg.securityEvents.some((e) => e.kind === 'job_unknown_on_sync'));
+    const events = reg.securityEvents.filter((e) => e.kind === 'job_unknown_on_sync');
+    assert.equal(events.length, 1);
+    assert.deepEqual(events[0].detail.job_ids, [unknown]);
+    assert.equal(events[0].detail.count, 1);
     assert.equal((await row(reg, cancelMe)).status, 'running');
   } finally {
     await r.close();
@@ -546,16 +550,133 @@ test('an agent that floods its job queue is disconnected; a 1 MiB output frame k
   }
 });
 
-test('agent_caps and agent_instance are recorded on enroll and cleared on close', async () => {
+test('agent presence is recorded on enroll and cleared on close; an older enroll never overwrites a newer one', async () => {
   const { r, reg, a } = await world();
   try {
-    assert.deepEqual(await reg.hostAgent(HOST_A), { instance: r.fm.jobs.instanceId, caps: ['sysscript_jobs'] });
+    const connId = r.fm.jobs.connIds.get(r.fm.connectedAgents.get(HOST_A));
+    assert.deepEqual(await reg.hostAgent(HOST_A), { instance: r.fm.jobs.instanceId, conn_id: connId, caps: ['sysscript_jobs'] });
     a.ws.terminate();
     await waitUntil('presence cleared', async () => (await reg.hostAgent(HOST_A)) === null);
-    // A close on another instance does not clear a newer enroll.
-    await reg.setAgentPresence(HOST_A, ['sysscript_jobs'], 'other-instance');
-    await reg.clearAgentPresence(HOST_A, r.fm.jobs.instanceId);
-    assert.equal((await reg.hostAgent(HOST_A)).instance, 'other-instance');
+
+    // A enrolled first but its write is delayed; B enrolled later and wrote;
+    // then A's write lands and A closes. B stays.
+    const t = Date.now();
+    const A = { caps: ['sysscript_jobs'], instance: 'inst-a', connId: 'inst-a:1', enrolledAt: new Date(t + 1000) };
+    const B = { caps: ['sysscript_jobs'], instance: 'inst-b', connId: 'inst-b:1', enrolledAt: new Date(t + 2000) };
+    assert.equal(await reg.setAgentPresence(HOST_A, B), true);
+    assert.equal(await reg.setAgentPresence(HOST_A, A), false);
+    assert.equal(await reg.clearAgentPresence(HOST_A, A.connId), false);
+    assert.equal((await reg.hostAgent(HOST_A)).conn_id, B.connId);
+    // The same enroll may write again (the tick re-asserts it).
+    assert.equal(await reg.setAgentPresence(HOST_A, B), true);
+    assert.equal(await reg.clearAgentPresence(HOST_A, B.connId), true);
+    assert.equal(await reg.hostAgent(HOST_A), null);
+    // A late write from the cleared older enroll does not come back.
+    assert.equal(await reg.setAgentPresence(HOST_A, A), false);
+  } finally {
+    await r.close();
+  }
+});
+
+test('the tick re-asserts presence; a job goes only to the socket cp_hosts names', async () => {
+  const { r, reg, a } = await world();
+  try {
+    const connId = r.fm.jobs.connIds.get(r.fm.connectedAgents.get(HOST_A));
+    reg.hosts.get(HOST_A).agent_conn_id = null; // a lost write
+    await r.fm.jobs.tick();
+    await waitUntil('presence healed', async () => (await reg.hostAgent(HOST_A)) && (await reg.hostAgent(HOST_A)).conn_id === connId);
+
+    // A newer enroll of the same host elsewhere: this socket gets nothing.
+    await reg.setAgentPresence(HOST_A, { caps: ['sysscript_jobs'], instance: 'other', connId: 'other:1', enrolledAt: new Date(Date.now() + 60000) });
+    const res = await submit(r, 'op-key', HOST_A);
+    assert.equal(res.status, 202);
+    await sleep(150);
+    assert.equal(a.jobs.has(res.body.job_id), false);
+    assert.equal((await row(reg, res.body.job_id)).status, 'submitted');
+  } finally {
+    await r.close();
+  }
+});
+
+test('review: NUL in a script is 400; a 500 says internal; error text only beside visible output; never-dispatched cancel is ended', async () => {
+  const { r, reg, a } = await world();
+  try {
+    const nul = await submit(r, 'op-key', HOST_A, { script: 'print(1)\u0000' });
+    assert.equal(nul.status, 400);
+    assert.equal(nul.body.error, 'bad_script');
+
+    const create = reg.createJob.bind(reg);
+    reg.createJob = async () => { const e = new Error('22P05 unsupported Unicode escape'); e.code = '22P05'; throw e; };
+    const boom = await submit(r, 'op-key', HOST_A);
+    assert.equal(boom.status, 500);
+    assert.equal(boom.body.error, 'internal');
+    reg.createJob = create;
+
+    const id = await dispatched(r, a, 'op-key');
+    a.result(id, { status: 'failed', error: 'secret path /etc/shadow\u0000x', output: 'out\u0000put' });
+    await a.waitFor('sysscript_job_ack', id);
+    const stored = await row(reg, id);
+    assert.equal(stored.output, 'out\uFFFDput');
+    assert.equal(stored.error, 'secret path /etc/shadow\uFFFDx');
+    assert.equal((await r.api('GET', `/api/v1/jobs/${id}`, 'op-key')).body.job.error, 'secret path /etc/shadow\uFFFDx');
+    assert.equal((await r.api('GET', `/api/v1/jobs/${id}`, 'op2-key')).body.job.error, 'agent_error');
+    const listed = (await r.api('GET', '/api/v1/jobs', 'op-key')).body.jobs.find((j) => j.job_id === id);
+    assert.equal(listed.error, 'agent_error');
+    const coded = await dispatched(r, a, 'op-key');
+    a.result(coded, { status: 'rejected', error: 'agent_busy' });
+    await ended(reg, coded, 'failed');
+    assert.equal((await r.api('GET', `/api/v1/jobs/${coded}`, 'op2-key')).body.job.error, 'agent_busy');
+
+    // Offline agent row still named in cp_hosts: the job is never sent and
+    // its cancel ends it on the spot.
+    const ends = [];
+    const orig = r.fm.jobs.ended.bind(r.fm.jobs);
+    r.fm.jobs.ended = (j) => { ends.push(j.job_id); orig(j); };
+    a.ws.terminate();
+    await waitUntil('offline', () => !r.fm.connectedAgents.has(HOST_A));
+    await reg.setAgentPresence(HOST_A, { caps: ['sysscript_jobs'], instance: 'other', connId: 'other:2', enrolledAt: new Date(Date.now() + 120000) });
+    const never = await submit(r, 'op-key', HOST_A);
+    assert.equal(never.status, 202);
+    const c = await r.api('POST', `/api/v1/jobs/${never.body.job_id}/cancel`, 'op-key');
+    assert.equal(c.status, 202);
+    assert.equal(c.body.job.status, 'cancelled');
+    assert.deepEqual(ends, [never.body.job_id]);
+  } finally {
+    await r.close();
+  }
+});
+
+test('job frame security events are rate limited per host and carry the suppressed count', async () => {
+  const { r, reg, a } = await world();
+  try {
+    for (let i = 0; i < 15; i += 1) a.result(`sjb_${String(i).padStart(22, 'Z')}`, { status: 'succeeded' });
+    await waitUntil('frames handled', () => (r.fm.jobs.chains.get(HOST_A) || { queued: 0 }).queued === 0 && reg.securityEvents.length >= 10);
+    await sleep(50);
+    assert.equal(reg.securityEvents.filter((e) => e.kind === 'job_frame_unknown').length, 10);
+    // Next window: the event that gets through says how many were dropped.
+    r.fm.jobs.securityRate.get(HOST_A).start -= 61000;
+    a.result('sjb_YYYYYYYYYYYYYYYYYYYYYY', { status: 'succeeded' });
+    const ev = await waitUntil('next event', () => reg.securityEvents.filter((e) => e.kind === 'job_frame_unknown')[10]);
+    assert.equal(ev.detail.suppressed, 5);
+  } finally {
+    await r.close();
+  }
+});
+
+test('the ack-timeout sweep skips a host whose job frames are still queued', async () => {
+  const { r, reg, a } = await world();
+  try {
+    const id = await dispatched(r, a);
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const transition = reg.transitionJob.bind(reg);
+    reg.transitionJob = async (...args) => { await gate; return transition(...args); };
+    a.status(id, { status: 'accepted' });
+    await waitUntil('queued', () => (r.fm.jobs.chains.get(HOST_A) || { queued: 0 }).queued > 0);
+    await r.fm.jobs.tick(Date.now() + 16000);
+    assert.equal((await row(reg, id)).status, 'submitted');
+    release();
+    await ended(reg, id, 'accepted');
   } finally {
     await r.close();
   }

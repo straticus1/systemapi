@@ -63,6 +63,7 @@ const { FileChannels } = require('./file');
 const { XferGrants } = require('./xfer');
 const { TerminalWatches } = require('./watch');
 const { SysscriptJobs } = require('./jobs');
+const { noNul } = require('../controlplane/registry');
 const { rejectUpgrade } = require('./channel');
 
 const PTY_FRAME_MAX = 64 * 1024;
@@ -892,7 +893,7 @@ class FleetManager {
             // replaced does not mark the host offline.
             if (this.connectedAgents.get(hostId) !== ws) return;
             this.connectedAgents.delete(hostId);
-            this.jobs.onClose(hostId);
+            this.jobs.onClose(ws, hostId);
             if (this.registry) {
                 try { await this.registry.setHostStatus(hostId, 'offline'); } catch (err) {
                     console.error('[Fleet] status update failed:', err.message);
@@ -969,7 +970,7 @@ class FleetManager {
             this.agentCaps.set(ws, request.systemapiCapabilities || new Set());
             this.agentKeys.set(ws, keyId);
             this.connectedAgents.set(hostId, ws);
-            this.jobs.onEnroll(ws, hostId, this.agentCaps.get(ws));
+            this.jobs.onEnroll(ws, hostId);
             ws.send(JSON.stringify({
                 type: 'enrolled',
                 host_id: hostId,
@@ -1309,9 +1310,11 @@ class FleetManager {
         };
         if (!ctx || ctx.hostId !== hostId) return reject('unknown_execution');
         const payload = msg.payload && typeof msg.payload === 'object' ? msg.payload : {};
-        const { severity, message } = payload;
+        const { severity } = payload;
         if (!ALERT_SEVERITIES.has(severity)) return reject('bad_severity');
-        if (typeof message !== 'string' || Buffer.byteLength(message, 'utf8') > ALERT_MESSAGE_MAX_BYTES) return reject('bad_message');
+        if (typeof payload.message !== 'string' || Buffer.byteLength(payload.message, 'utf8') > ALERT_MESSAGE_MAX_BYTES) return reject('bad_message');
+        // Postgres TEXT cannot hold U+0000.
+        const message = noNul(payload.message);
         ctx.alerts = (ctx.alerts || 0) + 1;
         if (ctx.alerts > ALERTS_PER_RUN_MAX) return reject('rate_limited');
         const tenantId = this.hostTenants.get(hostId);

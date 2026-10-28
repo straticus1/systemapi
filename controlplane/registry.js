@@ -293,10 +293,10 @@ function jobTransition(fromStatuses, fields) {
     throw http(500, 'bad_job_transition');
   }
   const set = { status: to };
-  if ('error' in fields) set.error = fields.error == null ? null : String(fields.error).slice(0, JOB_ERROR_MAX);
+  if ('error' in fields) set.error = fields.error == null ? null : noNul(String(fields.error)).slice(0, JOB_ERROR_MAX);
   if ('output' in fields) {
     if (fields.output !== null && typeof fields.output !== 'string') throw http(400, 'bad_job_output');
-    set.output = fields.output;
+    set.output = fields.output === null ? null : noNul(fields.output);
   }
   if ('output_truncated' in fields) set.output_truncated = fields.output_truncated === true;
   if (typeof set.output === 'string' && Buffer.byteLength(set.output, 'utf8') > JOB_OUTPUT_MAX) {
@@ -463,6 +463,18 @@ function publicJob(row, { withOutput = true } = {}) {
 // most 16.
 function agentCapList(caps) {
   return [...(caps || [])].filter((c) => typeof c === 'string' && /^[a-z][a-z0-9_]{0,15}$/.test(c)).slice(0, 16);
+}
+
+function agentPresence(caps, instance, connId, enrolledAt) {
+  const at = enrolledAt == null ? null : toDate(enrolledAt);
+  if (!nonEmpty(instance) || !nonEmpty(connId) || !at) throw http(500, 'bad_agent_presence');
+  return { caps: agentCapList(caps), instance, connId, enrolledAt: at };
+}
+
+// Postgres TEXT cannot hold U+0000 (22021): a result or alert that carries
+// one would fail to store and be lost. It becomes U+FFFD.
+function noNul(text) {
+  return text.includes('\u0000') ? text.replace(/\u0000/g, '\uFFFD') : text;
 }
 
 function jobRetentionDays(env) {
@@ -721,29 +733,38 @@ class MemoryRegistry {
     if (row) row.status = status;
   }
 
-  // The live agent of a host (cp_hosts.agent_caps/agent_instance): written
-  // by the instance holding its socket on enroll, cleared on close only by
-  // that instance, so a newer enroll elsewhere is never undone.
-  async setAgentPresence(hostId, caps, instance) {
+  // The live agent of a host (cp_hosts.agent_caps, agent_instance,
+  // agent_conn_id, agent_enrolled_at), written by the instance holding its
+  // socket. A write from an enroll older than the stored one is refused
+  // (false), so a delayed write never undoes a newer enroll elsewhere; the
+  // same enroll may write again (the tick re-asserts it). A close clears
+  // only its own conn_id. The enroll time is the enrolling instance's clock.
+  async setAgentPresence(hostId, { caps, instance, connId, enrolledAt }) {
+    const p = agentPresence(caps, instance, connId, enrolledAt);
     const row = this.hosts.get(hostId);
-    if (!row) return;
-    row.agent_caps = agentCapList(caps);
-    row.agent_instance = String(instance);
+    if (!row || (row.agent_enrolled_at && row.agent_enrolled_at > p.enrolledAt)) return false;
+    row.agent_caps = p.caps;
+    row.agent_instance = p.instance;
+    row.agent_conn_id = p.connId;
+    row.agent_enrolled_at = p.enrolledAt;
+    return true;
   }
 
-  async clearAgentPresence(hostId, instance) {
+  async clearAgentPresence(hostId, connId) {
     const row = this.hosts.get(hostId);
-    if (!row || row.agent_instance !== instance) return;
+    if (!row || !row.agent_conn_id || row.agent_conn_id !== connId) return false;
     row.agent_caps = null;
     row.agent_instance = null;
+    row.agent_conn_id = null;
+    return true;
   }
 
-  // {instance, caps} of the host's live agent, or null when none is
-  // recorded (or the host is retired).
+  // {instance, conn_id, caps} of the host's live agent, or null when none
+  // is recorded (or the host is retired).
   async hostAgent(hostId) {
     const row = this.hosts.get(hostId);
-    if (!row || row.retired_at || !row.agent_instance) return null;
-    return { instance: row.agent_instance, caps: [...(row.agent_caps || [])] };
+    if (!row || row.retired_at || !row.agent_conn_id) return null;
+    return { instance: row.agent_instance, conn_id: row.agent_conn_id, caps: [...(row.agent_caps || [])] };
   }
 
   // Stamps retired_at and appends the host_retired audit row (written
@@ -1672,29 +1693,34 @@ class PgRegistry {
     await this.pool.query('UPDATE cp_hosts SET status = $2 WHERE host_id = $1', [hostId, status]);
   }
 
-  async setAgentPresence(hostId, caps, instance) {
-    await this.pool.query(
-      'UPDATE cp_hosts SET agent_caps = $2::text[], agent_instance = $3 WHERE host_id = $1',
-      [hostId, agentCapList(caps), String(instance)]
+  async setAgentPresence(hostId, { caps, instance, connId, enrolledAt }) {
+    const p = agentPresence(caps, instance, connId, enrolledAt);
+    const res = await this.pool.query(
+      `UPDATE cp_hosts SET agent_caps = $2::text[], agent_instance = $3, agent_conn_id = $4, agent_enrolled_at = $5
+       WHERE host_id = $1 AND (agent_enrolled_at IS NULL OR agent_enrolled_at <= $5)`,
+      [hostId, p.caps, p.instance, p.connId, p.enrolledAt]
     );
+    return res.rowCount > 0;
   }
 
-  async clearAgentPresence(hostId, instance) {
-    await this.pool.query(
-      'UPDATE cp_hosts SET agent_caps = NULL, agent_instance = NULL WHERE host_id = $1 AND agent_instance = $2',
-      [hostId, String(instance)]
+  async clearAgentPresence(hostId, connId) {
+    const res = await this.pool.query(
+      `UPDATE cp_hosts SET agent_caps = NULL, agent_instance = NULL, agent_conn_id = NULL
+       WHERE host_id = $1 AND agent_conn_id = $2`,
+      [hostId, String(connId)]
     );
+    return res.rowCount > 0;
   }
 
   async hostAgent(hostId) {
     const res = await this.pool.query(
-      `SELECT agent_caps, agent_instance FROM cp_hosts
-       WHERE host_id = $1 AND retired_at IS NULL AND agent_instance IS NOT NULL`,
+      `SELECT agent_caps, agent_instance, agent_conn_id FROM cp_hosts
+       WHERE host_id = $1 AND retired_at IS NULL AND agent_conn_id IS NOT NULL`,
       [hostId]
     );
     const row = res.rows[0];
     if (!row) return null;
-    return { instance: row.agent_instance, caps: [...(row.agent_caps || [])] };
+    return { instance: row.agent_instance, conn_id: row.agent_conn_id, caps: [...(row.agent_caps || [])] };
   }
 
   // One transaction: lock the host row (it must belong to tenantId), stamp
@@ -2576,6 +2602,7 @@ async function createRegistry({ pool, env, logger = console }) {
 }
 
 module.exports = {
+  noNul,
   MemoryRegistry,
   PgRegistry,
   createRegistry,

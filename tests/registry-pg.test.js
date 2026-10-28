@@ -633,7 +633,10 @@ test('jobs: two FleetManagers on one database: submit on one, the agent on the o
     await regOne.setScopes(`ko${tag}`, ['exec:run', 'hosts:read']);
     const a = await connectAgent(two, hostId, { tenant, key: 'pg-agent' });
     assert.ok(a.frames.some((f) => f.type === 'enrolled'));
-    assert.deepEqual(await regOne.hostAgent(hostId), { instance: two.fm.jobs.instanceId, caps: ['sysscript_jobs'] });
+    const agentRow = await regOne.hostAgent(hostId);
+    assert.equal(agentRow.instance, two.fm.jobs.instanceId);
+    assert.equal(agentRow.conn_id, two.fm.jobs.connIds.get(two.fm.connectedAgents.get(hostId)));
+    assert.deepEqual(agentRow.caps, ['sysscript_jobs']);
     await one.fm.jobs.listen();
     await two.fm.jobs.listen();
 
@@ -664,8 +667,38 @@ test('jobs: two FleetManagers on one database: submit on one, the agent on the o
     );
     assert.deepEqual(audit.rows.map((x) => x.action), ['sysscript_job_submit', 'sysscript_job_cancel', 'sysscript_job_end']);
 
+    // U+0000 in output, error and an alert is stored as U+FFFD (Postgres
+    // TEXT refuses U+0000): the result is acked, not lost.
+    const n = await one.api('POST', `/api/v1/fleet/${hostId}/jobs`, 'pg-op', { script: 'print(3)' });
+    await a.waitJob(n.body.job_id, 8000);
+    a.status(n.body.job_id, { status: 'running' });
+    a.alert(n.body.job_id, { severity: 'warning', message: 'nul\u0000here' });
+    a.result(n.body.job_id, { status: 'failed', error: 'bad\u0000error', output: 'a\u0000b' });
+    await a.waitFor('sysscript_job_ack', n.body.job_id, 8000);
+    const nulRow = await regOne.getJob([tenant], n.body.job_id);
+    assert.equal(nulRow.status, 'failed');
+    assert.equal(nulRow.output, 'a\uFFFDb');
+    assert.equal(nulRow.error, 'bad\uFFFDerror');
+    assert.equal(nulRow.alert_count, 1);
+    const alerts = await regOne.listAlerts([tenant]);
+    assert.ok(alerts.some((x) => x.message === 'nul\uFFFDhere'));
+    // The legacy request_id alert path too.
+    two.fm.pendingExecutions.set('req-nul', { resolve() {}, reject() {}, script: 'x', hostId });
+    a.send({ type: 'sysscript_alert', request_id: 'req-nul', payload: { severity: 'info', message: 'legacy\u0000nul' } });
+    await waitUntil('legacy alert', async () => (await regOne.listAlerts([tenant])).some((x) => x.message === 'legacy\uFFFDnul'), 8000);
+    two.fm.pendingExecutions.delete('req-nul');
+
+    // Presence ordering: a delayed write from an older enroll, then its
+    // close, leave the newer enroll in place.
+    const live = await regOne.hostAgent(hostId);
+    const older = { caps: ['sysscript_jobs'], instance: 'old', connId: 'old:1', enrolledAt: new Date(Date.now() - 60000) };
+    assert.equal(await regOne.setAgentPresence(hostId, older), false);
+    assert.equal(await regOne.clearAgentPresence(hostId, older.connId), false);
+    assert.equal((await regOne.hostAgent(hostId)).conn_id, live.conn_id);
+
     a.ws.terminate();
     await waitUntil('presence cleared', async () => (await regOne.hostAgent(hostId)) === null, 8000);
+    assert.equal(await regOne.setAgentPresence(hostId, older), false);
     assert.equal((await registry.verifyAudit()).ok, true);
   } finally {
     await one.close();

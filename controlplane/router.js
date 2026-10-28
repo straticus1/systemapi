@@ -73,7 +73,11 @@ function http(status, code) {
 function sendError(res, err) {
   const status = err.status && err.status >= 400 && err.status < 600 ? err.status : 500;
   if (status >= 500) console.error('[control]', err.message);
-  res.status(status).json({ error: err.code || err.message || 'error' });
+  // A 500 body carries only a deliberate API code (an error thrown with its
+  // status set and a lowercase code, such as xfer's "io"); anything else,
+  // such as a Postgres error and its SQLSTATE, is "internal".
+  const deliberate = Number.isInteger(err.status) && typeof err.code === 'string' && /^[a-z_]{1,64}$/.test(err.code);
+  res.status(status).json({ error: status === 500 && !deliberate ? 'internal' : (err.code || err.message || 'error') });
 }
 
 function noStore(res) {
@@ -960,7 +964,8 @@ function mount(app, fleet) {
     requireScope(fleet, principal, host.tenant_id, 'exec:run');
     const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
     const script = body.script;
-    if (typeof script !== 'string' || script.length === 0 || !script.isWellFormed()
+    // U+0000 cannot be stored in the dispatch JSONB.
+    if (typeof script !== 'string' || script.length === 0 || !script.isWellFormed() || script.includes('\u0000')
       || Buffer.byteLength(script, 'utf8') > SCRIPT_MAX) {
       throw http(400, 'bad_script');
     }
@@ -1032,10 +1037,10 @@ function mount(app, fleet) {
     requireJobs(fleet);
     const job = await requireJob(fleet, principal, req.params.jobId);
     if (!jobOwnerOrAdmin(principal, job)) {
-      safeSecurity(fleet, {
+      await safeSecurity(fleet, {
         kind: 'scope_deny',
         tenant_id: job.tenant_id,
-        actor_fingerprint: fingerprint(principal.userId),
+        actor_fingerprint: principal.keyId ? fingerprint(principal.keyId) : fingerprint(principal.userId),
         detail: { scope: 'job:cancel' }
       });
       throw http(403, 'scope_denied');

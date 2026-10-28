@@ -30,7 +30,7 @@
 const WebSocket = require('ws');
 const { issueLease, sysscriptJobPayload, sha256Hex, SYSSCRIPT_JOB_RE } = require('../controlplane/lease');
 const { entitlementsSha256 } = require('../controlplane/entitlements');
-const { jobRetentionDays, jobOutputRetentionHours } = require('../controlplane/registry');
+const { jobRetentionDays, jobOutputRetentionHours, noNul } = require('../controlplane/registry');
 const { randomToken } = require('../controlplane/token');
 
 const JOB_CAPABILITY = 'sysscript_jobs';
@@ -43,6 +43,10 @@ const ALERTS_PER_JOB_MAX = 20;
 const SYNC_IDS_MAX = 1024;
 const ERROR_CODE_RE = /^[a-z_]{1,64}$/;
 const JOB_LEASE_TTL_S = 60;
+// Security events from job frames, per host: at most this many a minute;
+// the next event that gets through carries the suppressed count.
+const JOB_SECURITY_PER_MIN = 10;
+const SYNC_EVENT_IDS_MAX = 16;
 
 function http(status, code) {
     const err = new Error(code);
@@ -79,8 +83,14 @@ function isoOf(value) {
 
 // The API shape of a job row. Without output the key is left out (lists);
 // with output not visible to this principal it is null and output_visible
-// is false. conn_id, the lease nonce and the send stamps stay internal.
+// is false. The agent's error text can carry script output, so it is shown
+// in full only alongside visible output; otherwise only a code-shaped error
+// (or agent_error). conn_id, the lease nonce and the send stamps stay
+// internal.
 function jobView(row, { output = true, visible = true } = {}) {
+    const full = output && visible;
+    let error = row.error == null ? null : row.error;
+    if (error !== null && !full && !ERROR_CODE_RE.test(error)) error = 'agent_error';
     const out = {
         job_id: row.job_id,
         tenant_id: row.tenant_id,
@@ -88,7 +98,7 @@ function jobView(row, { output = true, visible = true } = {}) {
         actor: row.actor,
         source: row.source,
         status: row.status,
-        error: row.error == null ? null : row.error,
+        error,
         timeout_s: row.timeout_s,
         deadline_unix: unixOf(row.deadline_at),
         script_sha256: row.script_sha256,
@@ -115,8 +125,12 @@ class SysscriptJobs {
         this.fleet = fleet;
         // Written on the row (agent_instance) and into every conn_id.
         this.instanceId = randomToken(16);
-        // Per accepted agent socket: "<instance>:<token>".
+        // Per accepted agent socket: "<instance>:<token>", and when it
+        // enrolled (cp_hosts.agent_enrolled_at).
         this.connIds = new WeakMap();
+        this.enrolledAt = new WeakMap();
+        // Per host: the security event rate window.
+        this.securityRate = new Map();
         // Per host: the ordered chain of job frames and job deliveries.
         this.chains = new Map();
         // Per job id: the wait_s waiters woken by state events.
@@ -156,14 +170,35 @@ class SysscriptJobs {
         this.metric('jobFrameRejectedTotal', { reason });
     }
 
+    // Null when hostId is over JOB_SECURITY_PER_MIN this minute (counted as
+    // suppressed), else the count suppressed since the last event written.
+    securityAllowed(hostId) {
+        const now = Date.now();
+        let s = this.securityRate.get(hostId);
+        if (!s || now - s.start >= 60000) {
+            s = { start: now, n: 0, suppressed: s ? s.suppressed : 0 };
+            this.securityRate.set(hostId, s);
+        }
+        if (s.n >= JOB_SECURITY_PER_MIN) {
+            s.suppressed += 1;
+            return null;
+        }
+        s.n += 1;
+        const suppressed = s.suppressed;
+        s.suppressed = 0;
+        return suppressed;
+    }
+
     async security(hostId, kind, detail) {
         if (!this.fleet.registry) return;
+        const suppressed = this.securityAllowed(hostId);
+        if (suppressed === null) return;
         try {
             await this.fleet.registry.recordSecurity({
                 kind,
                 tenant_id: this.fleet.hostTenants.get(hostId) || null,
                 actor_fingerprint: null,
-                detail: { host_id: hostId, ...detail }
+                detail: { host_id: hostId, ...detail, ...(suppressed > 0 ? { suppressed } : {}) }
             });
         } catch (err) {
             console.error('[Fleet] security event failed:', err.message);
@@ -181,13 +216,28 @@ class SysscriptJobs {
         return !!this.localSocket(hostId) && this.fleet.agentSupports(hostId, JOB_CAPABILITY);
     }
 
+    // The conn_ids of sockets held here whose job chain is idle: a host with
+    // frames still queued may hold the ack the sweep would time out.
     localConnIds() {
         const out = [];
-        for (const ws of this.fleet.connectedAgents.values()) {
+        for (const [hostId, ws] of this.fleet.connectedAgents) {
             const id = this.connIds.get(ws);
-            if (id && ws.readyState === WebSocket.OPEN) out.push(id);
+            const c = this.chains.get(hostId);
+            if (id && ws.readyState === WebSocket.OPEN && !(c && c.queued > 0)) out.push(id);
         }
         return out;
+    }
+
+    async assertPresence(hostId, ws) {
+        const reg = this.fleet.registry;
+        const connId = this.connIds.get(ws);
+        if (!reg || typeof reg.setAgentPresence !== 'function' || !connId) return false;
+        return reg.setAgentPresence(hostId, {
+            caps: [...(this.fleet.agentCaps.get(ws) || [])],
+            instance: this.instanceId,
+            connId,
+            enrolledAt: this.enrolledAt.get(ws)
+        });
     }
 
     // Runs fn on hostId's chain. A frame from the agent (ws set) counts
@@ -218,23 +268,23 @@ class SysscriptJobs {
 
     // An accepted agent socket: its conn_id, the host's agent_caps and
     // agent_instance, then any dispatch or cancel waiting for it.
-    onEnroll(ws, hostId, caps) {
+    onEnroll(ws, hostId) {
         this.connIds.set(ws, `${this.instanceId}:${randomToken(16)}`);
+        this.enrolledAt.set(ws, new Date());
         this.listen();
-        const reg = this.fleet.registry;
         this.enqueue(hostId, async () => {
-            if (reg && typeof reg.setAgentPresence === 'function') {
-                await reg.setAgentPresence(hostId, [...(caps || [])], this.instanceId);
-            }
+            await this.assertPresence(hostId, ws);
             await this.pump(hostId);
         });
     }
 
-    // The host's current socket closed on this instance.
-    onClose(hostId) {
+    // The host's current socket closed on this instance: its presence row is
+    // cleared if it is still this socket's.
+    onClose(ws, hostId) {
         const reg = this.fleet.registry;
-        if (!reg || typeof reg.clearAgentPresence !== 'function') return;
-        this.enqueue(hostId, () => reg.clearAgentPresence(hostId, this.instanceId));
+        const connId = this.connIds.get(ws);
+        if (!reg || typeof reg.clearAgentPresence !== 'function' || !connId) return;
+        this.enqueue(hostId, () => reg.clearAgentPresence(hostId, connId));
     }
 
     onEvent(evt) {
@@ -252,11 +302,18 @@ class SysscriptJobs {
     // dispatch payload. The frame carries the payload exactly as stored at
     // submit, the entitlements object the lease hashed included. True when
     // sent.
+    // Only the socket named in cp_hosts (the newest enroll) is sent jobs, so
+    // a duplicate agent on another instance never takes one.
     async deliverDispatch(hostId, jobId) {
         if (!this.capable(hostId)) return false;
         const ws = this.localSocket(hostId);
         const connId = this.connIds.get(ws);
         if (!connId) return false;
+        const reg = this.fleet.registry;
+        if (typeof reg.hostAgent === 'function') {
+            const agent = await reg.hostAgent(hostId);
+            if (!agent || agent.conn_id !== connId) return false;
+        }
         const claimed = await this.fleet.registry.markDispatched(jobId, hostId, connId);
         if (!claimed || !claimed.dispatch) return false;
         const d = claimed.dispatch;
@@ -382,11 +439,13 @@ class SysscriptJobs {
     async onAlert(hostId, msg) {
         const jobId = msg.job_id;
         if (!isJobId(jobId)) return this.rejected(hostId, 'bad_job_id');
-        const { severity, message } = payloadOf(msg);
+        const { severity } = payloadOf(msg);
+        const raw = payloadOf(msg).message;
         if (!ALERT_SEVERITIES.has(severity)) return this.rejected(hostId, 'bad_severity');
-        if (typeof message !== 'string' || Buffer.byteLength(message, 'utf8') > ALERT_MESSAGE_MAX_BYTES) {
+        if (typeof raw !== 'string' || Buffer.byteLength(raw, 'utf8') > ALERT_MESSAGE_MAX_BYTES) {
             return this.rejected(hostId, 'bad_message');
         }
+        const message = noNul(raw);
         const reg = this.fleet.registry;
         const bump = await reg.bumpJobAlert(jobId, hostId, ALERTS_PER_JOB_MAX);
         if (!bump.ok) return this.rejected(hostId, bump.reason);
@@ -429,11 +488,12 @@ class SysscriptJobs {
         const listed = new Set([...active, ...unacked]);
         const reg = this.fleet.registry;
         const tenantId = this.fleet.hostTenants.get(hostId);
+        const unknown = [];
         for (const jobId of listed) {
             const row = tenantId ? await reg.getJob([tenantId], jobId) : null;
             if (!row || row.host_id !== hostId) {
                 sendJSON(ws, { type: 'sysscript_job_cancel', job_id: jobId, reason: 'unknown' });
-                await this.security(hostId, 'job_unknown_on_sync', { job_id: jobId });
+                unknown.push(jobId);
             } else if (TERMINAL.has(row.status)) {
                 if (unacked.has(jobId)) sendJSON(ws, { type: 'sysscript_job_ack', job_id: jobId });
                 if (active.has(jobId)) sendJSON(ws, { type: 'sysscript_job_cancel', job_id: jobId, reason: 'terminal' });
@@ -442,6 +502,10 @@ class SysscriptJobs {
                     await reg.markCancelSent(jobId, hostId);
                 }
             }
+        }
+        // One event per sync, however many ids it names.
+        if (unknown.length > 0) {
+            await this.security(hostId, 'job_unknown_on_sync', { count: unknown.length, job_ids: unknown.slice(0, SYNC_EVENT_IDS_MAX) });
         }
         const ended = await reg.reconcileHostJobs(hostId, connId, [...listed]);
         for (const row of ended) this.ended(row);
@@ -556,8 +620,14 @@ class SysscriptJobs {
 
     // After a cancel request: delivered here at once when this instance
     // holds the socket (the cancel event covers the others).
+    // A job never dispatched ended right there (cancelled_before_dispatch).
     cancelRequested(row) {
-        if (!row || TERMINAL.has(row.status) || !row.conn_id || !this.capable(row.host_id)) return;
+        if (!row) return;
+        if (TERMINAL.has(row.status)) {
+            this.ended(row);
+            return;
+        }
+        if (!row.conn_id || !this.capable(row.host_id)) return;
         this.enqueue(row.host_id, () => this.deliverCancel(row.host_id, row.job_id));
     }
 
@@ -570,6 +640,14 @@ class SysscriptJobs {
         if (!reg || typeof reg.sweepJobs !== 'function') return;
         this.listen();
         const ended = await reg.sweepJobs(now, { connectedConnIds: this.localConnIds() });
+        // Re-assert presence for the sockets held here (heals a row a lost
+        // write left stale); an older enroll than the stored one is refused.
+        // After the sweep, so this queued work does not hold off its ack check.
+        for (const [hostId, ws] of this.fleet.connectedAgents) {
+            if (ws.readyState === WebSocket.OPEN && this.connIds.has(ws)) {
+                this.enqueue(hostId, () => this.assertPresence(hostId, ws));
+            }
+        }
         for (const row of ended) this.ended(row);
         const env = this.fleet.env || {};
         await reg.expireOutput(jobOutputRetentionHours(env));

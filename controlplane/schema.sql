@@ -248,3 +248,7 @@ CREATE INDEX IF NOT EXISTS cp_sysscript_jobs_output_idx ON cp_sysscript_jobs (fi
 -- leave a stale value, overwritten on the next enroll.
 ALTER TABLE cp_hosts ADD COLUMN IF NOT EXISTS agent_caps TEXT[];
 ALTER TABLE cp_hosts ADD COLUMN IF NOT EXISTS agent_instance TEXT;
+-- The live agent socket's conn_id and enroll time: a presence write from an
+-- older enroll never overwrites a newer one, and a close clears only its own.
+ALTER TABLE cp_hosts ADD COLUMN IF NOT EXISTS agent_conn_id TEXT;
+ALTER TABLE cp_hosts ADD COLUMN IF NOT EXISTS agent_enrolled_at TIMESTAMPTZ;
