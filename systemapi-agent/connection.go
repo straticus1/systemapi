@@ -236,6 +236,9 @@ func (a *agentConn) runOnce(stop <-chan struct{}) (bool, error) {
 			// Cancel xfer children while this connection can still carry
 			// their results.
 			xferMgr().stopAll("stopped", xferStopTimeout)
+			// Running sysscripts end as agent_stopped and report on this
+			// connection while it is still open.
+			jobMgr().stopAll(jobKillGrace + jobStopMargin)
 			_ = out.WriteClose()
 			select {
 			case <-done:

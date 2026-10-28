@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -77,7 +76,16 @@ func main() {
 	xferAdvertiseFlag := flag.String("xfer-udp-advertise", "", "IP reported to the server in place of the bound one (a published port behind NAT or Docker)")
 	xferAllowDarwinFlag := flag.Bool("xfer-allow-darwin", false, "advertise xfer on macOS (development only: no openat2, no Pdeathsig)")
 	ptyRecordMinFreeFlag := flag.Uint64("pty-record-min-free", recordMinFreeDefault, "refuse a terminal session when the recording filesystem has less free space (bytes)")
+	sysscriptWorkersFlag := flag.Int("sysscript-workers", jobWorkersDefault, fmt.Sprintf("sysscripts run at once (1..%d); %d more may wait, then agent_busy", jobWorkersMax, jobPendingMax))
+	sysscriptLegacyFlag := flag.Int("sysscript-legacy-seconds", jobLegacyDefaultSec, fmt.Sprintf("whole-script deadline of a legacy sysscript frame (1..%d, at most --sysscript-max-seconds)", jobMaxSecondsMax))
+	sysscriptMaxFlag := flag.Int("sysscript-max-seconds", jobMaxSecondsMax, fmt.Sprintf("ceiling for any sysscript deadline (1..%d)", jobMaxSecondsMax))
 	flag.Parse()
+	jc, err := parseJobFlags(*sysscriptWorkersFlag, *sysscriptLegacyFlag, *sysscriptMaxFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(2)
+	}
+	jobCfg = jc
 	if *ptyRecordMaxFlag <= 0 || *ptyRecordMinFreeFlag == 0 {
 		fmt.Fprintln(os.Stderr, "Error: --pty-record-max-bytes and --pty-record-min-free must be positive")
 		os.Exit(2)
@@ -235,6 +243,9 @@ func main() {
 	// Graceful shutdown: each xfer child gets cancel and deletes its temp
 	// file; results not sent stay in their records for the next start.
 	xferMgr().stopAll("stopped", xferStopTimeout)
+	// Scripts still running end as agent_stopped (a no-op when the
+	// connection's stop already did it).
+	jobMgr().stopAll(jobKillGrace + jobStopMargin)
 	if err != nil {
 		log.Printf("fatal: %v", err)
 		os.Exit(1)
@@ -260,16 +271,8 @@ func processIncomingMessage(out ptyOut, hostID, stateDir string, message []byte)
 			return
 		}
 		log.Printf("sysscript %s", cmd.RequestID)
-		ctx, cancel := context.WithTimeout(context.Background(), legacyScriptTimeout)
-		engine := NewSysscriptEngine(ctx, cmd.Entitlements)
-		engine.alerts = &alertSink{send: out.WriteJSON, scriptID: cmd.RequestID}
-		output, err := engine.Execute(cmd.Script)
-		cancel()
-		errText := ""
-		if err != nil {
-			errText = err.Error()
-		}
-		writeCommandResult(out, cmd.RequestID, errText, output, engine.outputTruncated)
+		// Off the read loop: a worker runs it and writes command_result.
+		jobMgr().submitLegacy(out, cmd.RequestID, cmd.Script, cmd.Entitlements, jobCfg.Legacy)
 
 	case "pty_start":
 		log.Printf("pty_start %s action=%s", cmd.SessionID, cmd.Action)
@@ -331,11 +334,6 @@ func processIncomingMessage(out ptyOut, hostID, stateDir string, message []byte)
 		handlePTYStop(cmd.SessionID)
 	}
 }
-
-// legacyScriptTimeout is the whole-script deadline of a legacy "sysscript"
-// frame. The server stops waiting at 30 s; the script keeps running until
-// it ends or this deadline passes.
-const legacyScriptTimeout = 300 * time.Second
 
 // writeCommandResult sends the legacy command_result frame, its encoded size
 // capped at jobFrameMax (encodeOutputFrame).
