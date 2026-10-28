@@ -376,6 +376,226 @@ test('exec rejects a missing or oversized script before any request', async (t) 
   assert.equal(seen[0].url, '/api/v1/fleet/host-1/execute');
 });
 
+const JOB_DONE = 'sjb_' + 'd'.repeat(22);
+const JOB_SLOW = 'sjb_' + 's'.repeat(22);
+const JOB_FAIL = 'sjb_' + 'f'.repeat(22);
+const JOB_STUCK = 'sjb_' + 'r'.repeat(22);
+const JOB_HIDDEN = 'sjb_' + 'h'.repeat(22);
+const JOB_OVER = 'sjb_' + 'o'.repeat(22);
+
+function jobRow(id, status, extra) {
+  return {
+    job_id: id,
+    host_id: 'host-1',
+    source: 'api',
+    status,
+    error: null,
+    deadline_unix: Math.floor(Date.now() / 1000) + 300,
+    output_truncated: false,
+    output_expired: false,
+    created_at: '2026-10-28T00:00:00.000Z',
+    duration_ms: null,
+    output_visible: true,
+    output: null,
+    ...extra
+  };
+}
+
+function jobServer() {
+  const { server, seen } = record(KEY);
+  const gets = new Map();
+  server.on('request-done', (req, res, body) => {
+    const reply = (status, obj) => {
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(obj));
+    };
+    if (req.method === 'POST' && req.url === '/api/v1/fleet/host-1/jobs') {
+      const sent = JSON.parse(body);
+      if (sent.script === 'done' && sent.wait_s > 0) {
+        reply(200, { job: jobRow(JOB_DONE, 'succeeded', { output: 'hi\n', duration_ms: 5 }) });
+        return;
+      }
+      const id = { slow: JOB_SLOW, fail: JOB_FAIL, stuck: JOB_STUCK }[sent.script] || JOB_DONE;
+      reply(202, { job_id: id, status: 'submitted', deadline_unix: Math.floor(Date.now() / 1000) + 300 });
+      return;
+    }
+    const get = /^\/api\/v1\/jobs\/(sjb_[A-Za-z0-9_-]{22})$/.exec(req.url);
+    if (req.method === 'GET' && get) {
+      const id = get[1];
+      const n = (gets.get(id) || 0) + 1;
+      gets.set(id, n);
+      if (id === JOB_SLOW) {
+        reply(200, { job: n < 2 ? jobRow(id, 'running') : jobRow(id, 'succeeded', { output: 'slow done\n', duration_ms: 2100 }) });
+        return;
+      }
+      if (id === JOB_FAIL) {
+        reply(200, { job: jobRow(id, 'timed_out', { error: 'timed_out', output: 'partial\n' }) });
+        return;
+      }
+      if (id === JOB_HIDDEN) {
+        reply(200, { job: jobRow(id, 'succeeded', { output_visible: false, output: null }) });
+        return;
+      }
+      if (id === JOB_STUCK) {
+        reply(200, { job: jobRow(id, 'running', { deadline_unix: Math.floor(Date.now() / 1000) - 120 }) });
+        return;
+      }
+      reply(404, { error: 'not_found' });
+      return;
+    }
+    if (req.method === 'POST' && req.url === '/api/v1/jobs/' + JOB_STUCK + '/cancel') {
+      reply(202, { job: jobRow(JOB_STUCK, 'running', { cancel_requested_at: '2026-10-28T00:00:01.000Z' }) });
+      return;
+    }
+    if (req.method === 'POST' && req.url === '/api/v1/jobs/' + JOB_OVER + '/cancel') {
+      reply(409, { error: 'job_finished' });
+      return;
+    }
+    if (req.method === 'GET' && (req.url === '/api/v1/jobs' || req.url.startsWith('/api/v1/jobs?'))) {
+      reply(200, {
+        jobs: [
+          jobRow(JOB_DONE, 'succeeded', { duration_ms: 5 }),
+          jobRow(JOB_FAIL, 'timed_out', { source: 'sched\tule' })
+        ]
+      });
+      return;
+    }
+    reply(404, { error: 'not_found' });
+  });
+  return { server, seen };
+}
+
+test('jobs submit: async prints the id; --wait polls to the end; exit 0, 1 and 3', async (t) => {
+  const { server, seen } = jobServer();
+  const port = await listen(server);
+  t.after(() => close(server));
+  const base = 'http://127.0.0.1:' + port;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'systemapi-jobs-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const script = path.join(dir, 'job.star');
+
+  fs.writeFileSync(script, 'done');
+  const async = await run(['jobs', 'submit', 'host-1', script], env(base));
+  assert.equal(async.status, 0, async.stderr);
+  assert.equal(async.stdout, JOB_DONE + '\n');
+  assert.deepEqual(JSON.parse(seen[0].body), { script: 'done', entitlements: { allow_exec: true }, wait_s: 0 });
+
+  const quick = await run(['jobs', 'submit', 'host-1', script, '--timeout', '600', '--wait', '45'], env(base));
+  assert.equal(quick.status, 0, quick.stderr);
+  assert.equal(quick.stdout, 'hi\n');
+  assert.equal(quick.stderr, '');
+  assert.deepEqual(JSON.parse(seen[1].body), { script: 'done', entitlements: { allow_exec: true }, wait_s: 20, timeout_s: 600 });
+  assert.equal(seen.length, 2);
+
+  fs.writeFileSync(script, 'slow');
+  const slow = await run(['jobs', 'submit', 'host-1', script, '--wait', '5'], env(base));
+  assert.equal(slow.status, 0, slow.stderr);
+  assert.equal(slow.stdout, 'slow done\n');
+  assert.equal(JSON.parse(seen[2].body).wait_s, 5);
+  assert.deepEqual(seen.slice(3).map((row) => row.method + ' ' + row.url), [
+    'GET /api/v1/jobs/' + JOB_SLOW,
+    'GET /api/v1/jobs/' + JOB_SLOW
+  ]);
+
+  fs.writeFileSync(script, 'fail');
+  const failed = await run(['jobs', 'submit', 'host-1', script, '--wait', '3'], env(base));
+  assert.equal(failed.status, 1);
+  assert.equal(failed.stdout, 'partial\n');
+  assert.match(failed.stderr, /^timed_out timed_out\n$/);
+
+  fs.writeFileSync(script, 'stuck');
+  const stuck = await run(['jobs', 'submit', 'host-1', script, '--wait', '1'], env(base));
+  assert.equal(stuck.status, 3);
+  assert.equal(stuck.stdout, JOB_STUCK + '\n');
+  assert.match(stuck.stderr, /still running/);
+
+  const hidden = await run(['jobs', 'wait', JOB_HIDDEN], env(base));
+  assert.equal(hidden.status, 0);
+  assert.equal(hidden.stdout, '');
+  assert.match(hidden.stderr, /output hidden/);
+
+  // No --wait: a job past its deadline + 90 s is not waited on.
+  const past = await run(['jobs', 'wait', JOB_STUCK], env(base));
+  assert.equal(past.status, 3);
+  assert.equal(past.stdout, JOB_STUCK + '\n');
+
+  for (const row of seen) {
+    assert.equal(row.authOk, true);
+    assert.equal(row.authorization, false);
+    assert.equal(row.url.includes(KEY), false);
+    assert.equal(row.body.includes(KEY), false);
+  }
+  for (const out of [async, quick, slow, failed, stuck, hidden, past]) {
+    assert.equal(out.stdout.includes(KEY), false);
+    assert.equal(out.stderr.includes(KEY), false);
+  }
+});
+
+test('jobs status, cancel and list', async (t) => {
+  const { server, seen } = jobServer();
+  const port = await listen(server);
+  t.after(() => close(server));
+  const base = 'http://127.0.0.1:' + port;
+
+  const done = await run(['jobs', 'status', JOB_SLOW], env(base));
+  assert.equal(done.status, 3);
+  assert.equal(JSON.parse(done.stdout).status, 'running');
+  const failed = await run(['jobs', 'status', JOB_FAIL], env(base));
+  assert.equal(failed.status, 1);
+  assert.equal(JSON.parse(failed.stdout).status, 'timed_out');
+  const missing = await run(['jobs', 'status', 'sjb_' + 'x'.repeat(22)], env(base));
+  assert.equal(missing.status, 1);
+  assert.match(missing.stderr, /not_found/);
+
+  const cancel = await run(['jobs', 'cancel', JOB_STUCK], env(base));
+  assert.equal(cancel.status, 0, cancel.stderr);
+  assert.equal(cancel.stdout, JOB_STUCK + '\trunning\n');
+  const over = await run(['jobs', 'cancel', JOB_OVER], env(base));
+  assert.equal(over.status, 1);
+  assert.match(over.stderr, /job_finished/);
+
+  const list = await run(['jobs', 'list', '--host', 'host-1', '--status', 'timed_out'], env(base));
+  assert.equal(list.status, 0, list.stderr);
+  assert.equal(list.stdout, [
+    [JOB_DONE, 'host-1', 'succeeded', 'api', '2026-10-28T00:00:00.000Z', '5'].join('\t'),
+    [JOB_FAIL, 'host-1', 'timed_out', 'sched ule', '2026-10-28T00:00:00.000Z', ''].join('\t')
+  ].join('\n') + '\n');
+  assert.equal(seen[seen.length - 1].url, '/api/v1/jobs?host_id=host-1&status=timed_out');
+  const all = await run(['jobs', 'list'], env(base));
+  assert.equal(all.status, 0);
+  assert.equal(seen[seen.length - 1].url, '/api/v1/jobs');
+});
+
+test('jobs rejects bad arguments before any request', async (t) => {
+  const { server, seen } = jobServer();
+  const port = await listen(server);
+  t.after(() => close(server));
+  const base = 'http://127.0.0.1:' + port;
+  const cases = [
+    ['jobs'],
+    ['jobs', 'nope'],
+    ['jobs', 'status'],
+    ['jobs', 'status', 'not-a-job-id'],
+    ['jobs', 'status', JOB_DONE, '--wait', '1'],
+    ['jobs', 'cancel', '../' + JOB_DONE],
+    ['jobs', 'wait', JOB_DONE, '--wait', '-1'],
+    ['jobs', 'submit', 'host-1'],
+    ['jobs', 'submit', '..', '/dev/null'],
+    ['jobs', 'submit', 'host-1', '/dev/null', '--timeout', '0'],
+    ['jobs', 'submit', 'host-1', '/dev/null', '--timeout', '1.5'],
+    ['jobs', 'submit', 'host-1', '/dev/null', '--wait', '1', '--wait', '2'],
+    ['jobs', 'list', '--status', 'bogus'],
+    ['jobs', 'list', '--host', '..'],
+    ['jobs', 'list', 'extra']
+  ];
+  for (const args of cases) {
+    const out = await run(args, env(base));
+    assert.equal(out.status, 2, args.join(' '));
+    assert.equal(out.stdout, '');
+  }
+  assert.equal(seen.length, 0);
+});
+
 test('redirects are not followed and do not echo the key', async (t) => {
   const hits = [];
   const trap = http.createServer((req, res) => {

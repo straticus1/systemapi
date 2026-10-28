@@ -33,6 +33,20 @@ export const FleetAPI = {
     const res = await api.post(`/api/v1/fleet/${hostId}/execute`, { script, entitlements });
     return res.data;
   },
+  // Async sysscript jobs: each call is short (no wait_s), so the 10 s
+  // timeout holds however long the script runs.
+  submitJob: async (hostId, script, entitlements, timeoutS) => {
+    const res = await api.post(`/api/v1/fleet/${encodeURIComponent(hostId)}/jobs`, { script, entitlements, timeout_s: timeoutS });
+    return res.data;
+  },
+  getJob: async (jobId) => {
+    const res = await api.get(`/api/v1/jobs/${encodeURIComponent(jobId)}`);
+    return res.data;
+  },
+  cancelJob: async (jobId) => {
+    const res = await api.post(`/api/v1/jobs/${encodeURIComponent(jobId)}/cancel`);
+    return res.data;
+  },
   getAlerts: async () => {
     const res = await api.get('/api/v1/alerts');
     return res.data;

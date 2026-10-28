@@ -598,14 +598,15 @@ class SysscriptJobs {
 
     // 409 agent_offline or 501 agent_unsupported unless hostId's agent is
     // connected (here, or on the instance named in cp_hosts) and advertised
-    // sysscript_jobs.
+    // sysscript_jobs. A presence older than PRESENCE_FRESH_S (its instance
+    // may be gone) is offline, as in useJobs.
     async requireAgent(hostId) {
         if (this.localSocket(hostId)) {
             if (typeof this.fleet.agentSupports === 'function' && this.fleet.agentSupports(hostId, JOB_CAPABILITY)) return;
             throw http(501, 'agent_unsupported');
         }
         const reg = this.fleet.registry;
-        const agent = reg && typeof reg.hostAgent === 'function' ? await reg.hostAgent(hostId) : null;
+        const agent = reg && typeof reg.hostAgent === 'function' ? await reg.hostAgent(hostId, { maxAgeS: PRESENCE_FRESH_S }) : null;
         if (!agent) throw http(409, 'agent_offline');
         if (!agent.caps.includes(JOB_CAPABILITY)) throw http(501, 'agent_unsupported');
     }

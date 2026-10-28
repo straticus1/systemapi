@@ -30,3 +30,39 @@ export function resizeFrameFor(status, rows, cols) {
   if (status !== 'starting' && status !== 'started') return null;
   return JSON.stringify({ type: 'pty_resize', rows: termSize(rows), cols: termSize(cols) });
 }
+
+// A sysscript job is still going in these states (GET /api/v1/jobs/:id).
+export function jobActive(status) {
+  return status === 'submitted' || status === 'accepted' || status === 'running';
+}
+
+// Outcome of a finished job. data is the output (and the error, if any);
+// notice explains output the server did not return: hidden from this key
+// (only the submitter or a tenant admin sees it), expired, or truncated.
+export function jobOutcome(job) {
+  const success = !!job && job.status === 'succeeded';
+  const error = job && job.error ? job.error : '';
+  if (job && job.output_visible === false) {
+    return {
+      success,
+      data: error || (success ? '' : job.status),
+      notice: 'Output hidden: only the submitter or an admin of this host\'s tenant can read it.'
+    };
+  }
+  if (job && job.output_expired) {
+    return { success, data: error, notice: 'Output expired: it is kept for a limited time after the job ends.' };
+  }
+  const output = job && typeof job.output === 'string' ? job.output : '';
+  const data = [output, error].filter(Boolean).join(output.endsWith('\n') ? '' : '\n')
+    || (success ? 'No output returned.' : (job && job.status) || 'failed');
+  return { success, data, notice: job && job.output_truncated ? 'Output truncated by the agent.' : '' };
+}
+
+// "42s elapsed, 258s to deadline" while a job runs; the deadline part is
+// left out when it is unknown, and shows 0s once passed.
+export function jobClock(startedMs, deadlineUnix, nowMs) {
+  const elapsed = Math.max(0, Math.floor((nowMs - startedMs) / 1000));
+  if (typeof deadlineUnix !== 'number') return `${elapsed}s elapsed`;
+  const left = Math.max(0, Math.ceil(deadlineUnix - nowMs / 1000));
+  return `${elapsed}s elapsed, ${left}s to deadline`;
+}

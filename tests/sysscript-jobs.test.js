@@ -1103,3 +1103,30 @@ test('a capable agent on another instance whose presence is older than 90 s goes
     await one.r.close();
   }
 });
+
+test('POST /jobs for an agent on another instance whose presence is older than 90 s is 409 agent_offline, and no job is created', async () => {
+  const registry = new MemoryRegistry({ NODE_ENV: 'test' });
+  const two = await rig({ registry, keys: KEYS });
+  const a = await connectAgent(two, HOST_A);
+  const one = await world({ registry, agent: false });
+  try {
+    await waitUntil('presence', async () => registry.hosts.get(HOST_A).agent_seen_at);
+    registry.hosts.get(HOST_A).agent_seen_at = new Date(Date.now() - 91000);
+    assert.ok(await registry.hostAgent(HOST_A));
+    const stale = await submit(one.r, 'op-key', HOST_A);
+    assert.equal(stale.status, 409, JSON.stringify(stale.body));
+    assert.equal(stale.body.error, 'agent_offline');
+    assert.equal(registry.jobs.size, 0);
+
+    await two.fm.jobs.tick();
+    await waitUntil('fresh', () => registry.hostAgent(HOST_A, { maxAgeS: 90 }));
+    const res = await submit(one.r, 'op-key', HOST_A);
+    assert.equal(res.status, 202, JSON.stringify(res.body));
+    const { frame } = await a.waitJob(res.body.job_id);
+    a.result(frame.job_id, { status: 'succeeded', output: 'x' });
+    await ended(registry, res.body.job_id, 'succeeded');
+  } finally {
+    await two.close();
+    await one.r.close();
+  }
+});
