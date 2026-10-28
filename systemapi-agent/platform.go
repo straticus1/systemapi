@@ -70,6 +70,7 @@ type PackageManager interface {
 	RemoveArgv(name string) ([]string, error)
 	UpgradeArgv(name string) ([]string, error)
 	QueryArgv(name string) ([]string, error)
+	ListArgv() ([]string, error)
 }
 
 // ConfigStore owns config file writes and the reload/validate hooks around

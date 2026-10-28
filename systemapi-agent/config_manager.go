@@ -3,10 +3,14 @@ package main
 import (
 	"bytes"
 	"embed"
+	"errors"
 	"fmt"
-	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
 	"text/template"
 	"time"
 )
@@ -17,58 +21,136 @@ var embeddedTemplates embed.FS
 // ConfigManager handles atomic config writes, backups, and template rendering.
 type ConfigManager struct{}
 
+// Threats: path is a resolved path the caller checked against a grant, in
+// a directory scripts or local users may also write. Nothing here writes or
+// reads through a name someone could plant first: the temp file is
+// os.CreateTemp in the target's directory (random name, O_EXCL, so a planted
+// symlink fails the create), backups are created O_CREAT|O_EXCL|O_NOFOLLOW,
+// the target is replaced by rename (which replaces a final symlink rather
+// than following it), and a file is only read when it is a regular file
+// (readFileCapped: Lstat first, size cap) with a single hard link. A
+// replaced file keeps its mode and owner. Restore takes only names that
+// match path.bak.<digits> and are regular files. Does NOT stop a parent
+// directory being swapped for a symlink between the caller's check and these
+// calls.
+
+// backupSuffixRE matches the timestamp of a backup name written by
+// newBackupName (unix nanoseconds) or by older agents (unix seconds).
+var backupSuffixRE = regexp.MustCompile(`^[0-9]{1,19}$`)
+
 // AtomicWrite safely replaces path with content:
-//  1. Write content to path + ".systemapi.tmp"
-//  2. If original exists: copy to path + ".bak." + unix-timestamp
+//  1. Write content to a new random temp file beside path
+//  2. If original exists: copy it to path + ".bak." + unix-nanoseconds
 //  3. os.Rename(tmp, path) - atomic on same filesystem
-//  4. On rename failure: remove tmp, return error (backup preserved)
+//  4. On any failure: remove tmp, return error (backup preserved)
 func (cm *ConfigManager) AtomicWrite(path, content string) error {
-	tmp := path + ".systemapi.tmp"
-
-	if err := os.WriteFile(tmp, []byte(content), 0644); err != nil {
-		return fmt.Errorf("atomic write: create tmp: %w", err)
-	}
-
-	// Backup original if it exists
-	if _, err := os.Stat(path); err == nil {
-		backupPath := fmt.Sprintf("%s.bak.%d", path, time.Now().Unix())
-		if err := copyFile(path, backupPath); err != nil {
-			_ = os.Remove(tmp)
+	if _, err := os.Lstat(path); err == nil {
+		if _, err := cm.BackupConfig(path); err != nil {
 			return fmt.Errorf("atomic write: backup: %w", err)
 		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("atomic write: %w", err)
 	}
-
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("atomic write: rename: %w", err)
+	if err := atomicReplace(path, []byte(content)); err != nil {
+		return fmt.Errorf("atomic write: %w", err)
 	}
-
 	return nil
 }
 
-// BackupConfig copies path to path + ".bak." + timestamp. Returns the backup path.
+// atomicReplace writes data to a fresh temp file beside path and renames it
+// over path. The new file keeps the mode and owner of the regular file it
+// replaces (a new file, or one replacing a symlink, is 0644 and owned by the
+// agent), so restoring a 0600 secret does not make it readable.
+func atomicReplace(path string, data []byte) error {
+	mode := os.FileMode(0o644)
+	uid, gid, chown := 0, 0, false
+	if fi, err := os.Lstat(path); err == nil && fi.Mode().IsRegular() {
+		mode = fi.Mode().Perm()
+		uid, gid, chown = fileOwnerIDs(fi)
+	} else if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".systemapi-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create tmp: %w", err)
+	}
+	tmp := f.Name()
+	fail := func(err error) error {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if chown {
+		if err := f.Chown(uid, gid); err != nil {
+			return fail(fmt.Errorf("chown tmp: %w", err))
+		}
+	}
+	if err := f.Chmod(mode); err != nil {
+		return fail(fmt.Errorf("chmod tmp: %w", err))
+	}
+	if _, err := f.Write(data); err != nil {
+		return fail(fmt.Errorf("write tmp: %w", err))
+	}
+	if err := f.Sync(); err != nil {
+		return fail(fmt.Errorf("sync tmp: %w", err))
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("close tmp: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("rename: %w", err)
+	}
+	return nil
+}
+
+// BackupConfig copies path to path + ".bak." + unix-nanoseconds. Returns the
+// backup path.
 func (cm *ConfigManager) BackupConfig(path string) (string, error) {
-	backupPath := fmt.Sprintf("%s.bak.%d", path, time.Now().Unix())
+	backupPath := fmt.Sprintf("%s.bak.%d", path, time.Now().UnixNano())
 	if err := copyFile(path, backupPath); err != nil {
 		return "", err
 	}
 	return backupPath, nil
 }
 
-// RestoreConfig finds the latest .bak.* file for path and restores it atomically.
+// RestoreConfig restores the newest path.bak.<digits> regular file over path
+// with atomicReplace. A newest candidate that is not a regular file refuses.
 func (cm *ConfigManager) RestoreConfig(path string) error {
-	pattern := path + ".bak.*"
-	matches, err := filepath.Glob(pattern)
-	if err != nil || len(matches) == 0 {
+	dir, base := filepath.Dir(path), filepath.Base(path)+".bak."
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("restore: %w", err)
+	}
+	latest, latestTS := "", int64(-1)
+	for _, e := range entries {
+		suffix, ok := strings.CutPrefix(e.Name(), base)
+		if !ok || !backupSuffixRE.MatchString(suffix) {
+			continue
+		}
+		ts, err := strconv.ParseInt(suffix, 10, 64)
+		if err != nil {
+			continue
+		}
+		if len(suffix) <= 10 { // seconds from an older agent
+			ts *= int64(time.Second)
+		}
+		if ts > latestTS {
+			latest, latestTS = e.Name(), ts
+		}
+	}
+	if latest == "" {
 		return fmt.Errorf("restore: no backup found for %s", path)
 	}
-	// Latest backup = last lexicographic match (unix timestamps sort correctly)
-	latest := matches[len(matches)-1]
-	data, err := os.ReadFile(latest)
+	data, err := readFileCappedLinks(filepath.Join(dir, latest), hostFileCap, true)
 	if err != nil {
 		return fmt.Errorf("restore: read backup: %w", err)
 	}
-	return os.WriteFile(path, data, 0644)
+	if err := atomicReplace(path, []byte(data)); err != nil {
+		return fmt.Errorf("restore: %w", err)
+	}
+	return nil
 }
 
 // RenderTemplate renders a named embedded template with the given vars map.
@@ -120,19 +202,22 @@ func (cm *ConfigManager) RenderTemplate(name string, vars map[string]interface{}
 	return buf.String(), nil
 }
 
+// copyFile copies the regular file src (capped at hostFileCap) to a new
+// file dst, created O_EXCL|O_NOFOLLOW with mode 0600 so a planted name is
+// never written through.
 func copyFile(src, dst string) error {
-	in, err := os.Open(src)
+	data, err := readFileCappedLinks(src, hostFileCap, true)
 	if err != nil {
 		return err
 	}
-	defer in.Close()
-
-	out, err := os.Create(dst)
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL|openNoFollow, 0o600)
 	if err != nil {
 		return err
 	}
-	defer out.Close()
-
-	_, err = io.Copy(out, in)
-	return err
+	if _, err := out.WriteString(data); err != nil {
+		_ = out.Close()
+		_ = os.Remove(dst)
+		return err
+	}
+	return out.Close()
 }

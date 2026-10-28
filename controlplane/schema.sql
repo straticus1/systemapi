@@ -106,6 +106,10 @@ CREATE TABLE IF NOT EXISTS cp_alert_events (
 );
 
 CREATE INDEX IF NOT EXISTS cp_alert_events_host_idx ON cp_alert_events (host_id, rule_name, created_at DESC);
+-- sys.alerts.push from a script run (rule_name 'sysscript'): severity is
+-- info, warning or critical; message is at most 4096 bytes (playground/fleet.js).
+ALTER TABLE cp_alert_events ADD COLUMN IF NOT EXISTS severity TEXT;
+ALTER TABLE cp_alert_events ADD COLUMN IF NOT EXISTS message TEXT;
 
 CREATE TABLE IF NOT EXISTS cp_webhooks (
   id TEXT PRIMARY KEY,

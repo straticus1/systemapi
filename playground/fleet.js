@@ -81,6 +81,11 @@ const AGENT_PROBE_MS_DEFAULT = 5000;
 const AGENT_PING_MS = 30_000;
 const AGENT_REVOKED_CLOSE = 4403;
 const AGENT_CLOSE_GRACE_MS = 2000;
+// sys.alerts.push frames (sysscript_alert). The agent enforces the same
+// limits; these hold against an agent that does not.
+const ALERT_SEVERITIES = new Set(['info', 'warning', 'critical']);
+const ALERT_MESSAGE_MAX_BYTES = 4096;
+const ALERTS_PER_RUN_MAX = 20;
 const PURPOSE_ACTIONS = new Map([
     ['terminal:open', 'pty'],
     ['terminal:root', 'pty_root'],
@@ -812,14 +817,21 @@ class FleetManager {
                 if (msg.type === 'telemetry') {
                     hostId = await this.handleTelemetry(keyId, userId, ws, msg.payload, hostId);
                 } else if (msg.type === 'command_result') {
-                    if (this.pendingExecutions && msg.request_id && this.pendingExecutions.has(msg.request_id)) {
-                        const executionContext = this.pendingExecutions.get(msg.request_id);
+                    const executionContext = this.pendingExecutions && typeof msg.request_id === 'string'
+                        ? this.pendingExecutions.get(msg.request_id) : null;
+                    // Only the host the script was sent to may settle it,
+                    // as in onAgentAlert.
+                    if (executionContext && (!hostId || executionContext.hostId !== hostId)) {
+                        console.error(`[Fleet] command_result rejected host=${hostId} error=unknown_execution`);
+                    } else if (executionContext) {
                         this.logExecutionToDarkStorage(hostId, executionContext.script, msg.payload).catch((err) => {
                             console.error('[DarkStorage] audit write failed:', err.message);
                         });
                         executionContext.resolve(msg.payload);
                         this.pendingExecutions.delete(msg.request_id);
                     }
+                } else if (msg.type === 'sysscript_alert') {
+                    if (hostId) await this.onAgentAlert(hostId, msg);
                 } else if (msg.type === 'pty_status') {
                     const id = hostId;
                     if (id) inOrder(() => this.onAgentPtyStatus(ws, id, msg));
@@ -1266,6 +1278,48 @@ class FleetManager {
         }
     }
 
+    // A sysscript_alert frame from sys.alerts.push. Host and tenant come from
+    // the enrolled connection, never the frame. request_id must name a script
+    // this server sent to this host that is still waiting for its result;
+    // each such run stores at most ALERTS_PER_RUN_MAX alerts. The execution is
+    // looked up before any await, so a command_result right behind the alert
+    // does not drop it. Returns { alert } or { error }.
+    async onAgentAlert(hostId, msg) {
+        const requestId = typeof msg.request_id === 'string' ? msg.request_id : '';
+        const ctx = requestId ? this.pendingExecutions.get(requestId) : null;
+        const reject = (error) => {
+            console.error(`[Fleet] sysscript_alert rejected host=${hostId} error=${error}`);
+            return { error };
+        };
+        if (!ctx || ctx.hostId !== hostId) return reject('unknown_execution');
+        const payload = msg.payload && typeof msg.payload === 'object' ? msg.payload : {};
+        const { severity, message } = payload;
+        if (!ALERT_SEVERITIES.has(severity)) return reject('bad_severity');
+        if (typeof message !== 'string' || Buffer.byteLength(message, 'utf8') > ALERT_MESSAGE_MAX_BYTES) return reject('bad_message');
+        ctx.alerts = (ctx.alerts || 0) + 1;
+        if (ctx.alerts > ALERTS_PER_RUN_MAX) return reject('rate_limited');
+        const tenantId = this.hostTenants.get(hostId);
+        if (!tenantId || !this.registry) return reject('no_tenant');
+        const alert = await this.registry.openAlert({
+            tenant_id: tenantId,
+            host_id: hostId,
+            rule_name: 'sysscript',
+            metric: null,
+            value: null,
+            severity,
+            message
+        });
+        await this.registry.appendAudit({
+            tenant_id: tenantId,
+            host_id: hostId,
+            actor: 'agent',
+            action: 'sysscript_alert',
+            payload: { alert_id: alert.id, request_id: requestId, severity }
+        });
+        console.log(`[Fleet] sysscript alert host=${hostId} severity=${severity} alert_id=${alert.id}`);
+        return { alert };
+    }
+
     async logExecutionToDarkStorage(hostId, script, resultPayload) {
         const hash = crypto.createHash('sha256').update(String(script)).digest('hex');
         if (this.registry && hostId) {
@@ -1333,7 +1387,7 @@ class FleetManager {
                 reject(Object.assign(new Error('agent_offline'), { status: 409, code: 'agent_offline' }));
                 return;
             }
-            this.pendingExecutions.set(requestId, { resolve, reject, script });
+            this.pendingExecutions.set(requestId, { resolve, reject, script, hostId });
             setTimeout(() => {
                 if (this.pendingExecutions.has(requestId)) {
                     this.pendingExecutions.get(requestId).reject(Object.assign(new Error('agent_timeout'), { status: 504, code: 'agent_timeout' }));

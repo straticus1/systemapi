@@ -260,6 +260,7 @@ func processIncomingMessage(out ptyOut, hostID, stateDir string, message []byte)
 		}
 		log.Printf("sysscript %s", cmd.RequestID)
 		engine := NewSysscriptEngine(cmd.Entitlements)
+		engine.alerts = &alertSink{send: out.WriteJSON, scriptID: cmd.RequestID}
 		output, err := engine.Execute(cmd.Script)
 		errText := ""
 		if err != nil {

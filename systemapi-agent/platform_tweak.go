@@ -119,13 +119,9 @@ func (t *tweaksBackend) SetUnitOverride(unit, name, content string, allowConfigW
 	return t.cm.AtomicWrite(path, content)
 }
 
-// configWriteAllowed is the AllowConfigWrite prefix gate used by
-// sys.config.write, applied here so a unit override cannot escape it.
+// configWriteAllowed is the AllowConfigWrite gate used by sys.config.write
+// (fsGrantPath), applied here so a unit override cannot escape it.
 func configWriteAllowed(path string, allow []string) bool {
-	for _, prefix := range allow {
-		if prefix == "*" || strings.HasPrefix(path, prefix) {
-			return true
-		}
-	}
-	return false
+	_, err := fsGrantPath(allow, path, "config write", true)
+	return err == nil
 }

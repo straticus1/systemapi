@@ -563,6 +563,8 @@ class MemoryRegistry {
       rule_name: entry.rule_name,
       metric: entry.metric || null,
       value: entry.value,
+      severity: entry.severity || null,
+      message: entry.message || null,
       status: 'open',
       created_at: new Date().toISOString()
     };
@@ -1237,10 +1239,10 @@ class PgRegistry {
 
   async openAlert(entry) {
     const res = await this.pool.query(
-      `INSERT INTO cp_alert_events (tenant_id, host_id, rule_name, metric, value, status)
-       VALUES ($1, $2, $3, $4, $5, 'open')
-       RETURNING id, tenant_id, host_id, rule_name, metric, value, status, created_at`,
-      [entry.tenant_id, entry.host_id, entry.rule_name, entry.metric || null, entry.value]
+      `INSERT INTO cp_alert_events (tenant_id, host_id, rule_name, metric, value, severity, message, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'open')
+       RETURNING id, tenant_id, host_id, rule_name, metric, value, severity, message, status, created_at`,
+      [entry.tenant_id, entry.host_id, entry.rule_name, entry.metric || null, entry.value, entry.severity || null, entry.message || null]
     );
     return res.rows[0];
   }
@@ -1248,7 +1250,7 @@ class PgRegistry {
   async listAlerts(tenantIds, status) {
     if (!tenantIds || tenantIds.length === 0) return [];
     const res = await this.pool.query(
-      `SELECT id, tenant_id, host_id, rule_name, metric, value, status, created_at
+      `SELECT id, tenant_id, host_id, rule_name, metric, value, severity, message, status, created_at
        FROM cp_alert_events
        WHERE tenant_id = ANY($1::text[]) AND ($2::text IS NULL OR status = $2)
        ORDER BY created_at DESC`,
@@ -1262,7 +1264,7 @@ class PgRegistry {
     const res = await this.pool.query(
       `UPDATE cp_alert_events SET status = $3
        WHERE id = $1 AND tenant_id = ANY($2::text[])
-       RETURNING id, tenant_id, host_id, rule_name, metric, value, status, created_at`,
+       RETURNING id, tenant_id, host_id, rule_name, metric, value, severity, message, status, created_at`,
       [id, tenantIds, status]
     );
     return res.rows[0] || null;

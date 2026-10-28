@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"strings"
 	"time"
 
 	"go.starlark.net/starlark"
@@ -17,21 +16,15 @@ func (engine *SysscriptEngine) configWrite(thread *starlark.Thread, b *starlark.
 		return starlark.None, err
 	}
 
-	allowed := false
-	for _, prefix := range engine.Entitlements.AllowConfigWrite {
-		if prefix == "*" || strings.HasPrefix(path, prefix) {
-			allowed = true
-			break
-		}
-	}
-	if !allowed {
+	resolved, err := fsGrantPath(engine.Entitlements.AllowConfigWrite, path, "config write", true)
+	if err != nil {
 		result := starlark.NewDict(2)
 		result.SetKey(starlark.String("success"), starlark.False)
 		result.SetKey(starlark.String("error"), starlark.String(fmt.Sprintf("security exception: config write to %s not granted", path)))
 		return result, nil
 	}
 
-	err := currentPlatform().Config.AtomicWrite(path, content)
+	err = currentPlatform().Config.AtomicWrite(resolved, content)
 	result := starlark.NewDict(2)
 	if err != nil {
 		result.SetKey(starlark.String("success"), starlark.False)
@@ -84,7 +77,19 @@ func (engine *SysscriptEngine) configValidate(thread *starlark.Thread, b *starla
 		return starlark.None, err
 	}
 
-	out, err := currentPlatform().Config.Validate(service, path)
+	// The checkers run as root and echo the file back in their errors, so the
+	// path needs the same grant as sys.config.write (AllowConfigWrite), and
+	// only the resolved absolute path reaches argv.
+	resolved, err := fsGrantPath(engine.Entitlements.AllowConfigWrite, path, "config validate", true)
+	if err != nil {
+		result := starlark.NewDict(3)
+		result.SetKey(starlark.String("success"), starlark.False)
+		result.SetKey(starlark.String("output"), starlark.String(""))
+		result.SetKey(starlark.String("error"), starlark.String(err.Error()))
+		return result, nil
+	}
+
+	out, err := currentPlatform().Config.Validate(service, resolved)
 	result := starlark.NewDict(3)
 	if err != nil {
 		result.SetKey(starlark.String("success"), starlark.False)
@@ -143,14 +148,8 @@ func (engine *SysscriptEngine) configBackup(thread *starlark.Thread, b *starlark
 		return starlark.None, err
 	}
 
-	allowed := false
-	for _, prefix := range engine.Entitlements.AllowFSRead {
-		if prefix == "*" || strings.HasPrefix(path, prefix) {
-			allowed = true
-			break
-		}
-	}
-	if !allowed {
+	resolved, err := fsGrantPath(engine.Entitlements.AllowFSRead, path, "read", true)
+	if err != nil {
 		result := starlark.NewDict(3)
 		result.SetKey(starlark.String("success"), starlark.False)
 		result.SetKey(starlark.String("backup_path"), starlark.String(""))
@@ -158,7 +157,7 @@ func (engine *SysscriptEngine) configBackup(thread *starlark.Thread, b *starlark
 		return result, nil
 	}
 
-	backupPath, err := engine.cm.BackupConfig(path)
+	backupPath, err := engine.cm.BackupConfig(resolved)
 	result := starlark.NewDict(3)
 	if err != nil {
 		result.SetKey(starlark.String("success"), starlark.False)
@@ -181,29 +180,18 @@ func (engine *SysscriptEngine) configRestore(thread *starlark.Thread, b *starlar
 	}
 
 	// Check AllowFSWrite or AllowConfigWrite
-	allowed := false
-	for _, prefix := range engine.Entitlements.AllowFSWrite {
-		if prefix == "*" || strings.HasPrefix(path, prefix) {
-			allowed = true
-			break
-		}
+	resolved, err := fsGrantPath(engine.Entitlements.AllowFSWrite, path, "write", true)
+	if err != nil {
+		resolved, err = fsGrantPath(engine.Entitlements.AllowConfigWrite, path, "write", true)
 	}
-	if !allowed {
-		for _, prefix := range engine.Entitlements.AllowConfigWrite {
-			if prefix == "*" || strings.HasPrefix(path, prefix) {
-				allowed = true
-				break
-			}
-		}
-	}
-	if !allowed {
+	if err != nil {
 		result := starlark.NewDict(2)
 		result.SetKey(starlark.String("success"), starlark.False)
 		result.SetKey(starlark.String("error"), starlark.String(fmt.Sprintf("security exception: write to %s not granted", path)))
 		return result, nil
 	}
 
-	err := engine.cm.RestoreConfig(path)
+	err = engine.cm.RestoreConfig(resolved)
 	result := starlark.NewDict(2)
 	if err != nil {
 		result.SetKey(starlark.String("success"), starlark.False)

@@ -176,17 +176,11 @@ func (engine *SysscriptEngine) fsStat(thread *starlark.Thread, b *starlark.Built
 	if err := starlark.UnpackArgs("stat", args, kwargs, "path", &path); err != nil {
 		return starlark.None, err
 	}
-	allowed := false
-	for _, prefix := range engine.Entitlements.AllowFSRead {
-		if prefix == "*" || strings.HasPrefix(path, prefix) {
-			allowed = true
-			break
-		}
+	resolved, err := fsGrantPath(engine.Entitlements.AllowFSRead, path, "read", true)
+	if err != nil {
+		return starlark.None, err
 	}
-	if !allowed {
-		return starlark.None, fmt.Errorf("security exception: read to %s not granted", path)
-	}
-	info, err := os.Stat(path)
+	info, err := os.Stat(resolved)
 	if err != nil {
 		d := starlark.NewDict(1)
 		d.SetKey(starlark.String("exists"), starlark.False)
@@ -207,23 +201,24 @@ func (engine *SysscriptEngine) fsGlob(thread *starlark.Thread, b *starlark.Built
 	if err := starlark.UnpackArgs("glob", args, kwargs, "pattern", &pattern); err != nil {
 		return starlark.None, err
 	}
-	allowed := false
-	for _, prefix := range engine.Entitlements.AllowFSRead {
-		if prefix == "*" || strings.HasPrefix(pattern, prefix) {
-			allowed = true
-			break
-		}
-	}
-	if !allowed {
+	allow := engine.Entitlements.AllowFSRead
+	if pattern == "" || strings.ContainsRune(pattern, 0) || !filepath.IsAbs(pattern) {
 		return starlark.None, fmt.Errorf("security exception: read to %s not granted", pattern)
 	}
-	matches, err := filepath.Glob(pattern)
+	cleaned := filepath.Clean(pattern)
+	if !fsPrefixAllowed(allow, cleaned) {
+		return starlark.None, fmt.Errorf("security exception: read to %s not granted", pattern)
+	}
+	matches, err := filepath.Glob(cleaned)
 	if err != nil {
 		return starlark.None, fmt.Errorf("fs.glob: %w", err)
 	}
-	results := make([]starlark.Value, len(matches))
-	for i, m := range matches {
-		results[i] = starlark.String(m)
+	// A match reached through a symlink out of the grant is dropped.
+	results := make([]starlark.Value, 0, len(matches))
+	for _, m := range matches {
+		if _, err := fsGrantPath(allow, m, "read", true); err == nil {
+			results = append(results, starlark.String(m))
+		}
 	}
 	return starlark.NewList(results), nil
 }
@@ -234,15 +229,9 @@ func (engine *SysscriptEngine) fsMkdir(thread *starlark.Thread, b *starlark.Buil
 	if err := starlark.UnpackArgs("mkdir", args, kwargs, "path", &path, "mode?", &modeStr); err != nil {
 		return starlark.None, err
 	}
-	allowed := false
-	for _, prefix := range engine.Entitlements.AllowFSWrite {
-		if prefix == "*" || strings.HasPrefix(path, prefix) {
-			allowed = true
-			break
-		}
-	}
-	if !allowed {
-		return starlark.None, fmt.Errorf("security exception: write to %s not granted", path)
+	root, resolved, err := fsGrantRootPath(engine.Entitlements.AllowFSWrite, path, "write", true)
+	if err != nil {
+		return starlark.None, err
 	}
 	mode := os.FileMode(0755)
 	if modeStr != "" {
@@ -252,7 +241,7 @@ func (engine *SysscriptEngine) fsMkdir(thread *starlark.Thread, b *starlark.Buil
 		}
 		mode = os.FileMode(parsed)
 	}
-	if err := os.MkdirAll(path, mode); err != nil {
+	if err := mkdirBeneath(root, resolved, mode); err != nil {
 		return starlark.None, fmt.Errorf("fs.mkdir: %w", err)
 	}
 	return starlark.True, nil
@@ -265,21 +254,15 @@ func (engine *SysscriptEngine) fsRm(thread *starlark.Thread, b *starlark.Builtin
 	if err := starlark.UnpackArgs("rm", args, kwargs, "path", &path, "recursive?", &recursive); err != nil {
 		return starlark.None, err
 	}
-	allowed := false
-	for _, prefix := range engine.Entitlements.AllowFSWrite {
-		if prefix == "*" || strings.HasPrefix(path, prefix) {
-			allowed = true
-			break
-		}
+	// The final component is not followed: rm of a symlink removes the link.
+	resolved, err := fsGrantPath(engine.Entitlements.AllowFSWrite, path, "write", false)
+	if err != nil {
+		return starlark.None, err
 	}
-	if !allowed {
-		return starlark.None, fmt.Errorf("security exception: write to %s not granted", path)
-	}
-	var err error
 	if recursive {
-		err = os.RemoveAll(path)
+		err = os.RemoveAll(resolved)
 	} else {
-		err = os.Remove(path)
+		err = os.Remove(resolved)
 	}
 	if err != nil {
 		return starlark.None, fmt.Errorf("fs.rm: %w", err)
@@ -293,21 +276,15 @@ func (engine *SysscriptEngine) fsChmod(thread *starlark.Thread, b *starlark.Buil
 	if err := starlark.UnpackArgs("chmod", args, kwargs, "path", &path, "mode", &modeStr); err != nil {
 		return starlark.None, err
 	}
-	allowed := false
-	for _, prefix := range engine.Entitlements.AllowFSWrite {
-		if prefix == "*" || strings.HasPrefix(path, prefix) {
-			allowed = true
-			break
-		}
-	}
-	if !allowed {
-		return starlark.None, fmt.Errorf("security exception: write to %s not granted", path)
+	root, resolved, err := fsGrantRootPath(engine.Entitlements.AllowFSWrite, path, "write", true)
+	if err != nil {
+		return starlark.None, err
 	}
 	parsed, err := strconv.ParseUint(modeStr, 8, 32)
 	if err != nil {
 		return starlark.None, fmt.Errorf("fs.chmod: invalid mode %q", modeStr)
 	}
-	if err := os.Chmod(path, os.FileMode(parsed)); err != nil {
+	if err := chmodBeneath(root, resolved, os.FileMode(parsed)); err != nil {
 		return starlark.None, fmt.Errorf("fs.chmod: %w", err)
 	}
 	return starlark.True, nil

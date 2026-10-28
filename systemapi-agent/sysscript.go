@@ -18,6 +18,13 @@ import (
 	"go.starlark.net/starlarkstruct"
 )
 
+// sysscriptOpTimeout caps one long sys.* operation (image pull, compose,
+// package remove/upgrade/query/list). The server gives up on a whole script
+// after 30 s (pushSysscript in playground/fleet.js) and the agent runs the
+// script inline on its read loop, so an operation must end, with a clear
+// "timed out" error, before that. Keep it below the server timeout.
+const sysscriptOpTimeout = 25 * time.Second
+
 // Entitlements define what the current script is permitted to do
 type Entitlements struct {
 	AllowFSWrite       []string `json:"allow_fs_write"`
@@ -132,6 +139,7 @@ type SysscriptEngine struct {
 	dockerClient *DockerClient
 	k3sClient    *K3sClient
 	k8sClient    *K3sClient
+	alerts       *alertSink // sys.alerts.push delivery; nil means not connected
 }
 
 func NewSysscriptEngine(perms *Entitlements) *SysscriptEngine {
@@ -236,9 +244,11 @@ func (engine *SysscriptEngine) buildSysModule() *starlarkstruct.Struct {
 		"mkdir": starlark.NewBuiltin("mkdir", engine.fsMkdir),
 		"rm":    starlark.NewBuiltin("rm", engine.fsRm),
 		"chmod": starlark.NewBuiltin("chmod", engine.fsChmod),
+		"chown": starlark.NewBuiltin("chown", engine.fsChown),
+		"diff":  starlark.NewBuiltin("diff", engine.fsDiff),
 	}
 
-	// Reserved modules: sys.alerts logs locally; sys.security and sys.events fail as not implemented.
+	// sys.alerts forwards to the control plane; sys.security and sys.events fail as not implemented.
 	sysAlerts := starlark.StringDict{
 		"push": starlark.NewBuiltin("push", engine.alertsPush),
 	}
@@ -251,6 +261,10 @@ func (engine *SysscriptEngine) buildSysModule() *starlarkstruct.Struct {
 	}
 	sysPackages := starlark.StringDict{
 		"install": starlark.NewBuiltin("install", engine.packagesInstall),
+		"remove":  starlark.NewBuiltin("remove", engine.packagesRemove),
+		"upgrade": starlark.NewBuiltin("upgrade", engine.packagesUpgrade),
+		"query":   starlark.NewBuiltin("query", engine.packagesQuery),
+		"list":    starlark.NewBuiltin("list", engine.packagesList),
 	}
 
 	// sys.config
@@ -320,15 +334,25 @@ func (engine *SysscriptEngine) buildSysModule() *starlarkstruct.Struct {
 	// D-11: containers namespace absent when not entitled
 	if engine.Entitlements.AllowContainers {
 		sysContainers := starlark.StringDict{
-			"list":    starlark.NewBuiltin("list", engine.containersList),
-			"stats":   starlark.NewBuiltin("stats", engine.containersStats),
-			"stop":    starlark.NewBuiltin("stop", engine.containersStop),
-			"start":   starlark.NewBuiltin("start", engine.containersStart),
-			"restart": starlark.NewBuiltin("restart", engine.containersRestart),
-			"inspect": starlark.NewBuiltin("inspect", engine.containersInspect),
-			"logs":    starlark.NewBuiltin("logs", engine.containersLogs),
-			"run":     starlark.NewBuiltin("run", engine.containersRun),
-			"exec":    starlark.NewBuiltin("exec", engine.containersExec),
+			"list":           starlark.NewBuiltin("list", engine.containersList),
+			"stats":          starlark.NewBuiltin("stats", engine.containersStats),
+			"stop":           starlark.NewBuiltin("stop", engine.containersStop),
+			"start":          starlark.NewBuiltin("start", engine.containersStart),
+			"restart":        starlark.NewBuiltin("restart", engine.containersRestart),
+			"inspect":        starlark.NewBuiltin("inspect", engine.containersInspect),
+			"logs":           starlark.NewBuiltin("logs", engine.containersLogs),
+			"run":            starlark.NewBuiltin("run", engine.containersRun),
+			"exec":           starlark.NewBuiltin("exec", engine.containersExec),
+			"images":         starlark.NewBuiltin("images", engine.containersImages),
+			"pull":           starlark.NewBuiltin("pull", engine.containersPull),
+			"remove_image":   starlark.NewBuiltin("remove_image", engine.containersRemoveImage),
+			"volumes":        starlark.NewBuiltin("volumes", engine.containersVolumes),
+			"create_volume":  starlark.NewBuiltin("create_volume", engine.containersCreateVolume),
+			"remove_volume":  starlark.NewBuiltin("remove_volume", engine.containersRemoveVolume),
+			"networks":       starlark.NewBuiltin("networks", engine.containersNetworks),
+			"create_network": starlark.NewBuiltin("create_network", engine.containersCreateNetwork),
+			"remove_network": starlark.NewBuiltin("remove_network", engine.containersRemoveNetwork),
+			"compose":        starlark.NewBuiltin("compose", engine.containersCompose),
 		}
 		sysDict["containers"] = starlarkstruct.FromStringDict(starlark.String("containers"), sysContainers)
 	}
@@ -348,6 +372,8 @@ func (engine *SysscriptEngine) buildSysModule() *starlarkstruct.Struct {
 			"uptime":     starlark.NewBuiltin("uptime", engine.linuxUptime),
 			"users":      starlark.NewBuiltin("users", engine.linuxUsers),
 			"groups":     starlark.NewBuiltin("groups", engine.linuxGroups),
+			"selinux":    starlark.NewBuiltin("selinux", engine.linuxSELinux),
+			"apparmor":   starlark.NewBuiltin("apparmor", engine.linuxAppArmor),
 		})
 		sysDict["disk"] = starlarkstruct.FromStringDict(starlark.String("disk"), starlark.StringDict{
 			"mounts":        starlark.NewBuiltin("mounts", engine.diskMounts),
@@ -474,22 +500,16 @@ func (engine *SysscriptEngine) fsRead(thread *starlark.Thread, b *starlark.Built
 		return starlark.None, err
 	}
 
-	allowed := false
-	for _, prefix := range engine.Entitlements.AllowFSRead {
-		if prefix == "*" || strings.HasPrefix(path, prefix) {
-			allowed = true
-			break
-		}
-	}
-	if !allowed {
-		return starlark.None, fmt.Errorf("security exception: read to %s not granted", path)
-	}
-
-	data, err := os.ReadFile(path)
+	resolved, err := fsGrantPath(engine.Entitlements.AllowFSRead, path, "read", true)
 	if err != nil {
 		return starlark.None, err
 	}
-	return starlark.String(string(data)), nil
+
+	data, err := readFileCapped(resolved, hostFileCap)
+	if err != nil {
+		return starlark.None, err
+	}
+	return starlark.String(data), nil
 }
 
 // sys.fs.write(path, content)
@@ -499,18 +519,12 @@ func (engine *SysscriptEngine) fsWrite(thread *starlark.Thread, b *starlark.Buil
 		return starlark.None, err
 	}
 
-	allowed := false
-	for _, prefix := range engine.Entitlements.AllowFSWrite {
-		if prefix == "*" || strings.HasPrefix(path, prefix) {
-			allowed = true
-			break
-		}
-	}
-	if !allowed {
-		return starlark.None, fmt.Errorf("security exception: write to %s not granted", path)
+	root, resolved, err := fsGrantRootPath(engine.Entitlements.AllowFSWrite, path, "write", true)
+	if err != nil {
+		return starlark.None, err
 	}
 
-	err := os.WriteFile(path, []byte(content), 0644)
+	err = writeBeneath(root, resolved, []byte(content), 0644)
 	if err != nil {
 		return starlark.None, err
 	}

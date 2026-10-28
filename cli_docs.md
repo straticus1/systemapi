@@ -153,7 +153,7 @@ The other list fields are passed through for admins.
 
 Not implemented:
 
-- `sys.alerts.push(severity, message)` logs on the agent and returns `False`.
+- `sys.alerts.push(severity, message)` sends the alert to the control plane, which stores it as an alert event (`rule_name` `sysscript`) for the run's host and tenant and writes a `sysscript_alert` audit row. `severity` is `info`, `warning` or `critical` (anything else is an error); a message over 4096 bytes is cut. Returns `True` when the frame is handed to the connection, `False` when there is no connection or the run already pushed 20 alerts.
   Nothing forwards it to the control plane yet.
 - `sys.security.yara_scan`, `sys.security.scan_memory` and `sys.events.listen`
   raise a "not implemented" error.

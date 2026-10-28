@@ -77,7 +77,7 @@ func TestPackageArgvAllManagers(t *testing.T) {
 		{"apt-get", "install", "apt-get install -y --no-install-recommends -- nginx"},
 		{"apt-get", "remove", "apt-get remove -y -- nginx"},
 		{"apt-get", "upgrade", "apt-get install -y --only-upgrade -- nginx"},
-		{"apt-get", "query", "dpkg-query -W -- nginx"},
+		{"apt-get", "query", "dpkg-query -W -f ${Package}\t${Version}\t${db:Status-Abbrev}\n -- nginx"},
 		{"dnf", "install", "dnf install -y -- nginx"},
 		{"dnf", "remove", "dnf remove -y -- nginx"},
 		{"dnf", "upgrade", "dnf upgrade -y -- nginx"},

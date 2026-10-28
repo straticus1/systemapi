@@ -35,8 +35,8 @@ carries explicit entitlements.
 - Grafana dashboard `grafana/dashboards/fleet.json`. `systemapi_alerts_active`
   is the process-wide count of open alerts. There are no Grafana alert rules.
 - Alerts: the control plane raises z-score anomalies on CPU and memory and posts
-  them to tenant webhooks. `sys.alerts.push` in a script is logged on the agent
-  only.
+  them to tenant webhooks. `sys.alerts.push` in a script becomes an alert event
+  for its host (not posted to webhooks).
 - When `DARKSTORAGE_ACCESS_KEY` and `DARKSTORAGE_SECRET_KEY` are set, each
   script result's SHA-256 is also written to the `systemapi-audits` S3 bucket.
   The PostgreSQL audit chain is the record of truth.
