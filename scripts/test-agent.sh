@@ -26,13 +26,13 @@ WORK=$(mktemp -d)
 
 ARCH=$(docker version -f '{{.Server.Arch}}')
 if command -v go >/dev/null 2>&1; then
-  (cd "$REPO/systemapi-agent" && CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -tags sysscript_jobs_e2e -o "$WORK/systemapi-agent" .)
+  (cd "$REPO/systemapi-agent" && CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -o "$WORK/systemapi-agent" .)
 else
   docker run --rm --label "systemapi-e2e=$RUN" \
     -v "$REPO":/src -v "$WORK":/out \
     -v systemapi-gomod:/go/pkg/mod -v systemapi-gobuild:/root/.cache/go-build \
     -e CGO_ENABLED=0 -w /src/systemapi-agent \
-    "$GO_IMAGE" go build -tags sysscript_jobs_e2e -o /out/systemapi-agent .
+    "$GO_IMAGE" go build -o /out/systemapi-agent .
 fi
 
 PASS=$(node -e 'process.stdout.write(require("crypto").randomBytes(18).toString("hex"))')

@@ -8,13 +8,14 @@ import (
 )
 
 // expectedCaps builds the capability set this host should advertise from the
-// same probes the implementation uses: tcp and config are always on, pty off
-// only on windows, file only on Linux with openat2, and service/package/tweak
-// follow their platform probes.
+// same probes the implementation uses: tcp, config and sysscript_jobs are
+// always on, pty off only on windows, file only on Linux with openat2, and
+// service/package/tweak follow their platform probes.
 func expectedCaps() string {
 	present := map[string]bool{
-		"tcp":    true, // tcp.go
-		"config": true, // config store is a filesystem op, available everywhere
+		"tcp":            true, // tcp.go
+		"config":         true, // config store is a filesystem op, available everywhere
+		"sysscript_jobs": true, // sysscript_jobs.go, every platform
 	}
 	if runtime.GOOS != "windows" {
 		present["pty"] = true
@@ -45,8 +46,9 @@ func TestCapabilitiesAdvertiseOnlyWhatIsReal(t *testing.T) {
 	if got != want {
 		t.Fatalf("capabilities %q, want %q", got, want)
 	}
-	// config and tcp are always advertised; a host that drops them is a bug.
-	for _, must := range []string{"config", "tcp"} {
+	// config, sysscript_jobs and tcp are always advertised; a host that drops
+	// them is a bug (the server would send its scripts the legacy way).
+	for _, must := range []string{"config", "sysscript_jobs", "tcp"} {
 		if !strings.Contains(","+got+",", ","+must+",") {
 			t.Fatalf("capability %q must always be advertised, got %q", must, got)
 		}

@@ -23,6 +23,11 @@ var (
 	capMu     sync.Mutex
 	capProbes = map[string]func() bool{
 		"pty": func() bool { return runtime.GOOS != "windows" },
+		// Async sysscript jobs (sysscript_jobs.go): sysscript_job frames with
+		// acked results and a sync on every connection. Every platform runs
+		// them; outside unix the process-group kill falls back to
+		// Process.Kill (proc_group_other.go).
+		"sysscript_jobs": func() bool { return true },
 	}
 )
 
