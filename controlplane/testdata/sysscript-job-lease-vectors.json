@@ -1,0 +1,183 @@
+{
+  "seed_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+  "public_raw_b64": "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc=",
+  "host_id": "11111111-1111-4111-8111-111111111111",
+  "now_ms": 1700000000000,
+  "vectors": [
+    {
+      "name": "clamped_admin",
+      "job_id": "sjb_Q2xhdWRlLXRlc3QtMTIzNA",
+      "deadline_unix": 1700000300,
+      "timeout_s": 300,
+      "script": "print(sys.host.hostname())\n",
+      "entitlements": {
+        "allow_fs_write": false,
+        "allow_fs_read": true,
+        "allow_net_outbound": false,
+        "allow_exec": true,
+        "allow_config_write": false,
+        "allow_service_reload": false,
+        "allow_containers": true,
+        "allow_k3s": false,
+        "allow_linux": true,
+        "allow_k8s": false,
+        "allow_packages": [
+          "nginx",
+          "curl",
+          "nginx"
+        ],
+        "allow_images": [
+          "nginx:1.27"
+        ],
+        "allow_k3s_namespaces": [],
+        "allow_k8s_namespaces": [
+          "default"
+        ],
+        "allow_net_manage": [
+          "eth0"
+        ],
+        "allow_mount_targets": [
+          "/mnt/data"
+        ],
+        "allow_sysctl": [
+          "net.ipv4.ip_forward",
+          "kernel.core_pattern",
+          "vm.swappiness"
+        ]
+      },
+      "canonical_entitlements": "systemapi-entitlements-v1\nallow_fs_write#0\nallow_fs_read#0\nallow_net_outbound#0\nallow_exec=true\nallow_config_write#0\nallow_service_reload#0\nallow_containers=true\nallow_k3s=false\nallow_linux=true\nallow_k8s=false\nallow_packages#2\ncurl\nnginx\nallow_images#1\nnginx:1.27\nallow_k3s_namespaces#0\nallow_k8s_namespaces#1\ndefault\nallow_net_manage#1\neth0\nallow_mount_targets#1\n/mnt/data\nallow_sysctl#2\nnet.ipv4.ip_forward\nvm.swappiness\n",
+      "entitlements_sha256": "6f014aec524ceb3a0d0502f1c0ee2e32fee0601531fa7ae095b2ada6317717ec",
+      "script_sha256": "2d0ba9ef21978f9d6a14d0b7a0123fed41ab1ae6da357b9da85d6abf70023323",
+      "payload": "sjb_Q2xhdWRlLXRlc3QtMTIzNA\n1700000300\n300\n2d0ba9ef21978f9d6a14d0b7a0123fed41ab1ae6da357b9da85d6abf70023323\n6f014aec524ceb3a0d0502f1c0ee2e32fee0601531fa7ae095b2ada6317717ec",
+      "message": "systemapi-lease-v1\n11111111-1111-4111-8111-111111111111\nsysscript_job\n1700000060\nefefefefefefefefefefefefefefefef\ncc8f04dd13cdacd7fc8abb771f6cfd5d743b53b232af82b395380aa5e486ce13\n",
+      "lease": {
+        "v": 1,
+        "host_id": "11111111-1111-4111-8111-111111111111",
+        "action": "sysscript_job",
+        "expires_unix": 1700000060,
+        "nonce_hex": "efefefefefefefefefefefefefefefef",
+        "payload_sha256": "cc8f04dd13cdacd7fc8abb771f6cfd5d743b53b232af82b395380aa5e486ce13",
+        "signature": "RJRSuTkFLzYvc16xw+vTOhbtUA4k0wvrqNpdU5kNq3zUP0eV/m07e4SylfQq3ji+C1oKvLWg8pv3tOD3QGsbDQ=="
+      }
+    },
+    {
+      "name": "default_deny",
+      "job_id": "sjb_AAAAAAAAAAAAAAAAAAAAAA",
+      "deadline_unix": 1700001800,
+      "timeout_s": 1800,
+      "script": "",
+      "entitlements": {},
+      "canonical_entitlements": "systemapi-entitlements-v1\nallow_fs_write#0\nallow_fs_read#0\nallow_net_outbound#0\nallow_exec=false\nallow_config_write#0\nallow_service_reload#0\nallow_containers=false\nallow_k3s=false\nallow_linux=false\nallow_k8s=false\nallow_packages#0\nallow_images#0\nallow_k3s_namespaces#0\nallow_k8s_namespaces#0\nallow_net_manage#0\nallow_mount_targets#0\nallow_sysctl#0\n",
+      "entitlements_sha256": "820086f68bf69da046c20e3d18aceef4d2fcd53dfb0ba3b27384d9be16f619bd",
+      "script_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "payload": "sjb_AAAAAAAAAAAAAAAAAAAAAA\n1700001800\n1800\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n820086f68bf69da046c20e3d18aceef4d2fcd53dfb0ba3b27384d9be16f619bd",
+      "message": "systemapi-lease-v1\n11111111-1111-4111-8111-111111111111\nsysscript_job\n1700000060\nefefefefefefefefefefefefefefefef\nac90207e30cd3fd3039c12fee85fd69512b9333b41c0cf2c4195afd90c403f17\n",
+      "lease": {
+        "v": 1,
+        "host_id": "11111111-1111-4111-8111-111111111111",
+        "action": "sysscript_job",
+        "expires_unix": 1700000060,
+        "nonce_hex": "efefefefefefefefefefefefefefefef",
+        "payload_sha256": "ac90207e30cd3fd3039c12fee85fd69512b9333b41c0cf2c4195afd90c403f17",
+        "signature": "SjR1FPUKUFnsXj5vmWQxGIDb5jfxGIVusuOgN3IQjUp6vNJ2YUNKmndWd+h+Ddr8nGW+99wjt/rTvW6FUk+1Dg=="
+      }
+    },
+    {
+      "name": "byte_order_and_parse_edges",
+      "job_id": "sjb_zz-_09azAZ-_zz09azAZ-_",
+      "deadline_unix": 1700003600,
+      "timeout_s": 1,
+      "script": "print(\"héllo 😀\")\n",
+      "entitlements": {
+        "allow_fs_write": [
+          "/srv/b",
+          null,
+          "/srv/a",
+          "/srv/*"
+        ],
+        "allow_fs_read": "yes",
+        "allow_net_outbound": [
+          "a",
+          1
+        ],
+        "allow_exec": "true",
+        "allow_containers": 1,
+        "allow_k3s": true,
+        "allow_packages": [
+          "zeta",
+          "Zeta",
+          "é",
+          "ﬀ",
+          "😀",
+          "a",
+          "😀",
+          "*",
+          "x..y",
+          "",
+          "ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+          "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+        ],
+        "allow_images": true,
+        "allow_k3s_namespaces": [
+          "ns39",
+          "ns38",
+          "ns37",
+          "ns36",
+          "ns35",
+          "ns34",
+          "ns33",
+          "ns32",
+          "ns31",
+          "ns30",
+          "ns29",
+          "ns28",
+          "ns27",
+          "ns26",
+          "ns25",
+          "ns24",
+          "ns23",
+          "ns22",
+          "ns21",
+          "ns20",
+          "ns19",
+          "ns18",
+          "ns17",
+          "ns16",
+          "ns15",
+          "ns14",
+          "ns13",
+          "ns12",
+          "ns11",
+          "ns10",
+          "ns09",
+          "ns08",
+          "ns07",
+          "ns06",
+          "ns05",
+          "ns04",
+          "ns03",
+          "ns02",
+          "ns01",
+          "ns00"
+        ],
+        "allow_sysctl": [
+          "kernel.modprobe"
+        ]
+      },
+      "canonical_entitlements": "systemapi-entitlements-v1\nallow_fs_write#4\n\n/srv/*\n/srv/a\n/srv/b\nallow_fs_read#0\nallow_net_outbound#0\nallow_exec=false\nallow_config_write#0\nallow_service_reload#0\nallow_containers=false\nallow_k3s=true\nallow_linux=false\nallow_k8s=false\nallow_packages#7\nZeta\na\nzeta\né\néééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé\nﬀ\n😀\nallow_images#0\nallow_k3s_namespaces#32\nns08\nns09\nns10\nns11\nns12\nns13\nns14\nns15\nns16\nns17\nns18\nns19\nns20\nns21\nns22\nns23\nns24\nns25\nns26\nns27\nns28\nns29\nns30\nns31\nns32\nns33\nns34\nns35\nns36\nns37\nns38\nns39\nallow_k8s_namespaces#0\nallow_net_manage#0\nallow_mount_targets#0\nallow_sysctl#0\n",
+      "entitlements_sha256": "6fddbef79c68f3043d02f278ad863a55fa0c3d8ff59e510fd0575f3089ab49af",
+      "script_sha256": "1887422fd41b0b40a40d89ddf62fee828641b2eefb44bf8c622c59f805e10bff",
+      "payload": "sjb_zz-_09azAZ-_zz09azAZ-_\n1700003600\n1\n1887422fd41b0b40a40d89ddf62fee828641b2eefb44bf8c622c59f805e10bff\n6fddbef79c68f3043d02f278ad863a55fa0c3d8ff59e510fd0575f3089ab49af",
+      "message": "systemapi-lease-v1\n11111111-1111-4111-8111-111111111111\nsysscript_job\n1700000060\nefefefefefefefefefefefefefefefef\n64e1be0b62dd73bdf9735b6cb3486e4cac6531323546df06a7935495fcc65d05\n",
+      "lease": {
+        "v": 1,
+        "host_id": "11111111-1111-4111-8111-111111111111",
+        "action": "sysscript_job",
+        "expires_unix": 1700000060,
+        "nonce_hex": "efefefefefefefefefefefefefefefef",
+        "payload_sha256": "64e1be0b62dd73bdf9735b6cb3486e4cac6531323546df06a7935495fcc65d05",
+        "signature": "Ni+qyqyJFzWRbw02bdoEgxmLIzQauLeWwJVR+1STeKyp0WH1nJNeAyZD8vILvP4+QKhng/H3177Sy3+u+OmiBw=="
+      }
+    }
+  ]
+}

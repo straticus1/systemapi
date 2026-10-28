@@ -14,6 +14,12 @@
 // Xfer actions (xfer, xfer_root) sign "<action>\n<payload>" with the 18-line
 // payload of sahxfer docs/plans/2026-10-18-end-to-end-wiring.md ("Frames and
 // payloads"), checked against the shared golden vector in testdata.
+// An async sysscript job (sysscript_job) signs "sysscript_job\n<job_id>\n
+// <deadline_unix>\n<timeout_s>\n<sha256(script)>\n<sha256(canonical
+// entitlements v1)>". The agent rebuilds the entitlements text from its own
+// parse of the frame (canonicalEntitlements), so entitlements changed in
+// transit fail as payload_mismatch; the shared vectors are
+// controlplane/testdata/sysscript-job-lease-vectors.json.
 package main
 
 import (
@@ -24,6 +30,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -71,7 +78,7 @@ func payloadHash(action, payload string) string {
 }
 
 func payloadFor(action, payload string) string {
-	if terminalAction(action) || channelAction(action) || xferAction(action) {
+	if terminalAction(action) || channelAction(action) || xferAction(action) || action == "sysscript_job" {
 		return action + "\n" + payload
 	}
 	return payload
@@ -95,7 +102,7 @@ func hashEqual(a, b string) bool {
 }
 
 func knownAction(action string) bool {
-	return action == "sysscript" || terminalAction(action) || channelAction(action) || xferAction(action)
+	return action == "sysscript" || action == "sysscript_job" || terminalAction(action) || channelAction(action) || xferAction(action)
 }
 
 // xferAction reports the sahxfer grant lease actions.
@@ -331,6 +338,113 @@ func xferMaterial(key, routeToken []byte) (string, error) {
 	h.Write(key)
 	h.Write(routeToken)
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+const (
+	entitlementsPrefix = "systemapi-entitlements-v1\n"
+	// canonicalListMax refuses a list longer than this in the canonical
+	// text (path lists are not capped by the parse).
+	canonicalListMax = 64
+	// sysscriptJobTimeoutMax is the hard cap of a signed timeout_s.
+	sysscriptJobTimeoutMax = 3600
+)
+
+var sysscriptJobRe = regexp.MustCompile(`^sjb_[A-Za-z0-9_-]{22}$`)
+
+// canonicalEntitlements is the v1 text of parsed entitlements: a header
+// line, then one record per field in struct order. A boolean is
+// "<name>=true|false"; a list is "<name>#<count>" and one line per item,
+// deduplicated and sorted by byte order. An item with "\n" or "\r", or a
+// list over canonicalListMax items, is refused (bad_entitlements). nil
+// means no entitlements. controlplane/entitlements.js computes the same
+// text from the object it sends.
+func canonicalEntitlements(e *Entitlements) (string, error) {
+	if e == nil {
+		e = &Entitlements{}
+	}
+	var b strings.Builder
+	b.WriteString(entitlementsPrefix)
+	flag := func(name string, v bool) {
+		b.WriteString(name + "=" + strconv.FormatBool(v) + "\n")
+	}
+	list := func(name string, items []string) error {
+		if len(items) > canonicalListMax {
+			return errors.New("bad_entitlements")
+		}
+		seen := make(map[string]struct{}, len(items))
+		uniq := make([]string, 0, len(items))
+		for _, it := range items {
+			if strings.ContainsAny(it, "\n\r") {
+				return errors.New("bad_entitlements")
+			}
+			if _, dup := seen[it]; !dup {
+				seen[it] = struct{}{}
+				uniq = append(uniq, it)
+			}
+		}
+		sort.Strings(uniq)
+		b.WriteString(name + "#" + strconv.Itoa(len(uniq)) + "\n")
+		for _, it := range uniq {
+			b.WriteString(it + "\n")
+		}
+		return nil
+	}
+	for _, f := range []struct {
+		name   string
+		items  []string
+		isBool bool
+		v      bool
+	}{
+		{name: "allow_fs_write", items: e.AllowFSWrite},
+		{name: "allow_fs_read", items: e.AllowFSRead},
+		{name: "allow_net_outbound", items: e.AllowNetOutbound},
+		{name: "allow_exec", isBool: true, v: e.AllowExec},
+		{name: "allow_config_write", items: e.AllowConfigWrite},
+		{name: "allow_service_reload", items: e.AllowServiceReload},
+		{name: "allow_containers", isBool: true, v: e.AllowContainers},
+		{name: "allow_k3s", isBool: true, v: e.AllowK3s},
+		{name: "allow_linux", isBool: true, v: e.AllowLinux},
+		{name: "allow_k8s", isBool: true, v: e.AllowK8s},
+		{name: "allow_packages", items: e.AllowPackages},
+		{name: "allow_images", items: e.AllowImages},
+		{name: "allow_k3s_namespaces", items: e.AllowK3sNamespaces},
+		{name: "allow_k8s_namespaces", items: e.AllowK8sNamespaces},
+		{name: "allow_net_manage", items: e.AllowNetManage},
+		{name: "allow_mount_targets", items: e.AllowMountTargets},
+		{name: "allow_sysctl", items: e.AllowSysctl},
+	} {
+		if f.isBool {
+			flag(f.name, f.v)
+			continue
+		}
+		if err := list(f.name, f.items); err != nil {
+			return "", err
+		}
+	}
+	return b.String(), nil
+}
+
+// sha256Hex is the lowercase hex SHA-256 of s.
+func sha256Hex(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
+// sysscriptJobLeasePayload is the signed payload of a sysscript_job lease:
+// "<job_id>\n<deadline_unix>\n<timeout_s>\n<script_sha256>\n
+// <entitlements_sha256>". It refuses what the server's lease.js
+// sysscriptJobPayload would never sign.
+func sysscriptJobLeasePayload(jobID string, deadlineUnix int64, timeoutS int, scriptSHA, entsSHA string) (string, error) {
+	if !sysscriptJobRe.MatchString(jobID) {
+		return "", errors.New("bad_job_id")
+	}
+	if deadlineUnix <= 0 || timeoutS < 1 || timeoutS > sysscriptJobTimeoutMax {
+		return "", errors.New("bad_deadline")
+	}
+	if !hashHexRe.MatchString(scriptSHA) || !hashHexRe.MatchString(entsSHA) {
+		return "", errors.New("bad_payload")
+	}
+	return jobID + "\n" + strconv.FormatInt(deadlineUnix, 10) + "\n" + strconv.Itoa(timeoutS) + "\n" + scriptSHA + "\n" + entsSHA, nil
 }
 
 // verifyLease checks the signature and the time window. It does not record

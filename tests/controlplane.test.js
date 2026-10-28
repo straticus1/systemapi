@@ -249,6 +249,88 @@ test('deterministic lease vector matches the Go fixture', () => {
   assert.equal(verifyLease(sig.privateKey, stored.lease, payload, now).ok, true);
 });
 
+// Vectors shared with systemapi-agent/lease_sysscript_job_test.go: the
+// canonical entitlements text, both hashes and the lease agree with Go.
+test('sysscript_job lease: vectors, canonical entitlements and tamper rejection', () => {
+  const lease = require('../controlplane/lease');
+  const ents = require('../controlplane/entitlements');
+  const sig = signer();
+  const pub = sig.privateKey;
+  const vec = require('../controlplane/testdata/sysscript-job-lease-vectors.json');
+  assert.ok(vec.vectors.length >= 3);
+  const payloadOf = (c, over = {}) => {
+    const v = { ...c, ...over };
+    return lease.sysscriptJobPayload({
+      jobId: v.job_id,
+      deadlineUnix: v.deadline_unix,
+      timeoutS: v.timeout_s,
+      scriptSha256: lease.sha256Hex(Buffer.from(v.script, 'utf8')),
+      entitlementsSha256: ents.entitlementsSha256(v.entitlements)
+    });
+  };
+  for (const c of vec.vectors) {
+    assert.equal(ents.canonicalEntitlements(ents.parseEntitlements(c.entitlements)), c.canonical_entitlements, c.name);
+    assert.equal(ents.entitlementsSha256(c.entitlements), c.entitlements_sha256, c.name);
+    assert.equal(lease.sha256Hex(Buffer.from(c.script, 'utf8')), c.script_sha256, c.name);
+    assert.equal(payloadOf(c), c.payload, c.name);
+    assert.equal(lease.payloadHash('sysscript_job', c.payload), c.lease.payload_sha256, c.name);
+    assert.equal(sig.sign(c.message), c.lease.signature, 'ed25519 is deterministic');
+    assert.equal(lease.verifyLease(pub, c.lease, c.payload, vec.now_ms).ok, true, c.name);
+  }
+  // Byte order, not UTF-16 order: U+FB00 sorts before U+1F600.
+  const edge = vec.vectors.find((c) => c.name === 'byte_order_and_parse_edges');
+  const lines = edge.canonical_entitlements.split('\n');
+  assert.ok(lines.indexOf('ﬀ') < lines.indexOf('\u{1F600}'));
+  assert.ok(['\u{1F600}', 'ﬀ'].sort()[0] === '\u{1F600}', 'default sort would disagree');
+
+  const c = vec.vectors[0];
+  const now = vec.now_ms;
+  const mismatch = (over) => lease.verifyLease(pub, c.lease, payloadOf(c, over), now).error;
+  assert.equal(mismatch({ deadline_unix: c.deadline_unix + 1 }), 'payload_mismatch');
+  assert.equal(mismatch({ timeout_s: c.timeout_s - 1 }), 'payload_mismatch');
+  assert.equal(mismatch({ script: `${c.script} ` }), 'payload_mismatch');
+  assert.equal(mismatch({ job_id: 'sjb_Q2xhdWRlLXRlc3QtMTIzNQ' }), 'payload_mismatch');
+  // Only the entitlements change: one list item added, one boolean flipped.
+  const added = { ...c.entitlements, allow_packages: [...c.entitlements.allow_packages, 'openssh-server'] };
+  assert.equal(mismatch({ entitlements: added }), 'payload_mismatch');
+  assert.equal(mismatch({ entitlements: { ...c.entitlements, allow_k3s: true } }), 'payload_mismatch');
+  // Order, duplicates and items the agent drops do not change the hash.
+  const same = { ...c.entitlements, allow_packages: ['curl', 'nginx', '*'] };
+  assert.equal(lease.verifyLease(pub, c.lease, payloadOf(c, { entitlements: same }), now).ok, true);
+  // A job lease is not a sysscript lease.
+  assert.equal(lease.verifyLease(pub, { ...c.lease, action: 'sysscript' }, c.payload, now).error, 'payload_mismatch');
+  assert.equal(lease.payloadHash('sysscript', 'print(1)\n'), lease.payloadHash('sysscript', Buffer.from('print(1)\n')));
+  // Expired, wrong key, bad signature.
+  assert.equal(lease.verifyLease(pub, c.lease, c.payload, now + 200_000).error, 'expired');
+  const other = buildSigner(privateKeyFromSeed(Buffer.alloc(32, 2)), rawPublicKey(privateKeyFromSeed(Buffer.alloc(32, 2))));
+  assert.equal(lease.verifyLease(other.privateKey, c.lease, c.payload, now).error, 'bad_signature');
+  // Issue and verify a fresh lease.
+  const fresh = lease.issueLease(sig, { hostId: HOST_A, action: 'sysscript_job', payload: c.payload, now });
+  assert.equal(lease.verifyLease(pub, fresh, c.payload, now).ok, true);
+
+  // The payload builder refuses fields the agent would refuse.
+  const ok = { jobId: c.job_id, deadlineUnix: 1, timeoutS: 1, scriptSha256: c.script_sha256, entitlementsSha256: c.entitlements_sha256 };
+  assert.doesNotThrow(() => lease.sysscriptJobPayload(ok));
+  for (const bad of [
+    { jobId: 'sjb_short' }, { jobId: `${c.job_id}\n` }, { deadlineUnix: 0 }, { deadlineUnix: 1.5 },
+    { timeoutS: 0 }, { timeoutS: 3601 }, { scriptSha256: 'A'.repeat(64) }, { entitlementsSha256: 'a'.repeat(63) }
+  ]) {
+    assert.throws(() => lease.sysscriptJobPayload({ ...ok, ...bad }), /bad_payload/, JSON.stringify(bad));
+  }
+  // The canonical form refuses what the agent refuses, before signing.
+  const refuse = (obj) => assert.throws(() => ents.entitlementsSha256(obj), (err) => err.message === 'bad_entitlements' && err.status === 400);
+  refuse({ allow_fs_read: ['/a\n/b'] });
+  refuse({ allow_config_write: ['/a\r'] });
+  refuse({ allow_fs_write: Array.from({ length: 65 }, (_, i) => `/p${i}`) });
+  refuse({ allow_fs_write: ['\ud800'] });
+  refuse([]);
+  assert.doesNotThrow(() => ents.entitlementsSha256({ allow_fs_write: Array.from({ length: 64 }, (_, i) => `/p${i}`) }));
+  assert.equal(ents.entitlementsSha256(null), ents.entitlementsSha256({}));
+  // clampEntitlements output always canonicalizes.
+  const clamped = clampEntitlements({ allow_packages: ['nginx', 'é'.repeat(200)], allow_exec: true }, new Set(['admin', 'exec:run']));
+  assert.deepEqual(ents.parseEntitlements(clamped).allow_packages, ['nginx']);
+});
+
 test('audit hash chain detects a tampered payload', async () => {
   const reg = new MemoryRegistry({});
   await reg.appendAudit({ tenant_id: 'acme', action: 'sysscript', payload: { n: 1 } });

@@ -29,18 +29,25 @@
 // <deadline_unix>\nwatch\n<watch_id>\n<ro|rw>\n<true|false>\n<reason>", so
 // only the lease signer can claim an override and a start or renew lease
 // cannot be replayed as a watch (or the reverse).
+// An async sysscript job (action sysscript_job) signs "sysscript_job\n
+// <job_id>\n<deadline_unix>\n<timeout_s>\n<sha256_hex(script)>\n
+// <sha256_hex(canonical entitlements v1)>" (controlplane/entitlements.js),
+// so the agent runs only the signed script under the signed entitlements and
+// time limits, and a sysscript lease cannot start a job (or the reverse).
 'use strict';
 
 const crypto = require('node:crypto');
 const { validateFileRoot } = require('./channels');
 const { randomBytes, timingSafeEqual } = crypto;
 
-const ACTIONS = new Set(['sysscript', 'pty', 'pty_root', 'breakglass', 'tcp', 'file', 'file_root', 'xfer', 'xfer_root']);
+const ACTIONS = new Set(['sysscript', 'sysscript_job', 'pty', 'pty_root', 'breakglass', 'tcp', 'file', 'file_root', 'xfer', 'xfer_root']);
 const TERMINAL_ACTIONS = new Set(['pty', 'pty_root', 'breakglass']);
 const CHANNEL_ACTIONS = new Set(['tcp', 'file', 'file_root']);
 const XFER_ACTIONS = new Set(['xfer', 'xfer_root']);
 // Actions whose hash covers "<action>\n<payload>".
-const SESSION_ACTIONS = new Set([...TERMINAL_ACTIONS, ...CHANNEL_ACTIONS, ...XFER_ACTIONS]);
+const SESSION_ACTIONS = new Set([...TERMINAL_ACTIONS, ...CHANNEL_ACTIONS, ...XFER_ACTIONS, 'sysscript_job']);
+const SYSSCRIPT_JOB_RE = /^sjb_[A-Za-z0-9_-]{22}$/;
+const SYSSCRIPT_JOB_TIMEOUT_MAX = 3600;
 const TCP_SESSION_RE = /^tcs_[A-Za-z0-9_-]{16,64}$/;
 const FILE_SESSION_RE = /^fls_[A-Za-z0-9_-]{16,64}$/;
 const XFER_GRANT_RE = /^xfr_[A-Za-z0-9_-]{8,64}$/;
@@ -249,8 +256,24 @@ function xferPayload({
   ].join('\n');
 }
 
+// The sysscript_job payload (five lines, no trailing newline). The hashes
+// are 64 lowercase hex: sha256 of the script's UTF-8 bytes and
+// entitlementsSha256 of the entitlements sent in the frame.
+function sysscriptJobPayload({ jobId, deadlineUnix, timeoutS, scriptSha256, entitlementsSha256 } = {}) {
+  if (typeof jobId !== 'string' || !SYSSCRIPT_JOB_RE.test(jobId)) throw badPayload();
+  if (!intIn(deadlineUnix, 1, Number.MAX_SAFE_INTEGER)) throw badPayload();
+  if (!intIn(timeoutS, 1, SYSSCRIPT_JOB_TIMEOUT_MAX)) throw badPayload();
+  if (typeof scriptSha256 !== 'string' || !SHA256_HEX_RE.test(scriptSha256)) throw badPayload();
+  if (typeof entitlementsSha256 !== 'string' || !SHA256_HEX_RE.test(entitlementsSha256)) throw badPayload();
+  return `${jobId}\n${deadlineUnix}\n${timeoutS}\n${scriptSha256}\n${entitlementsSha256}`;
+}
+
 module.exports = {
   TERMINAL_ACTIONS,
+  SYSSCRIPT_JOB_RE,
+  SYSSCRIPT_JOB_TIMEOUT_MAX,
+  sysscriptJobPayload,
+  sha256Hex,
   CHANNEL_ACTIONS,
   TCP_SESSION_RE,
   FILE_SESSION_RE,
