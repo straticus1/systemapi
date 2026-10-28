@@ -44,6 +44,15 @@ async function boot(fleet, env = process.env, logger = console) {
   return fleet.registry;
 }
 
+// SYSTEMAPI_SCHEDULE_JOB_TIMEOUT_S: the timeout_s of a scheduled script
+// sent as a job. Default 300; a value that is not an integer from 1 to 3600
+// falls back to the default.
+function scheduleJobTimeoutS(env) {
+  const raw = env && env.SYSTEMAPI_SCHEDULE_JOB_TIMEOUT_S;
+  const n = raw === undefined || raw === '' ? NaN : Number(raw);
+  return Number.isInteger(n) && n >= 1 && n <= 3600 ? n : 300;
+}
+
 async function tickSchedules(fleet, logger = console) {
   if (!fleet.registry || !fleet.signer) return;
   const now = new Date();
@@ -53,19 +62,34 @@ async function tickSchedules(fleet, logger = console) {
     const marked = await fleet.registry.markSchedule(job.id, minuteKey);
     if (!marked) continue;
     try {
-      const lease = issueLease(fleet.signer, {
-        hostId: job.host_id,
-        action: 'sysscript',
-        payload: job.script,
-        ttl: 60
-      });
-      await fleet.pushSysscript(job.host_id, job.script, { allow_exec: true }, `sch-${job.id}`, lease);
+      const payload = { schedule_id: job.id, minute: minuteKey };
+      // A sysscript_jobs agent gets a job and the tick does not wait on it;
+      // otherwise, or with the kill switch off, the legacy push.
+      if (fleet.jobs && typeof fleet.jobs.useJobs === 'function' && await fleet.jobs.useJobs(job.host_id)) {
+        const { job: row } = await fleet.jobs.submit({
+          host: { host_id: job.host_id, tenant_id: job.tenant_id },
+          actor: 'scheduler',
+          source: 'schedule',
+          script: job.script,
+          entitlements: { allow_exec: true },
+          timeoutS: scheduleJobTimeoutS(fleet.env)
+        });
+        payload.job_id = row.job_id;
+      } else {
+        const lease = issueLease(fleet.signer, {
+          hostId: job.host_id,
+          action: 'sysscript',
+          payload: job.script,
+          ttl: 60
+        });
+        await fleet.pushSysscript(job.host_id, job.script, { allow_exec: true }, `sch-${job.id}`, lease);
+      }
       await fleet.registry.appendAudit({
         tenant_id: job.tenant_id,
         host_id: job.host_id,
         actor: 'scheduler',
         action: 'schedule',
-        payload: { schedule_id: job.id, minute: minuteKey }
+        payload
       });
     } catch (err) {
       logger.error('[control] schedule run failed:', err.message);
@@ -89,5 +113,6 @@ module.exports = {
   attach,
   boot,
   refreshGauges,
+  tickSchedules,
   deliverWebhooks
 };

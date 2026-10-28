@@ -189,6 +189,31 @@ Response:
 `success` means the agent answered. A script that failed on the host comes
 back with `success: true` and a non-empty `result.error`; check that field.
 
+On an agent that advertises the `sysscript_jobs` capability, these routes
+(and `/api/v1/playbooks/:id/run`) run the script as an async sysscript job
+and keep the same answer:
+
+- The body may carry `timeout_s`: the whole-script deadline in seconds,
+  from 1 to `SYSTEMAPI_SYSSCRIPT_JOB_MAX_S` (default 1800). The default is
+  300. A bad value is 400 `bad_timeout`.
+- The route waits up to 28 s. A job that ends in time answers 200 as above,
+  with `request_id` and a new `job_id` field both set to the job id. A job
+  that timed out or was cancelled answers 200 with `result.error` set to
+  `timed_out` or `cancelled`.
+- A job still running after 28 s answers 504
+  `{"error": "agent_timeout", "job_id": "sjb_..."}`. The job runs on; read
+  it with `GET /api/v1/jobs/:job_id`.
+- The audit actions change. These calls write `sysscript_job_submit` and
+  `sysscript_job_end` rows, not `sysscript` and `command_result`. Consumers
+  that filter the audit log on the old actions must add the new ones.
+- Scheduled scripts become jobs too (`source: "schedule"`, `timeout_s` from
+  `SYSTEMAPI_SCHEDULE_JOB_TIMEOUT_S`, default 300). Their `schedule` audit
+  row gains `job_id`. Playbooks run by an alert rule become jobs with
+  `source: "rule"`.
+
+An agent without the capability keeps the old path, unchanged. So does every
+agent when the server runs with `SYSTEMAPI_SYSSCRIPT_JOBS=0`.
+
 Entitlements are clamped by the caller's scopes before they reach the agent:
 `allow_exec` needs `exec:run`; every other entitlement needs `admin`. The
 names the agent understands are listed in `cli_docs.md`.

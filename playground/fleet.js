@@ -63,6 +63,8 @@ const { FileChannels } = require('./file');
 const { XferGrants } = require('./xfer');
 const { TerminalWatches } = require('./watch');
 const { SysscriptJobs } = require('./jobs');
+// The whole-script deadline of a rule playbook sent as a job.
+const RULE_JOB_TIMEOUT_S = 300;
 const { noNul, truncateUtf8 } = require('../controlplane/registry');
 const { rejectUpgrade } = require('./channel');
 
@@ -1256,8 +1258,7 @@ class FleetManager {
             console.error('[PLAYBOOK] signer unavailable');
             return;
         }
-        const lease = issueLease(this.signer, { hostId, action: 'sysscript', payload: script, ttl: 60 });
-        await this.pushSysscript(hostId, script, {
+        const entitlements = {
             allow_exec: true,
             allow_fs_write: false,
             allow_fs_read: false,
@@ -1266,7 +1267,23 @@ class FleetManager {
             allow_service_reload: false,
             allow_containers: false,
             allow_k3s: false
-        }, randomToken(16), lease);
+        };
+        // A sysscript_jobs agent gets a job (no waiting on the agent);
+        // otherwise, or with the kill switch off, the legacy push.
+        const tenantId = this.hostTenants.get(hostId);
+        if (tenantId && await this.jobs.useJobs(hostId)) {
+            await this.jobs.submit({
+                host: { host_id: hostId, tenant_id: tenantId },
+                actor: 'system:rule',
+                source: 'rule',
+                script,
+                entitlements,
+                timeoutS: RULE_JOB_TIMEOUT_S
+            });
+            return;
+        }
+        const lease = issueLease(this.signer, { hostId, action: 'sysscript', payload: script, ttl: 60 });
+        await this.pushSysscript(hostId, script, entitlements, randomToken(16), lease);
     }
 
     async sendAdstelcoSMS(toPhone, body) {

@@ -23,7 +23,7 @@ const { bucketName, linearForecast, toCSV, cronValid, zscore } = require('./stat
 const { listPlaybooks, readPlaybook } = require('./playbooks');
 const xfer = require('../playground/xfer');
 const { WATCH_PURPOSES, watchScopes } = require('../playground/watch');
-const { jobView, TERMINAL_JOB_STATUSES } = require('../playground/jobs');
+const { jobView, jobsEnabled, TERMINAL_JOB_STATUSES } = require('../playground/jobs');
 const { entitlementsSha256 } = require('./entitlements');
 
 const SCRIPT_MAX = 64 * 1024;
@@ -31,6 +31,9 @@ const JOB_TIMEOUT_DEFAULT_S = 300;
 const JOB_MAX_DEFAULT_S = 1800;
 const JOB_MAX_CAP_S = 3600;
 const JOB_WAIT_MAX_S = 25;
+// How long /execute, /fleet/execute and /playbooks/:id/run wait for a job
+// before answering 504 agent_timeout (pushSysscript's legacy wait is 30 s).
+const EXECUTE_JOB_WAIT_MS = 28000;
 const COOLDOWN_MS = 5 * 60 * 1000;
 const USER_RE = /^[a-zA-Z0-9][a-zA-Z0-9._@-]{0,128}$/;
 const RESOLVE_NAME_RE = /^[A-Za-z0-9._-]{1,253}$/;
@@ -79,7 +82,10 @@ function sendError(res, err) {
   // anything else, such as a Postgres error and its SQLSTATE, is "internal".
   const code = err.code || err.message || 'error';
   const deliberate = Number.isInteger(err.status) && typeof code === 'string' && /^[a-z_]{1,64}$/.test(code);
-  res.status(status).json({ error: status >= 500 && !deliberate ? 'internal' : code });
+  const body = { error: status >= 500 && !deliberate ? 'internal' : code };
+  // A legacy /execute that went as a job and timed out names the job.
+  if (deliberate && typeof err.jobId === 'string') body.job_id = err.jobId;
+  res.status(status).json(body);
 }
 
 function noStore(res) {
@@ -324,13 +330,19 @@ function clampEntitlements(requested, scopes) {
   return out;
 }
 
-async function runScript(fleet, principal, host, script, entitlements) {
+// opts.source is the job source (execute, fleet_execute or playbook) and
+// opts.timeoutS the request's timeout_s, both used only when the script goes
+// as a job (fleet.jobs.useJobs: kill switch on and a sysscript_jobs agent).
+async function runScript(fleet, principal, host, script, entitlements, opts = {}) {
   if (typeof script !== 'string' || script.length === 0 || script.length > SCRIPT_MAX) {
     throw http(400, 'bad_script');
   }
   const scopes = scopesFor(principal, host.tenant_id);
   requireScope(fleet, principal, host.tenant_id, 'exec:run');
   if (!fleet.signer) throw http(503, 'signer_unavailable');
+  if (fleet.jobs && typeof fleet.jobs.useJobs === 'function' && await fleet.jobs.useJobs(host.host_id)) {
+    return runScriptJob(fleet, principal, host, script, clampEntitlements(entitlements, scopes), opts);
+  }
   const lease = issueLease(fleet.signer, {
     hostId: host.host_id,
     action: 'sysscript',
@@ -354,6 +366,38 @@ async function runScript(fleet, principal, host, script, entitlements) {
     payload: { request_id: requestId, lease_nonce: lease.nonce_hex }
   });
   return { request_id: requestId, result };
+}
+
+// runScript on a sysscript_jobs agent: the script goes as a job (audited
+// as sysscript_job_submit/_end, not sysscript/command_result) and the
+// answer keeps the legacy shape: {request_id, result:{error, output}} once
+// the job ends within EXECUTE_JOB_WAIT_MS, else 504 agent_timeout with the
+// job_id while the job runs on. A job that timed out or was cancelled
+// answers with result.error set, as a script error does.
+async function runScriptJob(fleet, principal, host, script, entitlements, { source = 'execute', timeoutS } = {}) {
+  const maxS = jobMaxSeconds(fleet.env);
+  const timeout = intField({ timeout_s: timeoutS }, 'timeout_s', Math.min(JOB_TIMEOUT_DEFAULT_S, maxS), 1, maxS, 'bad_timeout');
+  try {
+    entitlementsSha256(entitlements);
+  } catch {
+    throw http(400, 'bad_entitlements');
+  }
+  const { job } = await fleet.jobs.submit({ host, actor: principal.userId, source, script, entitlements, timeoutS: timeout });
+  const waitMs = Number.isInteger(fleet.executeJobWaitMs) ? fleet.executeJobWaitMs : EXECUTE_JOB_WAIT_MS;
+  const row = await fleet.jobs.waitFor([host.tenant_id], job.job_id, waitMs);
+  const done = !!row && TERMINAL_JOB_STATUSES.has(row.status);
+  if (fleet.metrics && fleet.metrics.executionsTotal) fleet.metrics.executionsTotal.inc({ status: done ? 'ok' : 'error' });
+  if (!done) {
+    const err = http(504, 'agent_timeout');
+    err.jobId = job.job_id;
+    throw err;
+  }
+  const result = {
+    error: row.error || (row.status === 'succeeded' ? '' : row.status),
+    output: row.output == null ? '' : row.output
+  };
+  if (row.output_truncated) result.output_truncated = true;
+  return { request_id: job.job_id, job_id: job.job_id, result };
 }
 
 // Ticket rate, per actor and host, per minute. Four separate budgets:
@@ -535,8 +579,7 @@ async function watchTicket(fleet, principal, purpose, body, res) {
 
 // SYSTEMAPI_SYSSCRIPT_JOBS=0 turns the /jobs routes off (503 jobs_disabled).
 function requireJobs(fleet) {
-  const raw = fleet.env && fleet.env.SYSTEMAPI_SYSSCRIPT_JOBS;
-  if (String(raw === undefined || raw === null || raw === '' ? '1' : raw).trim() === '0' || !fleet.jobs) {
+  if (!jobsEnabled(fleet.env) || !fleet.jobs) {
     throw http(503, 'jobs_disabled');
   }
 }
@@ -882,7 +925,8 @@ function mount(app, fleet) {
     const results = [];
     for (const hostId of hostIds) {
       const host = await requireHost(fleet, principal, hostId);
-      results.push({ host_id: hostId, ...(await runScript(fleet, principal, host, script, req.body.entitlements)) });
+      results.push({ host_id: hostId, ...(await runScript(fleet, principal, host, script, req.body.entitlements,
+        { source: 'fleet_execute', timeoutS: req.body.timeout_s })) });
     }
     res.json({ results });
   }));
@@ -950,7 +994,8 @@ function mount(app, fleet) {
     const principal = await authenticate(req, fleet);
     requireScopeAnywhere(fleet, principal, ['exec:run']);
     const host = await requireHost(fleet, principal, req.params.hostId);
-    const out = await runScript(fleet, principal, host, req.body && req.body.script, req.body && req.body.entitlements);
+    const out = await runScript(fleet, principal, host, req.body && req.body.script, req.body && req.body.entitlements,
+      { source: 'execute', timeoutS: req.body && req.body.timeout_s });
     res.json({ success: true, ...out, executed_by: principal.email || principal.userId });
   }));
 
@@ -1236,7 +1281,8 @@ function mount(app, fleet) {
     requireScopeAnywhere(fleet, principal, ['exec:run']);
     const host = await requireHost(fleet, principal, req.body && req.body.host_id);
     const script = readPlaybook(req.params.id);
-    const out = await runScript(fleet, principal, host, script, { allow_exec: true });
+    const out = await runScript(fleet, principal, host, script, { allow_exec: true },
+      { source: 'playbook', timeoutS: req.body && req.body.timeout_s });
     res.json({ playbook: req.params.id, ...out });
   }));
 

@@ -52,6 +52,15 @@ const JOB_SECURITY_UNLIMITED = new Set(['job_frame_host_mismatch']);
 // ack-timeout sweep.
 const JOB_CHAIN_BUSY_GRACE_MS = 15000;
 const SYNC_EVENT_IDS_MAX = 16;
+// The agent's scriptMaxBytes (systemapi-agent/pty.go).
+const SCRIPT_MAX_BYTES = 64 * 1024;
+
+// SYSTEMAPI_SYSSCRIPT_JOBS: on unless it is "0". Off, the /jobs routes
+// answer 503 jobs_disabled and every legacy caller stays on pushSysscript.
+function jobsEnabled(env) {
+    const raw = env && env.SYSTEMAPI_SYSSCRIPT_JOBS;
+    return String(raw === undefined || raw === null || raw === '' ? '1' : raw).trim() !== '0';
+}
 
 function http(status, code) {
     const err = new Error(code);
@@ -598,11 +607,31 @@ class SysscriptJobs {
         if (!agent.caps.includes(JOB_CAPABILITY)) throw http(501, 'agent_unsupported');
     }
 
+    // The legacy callers (/execute, /fleet/execute, playbooks, the scheduler
+    // and rule playbooks) submit a job only when this is true: the kill
+    // switch is on and hostId's agent advertised sysscript_jobs, on the
+    // socket held here or, for a socket on another instance, in cp_hosts.
+    // Anything else, an old agent or an offline one, stays on pushSysscript.
+    async useJobs(hostId) {
+        if (!jobsEnabled(this.fleet.env)) return false;
+        if (this.localSocket(hostId)) {
+            return typeof this.fleet.agentSupports === 'function' && this.fleet.agentSupports(hostId, JOB_CAPABILITY);
+        }
+        const reg = this.fleet.registry;
+        const agent = reg && typeof reg.hostAgent === 'function' ? await reg.hostAgent(hostId) : null;
+        return !!agent && agent.caps.includes(JOB_CAPABILITY);
+    }
+
     // Creates the job row (with its submit audit row and dispatch event) and
     // sends it here when this instance holds the socket. entitlements must
     // already be clamped for the principal; the same object is hashed into
     // the lease, stored and sent. Returns {job, deadlineUnix}.
     async submit({ host, actor, source, script, entitlements, timeoutS }) {
+        // U+0000 cannot be stored in the dispatch JSONB.
+        if (typeof script !== 'string' || script.length === 0 || !script.isWellFormed() || script.includes('\u0000')
+            || Buffer.byteLength(script, 'utf8') > SCRIPT_MAX_BYTES) {
+            throw http(400, 'bad_script');
+        }
         const signer = this.fleet.signer;
         if (!signer) throw http(503, 'signer_unavailable');
         const ents = entitlements || {};
@@ -681,4 +710,4 @@ class SysscriptJobs {
     }
 }
 
-module.exports = { SysscriptJobs, jobView, JOB_CAPABILITY, TERMINAL_JOB_STATUSES: TERMINAL };
+module.exports = { SysscriptJobs, jobView, jobsEnabled, JOB_CAPABILITY, TERMINAL_JOB_STATUSES: TERMINAL };

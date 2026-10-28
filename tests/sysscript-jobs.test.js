@@ -10,6 +10,7 @@ const assert = require('node:assert/strict');
 
 const { MemoryRegistry } = require('../controlplane/registry');
 const { rig, connectAgent, waitUntil } = require('./job-agent-rig');
+const { tickSchedules } = require('../controlplane/index');
 
 const HOST_A = '11111111-1111-4111-8111-111111111111';
 const HOST_B = '22222222-2222-4222-8222-222222222222';
@@ -30,10 +31,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // acme: user-1 admin (enrolls HOST_A/HOST_B), user-3 and user-6 operators,
 // user-4 viewer, user-5 operator. beta: user-2 admin (enrolls HOST_C),
 // user-5 viewer. Every key's own scopes are admin, so the role decides.
-async function world({ env = {}, registry = new MemoryRegistry({ NODE_ENV: 'test' }), agent = true } = {}) {
+// caps: what HOST_A's agent advertises (default sysscript_jobs).
+async function world({ env = {}, registry = new MemoryRegistry({ NODE_ENV: 'test' }), agent = true, caps } = {}) {
   const r = await rig({ registry, keys: KEYS, env });
   for (const { key_id: id } of Object.values(KEYS)) await registry.setScopes(id, ['admin']);
-  const a = agent ? await connectAgent(r, HOST_A) : null;
+  const a = agent ? await connectAgent(r, HOST_A, caps === undefined ? {} : { caps }) : null;
   await registry.addMember('acme', 'user-3', 'operator');
   await registry.addMember('acme', 'user-6', 'operator');
   await registry.addMember('acme', 'user-4', 'viewer');
@@ -765,6 +767,231 @@ test('two instances on one registry: dispatch, result, wait and cancel cross ins
     const e = await submit(one.r, 'op-key', HOST_A);
     await one.r.fm.jobs.tick(Date.now() + 61000);
     assert.equal((await ended(registry, e.body.job_id, 'failed')).error, 'dispatch_timeout');
+  } finally {
+    await two.close();
+    await one.r.close();
+  }
+});
+
+// Commit 6b: the legacy callers. A fake agent that also answers the legacy
+// sysscript frame with a command_result, as an agent without the
+// capability does.
+function answerLegacy(agent, output = 'legacy') {
+  agent.ws.on('message', (data, isBinary) => {
+    if (isBinary) return;
+    const f = JSON.parse(data.toString());
+    if (f.type === 'sysscript') agent.send({ type: 'command_result', request_id: f.request_id, payload: { error: '', output } });
+  });
+}
+
+function jobsOf(reg, source) {
+  return [...reg.jobs.values()].filter((j) => j.source === source);
+}
+
+const execute = (r, body, key = 'op-key') => r.api('POST', `/api/v1/fleet/${HOST_A}/execute`, key, { script: 'print("hi")', ...body });
+
+test('legacy /execute on a sysscript_jobs agent goes as a job with the same answer; 504 names the job; timed_out is a result error', async () => {
+  const { r, reg, a } = await world({ env: { SYSTEMAPI_SYSSCRIPT_JOB_MAX_S: '600' } });
+  try {
+    const p = execute(r, {});
+    const { frame, lease } = await a.waitJob();
+    assert.equal(lease.ok, true, lease.error);
+    assert.equal(frame.timeout_s, 300, 'no timeout_s: the 300 s default');
+    a.status(frame.job_id, { status: 'running' });
+    a.result(frame.job_id, { status: 'succeeded', output: 'hi\n' });
+    const res = await p;
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.deepEqual(res.body, {
+      success: true,
+      request_id: frame.job_id,
+      job_id: frame.job_id,
+      result: { error: '', output: 'hi\n' },
+      executed_by: 'user-3'
+    });
+    const stored = await row(reg, frame.job_id);
+    assert.equal(stored.source, 'execute');
+    assert.equal(stored.actor, 'user-3');
+    assert.equal(a.of('sysscript').length, 0, 'no legacy frame');
+    const actions = reg.audit.map((x) => x.action);
+    assert.ok(actions.includes('sysscript_job_submit') && actions.includes('sysscript_job_end'));
+    assert.equal(actions.includes('sysscript'), false);
+    assert.equal(actions.includes('command_result'), false);
+
+    // Not done within the wait: 504 agent_timeout with the job id; the job
+    // runs on and ends later.
+    r.fm.executeJobWaitMs = 150;
+    const slow = await execute(r, { timeout_s: 45 });
+    assert.equal(slow.status, 504);
+    assert.equal(slow.body.error, 'agent_timeout');
+    assert.match(slow.body.job_id, /^sjb_/);
+    const sf = (await a.waitJob(slow.body.job_id)).frame;
+    assert.equal(sf.timeout_s, 45);
+    a.result(slow.body.job_id, { status: 'succeeded', output: 'late' });
+    assert.equal((await ended(reg, slow.body.job_id, 'succeeded')).output, 'late');
+
+    // timed_out and cancelled answer 200 with result.error set.
+    r.fm.executeJobWaitMs = 5000;
+    for (const status of ['timed_out', 'cancelled']) {
+      const q = execute(r, {});
+      const n = a.jobs.size;
+      await waitUntil('next job', () => a.jobs.size > n);
+      const id = [...a.jobs.keys()].pop();
+      a.result(id, { status, output: 'part' });
+      const out = await q;
+      assert.equal(out.status, 200);
+      assert.deepEqual(out.body.result, { error: status, output: 'part' });
+    }
+    // A script error keeps the agent's text, as the legacy path does.
+    const q = execute(r, {});
+    const n = a.jobs.size;
+    await waitUntil('next job', () => a.jobs.size > n);
+    a.result([...a.jobs.keys()].pop(), { status: 'failed', error: 'boom: line 1', output: '' });
+    assert.deepEqual((await q).body.result, { error: 'boom: line 1', output: '' });
+
+    // A bad timeout_s or a script the job store cannot hold is 400 and
+    // creates nothing.
+    const before = reg.jobs.size;
+    for (const [body, code] of [[{ timeout_s: 0 }, 'bad_timeout'], [{ timeout_s: 601 }, 'bad_timeout'],
+      [{ timeout_s: '30' }, 'bad_timeout'], [{ script: 'a\u0000b' }, 'bad_script']]) {
+      const bad = await execute(r, body);
+      assert.equal(bad.status, 400, code);
+      assert.equal(bad.body.error, code);
+    }
+    assert.equal(reg.jobs.size, before);
+  } finally {
+    await r.close();
+  }
+});
+
+test('/fleet/execute and /playbooks/:id/run on a sysscript_jobs agent go as jobs (fleet_execute, playbook)', async () => {
+  const { r, reg, a } = await world();
+  try {
+    const p = r.api('POST', '/api/v1/fleet/execute', 'op-key', { host_ids: [HOST_A], script: 'print(1)', timeout_s: 60 });
+    const { frame } = await a.waitJob();
+    assert.equal(frame.timeout_s, 60);
+    a.result(frame.job_id, { status: 'succeeded', output: '1\n' });
+    const res = await p;
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.body.results, [{ host_id: HOST_A, request_id: frame.job_id, job_id: frame.job_id, result: { error: '', output: '1\n' } }]);
+    assert.equal((await row(reg, frame.job_id)).source, 'fleet_execute');
+
+    const q = r.api('POST', '/api/v1/playbooks/disk_report/run', 'op-key', { host_id: HOST_A });
+    await waitUntil('playbook job', () => a.jobs.size === 2);
+    const pb = [...a.jobs.values()][1];
+    assert.equal(pb.lease.ok, true, pb.lease.error);
+    assert.equal(pb.frame.entitlements.allow_exec, true);
+    assert.equal(pb.frame.timeout_s, 300);
+    a.result(pb.frame.job_id, { status: 'succeeded', output: 'disk' });
+    const out = await q;
+    assert.equal(out.status, 200);
+    assert.equal(out.body.playbook, 'disk_report');
+    assert.equal(out.body.job_id, pb.frame.job_id);
+    assert.deepEqual(out.body.result, { error: '', output: 'disk' });
+    assert.equal((await row(reg, pb.frame.job_id)).source, 'playbook');
+    assert.equal(a.of('sysscript').length, 0);
+  } finally {
+    await r.close();
+  }
+});
+
+test('the scheduler and rule playbooks submit jobs without waiting; the schedule audit row carries the job id', async () => {
+  const { r, reg, a } = await world({ env: { SYSTEMAPI_SCHEDULE_JOB_TIMEOUT_S: '77' } });
+  try {
+    await reg.createSchedule({ id: 'sch-1', tenant_id: 'acme', host_id: HOST_A, cron: '* * * * *', script: 'print("tick")' });
+    const t0 = Date.now();
+    await tickSchedules(r.fm, { error: (...m) => assert.fail(m.join(' ')) });
+    assert.ok(Date.now() - t0 < 2000, 'the tick does not wait on the agent');
+    const [sch] = jobsOf(reg, 'schedule');
+    assert.equal(sch.actor, 'scheduler');
+    assert.equal(sch.timeout_s, 77);
+    const { frame, lease } = await a.waitJob(sch.job_id);
+    assert.equal(lease.ok, true, lease.error);
+    assert.equal(frame.timeout_s, 77);
+    assert.deepEqual(frame.entitlements, { allow_exec: true });
+    const audit = reg.audit.find((x) => x.action === 'schedule');
+    assert.equal(audit.actor, 'scheduler');
+    assert.deepEqual(audit.payload, { schedule_id: 'sch-1', minute: audit.payload.minute, job_id: sch.job_id });
+
+    await r.fm.dispatchPlaybook('disk_report', HOST_A);
+    const [rule] = jobsOf(reg, 'rule');
+    assert.equal(rule.actor, 'system:rule');
+    assert.equal(rule.timeout_s, 300);
+    const rj = await a.waitJob(rule.job_id);
+    assert.equal(rj.lease.ok, true, rj.lease.error);
+    assert.equal(rj.frame.entitlements.allow_exec, true);
+    assert.equal(rj.frame.entitlements.allow_fs_write, false);
+    assert.equal(a.of('sysscript').length, 0);
+  } finally {
+    await r.close();
+  }
+});
+
+// Every legacy caller once, against an agent answering the legacy frame:
+// the unchanged pushSysscript path, no job rows, the legacy audit actions.
+async function assertAllLegacy(r, reg, a) {
+  answerLegacy(a);
+  const ex = await execute(r, {});
+  assert.equal(ex.status, 200, JSON.stringify(ex.body));
+  assert.deepEqual(Object.keys(ex.body).sort(), ['executed_by', 'request_id', 'result', 'success']);
+  assert.deepEqual(ex.body.result, { error: '', output: 'legacy' });
+  assert.doesNotMatch(ex.body.request_id, /^sjb_/);
+  const fx = await r.api('POST', '/api/v1/fleet/execute', 'op-key', { host_ids: [HOST_A], script: 'print(1)' });
+  assert.equal(fx.status, 200);
+  assert.equal(fx.body.results[0].job_id, undefined);
+  const pb = await r.api('POST', '/api/v1/playbooks/disk_report/run', 'op-key', { host_id: HOST_A });
+  assert.equal(pb.status, 200);
+  assert.equal(pb.body.job_id, undefined);
+  await reg.createSchedule({ id: 'sch-l', tenant_id: 'acme', host_id: HOST_A, cron: '* * * * *', script: 'print(2)' });
+  await tickSchedules(r.fm, { error: (...m) => assert.fail(m.join(' ')) });
+  const sch = reg.audit.find((x) => x.action === 'schedule');
+  assert.equal(sch.payload.job_id, undefined);
+  await r.fm.dispatchPlaybook('disk_report', HOST_A);
+  assert.equal(a.of('sysscript').length, 5);
+  assert.equal(a.jobs.size, 0);
+  assert.equal(reg.jobs.size, 0);
+  assert.equal(reg.audit.filter((x) => x.action === 'sysscript').length, 3);
+  assert.equal(reg.audit.some((x) => x.action === 'sysscript_job_submit'), false);
+}
+
+test('an agent without sysscript_jobs stays on the legacy path for every caller (production until commit 6c)', async () => {
+  const { r, reg, a } = await world({ caps: '' });
+  try {
+    assert.equal(r.fm.agentSupports(HOST_A, 'sysscript_jobs'), false);
+    await assertAllLegacy(r, reg, a);
+  } finally {
+    await r.close();
+  }
+});
+
+test('SYSTEMAPI_SYSSCRIPT_JOBS=0 keeps every caller on the legacy path on a sysscript_jobs agent', async () => {
+  const { r, reg, a } = await world({ env: { SYSTEMAPI_SYSSCRIPT_JOBS: '0' } });
+  try {
+    assert.equal(r.fm.agentSupports(HOST_A, 'sysscript_jobs'), true);
+    await assertAllLegacy(r, reg, a);
+  } finally {
+    await r.close();
+  }
+});
+
+test('legacy /execute on another instance: a capable agent there gets a job, an old one stays legacy (409 here, as today)', async () => {
+  const registry = new MemoryRegistry({ NODE_ENV: 'test' });
+  const two = await rig({ registry, keys: KEYS });
+  const a = await connectAgent(two, HOST_A);
+  const one = await world({ registry, agent: false });
+  try {
+    const p = execute(one.r, {});
+    const { frame } = await a.waitJob();
+    a.result(frame.job_id, { status: 'succeeded', output: 'x' });
+    const res = await p;
+    assert.equal(res.status, 200);
+    assert.equal(res.body.job_id, frame.job_id);
+    assert.equal((await row(registry, frame.job_id)).source, 'execute');
+
+    const b = await connectAgent(two, HOST_B, { caps: '' });
+    const off = await one.r.api('POST', `/api/v1/fleet/${HOST_B}/execute`, 'op-key', { script: 'print(1)' });
+    assert.equal(off.status, 409);
+    assert.equal(off.body.error, 'agent_offline');
+    assert.equal(b.of('sysscript').length, 0);
   } finally {
     await two.close();
     await one.r.close();
