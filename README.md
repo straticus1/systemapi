@@ -92,5 +92,6 @@ An image built natively on Apple Silicon fails on amd64 nodes with
 
 - `api_docs.md`: REST and WebSocket routes.
 - `cli_docs.md`: agent flags, CLI commands, Sysscript modules and entitlements.
+- `docs/sah-sysscript-jobs.md`: async sysscript jobs, rollout and rollback.
 - `SECURITY_REVIEW.md`: controls that hold and known residuals.
 - `docs/sah-suite.md`: how SystemAPI fits the wider suite.

@@ -26,6 +26,10 @@ SYSTEMAPI_API_KEY=<key> ./systemapi-agent \
 | `--pty-record-dir` | `/var/lib/systemapi/recordings` as root, else `<state dir>/recordings` | One `<session_id>.rec` file per session, directory mode 0700. The HMAC key is `recording.key` (0600) in the state directory. |
 | `--pty-record-max-bytes` | 1 GiB | A session ends (`pty_exit` reason `stopped`, `record_error` `recording_size_limit`) once it has recorded this many bytes. |
 | `--pty-record-min-free` | 1 GiB | A session is refused (`recording_unavailable`) when the recording filesystem has less free space than this. |
+| `--sysscript-jobs` | `true` | Advertise the `sysscript_jobs` capability (Linux and macOS). `false` stops advertising it, so the server sends this host's scripts the legacy way. Windows agents never advertise it. |
+| `--sysscript-workers` | 4 | Scripts that run at once (1 to 16), jobs and legacy scripts together. 8 more may wait for a worker; beyond that a script is refused `agent_busy`. |
+| `--sysscript-legacy-seconds` | 300 | Whole-script deadline of a legacy (non-job) script, 1 to `--sysscript-max-seconds`. |
+| `--sysscript-max-seconds` | 3600 | Ceiling for any script deadline (1 to 3600). A job deadline beyond it is cut to it. |
 
 `terminal:root` sessions use their own lease action (`pty_root`), run as root,
 and need an agent running as root. The agent keeps 4 of its 32 session slots
@@ -89,6 +93,11 @@ SYSTEMAPI_URL=https://api.systemapi.io SYSTEMAPI_API_KEY=<key> node cli/systemap
   breakglass-ticket --host <id>
   host-json --host <id>
   retire --host <id> --reason <text> [--force]
+  jobs submit <host> <script-file> [--timeout <s>] [--wait <s>]
+  jobs status <job-id>
+  jobs wait <job-id> [--wait <s>]
+  jobs cancel <job-id>
+  jobs list [--host <id>] [--status <status>]
   login <username>
 ```
 
@@ -97,6 +106,40 @@ SYSTEMAPI_URL=https://api.systemapi.io SYSTEMAPI_API_KEY=<key> node cli/systemap
 refused `host_online`. It prints the JSON response.
 
 The key is sent only as `X-API-Key`. A key in `SYSTEMAPI_URL` is refused.
+
+### Jobs
+
+`jobs` runs a script as an async sysscript job (`api_docs.md`, "Async
+sysscript jobs"). The host's agent must advertise `sysscript_jobs`;
+otherwise use `exec`.
+
+- `jobs submit <host> <file>` posts the script with `entitlements:
+  {allow_exec: true}` and `--timeout` as `timeout_s` (server default 300).
+  - Without `--wait` it prints the job id on stdout and exits 0. The job
+    runs on.
+  - With `--wait W` it prints `job <id>` on stderr once the job exists, then
+    waits up to W seconds in total. The first POST asks the server to wait
+    `min(W, 20)` s; after that it polls `GET /api/v1/jobs/<id>` every 2 s.
+    Network errors, timeouts, 429 and 5xx answers are retried until W runs
+    out.
+- `jobs wait <id> [--wait W]` waits the same way. Without `--wait` it waits
+  until the job's deadline + 90 s, counted on the server's clock.
+- A finished wait prints the job's output on stdout. On stderr it prints
+  `<status> <error>` when the job did not succeed, and says when the output
+  is hidden (only the submitter and tenant admins can read it), expired or
+  truncated.
+- `jobs status <id>` prints the job as one JSON line.
+- `jobs cancel <id>` prints `<id>\t<status>`. The job ends `cancelled` once
+  the agent stops it.
+- `jobs list` prints `job_id`, `host_id`, `status`, `source`, `created_at`
+  and `duration_ms`, tab-separated, newest first (at most 50).
+
+| Exit | `submit` (no `--wait`) | `submit --wait`, `wait`, `status` | `cancel`, `list` |
+| --- | --- | --- | --- |
+| 0 | job created | `succeeded` | done |
+| 1 | request refused or failed | `failed`, `timed_out`, `cancelled`, or the request refused or failed | request refused or failed (for example 409 `job_finished`) |
+| 2 | bad arguments or missing `SYSTEMAPI_URL`/`SYSTEMAPI_API_KEY` | same | same |
+| 3 | - | still running when the wait ended (the job id is printed on stdout) | - |
 
 ## Sysscript
 

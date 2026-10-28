@@ -226,6 +226,114 @@ Entitlements are clamped by the caller's scopes before they reach the agent:
 `allow_exec` needs `exec:run`; every other entitlement needs `admin`. The
 names the agent understands are listed in `cli_docs.md`.
 
+### Async sysscript jobs
+
+A job runs a Sysscript on one host without holding the HTTP request open. The
+host's agent must advertise `sysscript_jobs` (see `cli_docs.md`,
+`--sysscript-jobs`).
+
+| Method | Path | Who |
+| --- | --- | --- |
+| POST | `/api/v1/fleet/:hostId/jobs` | `exec:run` in the host's tenant |
+| GET | `/api/v1/jobs/:jobId` | `exec:run` in the job's tenant |
+| GET | `/api/v1/jobs?host_id=&status=&limit=` | `exec:run` in at least one tenant |
+| POST | `/api/v1/jobs/:jobId/cancel` | the submitter, or `admin` in the job's tenant |
+
+Every answer carries `Cache-Control: no-store`.
+
+**Submit.** Request:
+
+```json
+{
+  "script": "sys.exec.run(\"sleep\", \"90\")",
+  "entitlements": { "allow_exec": true },
+  "timeout_s": 600,
+  "wait_s": 0
+}
+```
+
+- `script`: 1 byte to 64 KiB of UTF-8, well-formed, no NUL.
+- `entitlements`: an object, clamped by the caller's scopes as above.
+- `timeout_s`: the whole-script deadline, an integer from 1 to
+  `SYSTEMAPI_SYSSCRIPT_JOB_MAX_S` (default 1800, at most 3600). The default
+  is 300. The agent also caps it at its own `--sysscript-max-seconds`.
+- `wait_s`: 0 to 25. With 0 the route answers at once. Otherwise it waits up
+  to that long for the job to end.
+
+Response: `202 {"job_id": "sjb_...", "status": "submitted", "deadline_unix": 1767225600}`.
+A job that ends within `wait_s` answers `200 {"job": {...}}` instead.
+
+**Read.** `GET /api/v1/jobs/:jobId` answers `200 {"job": {...}}`:
+
+```json
+{
+  "job_id": "sjb_...", "tenant_id": "acme", "host_id": "...",
+  "actor": "user-1", "source": "api", "status": "succeeded", "error": null,
+  "timeout_s": 600, "deadline_unix": 1767225600,
+  "script_sha256": "...", "entitlements_sha256": "...", "alert_count": 0,
+  "output_truncated": false, "output_expired": false,
+  "cancel_requested_at": null, "created_at": "...", "accepted_at": "...",
+  "started_at": "...", "finished_at": "...", "duration_ms": 90012,
+  "output_visible": true, "output": "..."
+}
+```
+
+- `status`: `submitted`, `accepted`, `running`, then one of `succeeded`,
+  `failed`, `cancelled`, `timed_out`.
+- `error` on a failed job is a code or the agent's message. Codes from the
+  server: `dispatch_timeout` (no agent took it within 60 s), `agent_no_ack`
+  (sent, not acknowledged within 15 s), `result_lost` (no result by deadline
+  + 60 s), and `agent_lost_job` (the agent reconnected without it). Codes from
+  the agent include `agent_busy`, `agent_stopped`, `duplicate_job`,
+  `bad_host` and `bad_entitlements`.
+- `source`: `api`, `execute`, `fleet_execute`, `playbook`, `schedule` or
+  `rule`.
+- **Output visibility.** Only the submitter and the tenant's admins see
+  `output`. Anyone else with `exec:run` gets `output: null`,
+  `output_visible: false`, and `error` reduced to a code (`agent_error` when
+  the agent's text is not one).
+- `output` is capped at 1 MiB (`output_truncated: true` when it was cut).
+- **Retention.** Output is removed `SYSTEMAPI_JOB_OUTPUT_RETENTION_HOURS`
+  (default 72, 1 to 8760) after the job ends, which sets
+  `output_expired: true`. Ended jobs are deleted after
+  `SYSTEMAPI_JOB_RETENTION_DAYS` (default 30, 1 to 3650).
+
+**List.** `GET /api/v1/jobs` answers `200 {"jobs": [...]}`: newest first, the
+jobs of every tenant where the caller holds `exec:run`, without `output` or
+`output_visible`. `host_id` and `status` filter; `limit` is 1 to 200
+(default 50).
+
+**Cancel.** Answers `202 {"job": {...}}` with `cancel_requested_at` set. The
+job ends `cancelled` once the agent has stopped it: SIGTERM to the script's
+process group, then SIGKILL 10 s later. A job that has already ended is 409
+`job_finished`.
+
+**Errors.**
+
+| Status | `error` | When |
+| --- | --- | --- |
+| 400 | `bad_script`, `bad_entitlements`, `bad_timeout`, `bad_wait` | Submit body out of range. |
+| 400 | `bad_host_id`, `bad_status`, `bad_limit` | List query. |
+| 403 | `scope_denied` | No `exec:run`, or a cancel by someone other than the submitter or an admin. |
+| 404 | `not_found` | Unknown host or job, or one in another tenant (logged as an `idor` security event). |
+| 409 | `agent_offline` | The host's agent is not connected (or its presence on another instance is older than 90 s). |
+| 409 | `job_finished` | Cancel of an ended job. |
+| 429 | `too_many_jobs` | 8 live jobs on the host, or 64 in the tenant. |
+| 501 | `agent_unsupported` | The agent does not advertise `sysscript_jobs`. |
+| 503 | `jobs_disabled` | The server runs with `SYSTEMAPI_SYSSCRIPT_JOBS=0`. |
+
+**Server settings.**
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `SYSTEMAPI_SYSSCRIPT_JOBS` | `1` | `0` is the kill switch: the `/jobs` routes answer 503 and every caller (`/execute`, `/fleet/execute`, playbooks, schedules, rule playbooks) uses the legacy path. Jobs already submitted still end and are stored. |
+| `SYSTEMAPI_SYSSCRIPT_JOB_MAX_S` | `1800` | Largest `timeout_s` accepted (1 to 3600). |
+| `SYSTEMAPI_SCHEDULE_JOB_TIMEOUT_S` | `300` | `timeout_s` of a scheduled script (1 to 3600). |
+| `SYSTEMAPI_JOB_OUTPUT_RETENTION_HOURS` | `72` | Hours output is kept after a job ends. |
+| `SYSTEMAPI_JOB_RETENTION_DAYS` | `30` | Days an ended job row is kept. |
+
+Rollout and rollback: `docs/sah-sysscript-jobs.md`.
+
 ## Audit, compliance, tenants
 
 | Method | Path |
