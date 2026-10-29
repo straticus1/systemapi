@@ -242,31 +242,38 @@ func starlarkToGo(v starlark.Value) interface{} {
 	}
 }
 
-// goToStarlark converts a native Go value (as produced by yaml.v3 Unmarshal) to a Starlark value.
-func goToStarlark(v interface{}) starlark.Value {
+// goToStarlark converts a native Go value (as produced by yaml.v3 or
+// encoding/json Unmarshal) to a Starlark value. Dict keys are in sorted
+// order, so a dict iterates the same way every run (the converge
+// declaration depends on it). Non-string map keys are formatted with %v; two
+// keys that format alike (1 and "1") are an error rather than one silently
+// replacing the other.
+func goToStarlark(v interface{}) (starlark.Value, error) {
 	if v == nil {
-		return starlark.None
+		return starlark.None, nil
 	}
 	switch val := v.(type) {
 	case bool:
-		return starlark.Bool(val)
+		return starlark.Bool(val), nil
 	case int:
-		return starlark.MakeInt(val)
+		return starlark.MakeInt(val), nil
 	case int64:
-		return starlark.MakeInt64(val)
+		return starlark.MakeInt64(val), nil
 	case float64:
-		return starlark.Float(val)
+		return starlark.Float(val), nil
 	case string:
-		return starlark.String(val)
+		return starlark.String(val), nil
 	case []interface{}:
 		elems := make([]starlark.Value, len(val))
 		for i, item := range val {
-			elems[i] = goToStarlark(item)
+			e, err := goToStarlark(item)
+			if err != nil {
+				return nil, err
+			}
+			elems[i] = e
 		}
-		return starlark.NewList(elems)
+		return starlark.NewList(elems), nil
 	case map[string]interface{}:
-		// Keys in sorted order, so a dict iterates the same way every run
-		// (the converge declaration depends on it).
 		keys := make([]string, 0, len(val))
 		for k := range val {
 			keys = append(keys, k)
@@ -274,17 +281,26 @@ func goToStarlark(v interface{}) starlark.Value {
 		sort.Strings(keys)
 		d := starlark.NewDict(len(val))
 		for _, k := range keys {
-			d.SetKey(starlark.String(k), goToStarlark(val[k]))
+			e, err := goToStarlark(val[k])
+			if err != nil {
+				return nil, err
+			}
+			if err := d.SetKey(starlark.String(k), e); err != nil {
+				return nil, err
+			}
 		}
-		return d
+		return d, nil
 	case map[interface{}]interface{}:
-		// yaml.v3 can produce this for non-string-keyed maps
 		byKey := make(map[string]interface{}, len(val))
 		for k, item := range val {
-			byKey[fmt.Sprintf("%v", k)] = item
+			ks := fmt.Sprintf("%v", k)
+			if _, dup := byKey[ks]; dup {
+				return nil, fmt.Errorf("map keys collide as %q", ks)
+			}
+			byKey[ks] = item
 		}
 		return goToStarlark(byKey)
 	default:
-		return starlark.String(fmt.Sprintf("%v", val))
+		return starlark.String(fmt.Sprintf("%v", val)), nil
 	}
 }

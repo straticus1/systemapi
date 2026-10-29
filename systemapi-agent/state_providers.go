@@ -147,16 +147,7 @@ func pathFactsOf(fi os.FileInfo) pathFacts {
 	default:
 		pf.Type = "other"
 	}
-	pf.Mode = uint32(fi.Mode().Perm())
-	if fi.Mode()&os.ModeSetuid != 0 {
-		pf.Mode |= 0o4000
-	}
-	if fi.Mode()&os.ModeSetgid != 0 {
-		pf.Mode |= 0o2000
-	}
-	if fi.Mode()&os.ModeSticky != 0 {
-		pf.Mode |= 0o1000
-	}
+	pf.Mode = rawMode(fi.Mode())
 	if uid, gid, ok := fileOwnerIDs(fi); ok {
 		pf.UID, pf.GID = uid, gid
 	}
@@ -411,14 +402,52 @@ func sysctlStateGranted(ents *Entitlements, key string) bool {
 
 func fmtMode(m uint32) string { return fmt.Sprintf("%04o", m) }
 
-// parseStateMode parses an octal mode of at most 0777 (no setuid, setgid or
-// sticky bit).
-func parseStateMode(s string) (uint32, error) {
+// rawMode is the 0o7777 permission bits of m, as stat reports them.
+func rawMode(m os.FileMode) uint32 {
+	r := uint32(m.Perm())
+	if m&os.ModeSetuid != 0 {
+		r |= 0o4000
+	}
+	if m&os.ModeSetgid != 0 {
+		r |= 0o2000
+	}
+	if m&os.ModeSticky != 0 {
+		r |= 0o1000
+	}
+	return r
+}
+
+// fileModeOf turns raw 0o7777 bits into an os.FileMode for chmod.
+func fileModeOf(r uint32) os.FileMode {
+	m := os.FileMode(r & 0o777)
+	if r&0o4000 != 0 {
+		m |= os.ModeSetuid
+	}
+	if r&0o2000 != 0 {
+		m |= os.ModeSetgid
+	}
+	if r&0o1000 != 0 {
+		m |= os.ModeSticky
+	}
+	return m
+}
+
+// parseStateMode parses an octal mode of at most 0777 for a file. For a
+// directory (dir) the setgid (2000) and sticky (1000) bits are also
+// allowed; setuid never is.
+func parseStateMode(s string, dir bool) (uint32, error) {
+	limit := uint64(0o777)
+	if dir {
+		limit = 0o3777
+	}
 	if s == "" || len(s) > 4 {
 		return 0, fmt.Errorf("invalid mode %q", s)
 	}
 	n, err := strconv.ParseUint(s, 8, 32)
-	if err != nil || n > 0o777 {
+	if err != nil || n > limit {
+		if dir {
+			return 0, fmt.Errorf("invalid mode %q (octal, at most 3777: no setuid)", s)
+		}
 		return 0, fmt.Errorf("invalid mode %q (octal, at most 0777)", s)
 	}
 	return uint32(n), nil
@@ -663,13 +692,14 @@ func (r *dirResource) Apply(ctx context.Context, rw WriteHost, d Diff) error {
 		return fmt.Errorf("%s exists and is not a directory", r.path)
 	}
 	if !pf.Exists {
-		if err := rw.Mkdir(r.path, os.FileMode(r.mode)); err != nil {
+		if err := rw.Mkdir(r.path, os.FileMode(r.mode&0o777)); err != nil {
 			return err
 		}
 	}
-	// mkdir is subject to the umask, so the mode is set explicitly.
+	// mkdir is subject to the umask and drops the special bits, so the mode
+	// is set explicitly.
 	if !pf.Exists || hasField(d.Fields, "mode") {
-		if err := rw.Chmod(r.path, grantFSWrite, os.FileMode(r.mode)); err != nil {
+		if err := rw.Chmod(r.path, grantFSWrite, fileModeOf(r.mode)); err != nil {
 			return err
 		}
 	}
@@ -886,10 +916,21 @@ func checkResource(ctx context.Context, c Checker, ro ReadOnlyHost) resourceResu
 	default:
 		res.Status = statusDrift
 		if !c.Sensitive() {
-			res.Diff = d.Text
+			res.Diff = capDiff(d.Text)
 		}
 	}
 	return res
+}
+
+// stateDiffMax caps one resource's diff text.
+const stateDiffMax = 32 * 1024
+
+// capDiff cuts a diff at stateDiffMax bytes and marks the cut.
+func capDiff(s string) string {
+	if len(s) <= stateDiffMax {
+		return s
+	}
+	return s[:stateDiffMax] + "\n[diff truncated]\n"
 }
 
 // applyChecked applies a resource whose check drifted, then verifies it

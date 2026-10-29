@@ -109,7 +109,7 @@ func (h *fakeHost) mkdirAll(root, target string, mode os.FileMode) error {
 func (h *fakeHost) chmod(root, target string, mode os.FileMode) error {
 	h.writes++
 	if f, ok := h.files[target]; ok && !h.inert {
-		f.mode = uint32(mode.Perm())
+		f.mode = rawMode(mode)
 	}
 	return nil
 }
@@ -582,14 +582,50 @@ func TestReplaceBeneathRefusesSwappedParent(t *testing.T) {
 
 func TestStateParseMode(t *testing.T) {
 	for _, ok := range []string{"0644", "755", "0", "0777"} {
-		if _, err := parseStateMode(ok); err != nil {
+		if _, err := parseStateMode(ok, false); err != nil {
 			t.Errorf("%q: %v", ok, err)
 		}
 	}
-	for _, bad := range []string{"", "4755", "1777", "0888", "abc", "-1", "07777"} {
-		if _, err := parseStateMode(bad); err == nil {
-			t.Errorf("%q accepted", bad)
+	for _, bad := range []string{"", "4755", "1777", "2755", "0888", "abc", "-1", "07777"} {
+		if _, err := parseStateMode(bad, false); err == nil {
+			t.Errorf("file %q accepted", bad)
 		}
+	}
+	for _, ok := range []string{"0755", "1777", "2775", "3777"} {
+		if _, err := parseStateMode(ok, true); err != nil {
+			t.Errorf("dir %q: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"4755", "6755", "7777"} {
+		if _, err := parseStateMode(bad, true); err == nil {
+			t.Errorf("dir %q (setuid) accepted", bad)
+		}
+	}
+	for _, r := range []uint32{0o755, 0o1777, 0o2775, 0o4755} {
+		if rawMode(fileModeOf(r)) != r {
+			t.Errorf("%o does not round-trip", r)
+		}
+	}
+}
+
+// A directory may carry the sticky bit; check, apply and check converge on
+// the real filesystem.
+func TestOSDirStickyMode(t *testing.T) {
+	ctx := context.Background()
+	dir := realTempDir(t)
+	ents := &Entitlements{AllowFSWrite: []string{dir}}
+	b := osHostBackend()
+	ro := newReadOnlyHost(ents, b.reads)
+	r := &dirResource{path: filepath.Join(dir, "spool"), mode: 0o1777}
+	res := applyChecked(ctx, r, ro, newWriteHost(ents, b.newWrites()), checkResource(ctx, r, ro))
+	if res.Status != statusChanged {
+		t.Fatalf("%s %q", res.Status, res.Error)
+	}
+	if again := checkResource(ctx, r, ro); again.Status != statusOK {
+		t.Fatalf("recheck %s %v", again.Status, again.diff.Fields)
+	}
+	if fi, _ := os.Stat(r.path); fi.Mode()&os.ModeSticky == 0 || fi.Mode().Perm() != 0o777 {
+		t.Fatalf("mode %v", fi.Mode())
 	}
 }
 
@@ -600,7 +636,7 @@ func TestSystemdEnabledState(t *testing.T) {
 			t.Errorf("%q: %v %v", state, got, err)
 		}
 	}
-	for _, bad := range []string{"", "not-found", "bad", "Failed to get unit file state"} {
+	for _, bad := range []string{"", "not-found", "bad", "alias", "Failed to get unit file state"} {
 		if _, err := systemdEnabledState(bad); err == nil {
 			t.Errorf("%q classified", bad)
 		}

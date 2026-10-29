@@ -27,6 +27,7 @@ SYSTEMAPI_API_KEY=<key> ./systemapi-agent \
 | `--pty-record-max-bytes` | 1 GiB | A session ends (`pty_exit` reason `stopped`, `record_error` `recording_size_limit`) once it has recorded this many bytes. |
 | `--pty-record-min-free` | 1 GiB | A session is refused (`recording_unavailable`) when the recording filesystem has less free space than this. |
 | `--sysscript-jobs` | `true` | Advertise the `sysscript_jobs` capability (Linux and macOS). `false` stops advertising it, so the server sends this host's scripts the legacy way. Windows agents never advertise it. |
+| `--state-backup-dir` | `/var/lib/systemapi/backups` | Where `sys.state` keeps file backups (absolute, root-only). It must not overlap any write grant, or file changes that need a backup fail. |
 | `--sysscript-workers` | 4 | Scripts that run at once (1 to 16), jobs and legacy scripts together. 8 more may wait for a worker; beyond that a script is refused `agent_busy`. |
 | `--sysscript-legacy-seconds` | 300 | Whole-script deadline of a legacy (non-job) script, 1 to 3600, cut to `--sysscript-max-seconds`. |
 | `--sysscript-max-seconds` | 3600 | Ceiling for any script deadline (1 to 3600). A job deadline beyond it is cut to it. |
@@ -217,15 +218,23 @@ takes the same arguments and only checks; it never changes the host.
 
 | Verb | Arguments | Grant (checked for check and ensure) |
 | --- | --- | --- |
-| `file` | `path, content, mode="0644", owner="", group="", sensitive=False` | path under `allow_config_write` or `allow_fs_write` |
+| `file` | `path, content, mode="0644" (0600 when sensitive), owner="", group="", sensitive=False` | path under `allow_config_write` or `allow_fs_write`; check reads the current content under that write grant |
 | `directory` | `path, mode="0755", owner="", group=""` | path under `allow_fs_write` |
 | `absent` | `path` | path under `allow_fs_write` |
 | `package` | `name, present=True, version=None` | `name` in `allow_packages` |
 | `service` | `name, running=True, enabled=True` | `name` in `allow_service_reload` (exactly; `"*"` does not count) |
 | `sysctl` | `key, value` | `key` in `allow_sysctl`, plus `allow_linux` |
 
-- Paths must be absolute and clean. A mode is octal, at most `0777`. `owner`
-  and `group` are names or numeric ids; empty leaves them as they are.
+- `check_file` and `ensure_file` read the file's current content under the
+  write grant (`allow_config_write` or `allow_fs_write`); no `allow_fs_read`
+  is needed. Holding the right to write a path implies reading it: the
+  result carries its sha256 and a unified diff (capped at 32 KiB) unless
+  `sensitive=True`. Do not grant write on a path whose current content the
+  script's reader must not see.
+- Paths must be absolute and clean. A mode is octal: at most `0777` for a
+  file; a directory may also carry setgid (`2000`) and sticky (`1000`), never
+  setuid. `owner` and `group` are names or numeric ids; empty leaves them as
+  they are.
 - `file` compares content, mode and owner. It replaces the file atomically
   (a temp file in the same directory, renamed over it) with the given mode
   and owner. A symlink at the path is replaced, never followed. A file with
@@ -234,11 +243,13 @@ takes the same arguments and only checks; it never changes the host.
   `/var/lib/systemapi/backups/<sha256 of the path>/<unix ns>` (directory
   0700, file 0600); the newest 5 are kept per path. Nothing is written beside
   the target. The backup directory may not overlap a write grant; if it
-  does, the change fails.
+  does, the change fails. A broad write grant (`/`, `/var`, `/var/lib` or
+  `"*"`) therefore makes every file change that needs a backup fail closed:
+  start the agent with `--state-backup-dir` pointing outside the grants.
 - `absent` removes a file, a symlink or an empty directory, never
   recursively.
 - `sensitive=True` reports only whether the content matches: no hash, size
-  or diff.
+  or diff. Its mode defaults to `0600`.
 - `version=` is check-only: a different installed version is reported as
   drift, and `ensure_package` then fails with `version_pin_unsupported`
   without calling the package manager.

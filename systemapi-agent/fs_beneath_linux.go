@@ -241,34 +241,36 @@ func statBeneath(root, target string) (pathFacts, error) {
 }
 
 // readBeneath reads target under root: a regular file with a single link,
-// at most max bytes, opened O_NOFOLLOW|O_NONBLOCK.
+// at most max bytes. It opens O_PATH|O_NOFOLLOW first and checks the inode
+// with fstat, then opens it for reading through /proc/self/fd/N only when
+// it is a regular file, so a FIFO or device is never opened for I/O.
+// Without /proc it fails closed.
 func readBeneath(root, target string, max int) ([]byte, error) {
-	rootFD, rel, err := openBeneathRoot(root, target)
+	fd, st, err := openPathBeneath(root, target)
 	if err != nil {
 		return nil, err
 	}
-	defer unix.Close(rootFD)
-	if rel == "." {
-		return nil, fmt.Errorf("is a directory")
-	}
-	fd, err := openat2(rootFD, rel, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, fileResolve)
-	if err != nil {
-		return nil, beneathErr(err)
-	}
-	f := os.NewFile(uintptr(fd), target)
-	defer f.Close()
-	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil {
-		return nil, err
-	}
+	defer unix.Close(fd)
 	if st.Mode&unix.S_IFMT != unix.S_IFREG {
 		return nil, fmt.Errorf("not a regular file")
 	}
-	if hardLinked(&st) {
+	if hardLinked(st) {
 		return nil, fmt.Errorf("refusing a file with more than one hard link")
 	}
 	if st.Size > int64(max) {
 		return nil, fmt.Errorf("file exceeds %d bytes", max)
+	}
+	f, err := os.OpenFile("/proc/self/fd/"+strconv.Itoa(fd), os.O_RDONLY|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var again unix.Stat_t
+	if err := unix.Fstat(int(f.Fd()), &again); err != nil {
+		return nil, err
+	}
+	if again.Dev != st.Dev || again.Ino != st.Ino {
+		return nil, fmt.Errorf("file changed while opening")
 	}
 	return readLimited(f, max)
 }

@@ -135,8 +135,10 @@ func systemdEnabledState(state string) (bool, error) {
 	case "enabled", "enabled-runtime":
 		return true, nil
 	case "disabled", "static", "indirect", "masked", "masked-runtime", "linked", "linked-runtime",
-		"alias", "generated", "transient":
+		"generated", "transient":
 		return false, nil
+	case "alias":
+		return false, fmt.Errorf("service is an alias; manage the unit it points to")
 	default:
 		return false, fmt.Errorf("service enabled state unknown")
 	}
@@ -157,13 +159,15 @@ func (m openrcServiceManager) Action(ctx context.Context, verb, service string) 
 	if err := validService(verb, service); err != nil {
 		return "", err
 	}
-	// enable/disable are rc-update; the rest are rc-service verbs.
+	// enable/disable are rc-update on the default runlevel, named
+	// explicitly so IsEnabled checks the same level; the rest are rc-service
+	// verbs.
 	var cmd *jobCmd
 	switch verb {
 	case "enable":
-		cmd = jobCommand(ctx, "rc-update", "add", service)
+		cmd = jobCommand(ctx, "rc-update", "add", service, "default")
 	case "disable":
-		cmd = jobCommand(ctx, "rc-update", "del", service)
+		cmd = jobCommand(ctx, "rc-update", "del", service, "default")
 	default:
 		cmd = jobCommand(ctx, "rc-service", service, verb)
 	}
@@ -185,22 +189,20 @@ func (m openrcServiceManager) Status(ctx context.Context, service string) (Servi
 	return ServiceStatus{Active: active, State: state, Output: text}, nil
 }
 
-// IsEnabled reports whether the service is in the default or boot
-// runlevel, which is what `rc-update add` creates.
+// IsEnabled reports whether the service is in the default runlevel, the
+// level Action's enable and disable add to and remove from.
 func (m openrcServiceManager) IsEnabled(ctx context.Context, service string) (bool, error) {
 	if !serviceNameRE.MatchString(service) {
 		return false, fmt.Errorf("service not allowed")
 	}
-	for _, level := range []string{"default", "boot"} {
-		_, err := os.Lstat(filepath.Join("/etc/runlevels", level, service))
-		if err == nil {
-			return true, nil
-		}
-		if !errors.Is(err, fs.ErrNotExist) {
-			return false, err
-		}
+	_, err := os.Lstat(filepath.Join("/etc/runlevels/default", service))
+	if err == nil {
+		return true, nil
 	}
-	return false, nil
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	return false, err
 }
 
 // launchdEnabledFrom reads `launchctl print-disabled system` output. A

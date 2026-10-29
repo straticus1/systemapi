@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"go.starlark.net/starlark"
 )
 
 // stateEngine is a test engine with backups under a temp dir.
@@ -168,4 +170,51 @@ func TestSysStateRejectsBadArguments(t *testing.T) {
 // quoteStar quotes s as a Starlark string literal.
 func quoteStar(s string) string {
 	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s) + `"`
+}
+
+// Gate 5: sensitive=True defaults the mode to 0600; an explicit mode wins.
+func TestSysStateSensitiveDefaultsTo0600(t *testing.T) {
+	for _, c := range []struct{ args, want string }{
+		{`sensitive=True`, "0600"},
+		{`sensitive=True, mode="0640"`, "0640"},
+		{``, "0644"},
+	} {
+		r, err := parseFileResource("ensure_file", nil, kwargsFor(t, c.args))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fmtMode(r.mode) != c.want {
+			t.Errorf("%q: mode %s", c.args, fmtMode(r.mode))
+		}
+	}
+}
+
+// kwargsFor parses "a=1, b=2" Starlark keyword arguments plus a fixed
+// path and content.
+func kwargsFor(t *testing.T, extra string) []starlark.Tuple {
+	t.Helper()
+	src := `kw = dict(path="/srv/x", content="c"`
+	if extra != "" {
+		src += ", " + extra
+	}
+	src += ")"
+	g, err := starlark.ExecFile(&starlark.Thread{}, "kw.star", src, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []starlark.Tuple
+	for _, kv := range g["kw"].(*starlark.Dict).Items() {
+		out = append(out, starlark.Tuple{kv[0], kv[1]})
+	}
+	return out
+}
+
+func TestGoToStarlarkKeyCollision(t *testing.T) {
+	if _, err := goToStarlark(map[interface{}]interface{}{1: "a", "1": "b"}); err == nil {
+		t.Fatal("colliding keys accepted")
+	}
+	v, err := goToStarlark(map[interface{}]interface{}{1: "a", "2": "b"})
+	if err != nil || v.(*starlark.Dict).Len() != 2 {
+		t.Fatalf("%v %v", v, err)
+	}
 }

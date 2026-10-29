@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 // bundleJSON builds a bundle string.
@@ -295,10 +296,11 @@ func TestConvergePlanHashDeterministicAndCoversRestart(t *testing.T) {
 		keys[r.Key()] = i
 	}
 	plan := buildPlan(resources, results, keys)
-	if planSHA256(plan, resources, results) != a.PlanSHA256 {
+	bsha := sha256Hex(nginxBundle(t, 8080))
+	if planSHA256(bsha, plan, resources, results) != a.PlanSHA256 {
 		t.Fatal("recomputed hash differs")
 	}
-	if planSHA256(plan[:len(plan)-1], resources, results) == a.PlanSHA256 {
+	if planSHA256(bsha, plan[:len(plan)-1], resources, results) == a.PlanSHA256 {
 		t.Fatal("the restart line is not in the plan hash")
 	}
 	// A different port is a different plan.
@@ -481,5 +483,155 @@ func TestConvergeTemplateInDeclarationIsPure(t *testing.T) {
 	}
 	if first.Resources[0].Desired["sha256"] != sha256Hex("a=b\nm=2\nz=1\nweb\n") {
 		t.Fatalf("rendered content: %v", first.Resources[0].Desired)
+	}
+}
+
+// B1: a value doubled through a variable is refused long before it grows
+// large, although it is never written.
+func TestTemplateDoublingBombRefused(t *testing.T) {
+	for _, src := range []string{
+		`{{$x := "ab"}}{{range 24}}{{$x = printf "%s%s" $x $x}}{{end}}{{len $x}}`,
+		`{{$x := "ab"}}{{range 40}}{{$x = printf "%s%s" $x $x}}{{end}}{{len $x}}`,
+		`{{$x := "ab"}}{{range 40}}{{$x = print $x $x}}{{end}}{{len $x}}`,
+		`{{$x := "ab"}}{{range 40}}{{$x = quote (print $x $x)}}{{end}}{{len $x}}`,
+		`{{$x := "ab"}}{{range 40}}{{$x = indent 64 (print $x "\n" $x)}}{{end}}{{len $x}}`,
+	} {
+		b := templateBudget{rangeLeft: templateRangeBudget}
+		out, err := renderTemplate(context.Background(), src, map[string]any{}, &b)
+		if err == nil {
+			t.Errorf("%s: rendered %q", src, out)
+			continue
+		}
+		var ce *codedError
+		if !errors.As(err, &ce) || (ce.code != "template_output_too_large" && ce.code != "template_too_complex") {
+			t.Errorf("%s: %v", src, err)
+		}
+		if b.funcBytes > templateFuncBytesMax+templateCallMax {
+			t.Errorf("%s: produced %d bytes", src, b.funcBytes)
+		}
+	}
+	// Many small values add up to the run budget.
+	b := templateBudget{rangeLeft: templateRangeBudget}
+	big := strings.Repeat("y", 200*1024)
+	_, err := renderTemplate(context.Background(), `{{range 100}}{{$y := upper $.s}}{{end}}`, map[string]any{"s": big}, &b)
+	if err == nil || !strings.HasPrefix(err.Error(), "template_too_complex") {
+		t.Fatalf("run budget: %v", err)
+	}
+}
+
+// B1: a range that writes nothing still stops on cancel, per iteration.
+func TestTemplateNonWritingRangeCancels(t *testing.T) {
+	ctx := &cancelAfter{Context: context.Background(), n: 50}
+	b := templateBudget{rangeLeft: templateRangeBudget}
+	_, err := renderTemplate(ctx, `{{range .l}}{{end}}`, map[string]any{"l": make([]any, 900000)}, &b)
+	if !errors.Is(err, errScriptCancelled) {
+		t.Fatalf("err %v", err)
+	}
+	if ctx.calls > 60 {
+		t.Fatalf("ran on after cancel: %d ctx checks", ctx.calls)
+	}
+}
+
+// B1: a declaration that grows the heap past the budget is stopped.
+func TestConvergeHeapWatchdog(t *testing.T) {
+	oldMax, oldSample := convergeHeapMax, convergeHeapSample
+	convergeHeapMax, convergeHeapSample = 32<<20, 2*time.Millisecond
+	t.Cleanup(func() { convergeHeapMax, convergeHeapSample = oldMax, oldSample })
+	h := newFakeHost()
+	built := 0
+	res := runCheck(t, bundleJSON(t, map[string]string{"main.star": `
+l = []
+for i in range(400):
+    l.append("x" * (1 << 20) + str(i))
+`}, nil), h, &built)
+	if res.ErrorCode != "too_much_memory" || built != 0 {
+		t.Fatalf("%s %s %q", res.Status, res.ErrorCode, res.Error)
+	}
+}
+
+// B2: error text that quotes a vars value is masked.
+func TestConvergeErrorMasksVars(t *testing.T) {
+	vars := map[string]any{"pw": "hunter2secret", "path": "/srv/app/hunter3-secret"}
+	for name, main := range map[string]string{
+		"fail":      `fail(state.vars["pw"])`,
+		"dict miss": `x = {}[state.vars["pw"]]`,
+		"template":  `template("{{" + state.vars["pw"] + "}}", {})`,
+	} {
+		h := newFakeHost()
+		built := 0
+		res := runCheck(t, bundleJSON(t, map[string]string{"main.star": main}, vars), h, &built)
+		if res.Status != "failed" || strings.Contains(res.Error, "hunter2") || !strings.HasSuffix(res.Error, "[masked]") {
+			t.Errorf("%s: %s %q", name, res.ErrorCode, res.Error)
+		}
+		if strings.Contains(string(res.Report), "hunter2") {
+			t.Errorf("%s: report %s", name, res.Report)
+		}
+	}
+	// A resource error quoting a path built from vars. (The key itself is
+	// the resource's identity and stays in the plan.)
+	h := newFakeHost()
+	built := 0
+	ents := convergeGrants()
+	ents.AllowFSWrite = nil
+	res := convergeRun(context.Background(), convergeRequest{BundleJSON: bundleJSON(t, map[string]string{"main.star": `state.file(state.vars["path"], "x")`}, vars),
+		Ents: ents, Mode: "check", ExpectPlan: "-"}, countingBackend(h, &built))
+	if !strings.Contains(string(res.Report), `"error":"[masked]"`) {
+		t.Fatalf("report %s", res.Report)
+	}
+}
+
+// Gate 3: a change to a sensitive file's desired content changes the plan
+// hash although its facts carry no hash.
+func TestConvergePlanHashCoversSensitiveContent(t *testing.T) {
+	h := newFakeHost()
+	h.files["/srv/app/token"] = &fakeFile{content: "old", mode: 0o600}
+	built := 0
+	plan := func(v string) string {
+		return decodeReport(t, runCheck(t, bundleJSON(t, map[string]string{"main.star": `state.file("/srv/app/token", state.vars["t"], sensitive=True)`},
+			map[string]any{"t": v}), h, &built)).PlanSHA256
+	}
+	if plan("new-1") == plan("new-2") {
+		t.Fatal("sensitive content change kept the plan hash")
+	}
+}
+
+// Gate 6: one path cannot be declared as two kinds.
+func TestConvergePathDeclaredTwice(t *testing.T) {
+	for _, main := range []string{
+		"state.directory(\"/srv/app/x\")\nstate.file(\"/srv/app/x\", \"\")",
+		"state.file(\"/srv/app/x\", \"\")\nstate.directory(\"/srv/app/x\")",
+		"state.absent(\"/srv/app/x\")\nstate.directory(\"/srv/app/x\")",
+	} {
+		h := newFakeHost()
+		built := 0
+		if res := runCheck(t, bundleJSON(t, map[string]string{"main.star": main}, nil), h, &built); res.ErrorCode != "duplicate_resource" {
+			t.Errorf("%q: %s", main, res.ErrorCode)
+		}
+	}
+}
+
+// Low 9: restart_on must be a list or tuple.
+func TestConvergeRestartOnType(t *testing.T) {
+	h := newFakeHost()
+	built := 0
+	res := runCheck(t, bundleJSON(t, map[string]string{"main.star": "k = state.file(\"/srv/app/a\", \"\")\nstate.service(\"nginx\", restart_on=k)"}, nil), h, &built)
+	if res.ErrorCode != "declaration_failed" || !strings.Contains(res.Error, "list or tuple") {
+		t.Fatalf("%s %q", res.ErrorCode, res.Error)
+	}
+	res = runCheck(t, bundleJSON(t, map[string]string{"main.star": "k = state.file(\"/srv/app/a\", \"\")\nstate.service(\"nginx\", restart_on=(k,))"}, nil), h, &built)
+	if res.Status != "succeeded" {
+		t.Fatalf("tuple: %s %q", res.ErrorCode, res.Error)
+	}
+}
+
+// Low 10: a large diff is cut with a marker.
+func TestConvergeDiffCapped(t *testing.T) {
+	h := newFakeHost()
+	h.files["/srv/app/big"] = &fakeFile{content: strings.Repeat("a", 100000) + "\n", mode: 0o644}
+	built := 0
+	rep := decodeReport(t, runCheck(t, bundleJSON(t, map[string]string{"main.star": `state.file("/srv/app/big", "b" * 100000 + "\n")`}, nil), h, &built))
+	d := rep.Resources[0].Diff
+	if len(d) > stateDiffMax+64 || !strings.HasSuffix(d, "[diff truncated]\n") {
+		t.Fatalf("diff %d bytes", len(d))
 	}
 }

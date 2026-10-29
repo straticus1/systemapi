@@ -29,7 +29,7 @@ func jsonParse(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple
 	if err := json.Unmarshal([]byte(content), &raw); err != nil {
 		return starlark.None, fmt.Errorf("json.parse: %w", err)
 	}
-	return goToStarlark(raw), nil
+	return goToStarlark(raw)
 }
 
 // sys.json.encode(value) - Starlark dict/list -> JSON string
@@ -182,7 +182,7 @@ func yamlParse(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple
 	if err := yaml.Unmarshal([]byte(content), &raw); err != nil {
 		return starlark.None, fmt.Errorf("yaml parse error: %w", err)
 	}
-	return goToStarlark(raw), nil
+	return goToStarlark(raw)
 }
 
 // --- sys.yaml.encode(value) ---

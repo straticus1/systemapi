@@ -12,8 +12,13 @@ package main
 // call, against the run's entitlements: these verbs reach nothing the
 // matching sys.fs, sys.config, sys.packages, sys.services and sys.procfs
 // verbs could not, and services need an exact grant ("*" is refused). A
-// check_* verb builds only a ReadOnlyHost. Results carry facts and a capped
-// error, never a sensitive file's hash, size or diff.
+// check_* verb builds only a ReadOnlyHost, but it is not a read-only
+// grant: check_file (like ensure_file and the converge diff) reads the
+// current content of a path under a write grant (allow_config_write or
+// allow_fs_write), with no allow_fs_read, and returns its hash and a diff
+// (capped at 32 KiB) unless sensitive=True. Holding the right to write a
+// path implies reading it. Results carry facts and a capped error, never a
+// sensitive file's hash, size or diff.
 
 import (
 	"fmt"
@@ -75,8 +80,7 @@ func parseOwners(fn, owner, group string) error {
 // parseFileResource: (path, content, mode="0644", owner="", group="",
 // sensitive=False).
 func parseFileResource(fn string, args starlark.Tuple, kwargs []starlark.Tuple) (*fileResource, error) {
-	var path, content, owner, group string
-	mode := "0644"
+	var path, content, owner, group, mode string
 	var sensitive bool
 	if err := starlark.UnpackArgs(fn, args, kwargs, "path", &path, "content", &content,
 		"mode?", &mode, "owner?", &owner, "group?", &group, "sensitive?", &sensitive); err != nil {
@@ -88,7 +92,14 @@ func parseFileResource(fn string, args starlark.Tuple, kwargs []starlark.Tuple) 
 	if len(content) > stateContentMax {
 		return nil, fmt.Errorf("%s: content exceeds %d bytes", fn, stateContentMax)
 	}
-	m, err := parseStateMode(mode)
+	if mode == "" {
+		// A sensitive file is private unless a mode is given.
+		mode = "0644"
+		if sensitive {
+			mode = "0600"
+		}
+	}
+	m, err := parseStateMode(mode, false)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", fn, err)
 	}
@@ -108,7 +119,7 @@ func parseDirResource(fn string, args starlark.Tuple, kwargs []starlark.Tuple) (
 	if err := parsePath(fn, path); err != nil {
 		return nil, err
 	}
-	m, err := parseStateMode(mode)
+	m, err := parseStateMode(mode, true)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", fn, err)
 	}
@@ -177,9 +188,14 @@ func parseServiceResource(fn string, args starlark.Tuple, kwargs []starlark.Tupl
 	}
 	r := &serviceResource{name: name, running: running, enabled: enabled}
 	if restartOn != starlark.None {
-		seq, ok := restartOn.(starlark.Indexable)
-		if !ok {
-			return nil, fmt.Errorf("%s: restart_on must be a list of resource keys", fn)
+		var seq starlark.Indexable
+		switch v := restartOn.(type) {
+		case *starlark.List:
+			seq = v
+		case starlark.Tuple:
+			seq = v
+		default:
+			return nil, fmt.Errorf("%s: restart_on must be a list or tuple of resource keys", fn)
 		}
 		if seq.Len() > restartOnMax {
 			return nil, fmt.Errorf("%s: restart_on has more than %d keys", fn, restartOnMax)
@@ -225,7 +241,11 @@ func factsValue(f Facts) (starlark.Value, error) {
 	sort.Strings(keys)
 	d := starlark.NewDict(len(f))
 	for _, k := range keys {
-		if err := d.SetKey(starlark.String(k), goToStarlark(f[k])); err != nil {
+		v, err := goToStarlark(f[k])
+		if err != nil {
+			return nil, err
+		}
+		if err := d.SetKey(starlark.String(k), v); err != nil {
 			return nil, err
 		}
 	}

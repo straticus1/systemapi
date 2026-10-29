@@ -21,15 +21,23 @@ package main
 // renders text/template from a bundle file or an inline string with a fixed
 // side-effect-free FuncMap: no now, env or file function, no define, block
 // or template action (so no recursion), a range iteration budget charged
-// before each range runs, an output cap per call and per run, a capped
-// printf width, and a context check at every write and range; a top-level
-// generated_at var is refused so no timestamp can enter rendered content.
-// print() output is capped and a line holding a vars value is masked. Check
-// mode never builds a WriteHost: newWrites is called only on the apply path,
-// after the plan hash matched. Does NOT bound Starlark memory: starlark-go
-// caps one allocation at 1 GiB and the step budget bounds the operation
-// count, but a hostile bundle can still hold large values; the bundle is
-// authored by an admin-clamped publisher (§5).
+// before each range runs, a context check at every range iteration and
+// every write, an output cap per call and per run, and every text-producing
+// function (printf, print, join, indent, quote, ...) refusing a value over
+// the per-call cap and charging its length to a per-run byte budget, so a
+// value doubled through a variable stays bounded although it is never
+// written; a top-level generated_at var is refused so no timestamp can enter
+// rendered content. print() output is capped, and a print line, the run's
+// error and a resource's error holding a vars value are masked. Check mode
+// never builds a WriteHost: newWrites is called only on the apply path,
+// after the plan hash matched; the plan hash starts with the bundle hash, so
+// a change to a sensitive file's content (whose facts carry no hash) changes
+// it. Starlark has no allocation accounting: starlark-go caps one allocation
+// at 1 GiB, and heapWatchdog cancels the declaration once the process heap
+// has grown by convergeHeapMax (512 MiB) since it started. Does NOT make that
+// exact: the heap is process-wide and sampled every 20 ms, so a single large
+// allocation lands before the cancel. Resource keys (paths, names) are the
+// plan's identity and are reported as declared, even when built from vars.
 
 import (
 	"bytes"
@@ -40,11 +48,14 @@ import (
 	"io"
 	"reflect"
 	"regexp"
+	"runtime/metrics"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"text/template"
 	"text/template/parse"
+	"time"
 
 	"go.starlark.net/starlark"
 	"go.starlark.net/starlarkstruct"
@@ -71,6 +82,7 @@ const (
 	templateRangeBudget     = 1_000_000 // iterations per run
 	templateIndentMax       = 64
 	templatePrintfWidthMax  = 256
+	templateFuncBytesMax    = 4 << 20 // bytes FuncMap calls may produce per run
 	hostFieldMax            = 253
 	hostTagsMax             = 32
 )
@@ -269,6 +281,16 @@ type maskedPrinter struct {
 	needles []string
 }
 
+// masks reports whether s holds a vars value.
+func (p *maskedPrinter) masks(s string) bool {
+	for _, n := range p.needles {
+		if strings.Contains(s, n) {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *maskedPrinter) print(msg string) {
 	for _, line := range strings.Split(msg, "\n") {
 		for _, n := range p.needles {
@@ -296,7 +318,8 @@ type declaration struct {
 	loading      map[string]bool
 	stack        []*starlark.Thread
 	stepsDone    uint64
-	code         string // first coded failure raised by a builtin
+	code         string            // first coded failure raised by a builtin
+	paths        map[string]string // path -> key, across file:, dir: and absent
 }
 
 func (d *declaration) fail(code, format string, a ...any) error {
@@ -375,6 +398,21 @@ func (d *declaration) add(r Applier) (starlark.Value, error) {
 	}
 	if _, dup := d.keys[r.Key()]; dup {
 		return nil, d.fail("duplicate_resource", "%s declared twice", r.Key())
+	}
+	var path string
+	switch x := r.(type) {
+	case *fileResource:
+		path = x.path
+	case *dirResource:
+		path = x.path
+	case *absentResource:
+		path = x.path
+	}
+	if path != "" {
+		if other, dup := d.paths[path]; dup {
+			return nil, d.fail("duplicate_resource", "%s and %s name the same path", other, r.Key())
+		}
+		d.paths[path] = r.Key()
 	}
 	if f, ok := r.(*fileResource); ok {
 		d.contentTotal += len(f.content)
@@ -467,6 +505,7 @@ func declare(ctx context.Context, b *convergeBundle, printer *maskedPrinter) ([]
 		ctx:     ctx,
 		files:   b.Files,
 		keys:    map[string]int{},
+		paths:   map[string]string{},
 		tmpl:    templateBudget{rangeLeft: templateRangeBudget},
 		threads: &threadSet{},
 		printer: printer,
@@ -508,12 +547,17 @@ func declare(ctx context.Context, b *convergeBundle, printer *maskedPrinter) ([]
 	}
 	stop := context.AfterFunc(ctx, func() { d.threads.cancelAll(jobCtxReason(ctx)) })
 	defer stop()
+	overHeap := heapWatchdog(d.threads)
 	main := d.newThread("main.star", convergeMaxSteps)
 	d.stack = append(d.stack, main)
 	_, err = starlark.ExecFileOptions(convergeFileOptions, main, "main.star", b.Files["main.star"], d.predeclared)
+	exceeded := overHeap()
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, scriptCtxErr(ctx)
+		}
+		if exceeded {
+			return nil, &codedError{code: "too_much_memory", detail: fmt.Sprintf("the declaration grew the heap by more than %d MiB", convergeHeapMax>>20)}
 		}
 		code := d.code
 		if code == "" {
@@ -538,12 +582,64 @@ func declare(ctx context.Context, b *convergeBundle, printer *maskedPrinter) ([]
 	return d.resources, nil
 }
 
+// convergeHeapMax and convergeHeapSample drive heapWatchdog. Vars so tests
+// can lower them.
+var (
+	convergeHeapMax    uint64 = 512 << 20
+	convergeHeapSample        = 20 * time.Millisecond
+)
+
+// heapBytes is the bytes in heap objects (live plus not yet swept).
+func heapBytes() uint64 {
+	s := []metrics.Sample{{Name: "/memory/classes/heap/objects:bytes"}}
+	metrics.Read(s)
+	if s[0].Value.Kind() != metrics.KindUint64 {
+		return 0
+	}
+	return s[0].Value.Uint64()
+}
+
+// heapWatchdog samples the heap while a declaration runs and cancels its
+// threads once the heap has grown by more than convergeHeapMax since the
+// start. The returned func stops the watchdog and reports whether it fired.
+// The heap is process-wide, so another job allocating at the same time
+// counts too; that errs toward stopping the declaration.
+func heapWatchdog(threads *threadSet) func() bool {
+	base := heapBytes()
+	var fired atomic.Bool
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		t := time.NewTicker(convergeHeapSample)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				if h := heapBytes(); h > base && h-base > convergeHeapMax {
+					fired.Store(true)
+					threads.cancelAll("memory budget exceeded")
+					return
+				}
+			}
+		}
+	}()
+	return func() bool {
+		close(done)
+		<-finished
+		return fired.Load()
+	}
+}
+
 // --- template ---
 
 // templateBudget is shared by every template() call of one run.
 type templateBudget struct {
-	out       int
-	rangeLeft int
+	out       int // bytes written
+	rangeLeft int // range iterations left
+	funcBytes int // bytes produced by FuncMap calls, intermediate values included
 }
 
 type templateDataLimits struct{ nodes, bytes int }
@@ -669,16 +765,53 @@ func templatePrintf(format string, args ...any) (string, error) {
 	return fmt.Sprintf(format, args...), nil
 }
 
-// templateFuncs is the fixed FuncMap. It overrides printf; the remaining
-// text/template builtins (len, index, slice, eq, and, ...) are pure and
-// bounded by their inputs.
+// templateFuncs is the fixed FuncMap. Every function that returns text
+// refuses a result over templateCallMax and charges its length to the run's
+// funcBytes budget, so a value grown through variables ($x = printf "%s%s"
+// $x $x) is bounded even though it is never written. It overrides the
+// text-producing builtins (printf, print, println, html, js, urlquery) and
+// call; the rest (len, index, slice, eq, and, ...) return parts of their
+// inputs.
 func templateFuncs(ctx context.Context, budget *templateBudget) template.FuncMap {
-	return template.FuncMap{
-		"default": func(def, val any) any {
-			if val == nil || val == "" || val == 0 || val == int64(0) {
-				return def
+	charge := func(s string) (string, error) {
+		if ctx.Err() != nil {
+			return "", scriptCtxErr(ctx)
+		}
+		if len(s) > templateCallMax {
+			return "", &codedError{code: "template_output_too_large", detail: fmt.Sprintf("a template value exceeds %d bytes", templateCallMax)}
+		}
+		budget.funcBytes += len(s)
+		if budget.funcBytes > templateFuncBytesMax {
+			return "", &codedError{code: "template_too_complex", detail: fmt.Sprintf("template functions produced more than %d bytes", templateFuncBytesMax)}
+		}
+		return s, nil
+	}
+	// argsFit refuses string arguments whose total is already over the cap,
+	// before any formatting allocates.
+	argsFit := func(args []any) error {
+		n := 0
+		for _, a := range args {
+			if s, ok := a.(string); ok {
+				n += len(s)
 			}
-			return val
+		}
+		if n > templateCallMax {
+			return &codedError{code: "template_output_too_large", detail: fmt.Sprintf("a template value exceeds %d bytes", templateCallMax)}
+		}
+		return nil
+	}
+	return template.FuncMap{
+		"default": func(def, val any) (any, error) {
+			out := val
+			if val == nil || val == "" || val == 0 || val == int64(0) {
+				out = def
+			}
+			if s, ok := out.(string); ok {
+				if _, err := charge(s); err != nil {
+					return nil, err
+				}
+			}
+			return out, nil
 		},
 		"join": func(list any, sep string) (string, error) {
 			rv := reflect.ValueOf(list)
@@ -686,22 +819,75 @@ func templateFuncs(ctx context.Context, budget *templateBudget) template.FuncMap
 				return "", fmt.Errorf("join: not a list")
 			}
 			parts := make([]string, rv.Len())
+			n := 0
 			for i := range parts {
 				parts[i] = fmt.Sprint(rv.Index(i).Interface())
+				n += len(parts[i]) + len(sep)
+				if n > templateCallMax {
+					return charge(strings.Repeat(" ", n))
+				}
 			}
-			return strings.Join(parts, sep), nil
+			return charge(strings.Join(parts, sep))
 		},
 		"indent": func(n int, s string) (string, error) {
 			if n < 0 || n > templateIndentMax {
 				return "", fmt.Errorf("indent: 0 to %d", templateIndentMax)
 			}
+			if len(s)+n*(strings.Count(s, "\n")+1) > templateCallMax {
+				return charge(strings.Repeat(" ", templateCallMax+1))
+			}
 			pad := strings.Repeat(" ", n)
-			return pad + strings.ReplaceAll(s, "\n", "\n"+pad), nil
+			return charge(pad + strings.ReplaceAll(s, "\n", "\n"+pad))
 		},
-		"quote":  func(v any) string { return strconv.Quote(fmt.Sprint(v)) },
-		"lower":  strings.ToLower,
-		"upper":  strings.ToUpper,
-		"printf": templatePrintf,
+		"quote": func(v any) (string, error) {
+			if err := argsFit([]any{v}); err != nil {
+				return "", err
+			}
+			return charge(strconv.Quote(fmt.Sprint(v)))
+		},
+		"lower": func(s string) (string, error) { return charge(strings.ToLower(s)) },
+		"upper": func(s string) (string, error) { return charge(strings.ToUpper(s)) },
+		"printf": func(format string, args ...any) (string, error) {
+			if err := argsFit(append([]any{format}, args...)); err != nil {
+				return "", err
+			}
+			out, err := templatePrintf(format, args...)
+			if err != nil {
+				return "", err
+			}
+			return charge(out)
+		},
+		"print": func(args ...any) (string, error) {
+			if err := argsFit(args); err != nil {
+				return "", err
+			}
+			return charge(fmt.Sprint(args...))
+		},
+		"println": func(args ...any) (string, error) {
+			if err := argsFit(args); err != nil {
+				return "", err
+			}
+			return charge(fmt.Sprintln(args...))
+		},
+		"html": func(args ...any) (string, error) {
+			if err := argsFit(args); err != nil {
+				return "", err
+			}
+			return charge(template.HTMLEscaper(args...))
+		},
+		"js": func(args ...any) (string, error) {
+			if err := argsFit(args); err != nil {
+				return "", err
+			}
+			return charge(template.JSEscaper(args...))
+		},
+		"urlquery": func(args ...any) (string, error) {
+			if err := argsFit(args); err != nil {
+				return "", err
+			}
+			return charge(template.URLQueryEscaper(args...))
+		},
+		"call": func(any, ...any) (any, error) { return nil, fmt.Errorf("call is not allowed") },
 		// rangeGuardFunc is appended to every range pipeline by guardRanges:
 		// it charges the iterations before the range runs.
 		rangeGuardFunc: func(v any) (any, error) {
@@ -726,10 +912,22 @@ func templateFuncs(ctx context.Context, budget *templateBudget) template.FuncMap
 			}
 			return v, nil
 		},
+		// rangeTickFunc opens every range body (guardRanges): it checks the
+		// context once per iteration, so a range that writes nothing still
+		// stops on cancel. It prints nothing.
+		rangeTickFunc: func() (string, error) {
+			if ctx.Err() != nil {
+				return "", scriptCtxErr(ctx)
+			}
+			return "", nil
+		},
 	}
 }
 
-const rangeGuardFunc = "_range_guard"
+const (
+	rangeGuardFunc = "_range_guard"
+	rangeTickFunc  = "_range_tick"
+)
 
 // guardRanges refuses template actions (recursion) and appends the range
 // guard to every range pipeline.
@@ -755,7 +953,19 @@ func guardRanges(tree *parse.Tree, n parse.Node) error {
 	case *parse.RangeNode:
 		ident := parse.NewIdentifier(rangeGuardFunc).SetTree(tree).SetPos(x.Pos)
 		x.Pipe.Cmds = append(x.Pipe.Cmds, &parse.CommandNode{NodeType: parse.NodeCommand, Pos: x.Pos, Args: []parse.Node{ident}})
-		return guardBranch(tree, &x.BranchNode)
+		if err := guardBranch(tree, &x.BranchNode); err != nil {
+			return err
+		}
+		if x.List == nil {
+			x.List = &parse.ListNode{NodeType: parse.NodeList, Pos: x.Pos}
+		}
+		tick := parse.NewIdentifier(rangeTickFunc).SetTree(tree).SetPos(x.Pos)
+		action := &parse.ActionNode{NodeType: parse.NodeAction, Pos: x.Pos, Line: x.Line, Pipe: &parse.PipeNode{
+			NodeType: parse.NodePipe, Pos: x.Pos, Line: x.Line,
+			Cmds: []*parse.CommandNode{{NodeType: parse.NodeCommand, Pos: x.Pos, Args: []parse.Node{tick}}},
+		}}
+		x.List.Nodes = append([]parse.Node{action}, x.List.Nodes...)
+		return nil
 	}
 	return nil
 }
@@ -865,10 +1075,14 @@ func (p planItem) key(resources []Applier) string {
 	return "restart:" + resources[p.service].(*serviceResource).name
 }
 
-// planSHA256 is sha256 over "<key>\t<status>\t<before_digest>\t<desired_digest>\n"
-// for every plan line in order (restart lines carry "-" digests).
-func planSHA256(plan []planItem, resources []Applier, results []resourceResult) string {
+// planSHA256 is sha256 over "bundle\t<bundle_sha256>\n" followed by
+// "<key>\t<status>\t<before_digest>\t<desired_digest>\n" for every plan line
+// in order (restart lines carry "-" digests). The bundle line binds the plan
+// to the exact desired content, including a sensitive file's, whose facts
+// carry no hash.
+func planSHA256(bundleSHA string, plan []planItem, resources []Applier, results []resourceResult) string {
 	var b strings.Builder
+	fmt.Fprintf(&b, "bundle\t%s\n", bundleSHA)
 	for _, p := range plan {
 		status, before, desired := p.status, "-", "-"
 		if p.res >= 0 {
@@ -963,6 +1177,16 @@ func convergeRun(ctx context.Context, req convergeRequest, b hostBackend) conver
 		} else if s.Failed+s.Denied > 0 {
 			res.Status = "failed"
 		}
+		// Error text can quote a vars value (fail(state.vars["pw"]), a
+		// missing dict key, a path built from vars): mask it as print is.
+		if printer.masks(res.Error) {
+			res.Error = res.ErrorCode + ": [masked]"
+		}
+		for i := range rep.Resources {
+			if printer.masks(rep.Resources[i].Error) {
+				rep.Resources[i].Error = "[masked]"
+			}
+		}
 		res.Report = capReport(&rep)
 		return res
 	}
@@ -990,7 +1214,7 @@ func convergeRun(ctx context.Context, req convergeRequest, b hostBackend) conver
 		results[i] = checkResource(ctx, r, ro)
 	}
 	plan := buildPlan(resources, results, keys)
-	rep.PlanSHA256 = planSHA256(plan, resources, results)
+	rep.PlanSHA256 = planSHA256(rep.BundleSHA256, plan, resources, results)
 
 	var runErr error
 	if apply {

@@ -83,7 +83,13 @@ func main() {
 	sysscriptLegacyFlag := flag.Int("sysscript-legacy-seconds", jobLegacyDefaultSec, fmt.Sprintf("whole-script deadline of a legacy sysscript frame (1..%d, at most --sysscript-max-seconds)", jobMaxSecondsMax))
 	sysscriptJobsFlag := flag.Bool("sysscript-jobs", true, "advertise async sysscript jobs (sysscript_jobs, Linux and macOS only); =false makes the server send this host's scripts the legacy way")
 	sysscriptMaxFlag := flag.Int("sysscript-max-seconds", jobMaxSecondsMax, fmt.Sprintf("ceiling for any sysscript deadline (1..%d)", jobMaxSecondsMax))
+	stateBackupDirFlag := flag.String("state-backup-dir", stateBackupDir, "directory for desired-state file backups (absolute, root-only; must not overlap any write grant, or file changes that need a backup fail)")
 	flag.Parse()
+	if !statePathOK(*stateBackupDirFlag) {
+		fmt.Fprintln(os.Stderr, "Error: --state-backup-dir must be an absolute, clean path other than /")
+		os.Exit(2)
+	}
+	stateBackupDir = *stateBackupDirFlag
 	sysscriptJobsOn = *sysscriptJobsFlag
 	jc, err := parseJobFlags(*sysscriptWorkersFlag, *sysscriptLegacyFlag, *sysscriptMaxFlag)
 	if err != nil {
