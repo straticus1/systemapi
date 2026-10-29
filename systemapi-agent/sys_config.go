@@ -2,10 +2,10 @@ package main
 
 import (
 	"fmt"
+	"sort"
 	"time"
 
 	"go.starlark.net/starlark"
-	"gopkg.in/yaml.v3"
 )
 
 // --- sys.config.write(path, content) ---
@@ -203,37 +203,6 @@ func (engine *SysscriptEngine) configRestore(thread *starlark.Thread, b *starlar
 	return result, nil
 }
 
-// --- sys.yaml.parse(content) ---
-
-func (engine *SysscriptEngine) yamlParse(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	var content string
-	if err := starlark.UnpackArgs("parse", args, kwargs, "content", &content); err != nil {
-		return starlark.None, err
-	}
-
-	var raw interface{}
-	if err := yaml.Unmarshal([]byte(content), &raw); err != nil {
-		return starlark.None, fmt.Errorf("yaml parse error: %w", err)
-	}
-	return goToStarlark(raw), nil
-}
-
-// --- sys.yaml.encode(value) ---
-
-func (engine *SysscriptEngine) yamlEncode(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	var val starlark.Value
-	if err := starlark.UnpackArgs("encode", args, kwargs, "value", &val); err != nil {
-		return starlark.None, err
-	}
-
-	goVal := starlarkToGo(val)
-	out, err := yaml.Marshal(goVal)
-	if err != nil {
-		return starlark.None, fmt.Errorf("yaml encode error: %w", err)
-	}
-	return starlark.String(string(out)), nil
-}
-
 // --- Conversion helpers ---
 
 // starlarkToGo converts a Starlark value to a native Go value.
@@ -296,19 +265,25 @@ func goToStarlark(v interface{}) starlark.Value {
 		}
 		return starlark.NewList(elems)
 	case map[string]interface{}:
+		// Keys in sorted order, so a dict iterates the same way every run
+		// (the converge declaration depends on it).
+		keys := make([]string, 0, len(val))
+		for k := range val {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
 		d := starlark.NewDict(len(val))
-		for k, item := range val {
-			d.SetKey(starlark.String(k), goToStarlark(item))
+		for _, k := range keys {
+			d.SetKey(starlark.String(k), goToStarlark(val[k]))
 		}
 		return d
 	case map[interface{}]interface{}:
 		// yaml.v3 can produce this for non-string-keyed maps
-		d := starlark.NewDict(len(val))
+		byKey := make(map[string]interface{}, len(val))
 		for k, item := range val {
-			keyStr := fmt.Sprintf("%v", k)
-			d.SetKey(starlark.String(keyStr), goToStarlark(item))
+			byKey[fmt.Sprintf("%v", k)] = item
 		}
-		return d
+		return goToStarlark(byKey)
 	default:
 		return starlark.String(fmt.Sprintf("%v", val))
 	}

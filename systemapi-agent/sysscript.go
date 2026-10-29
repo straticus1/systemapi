@@ -369,22 +369,22 @@ func (engine *SysscriptEngine) buildSysModule() *starlarkstruct.Struct {
 
 	// sys.yaml
 	sysYAML := starlark.StringDict{
-		"parse":  starlark.NewBuiltin("parse", engine.yamlParse),
-		"encode": starlark.NewBuiltin("encode", engine.yamlEncode),
+		"parse":  starlark.NewBuiltin("parse", yamlParse),
+		"encode": starlark.NewBuiltin("encode", yamlEncode),
 	}
 
 	// sys.json
 	sysJSON := starlark.StringDict{
-		"parse":         starlark.NewBuiltin("parse", engine.jsonParse),
-		"encode":        starlark.NewBuiltin("encode", engine.jsonEncode),
-		"encode_pretty": starlark.NewBuiltin("encode_pretty", engine.jsonEncodePretty),
+		"parse":         starlark.NewBuiltin("parse", jsonParse),
+		"encode":        starlark.NewBuiltin("encode", jsonEncode),
+		"encode_pretty": starlark.NewBuiltin("encode_pretty", jsonEncodePretty),
 	}
 
 	// sys.ini
 	sysINI := starlark.StringDict{
-		"parse":  starlark.NewBuiltin("parse", engine.iniParse),
-		"encode": starlark.NewBuiltin("encode", engine.iniEncode),
-		"get":    starlark.NewBuiltin("get", engine.iniGet),
+		"parse":  starlark.NewBuiltin("parse", iniParse),
+		"encode": starlark.NewBuiltin("encode", iniEncode),
+		"get":    starlark.NewBuiltin("get", iniGet),
 	}
 
 	// sys.services
