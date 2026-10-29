@@ -765,6 +765,7 @@ function copts(t, kind = 'check', over = {}) {
       assignmentId: t.a.assignment_id,
       versionId: t.v.version_id,
       bundleJson: kind === 'plan' ? CONV_BUNDLE : undefined,
+      expectPlanSha: kind === 'apply' ? 'c'.repeat(64) : undefined,
       ...over
     }
   };
@@ -788,7 +789,7 @@ function creport(kind, { drift = 0, changed = 0, truncated = false } = {}) {
 async function csubmit(reg, t, kind = 'check', over = {}, opts = {}) {
   const row = cjob(t, kind, over);
   await reg.createJob(row, { ...copts(t, kind, opts.conv), ...(opts.caps || {}) });
-  assert.ok(await reg.markDispatched(row.job_id, row.host_id, `c-${row.job_id}`));
+  assert.ok(await reg.markDispatched(row.job_id, row.host_id, `c-${row.job_id}`, { allowConverge: true }));
   return row;
 }
 
@@ -958,7 +959,7 @@ test('converge: a sweep releases the claim, a swept apply is partial, and a re-s
   assert.equal(row.status, 'unknown');
   const due = (await pool.query('SELECT extract(epoch FROM next_check_at - now())::float8 AS s FROM cp_host_state WHERE host_id = $1 AND state_id = $2',
     [A.hosts[0], A.st.state_id])).rows[0].s;
-  assert.ok(due > 0.9 * 3600 - 5, `a run ended without a report is next due one interval later (${due} s)`);
+  assert.ok(due > 0.9 * 600 - 5 && due < 1.1 * 600 + 5, `a first run ended without a report is retried after 10 min (${due} s)`);
   const [r1, r2] = await Promise.all([
     registry.ingestConvergeResend(j.job_id, A.hosts[0], creport('check', { drift: 1 })),
     registry.ingestConvergeResend(j.job_id, A.hosts[0], creport('check', { drift: 1 }))
@@ -984,6 +985,69 @@ test('converge: a sweep releases the claim, a swept apply is partial, and a re-s
   await registry.requestJobCancel([A.tenant], c.job_id, A.user);
   assert.equal((await hstate(A)).check_job_id, null);
   assert.equal((await registry.verifyAudit()).ok, true);
+});
+
+test('converge: the claim leaves a converge row without allowConverge (source-keyed, in one statement); a script row is claimed either way', async () => {
+  const [A] = await cworld(1);
+  const row = cjob(A);
+  await registry.createJob(row, copts(A));
+  assert.equal(await registry.markDispatched(row.job_id, A.hosts[0], 'c-no'), null);
+  assert.equal(await registry.markDispatched(row.job_id, A.hosts[0], 'c-no', { allowConverge: false }), null);
+  const left = (await pool.query('SELECT conn_id, dispatch IS NOT NULL AS pending FROM cp_sysscript_jobs WHERE job_id = $1', [row.job_id])).rows[0];
+  assert.deepEqual([left.conn_id, left.pending], [null, true]);
+  const claimed = await registry.markDispatched(row.job_id, A.hosts[0], 'c-yes', { allowConverge: true });
+  assert.equal(claimed.dispatch.kind, 'converge');
+  const plain = jobRow(A);
+  await registry.createJob(plain);
+  assert.equal((await registry.markDispatched(plain.job_id, A.hosts[0], 'c-plain')).dispatch.script, 'print(1)');
+});
+
+test('converge: an apply\'s expectPlanSha must equal the locked plan\'s hash (409 plan_stale, plan not consumed)', async () => {
+  const [A] = await cworld(1);
+  const p = await csubmit(registry, A, 'plan');
+  await cfinish(registry, p, creport('plan', { drift: 1 }));
+  await assert.rejects(csubmit(registry, A, 'apply', {}, { conv: { planRunId: p.job_id, expectPlanSha: '0'.repeat(64) } }),
+    (e) => e.status === 409 && e.code === 'plan_stale');
+  await assert.rejects(csubmit(registry, A, 'apply', {}, { conv: { planRunId: p.job_id, expectPlanSha: '-' } }), (e) => e.code === 'bad_job');
+  await assert.rejects(csubmit(registry, A, 'check', {}, { conv: { expectPlanSha: 'c'.repeat(64) } }), (e) => e.code === 'bad_job');
+  const plan = (await pool.query('SELECT consumed_by_run_id FROM cp_converge_runs WHERE run_id = $1', [p.job_id])).rows[0];
+  assert.equal(plan.consumed_by_run_id, null);
+  assert.equal((await hstate(A)).last_apply_run_id, null);
+  const ap = await csubmit(registry, A, 'apply', {}, { conv: { planRunId: p.job_id } });
+  assert.equal((await pool.query('SELECT consumed_by_run_id FROM cp_converge_runs WHERE run_id = $1', [p.job_id])).rows[0].consumed_by_run_id, ap.job_id);
+});
+
+test('retention: the check run of a pruned job is waited for when another transaction holds it, never left orphaned', async () => {
+  const [A] = await cworld(1);
+  const j = await csubmit(registry, A);
+  await cfinish(registry, j, creport('check'));
+  await pool.query("UPDATE cp_sysscript_jobs SET finished_at = now() - interval '400 days' WHERE job_id = $1", [j.job_id]);
+  const x = await pool.connect();
+  try {
+    await x.query('BEGIN');
+    await x.query('SELECT 1 FROM cp_converge_runs WHERE run_id = $1 FOR UPDATE', [j.job_id]);
+    const prune = registry.pruneJobs(30);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await x.query('COMMIT');
+    assert.ok(await prune >= 1);
+  } finally {
+    x.release();
+  }
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM cp_sysscript_jobs WHERE job_id = $1', [j.job_id])).rows[0].n, 0);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM cp_converge_runs WHERE run_id = $1', [j.job_id])).rows[0].n, 0, 'no orphan run');
+});
+
+test('converge: a second reportless check in a row waits the whole interval', async () => {
+  const [A] = await cworld(1);
+  const due = async () => (await pool.query('SELECT extract(epoch FROM next_check_at - now())::float8 AS s FROM cp_host_state WHERE host_id = $1 AND state_id = $2',
+    [A.hosts[0], A.st.state_id])).rows[0].s;
+  const j1 = await csubmit(registry, A);
+  await registry.transitionJob(j1.job_id, A.hosts[0], ['submitted'], { status: 'failed', error: 'bad_payload' });
+  const first = await due();
+  assert.ok(first > 0.9 * 600 - 5 && first < 1.1 * 600 + 5, `first: ${first} s`);
+  const j2 = await csubmit(registry, A);
+  await registry.transitionJob(j2.job_id, A.hosts[0], ['submitted'], { status: 'failed', error: 'bad_payload' });
+  assert.ok(await due() > 0.9 * 3600 - 5, 'second: one interval');
 });
 
 test('converge: a 429 does not burn the plan; approval, single consumption and the manual apply record', async () => {
@@ -1228,6 +1292,45 @@ test('converge: markStaleHostStates skips rows another transaction holds and nev
   }
   await registry.markStaleHostStates();
   assert.equal((await pool.query('SELECT status FROM cp_host_state WHERE host_id = $1', [lo])).rows[0].status, 'stale');
+});
+
+test('boot: the boot lock itself is waited for past the lock timeout (another replica booting), and no lock_timeout is left behind', async () => {
+  const quiet = { log() {}, warn() {}, error() {} };
+  const env = { NODE_ENV: 'production', SYSTEMAPI_BOOT_LOCK_TIMEOUT_MS: '100' };
+  const name = `bootadv_${crypto.randomBytes(5).toString('hex')}`;
+  const admin = new Pool({ connectionString: BASE });
+  await admin.query(`CREATE DATABASE ${name}`);
+  const p = new Pool({ connectionString: withDatabase(BASE, name), max: 3 });
+  p.on('error', () => {});
+  const holder = new Pool({ connectionString: withDatabase(BASE, name), max: 1 });
+  holder.on('error', () => {});
+  try {
+    await createRegistry({ pool: p, env, logger: quiet });
+    const h = await holder.connect();
+    try {
+      await h.query('SELECT pg_advisory_lock(1396789321, 2)');
+      const t0 = Date.now();
+      const boot = createRegistry({ pool: p, env, logger: quiet });
+      // Held for far longer than 5 attempts x 100 ms would allow.
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      await h.query('SELECT pg_advisory_unlock(1396789321, 2)');
+      assert.ok((await boot) instanceof PgRegistry);
+      assert.ok(Date.now() - t0 >= 1500, 'it waited for the boot lock');
+    } finally {
+      h.release();
+    }
+    const c = await p.connect();
+    try {
+      assert.equal((await c.query('SHOW lock_timeout')).rows[0].lock_timeout, '0');
+    } finally {
+      c.release();
+    }
+  } finally {
+    await p.end();
+    await holder.end();
+    await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
+    await admin.end();
+  }
 });
 
 test('boot: a table lock held by a long transaction fails the boot after bounded retries, and a boot retrying succeeds once it is released', async () => {

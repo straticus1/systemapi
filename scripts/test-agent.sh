@@ -39,8 +39,8 @@ trap 'cleanup; exit 143' TERM
 # systemapi-agent/recorder.go) when the Docker VM has under its default
 # --pty-record-min-free (1 GiB), which otherwise shows up as an opaque
 # terminal timeout. Check free space on the same storage containers use by
-# running df inside the already-pinned agent image, and fail early with
-# room to spare.
+# running df inside the already-pinned agent image, and fail early unless
+# 2 GiB are free (the 1 GiB floor plus margin).
 FREE_BYTES=$(docker run --rm --label "$LABEL" "$AGENT_IMAGE" df -B1 / | awk 'NR==2 {print $4}')
 case "$FREE_BYTES" in
   '' | *[!0-9]*)
@@ -51,9 +51,10 @@ esac
 MIN_FREE_BYTES=$((2 * 1024 * 1024 * 1024))
 if [ "$FREE_BYTES" -lt "$MIN_FREE_BYTES" ]; then
   FREE_GIB=$(awk -v b="$FREE_BYTES" 'BEGIN { printf "%.2f", b / 1073741824 }')
-  echo "Docker VM disk has only ${FREE_GIB} GiB free; the agent needs >= 1 GiB free" \
-    "(--pty-record-min-free, systemapi-agent/recorder.go) to record a PTY and refuses" \
-    "with recording_disk_low below that. Free up Docker Desktop disk space and retry." >&2
+  echo "Docker VM disk has only ${FREE_GIB} GiB free; this suite requires >= 2 GiB free" \
+    "(the agent's 1 GiB --pty-record-min-free floor, systemapi-agent/recorder.go, plus" \
+    "margin; below the floor it refuses PTYs with recording_disk_low). Free up Docker" \
+    "Desktop disk space and retry." >&2
   exit 1
 fi
 

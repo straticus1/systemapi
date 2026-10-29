@@ -1297,3 +1297,31 @@ test('converge: SYSTEMAPI_CONVERGE off leaves a converge row unsent even to a co
     await r.close();
   }
 });
+
+test('converge: kind follows source (reviewer probe: kind converge with source api is 400 bad_job); the claim gate keys on the row source', async () => {
+  const { r, reg, a } = await world({ env: { SYSTEMAPI_CONVERGE: '0' } });
+  try {
+    const args = await convergeSetup(reg);
+    r.fm.env.SYSTEMAPI_CONVERGE = '1';
+    const refuse = (over, code) => assert.rejects(r.fm.jobs.submit({ ...args, ...over }), (e) => e.status === 400 && e.code === code, JSON.stringify(over));
+    // The probe: a converge frame under a non-converge source, without the
+    // registry's converge options.
+    await refuse({ source: 'api', converge: undefined }, 'bad_job');
+    await refuse({ source: 'api' }, 'bad_job');
+    await refuse({ converge: undefined }, 'bad_job');
+    await refuse({ kind: undefined, script: 'print(1)' }, 'bad_job');
+    await refuse({ kind: 'sysscript', script: 'print(1)' }, 'bad_job');
+    assert.equal([...reg.jobs.values()].length, 0, 'nothing was created');
+    // A converge-source row whose dispatch does not even say converge is
+    // still never claimed for this agent (no converge capability), nor
+    // with the switch off.
+    const { job } = await r.fm.jobs.submit(args);
+    reg.jobs.get(job.job_id).dispatch.kind = undefined;
+    assert.equal(await r.fm.jobs.deliverDispatch(HOST_A, job.job_id), false);
+    assert.equal(await r.fm.jobs.pump(HOST_A), 0);
+    assert.equal(a.jobs.has(job.job_id), false);
+    assert.notEqual(reg.jobs.get(job.job_id).dispatch, null);
+  } finally {
+    await r.close();
+  }
+});

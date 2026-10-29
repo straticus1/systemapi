@@ -30,6 +30,10 @@ function fakePool(failOn = null) {
         locks.push(sql.includes('unlock') ? 'unlock' : 'lock');
         return { rows: [], rowCount: 1 };
       }
+      if (/lock_timeout/.test(sql)) {
+        locks.push(sql.startsWith('RESET') ? 'timeout_reset' : 'timeout_set');
+        return { rows: [], rowCount: 1 };
+      }
       seen.push(sql);
       if (failOn && sql === failOn) throw new Error('permission denied for table playground_credits');
       return { rows: [], rowCount: 0 };
@@ -46,7 +50,9 @@ test('createRegistry applies the control-plane schema, then the playground keys 
   const registry = await createRegistry({ pool, env: { NODE_ENV: 'production' }, logger: quiet });
   assert.ok(registry instanceof PgRegistry);
   assert.deepEqual(pool.seen, [CP, KEYS, FLEET]);
-  assert.deepEqual(pool.locks, ['lock', 'unlock']);
+  // The boot lock is waited for without the lock_timeout, which is set once
+  // it is held and RESET after it is released.
+  assert.deepEqual(pool.locks, ['lock', 'timeout_set', 'unlock', 'timeout_reset']);
   assert.equal(pool.released, 1);
 });
 
@@ -57,7 +63,7 @@ test('a playground schema failure is fatal in production', async () => {
       createRegistry({ pool, env: { NODE_ENV: 'production' }, logger: quiet }),
       /permission denied/
     );
-    assert.deepEqual(pool.locks, ['lock', 'unlock'], 'the boot lock is released on failure');
+    assert.deepEqual(pool.locks, ['lock', 'timeout_set', 'unlock', 'timeout_reset'], 'the boot lock is released on failure');
   }
 });
 

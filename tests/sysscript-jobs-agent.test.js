@@ -374,8 +374,14 @@ async function openTerminal() {
   const status = await waitUntil('terminal started or an error',
     () => term.statuses.find((s) => s.status === 'started' || s.error), 15000);
   if (status.error) {
-    const log = await agentLog();
-    throw new Error(`terminal failed to start: ${status.error}\n--- agent log (tail) ---\n${log.slice(-4000)}`);
+    ws.close();
+    let log;
+    try {
+      log = (await agentLog()).slice(-4000);
+    } catch (err) {
+      log = `(agent log unavailable: ${err.message})`;
+    }
+    throw new Error(`terminal failed to start: ${status.error}\n--- agent log (tail) ---\n${log}`);
   }
   return term;
 }

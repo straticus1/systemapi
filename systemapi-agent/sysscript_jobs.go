@@ -52,7 +52,8 @@ package main
 // plan hash, so a check cannot be turned into an apply or pointed at another
 // plan. It is refused as converge_unsupported unless --converge is on, as
 // bad_mode unless mode=apply goes with a plan hash and mode=check with "-",
-// and as bundle_too_large over the bundle cap. convergeRun's capped report
+// and as bundle_too_large over the bundle cap; a script frame carrying
+// bundle_json or expect_plan_sha256 is bad_payload. convergeRun's capped report
 // rides in the result frame next to the capped output. Any other kind is
 // bad_kind.
 
@@ -682,6 +683,11 @@ func (m *jobManager) startJob(hostID string, cmd *CommandMessage, now time.Time)
 	var conv *convergeRequest
 	switch cmd.Kind {
 	case "", "sysscript":
+		// Converge fields on a script frame are a mislabeled converge job.
+		if cmd.BundleJSON != "" || cmd.ExpectPlan != "" {
+			m.rejectJob(id, "bad_payload")
+			return
+		}
 		if len(cmd.Script) > scriptMaxBytes {
 			m.rejectJob(id, "script_too_large")
 			return

@@ -74,6 +74,7 @@ function convOpts(t, a, over = {}) {
     assignmentId: a ? a.assignment_id : undefined,
     versionId: t.v.version_id,
     bundleJson: kind === 'plan' ? BUNDLE : undefined,
+    expectPlanSha: kind === 'apply' ? 'c'.repeat(64) : undefined,
     ...over
   };
 }
@@ -98,7 +99,7 @@ function report(kind, { drift = 0, ok = 1, failed = 0, changed = 0, truncated = 
 async function submit(reg, t, a, over = {}, opts = {}) {
   const row = jobRow(t, over);
   await reg.createJob(row, { converge: convOpts(t, a, opts.conv), ...(opts.caps || {}) });
-  await reg.markDispatched(row.job_id, row.host_id, 'c1');
+  await reg.markDispatched(row.job_id, row.host_id, 'c1', { allowConverge: true });
   return row;
 }
 
@@ -566,7 +567,7 @@ test('memory: claim ties break on (next_check_at, host_id, state_id); a concurre
   assert.deepEqual([cur.drift_threshold, cur.check_interval_s], [won[0].value.drift_threshold, won[0].value.check_interval_s]);
 });
 
-test('memory: a check that ends without a report is next due one interval later, not at the claim expiry', async () => {
+test('memory: a check that ends without a report is retried after min(interval, 10 min) the first time, then one interval later', async () => {
   const reg = await rig();
   const t = await published(reg);
   const a = await reg.createAssignment({ tenantId: 'acme', stateId: t.st.state_id, versionId: t.v.version_id, actor: 'u-a', targetKind: 'host', targetValue: H1, checkIntervalS: 3600 });
@@ -577,7 +578,44 @@ test('memory: a check that ends without a report is next due one interval later,
   await reg.transitionJob(j.job_id, H1, ['submitted'], { status: 'failed', error: 'bad_payload' }, { converge: {} });
   const row = hs(reg, H1, t.st.state_id);
   assert.equal(row.check_claimed_at, null);
-  assert.ok(row.next_check_at.getTime() >= Date.now() + 0.9 * 3600000 - 1000, 'one interval (± 10%) ahead');
+  const first = row.next_check_at.getTime() - Date.now();
+  assert.ok(first >= 0.9 * 600000 - 1000 && first <= 1.1 * 600000 + 1000, `first failure: 10 min (± 10%) ahead (${first} ms)`);
+  // A second failure in a row waits the whole interval.
+  const j2 = await submit(reg, t, a);
+  await reg.transitionJob(j2.job_id, H1, ['submitted'], { status: 'failed', error: 'bad_payload' }, { converge: {} });
+  assert.ok(hs(reg, H1, t.st.state_id).next_check_at.getTime() >= Date.now() + 0.9 * 3600000 - 1000, 'one interval (± 10%) ahead');
+});
+
+test('memory: a converge row is claimed only with allowConverge; a script row either way', async () => {
+  const reg = await rig();
+  const t = await published(reg);
+  const a = await reg.createAssignment({ tenantId: 'acme', stateId: t.st.state_id, versionId: t.v.version_id, actor: 'u-a', targetKind: 'host', targetValue: H1 });
+  const row = jobRow(t);
+  await reg.createJob(row, { converge: convOpts(t, a) });
+  assert.equal(await reg.markDispatched(row.job_id, H1, 'c1'), null);
+  assert.equal(await reg.markDispatched(row.job_id, H1, 'c1', { allowConverge: false }), null);
+  assert.notEqual(reg.jobs.get(row.job_id).dispatch, null, 'left for a converge agent');
+  const claimed = await reg.markDispatched(row.job_id, H1, 'c1', { allowConverge: true });
+  assert.equal(claimed.dispatch.kind, 'converge');
+  const plain = jobRow(t, { source: 'api', dispatch: { script: 'print(1)' } });
+  await reg.createJob(plain);
+  assert.equal((await reg.markDispatched(plain.job_id, H1, 'c1')).dispatch.script, 'print(1)');
+});
+
+test('memory: an apply\'s expectPlanSha must be the approved plan\'s hash (409 plan_stale, plan not consumed); check takes none', async () => {
+  const reg = await rig();
+  const t = await published(reg);
+  const a = await reg.createAssignment({ tenantId: 'acme', stateId: t.st.state_id, versionId: t.v.version_id, actor: 'u-a', targetKind: 'host', targetValue: H1 });
+  const p = await submit(reg, { ...t, kind: 'plan' }, a);
+  await finish(reg, p, report('plan', { drift: 1 }));
+  const apply = { ...t, kind: 'apply' };
+  await assert.rejects(submit(reg, apply, a, {}, { conv: { planRunId: p.job_id, expectPlanSha: '0'.repeat(64) } }), (e) => e.status === 409 && e.code === 'plan_stale');
+  await assert.rejects(submit(reg, apply, a, {}, { conv: { planRunId: p.job_id, expectPlanSha: undefined } }), (e) => e.code === 'bad_job');
+  await assert.rejects(submit(reg, apply, a, {}, { conv: { planRunId: p.job_id, expectPlanSha: '-' } }), (e) => e.code === 'bad_job');
+  await assert.rejects(submit(reg, t, a, {}, { conv: { expectPlanSha: 'c'.repeat(64) } }), (e) => e.code === 'bad_job');
+  assert.equal(reg.convergeRuns.get(p.job_id).consumed_by_run_id, null);
+  const ap = await submit(reg, apply, a, {}, { conv: { planRunId: p.job_id } });
+  assert.equal(reg.convergeRuns.get(p.job_id).consumed_by_run_id, ap.job_id);
 });
 
 test('memory: the undo of a failed ingest removes only the alert it added', async () => {

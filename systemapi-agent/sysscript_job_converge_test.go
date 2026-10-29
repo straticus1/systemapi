@@ -236,6 +236,17 @@ func TestConvergeJobRefusals(t *testing.T) {
 	if p := h.result(id); p["error"] != "bad_payload" {
 		t.Fatalf("script beside bundle: %v", p)
 	}
+	// Converge fields on a script frame (no kind, or kind sysscript).
+	for _, c := range []CommandMessage{
+		{Script: "print(1)", BundleJSON: bundle},
+		{Kind: "sysscript", Script: "print(1)", ExpectPlan: "-"},
+	} {
+		c.Type, c.JobID = "sysscript_job", newJobID(t)
+		h.m.startJob(ptyTestHost, &c, time.Now())
+		if p := h.result(c.JobID); p["status"] != "rejected" || p["error"] != "bad_payload" {
+			t.Fatalf("script frame with converge fields: %v", p)
+		}
+	}
 	id = newJobID(t)
 	h.m.startJob(ptyTestHost, &CommandMessage{Type: "sysscript_job", JobID: id, Kind: "shell"}, time.Now())
 	if p := h.result(id); p["error"] != "bad_kind" {

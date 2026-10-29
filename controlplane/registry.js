@@ -615,7 +615,9 @@ function assignmentAuditPayload(row, op) {
 }
 
 // createJob's opts.converge: {kind, stateId, assignmentId, versionId,
-// planRunId (apply), bundleJson (plan; optional for check), parentJobId}.
+// planRunId (apply), bundleJson (plan; optional for check), parentJobId,
+// expectPlanSha (apply: the plan hash signed into the lease, compared with
+// the locked plan run's plan_sha256; check and plan: absent or "-")}.
 // The job source must be the kind's; a converge source needs
 // opts.converge; a bundleJson given must hash to the job's script_sha256
 // (only a plan run keeps it).
@@ -631,7 +633,9 @@ function convergeJobInput(r, c) {
     && (c.kind !== 'plan' || typeof c.bundleJson === 'string')
     && (c.bundleJson === undefined || c.bundleJson === null || c.kind === 'apply'
       || (typeof c.bundleJson === 'string' && sha256Hex(c.bundleJson) === r.script_sha256))
-    && (c.kind !== 'apply' || c.bundleJson === undefined || c.bundleJson === null);
+    && (c.kind !== 'apply' || c.bundleJson === undefined || c.bundleJson === null)
+    && (c.kind === 'apply' ? typeof c.expectPlanSha === 'string' && SHA256_RE.test(c.expectPlanSha)
+      : c.expectPlanSha === undefined || c.expectPlanSha === null || c.expectPlanSha === '-');
   if (!ok) throw http(400, 'bad_job');
   return {
     kind: c.kind,
@@ -640,7 +644,8 @@ function convergeJobInput(r, c) {
     version_id: c.kind === 'apply' ? null : c.versionId,
     plan_run_id: c.kind === 'apply' ? c.planRunId : null,
     bundle_json: c.kind === 'plan' ? c.bundleJson : null,
-    parent_job_id: c.parentJobId || null
+    parent_job_id: c.parentJobId || null,
+    expect_plan_sha256: c.kind === 'apply' ? c.expectPlanSha : '-'
   };
 }
 
@@ -670,6 +675,8 @@ function convergeCreateCheck(r, c, { hs, version, assignment, plan, planJobStatu
     if (hs.assignment_id !== plan.assignment_id || hs.version_id !== plan.version_id) throw http(409, 'plan_superseded');
     if (assignment.require_approval && !plan.approved_by) throw http(409, 'approval_required');
     if (sha256Hex(plan.bundle_json) !== r.script_sha256) throw http(409, 'plan_bundle_mismatch');
+    // The plan hash signed into the lease must be the approved plan's.
+    if (c.expect_plan_sha256 !== plan.plan_sha256) throw http(409, 'plan_stale');
   }
   if (!version || version.version_id !== hs.version_id || version.entitlements_sha256 !== r.entitlements_sha256) {
     throw http(409, 'entitlements_mismatch');
@@ -744,6 +751,16 @@ function driftAlertEntry(run, rep) {
 // any check or plan run that ended, with or without a report (a run that
 // keeps ending without one is retried once per interval, not at every claim
 // expiry; the expiry is the due time only of a claim that never got a job).
+// The first run to end without a report after one that did not fail
+// (last_error null) is retried sooner: nextCheckMaxS caps that interval at
+// REPORTLESS_RETRY_S, so one lost result does not hide drift for a whole
+// interval.
+const REPORTLESS_RETRY_S = 600;
+
+function nextCheckIntervalS(intervalS, upd) {
+  return upd.nextCheckMaxS && intervalS > 0 ? Math.min(intervalS, upd.nextCheckMaxS) : intervalS;
+}
+
 function hostStateUpdate(run, job, v, hs, clash) {
   const rep = v ? v.report : null;
   const out = convergeOutcome(run.kind, job.status, rep, hs);
@@ -757,6 +774,7 @@ function hostStateUpdate(run, job, v, hs, clash) {
   const set = {};
   const now = [];
   let nextCheck = false;
+  let nextCheckMaxS = null;
   if (run.kind === 'apply') {
     Object.assign(set, { status, consecutive_drift: out.consecutive_drift, last_error: lastError });
     if (rep) set.facts = v.facts;
@@ -778,8 +796,9 @@ function hostStateUpdate(run, job, v, hs, clash) {
   } else {
     Object.assign(set, { check_claimed_at: null, check_job_id: null, last_error: lastError });
     nextCheck = true;
+    if (hs.last_error == null) nextCheckMaxS = REPORTLESS_RETRY_S;
   }
-  return { set, now, nextCheck };
+  return { set, now, nextCheck, nextCheckMaxS };
 }
 
 function claimInput({ replicaBudget, perTenantCap, claimExpiryS, presenceFreshS = 90 } = {}) {
@@ -1488,11 +1507,14 @@ class MemoryRegistry {
   }
 
   // Claims the dispatch payload once: it is returned to this caller and
-  // nulled on the row, with conn_id and sent_at set.
-  async markDispatched(jobId, hostId, connId) {
+  // nulled on the row, with conn_id and sent_at set. A converge row is
+  // claimed only with opts.allowConverge (the socket's agent runs converge
+  // and SYSTEMAPI_CONVERGE is on); otherwise it stays unclaimed.
+  async markDispatched(jobId, hostId, connId, opts = {}) {
     if (!nonEmpty(connId)) throw http(500, 'bad_conn_id');
     const row = this.jobs.get(jobId);
     if (!row || row.host_id !== hostId || row.status !== 'submitted' || row.dispatch == null) return null;
+    if (isConvergeSource(row.source) && opts.allowConverge !== true) return null;
     const dispatch = row.dispatch;
     row.dispatch = null;
     row.conn_id = connId;
@@ -2133,7 +2155,7 @@ class MemoryRegistry {
     Object.assign(hs, JSON.parse(JSON.stringify(upd.set)));
     for (const c of upd.now) hs[c] = now;
     if (upd.nextCheck) {
-      const interval = a ? a.check_interval_s : 0;
+      const interval = nextCheckIntervalS(a ? a.check_interval_s : 0, upd);
       hs.next_check_at = interval ? new Date(now.getTime() + interval * (0.9 + Math.random() * 0.2) * 1000) : null;
     }
     Object.assign(result, { host_state_updated: true, prev_status: prev, status: hs.status });
@@ -3136,19 +3158,22 @@ class PgRegistry {
 
   // Claims the dispatch payload once across instances: the row lock makes a
   // second caller see dispatch already NULL.
-  async markDispatched(jobId, hostId, connId) {
+  // The converge gate is in the claim's own WHERE, so the check and the
+  // claim are one statement.
+  async markDispatched(jobId, hostId, connId, opts = {}) {
     if (!nonEmpty(connId)) throw http(500, 'bad_conn_id');
     if (typeof jobId !== 'string' || typeof hostId !== 'string') return null;
     const res = await this.pool.query(
       `WITH cur AS (
          SELECT job_id, dispatch FROM cp_sysscript_jobs
          WHERE job_id = $1 AND host_id = $2 AND status = 'submitted' AND dispatch IS NOT NULL
+           AND ($4::boolean OR source <> ALL($5::text[]))
          FOR UPDATE
        )
        UPDATE cp_sysscript_jobs j SET conn_id = $3, sent_at = now(), dispatch = NULL
        FROM cur WHERE j.job_id = cur.job_id
        RETURNING cur.dispatch AS claimed_dispatch, ${jobCols('j.')}`,
-      [jobId, hostId, connId]
+      [jobId, hostId, connId, opts.allowConverge === true, Object.values(CONVERGE_SOURCES)]
     );
     const row = res.rows[0];
     if (!row) return null;
@@ -3342,6 +3367,9 @@ class PgRegistry {
 
   // Check runs go with their job row; plan and apply runs are kept
   // SYSTEMAPI_APPLY_RUN_RETENTION_DAYS (365). Returns the count of job rows.
+  // The check runs of the deleted jobs are locked in run_id order and waited
+  // for (not skipped, which would leave them orphaned): every writer locks
+  // job, then run, then host-state rows, so the wait cannot deadlock.
   async pruneJobs(days) {
     const n = jobRetentionDays({ SYSTEMAPI_JOB_RETENTION_DAYS: String(days) });
     const res = await this.pool.query(
@@ -3352,7 +3380,7 @@ class PgRegistry {
        runs AS (
          DELETE FROM cp_converge_runs c
          USING (SELECT r.run_id FROM cp_converge_runs r JOIN gone ON r.run_id = gone.job_id
-                WHERE r.kind = 'check' ORDER BY r.run_id FOR UPDATE OF r SKIP LOCKED) l
+                WHERE r.kind = 'check' ORDER BY r.run_id FOR UPDATE OF r) l
          WHERE c.run_id = l.run_id)
        SELECT count(*)::int AS n FROM gone`,
       [n, JOB_ACTIVE]
@@ -4111,7 +4139,7 @@ class PgRegistry {
         sets.push(`${col} = now()`);
       }
       if (upd.nextCheck) {
-        values.push(run.check_interval_s || 0);
+        values.push(nextCheckIntervalS(run.check_interval_s || 0, upd));
         const n = values.length;
         sets.push(`next_check_at = CASE WHEN $${n}::int > 0 THEN now() + make_interval(secs => $${n}::int * (0.9 + random() * 0.2)) ELSE NULL END`);
       }
@@ -4235,10 +4263,12 @@ function bucketKey(ts, bucket) {
 // then ALTER TABLE on one table deadlocks). The lock is released in finally;
 // a connection whose unlock fails is destroyed, which releases it too.
 // lock_timeout (SYSTEMAPI_BOOT_LOCK_TIMEOUT_MS, default 10 s) bounds every
-// lock wait of the boot connection, the boot lock included: a long-running
-// transaction holding a table lock fails the attempt (55P03, rolled back)
-// instead of wedging every booting replica behind the boot lock. A timed-out
-// attempt is retried up to BOOT_ATTEMPTS times, then the error is thrown.
+// table lock wait of the boot connection: a long-running transaction holding
+// a table lock fails the attempt (55P03, rolled back) instead of wedging
+// every booting replica behind the boot lock. The boot lock itself is waited
+// for without that bound: its holder is another booting replica, whose own
+// table lock waits are bounded. A timed-out attempt is retried up to
+// BOOT_ATTEMPTS times, then the error is thrown.
 const BOOT_ATTEMPTS = 5;
 
 function bootLockTimeoutMs(env) {
@@ -4246,31 +4276,27 @@ function bootLockTimeoutMs(env) {
   return Number.isInteger(n) && n >= 50 && n <= 600000 ? n : 10000;
 }
 
-// The boot lock_timeout is set in the statement that takes the boot lock
-// (the FROM subquery runs first) and reset in the one that releases it. A
-// connection whose lock wait fails is destroyed, never pooled with it.
+// The boot lock_timeout is set once the boot lock is held and RESET after
+// it is released. A connection whose lock or unlock fails is destroyed,
+// never pooled with either.
 async function applySchemaOnce(pool, timeoutMs) {
   const client = await pool.connect();
   let broken;
   try {
     try {
-      await client.query(
-        `SELECT pg_advisory_lock($1::int, $2::int) FROM (SELECT set_config('lock_timeout', $3, false)) AS t`,
-        [AUDIT_LOCK_NS, BOOT_LOCK_KEY, `${timeoutMs}ms`]
-      );
+      await client.query('SELECT pg_advisory_lock($1::int, $2::int)', [AUDIT_LOCK_NS, BOOT_LOCK_KEY]);
     } catch (err) {
       broken = err;
       throw err;
     }
     try {
+      await client.query("SELECT set_config('lock_timeout', $1, false)", [`${timeoutMs}ms`]);
       await client.query(SCHEMA_SQL);
       for (const sql of PLAYGROUND_SQL) await client.query(sql);
     } finally {
       try {
-        await client.query(
-          "SELECT pg_advisory_unlock($1::int, $2::int), set_config('lock_timeout', '0', false)",
-          [AUDIT_LOCK_NS, BOOT_LOCK_KEY]
-        );
+        await client.query('SELECT pg_advisory_unlock($1::int, $2::int)', [AUDIT_LOCK_NS, BOOT_LOCK_KEY]);
+        await client.query('RESET lock_timeout');
       } catch (err) {
         broken = err;
       }

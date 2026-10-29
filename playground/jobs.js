@@ -27,11 +27,16 @@
  * Converge jobs (.omc/plans/convergence-drift.md §7) ride the same rows:
  * submit({kind:'converge'}) signs a converge_job lease over the bundle hash,
  * entitlements hash, mode and plan hash, and stores kind, mode, bundle_json
- * and expect_plan_sha256 in dispatch for the frame. They are refused at
+ * and expect_plan_sha256 in dispatch for the frame. kind 'converge' goes
+ * only with a converge source and the registry's converge options (400
+ * bad_job otherwise), and an apply's plan hash is checked against the
+ * approved plan run inside createJob (409 plan_stale). They are refused at
  * submit (503 converge_disabled) and never dispatched while
  * SYSTEMAPI_CONVERGE is off (default; it is set only after every replica
  * runs this code, §7.6), and never sent to a socket whose agent did not
- * advertise converge: such a row stays submitted until the sweep ends it.
+ * advertise converge (checked on the socket the frame goes to, and enforced
+ * in the registry's claim, keyed on the row's source): such a row stays
+ * submitted until the sweep ends it.
  * A converge result's report goes into the terminal transition (the
  * registry validates and ingests it in that transaction, before the ack);
  * a report re-sent for an already terminal row is ingested once
@@ -364,15 +369,12 @@ class SysscriptJobs {
             const agent = await reg.hostAgent(hostId);
             if (!agent || agent.conn_id !== connId) return false;
         }
-        // A converge row is claimed only for a converge agent while the
-        // switch is on; otherwise it is left unclaimed (checked before the
-        // claim, which takes the payload for good).
-        if (!(convergeEnabled(this.fleet.env) && this.fleet.agentSupports(hostId, CONVERGE_CAPABILITY))) {
-            const tenantId = this.fleet.hostTenants.get(hostId);
-            const row = tenantId ? await reg.getJob([tenantId], jobId) : null;
-            if (!row || isConvergeSource(row.source)) return false;
-        }
-        const claimed = await reg.markDispatched(jobId, hostId, connId);
+        // A converge row (by its source) is claimed only for this socket's
+        // agent advertising converge while the switch is on; the registry
+        // leaves it unclaimed otherwise, in the claim itself.
+        const caps = this.fleet.agentCaps.get(ws);
+        const allowConverge = convergeEnabled(this.fleet.env) && !!caps && caps.has(CONVERGE_CAPABILITY);
+        const claimed = await reg.markDispatched(jobId, hostId, connId, { allowConverge });
         if (!claimed || !claimed.dispatch) return false;
         const d = claimed.dispatch;
         const frame = {
@@ -690,6 +692,10 @@ class SysscriptJobs {
     async submit({ host, actor, source, script, entitlements, timeoutS, kind, mode, bundleJson, expectPlanSha, converge }) {
         const isConverge = kind === 'converge';
         if (kind !== undefined && kind !== 'sysscript' && !isConverge) throw http(400, 'bad_kind');
+        // The kind follows the source (the claim gate keys on the source).
+        if (isConverge !== isConvergeSource(source) || (isConverge && (!converge || typeof converge !== 'object'))) {
+            throw http(400, 'bad_job');
+        }
         if (isConverge && !convergeEnabled(this.fleet.env)) throw http(503, 'converge_disabled');
         const body = isConverge ? bundleJson : script;
         // U+0000 cannot be stored in the dispatch JSONB.
@@ -738,7 +744,7 @@ class SysscriptJobs {
             deadline_at: new Date(deadlineUnix * 1000),
             lease_nonce: lease.nonce_hex,
             dispatch
-        }, isConverge ? { converge } : {});
+        }, isConverge ? { converge: { ...converge, expectPlanSha } } : {});
         if (this.capable(host.host_id)) this.enqueue(host.host_id, () => this.deliverDispatch(host.host_id, jobId));
         return { job, deadlineUnix };
     }
