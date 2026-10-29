@@ -24,16 +24,30 @@
  * scan every tick as the fallback.
  * Does NOT decide who may submit, read or cancel (router.js does), and does
  * NOT keep the script after dispatch (only its hash stays on the row).
+ * Converge jobs (.omc/plans/convergence-drift.md §7) ride the same rows:
+ * submit({kind:'converge'}) signs a converge_job lease over the bundle hash,
+ * entitlements hash, mode and plan hash, and stores kind, mode, bundle_json
+ * and expect_plan_sha256 in dispatch for the frame. They are refused at
+ * submit (503 converge_disabled) and never dispatched while
+ * SYSTEMAPI_CONVERGE is off (default; it is set only after every replica
+ * runs this code, §7.6), and never sent to a socket whose agent did not
+ * advertise converge: such a row stays submitted until the sweep ends it.
+ * A converge result's report goes into the terminal transition (the
+ * registry validates and ingests it in that transaction, before the ack);
+ * a report re-sent for an already terminal row is ingested once
+ * (ingestConvergeResend) before the ack.
  */
 'use strict';
 
 const WebSocket = require('ws');
-const { issueLease, sysscriptJobPayload, sha256Hex, SYSSCRIPT_JOB_RE } = require('../controlplane/lease');
+const { issueLease, sysscriptJobPayload, convergeJobPayload, sha256Hex, SYSSCRIPT_JOB_RE } = require('../controlplane/lease');
 const { entitlementsSha256 } = require('../controlplane/entitlements');
 const { jobRetentionDays, jobOutputRetentionHours, noNul, truncateUtf8 } = require('../controlplane/registry');
 const { randomToken } = require('../controlplane/token');
+const { isConvergeSource } = require('../controlplane/statestore');
 
 const JOB_CAPABILITY = 'sysscript_jobs';
+const CONVERGE_CAPABILITY = 'converge';
 const ACTIVE = ['submitted', 'accepted', 'running'];
 const TERMINAL = new Set(['succeeded', 'failed', 'cancelled', 'timed_out']);
 const RESULT_STATUSES = new Set([...TERMINAL, 'rejected']);
@@ -63,6 +77,13 @@ const SCRIPT_MAX_BYTES = 64 * 1024;
 function jobsEnabled(env) {
     const raw = env && env.SYSTEMAPI_SYSSCRIPT_JOBS;
     return String(raw === undefined || raw === null || raw === '' ? '1' : raw).trim() !== '0';
+}
+
+// SYSTEMAPI_CONVERGE: off unless it is "1" (§5, §7.6). Off, no converge job
+// is submitted or dispatched; results of jobs already running are still
+// stored.
+function convergeEnabled(env) {
+    return String((env && env.SYSTEMAPI_CONVERGE) || '').trim() === '1';
 }
 
 function http(status, code) {
@@ -343,10 +364,18 @@ class SysscriptJobs {
             const agent = await reg.hostAgent(hostId);
             if (!agent || agent.conn_id !== connId) return false;
         }
-        const claimed = await this.fleet.registry.markDispatched(jobId, hostId, connId);
+        // A converge row is claimed only for a converge agent while the
+        // switch is on; otherwise it is left unclaimed (checked before the
+        // claim, which takes the payload for good).
+        if (!(convergeEnabled(this.fleet.env) && this.fleet.agentSupports(hostId, CONVERGE_CAPABILITY))) {
+            const tenantId = this.fleet.hostTenants.get(hostId);
+            const row = tenantId ? await reg.getJob([tenantId], jobId) : null;
+            if (!row || isConvergeSource(row.source)) return false;
+        }
+        const claimed = await reg.markDispatched(jobId, hostId, connId);
         if (!claimed || !claimed.dispatch) return false;
         const d = claimed.dispatch;
-        const sent = sendJSON(ws, {
+        const frame = {
             type: 'sysscript_job',
             job_id: jobId,
             script: d.script,
@@ -354,7 +383,15 @@ class SysscriptJobs {
             deadline_unix: d.deadline_unix,
             timeout_s: d.timeout_s,
             lease: d.lease
-        });
+        };
+        if (d.kind === 'converge') {
+            delete frame.script;
+            frame.kind = 'converge';
+            frame.mode = d.mode;
+            frame.bundle_json = d.bundle_json;
+            frame.expect_plan_sha256 = d.expect_plan_sha256;
+        }
+        const sent = sendJSON(ws, frame);
         // A socket that closed after the claim: the row carries its conn_id,
         // so the next sync ends it agent_lost_job (or the deadline sweep does).
         if (!sent) console.error(`[Fleet] sysscript job ${jobId} lost its socket at dispatch`);
@@ -368,8 +405,9 @@ class SysscriptJobs {
         return true;
     }
 
-    // The dispatches and cancels waiting for hostId, delivered here.
-    // Returns how many frames were sent.
+    // The dispatches and cancels waiting for hostId, delivered here
+    // (deliverDispatch skips converge rows this agent cannot run). Returns
+    // how many frames were sent.
     async pump(hostId) {
         if (!this.capable(hostId)) return 0;
         const rows = await this.fleet.registry.pendingForHosts([hostId]);
@@ -445,20 +483,31 @@ class SysscriptJobs {
             if (cur) this.rejected(hostId, `late_reject_${cur.status}`);
             return undefined;
         }
+        // A converge row's report is validated and ingested in the
+        // transition's transaction; the registry ignores it on other rows.
+        const { report } = p;
         const row = await reg.transitionJob(jobId, hostId, ACTIVE, {
             status: p.status,
             error: typeof p.error === 'string' && p.error !== '' ? p.error : null,
             output: typeof p.output === 'string' ? p.output : null,
             output_truncated: p.output_truncated === true,
             duration_ms: Number.isInteger(p.duration_ms) ? p.duration_ms : null
-        }, { audit: { actor: 'agent' }, notify: true });
+        }, { audit: { actor: 'agent' }, notify: true, ...(report === undefined ? {} : { converge: { report } }) });
         if (row) {
             sendJSON(ws, { type: 'sysscript_job_ack', job_id: jobId });
             this.ended(row);
             return undefined;
         }
         const cur = await this.ownRow(hostId, jobId);
-        if (cur && TERMINAL.has(cur.status)) sendJSON(ws, { type: 'sysscript_job_ack', job_id: jobId });
+        if (cur && TERMINAL.has(cur.status)) {
+            // A re-send for a row ended elsewhere (a sweep, or a crash after
+            // the transition): its report is ingested once, then acked. A
+            // failed write throws before the ack, so the agent sends again.
+            if (report !== undefined && isConvergeSource(cur.source) && typeof reg.ingestConvergeResend === 'function') {
+                await reg.ingestConvergeResend(jobId, hostId, report);
+            }
+            sendJSON(ws, { type: 'sysscript_job_ack', job_id: jobId });
+        }
         return undefined;
     }
 
@@ -633,25 +682,48 @@ class SysscriptJobs {
     // sends it here when this instance holds the socket. entitlements must
     // already be clamped for the principal; the same object is hashed into
     // the lease, stored and sent. Returns {job, deadlineUnix}.
-    async submit({ host, actor, source, script, entitlements, timeoutS }) {
+    // kind 'converge' sends bundleJson (its hash is the row's script_sha256)
+    // in mode 'check' (expectPlanSha '-') or 'apply' (expectPlanSha the plan
+    // hash, source converge_apply only) under a converge_job lease; converge
+    // is the registry's createJob opts.converge (state, assignment, version,
+    // plan run). Refused while SYSTEMAPI_CONVERGE is off.
+    async submit({ host, actor, source, script, entitlements, timeoutS, kind, mode, bundleJson, expectPlanSha, converge }) {
+        const isConverge = kind === 'converge';
+        if (kind !== undefined && kind !== 'sysscript' && !isConverge) throw http(400, 'bad_kind');
+        if (isConverge && !convergeEnabled(this.fleet.env)) throw http(503, 'converge_disabled');
+        const body = isConverge ? bundleJson : script;
         // U+0000 cannot be stored in the dispatch JSONB.
-        if (typeof script !== 'string' || script.length === 0 || !script.isWellFormed() || script.includes('\u0000')
-            || Buffer.byteLength(script, 'utf8') > SCRIPT_MAX_BYTES) {
-            throw http(400, 'bad_script');
+        if (typeof body !== 'string' || body.length === 0 || !body.isWellFormed() || body.includes('\u0000')
+            || Buffer.byteLength(body, 'utf8') > SCRIPT_MAX_BYTES) {
+            throw http(400, isConverge ? 'bad_bundle' : 'bad_script');
+        }
+        if (isConverge && !((mode === 'check' && expectPlanSha === '-' && source !== 'converge_apply')
+            || (mode === 'apply' && source === 'converge_apply' && typeof expectPlanSha === 'string' && /^[0-9a-f]{64}$/.test(expectPlanSha)))) {
+            throw http(400, 'bad_mode');
         }
         const signer = this.fleet.signer;
         if (!signer) throw http(503, 'signer_unavailable');
         const ents = entitlements || {};
         const entSha = entitlementsSha256(ents);
-        const scriptSha = sha256Hex(Buffer.from(script, 'utf8'));
+        const scriptSha = sha256Hex(Buffer.from(body, 'utf8'));
         const jobId = `sjb_${randomToken(16)}`;
         const deadlineUnix = Math.floor(Date.now() / 1000) + timeoutS;
-        const lease = issueLease(signer, {
+        const lease = issueLease(signer, isConverge ? {
+            hostId: host.host_id,
+            action: 'converge_job',
+            payload: convergeJobPayload({
+                jobId, deadlineUnix, timeoutS, bundleSha256: scriptSha, entitlementsSha256: entSha, mode, expectPlanSha256: expectPlanSha
+            }),
+            ttl: JOB_LEASE_TTL_S
+        } : {
             hostId: host.host_id,
             action: 'sysscript_job',
             payload: sysscriptJobPayload({ jobId, deadlineUnix, timeoutS, scriptSha256: scriptSha, entitlementsSha256: entSha }),
             ttl: JOB_LEASE_TTL_S
         });
+        const dispatch = isConverge
+            ? { kind: 'converge', mode, bundle_json: bundleJson, expect_plan_sha256: expectPlanSha, entitlements: ents, lease, deadline_unix: deadlineUnix, timeout_s: timeoutS }
+            : { script, entitlements: ents, lease, deadline_unix: deadlineUnix, timeout_s: timeoutS };
         this.listen();
         const job = await this.fleet.registry.createJob({
             job_id: jobId,
@@ -665,8 +737,8 @@ class SysscriptJobs {
             timeout_s: timeoutS,
             deadline_at: new Date(deadlineUnix * 1000),
             lease_nonce: lease.nonce_hex,
-            dispatch: { script, entitlements: ents, lease, deadline_unix: deadlineUnix, timeout_s: timeoutS }
-        });
+            dispatch
+        }, isConverge ? { converge } : {});
         if (this.capable(host.host_id)) this.enqueue(host.host_id, () => this.deliverDispatch(host.host_id, jobId));
         return { job, deadlineUnix };
     }
@@ -717,4 +789,4 @@ class SysscriptJobs {
     }
 }
 
-module.exports = { SysscriptJobs, jobView, jobsEnabled, JOB_CAPABILITY, TERMINAL_JOB_STATUSES: TERMINAL };
+module.exports = { SysscriptJobs, jobView, jobsEnabled, convergeEnabled, JOB_CAPABILITY, CONVERGE_CAPABILITY, TERMINAL_JOB_STATUSES: TERMINAL };

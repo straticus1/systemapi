@@ -331,6 +331,71 @@ test('sysscript_job lease: vectors, canonical entitlements and tamper rejection'
   assert.deepEqual(ents.parseEntitlements(clamped).allow_packages, ['nginx']);
 });
 
+test('converge_job lease: Go/Node vectors; each single-field swap is payload_mismatch; not interchangeable with sysscript_job', () => {
+  const lease = require('../controlplane/lease');
+  const ents = require('../controlplane/entitlements');
+  const sig = signer();
+  const pub = sig.privateKey;
+  const vec = require('../controlplane/testdata/converge-job-lease-vectors.json');
+  assert.ok(vec.vectors.length >= 3);
+  const payloadOf = (c, over = {}) => {
+    const v = { ...c, ...over };
+    return lease.convergeJobPayload({
+      jobId: v.job_id,
+      deadlineUnix: v.deadline_unix,
+      timeoutS: v.timeout_s,
+      bundleSha256: lease.sha256Hex(Buffer.from(v.bundle_json, 'utf8')),
+      entitlementsSha256: ents.entitlementsSha256(v.entitlements),
+      mode: v.mode,
+      expectPlanSha256: v.expect_plan_sha256
+    });
+  };
+  for (const c of vec.vectors) {
+    assert.equal(ents.canonicalEntitlements(ents.parseEntitlements(c.entitlements)), c.canonical_entitlements, c.name);
+    assert.equal(ents.entitlementsSha256(c.entitlements), c.entitlements_sha256, c.name);
+    assert.equal(lease.sha256Hex(Buffer.from(c.bundle_json, 'utf8')), c.bundle_sha256, c.name);
+    assert.equal(payloadOf(c), c.payload, c.name);
+    assert.equal(c.payload.split('\n').length, 7, c.name);
+    assert.equal(lease.payloadHash('converge_job', c.payload), c.lease.payload_sha256, c.name);
+    assert.equal(sig.sign(c.message), c.lease.signature, 'ed25519 is deterministic');
+    assert.equal(lease.verifyLease(pub, c.lease, c.payload, vec.now_ms).ok, true, c.name);
+  }
+  const now = vec.now_ms;
+  const check = vec.vectors.find((c) => c.mode === 'check');
+  const apply = vec.vectors.find((c) => c.mode === 'apply');
+  for (const c of [check, apply]) {
+    const mismatch = (over) => lease.verifyLease(pub, c.lease, payloadOf(c, over), now).error;
+    assert.equal(mismatch({ job_id: 'sjb_Q29udmVyZ2UtY2hlY2stMg' }), 'payload_mismatch');
+    assert.equal(mismatch({ deadline_unix: c.deadline_unix + 1 }), 'payload_mismatch');
+    assert.equal(mismatch({ timeout_s: c.timeout_s - 1 }), 'payload_mismatch');
+    assert.equal(mismatch({ bundle_json: `${c.bundle_json} ` }), 'payload_mismatch');
+    assert.equal(mismatch({ entitlements: { ...c.entitlements, allow_k3s: true } }), 'payload_mismatch');
+    if (c.mode === 'check') {
+      assert.equal(mismatch({ mode: 'apply', expect_plan_sha256: 'a'.repeat(64) }), 'payload_mismatch');
+    } else {
+      assert.equal(mismatch({ expect_plan_sha256: '0'.repeat(64) }), 'payload_mismatch');
+      assert.equal(mismatch({ mode: 'check', expect_plan_sha256: '-' }), 'payload_mismatch');
+    }
+  }
+  // Not interchangeable with sysscript_job, either way.
+  assert.equal(lease.verifyLease(pub, { ...check.lease, action: 'sysscript_job' }, check.payload, now).error, 'payload_mismatch');
+  const job = require('../controlplane/testdata/sysscript-job-lease-vectors.json').vectors[0];
+  assert.equal(lease.verifyLease(pub, { ...job.lease, action: 'converge_job' }, job.payload, now).error, 'payload_mismatch');
+  assert.notEqual(lease.payloadHash('converge_job', job.payload), lease.payloadHash('sysscript_job', job.payload));
+  // The builder refuses what the agent refuses, including a mode and plan
+  // that disagree.
+  const ok = { jobId: check.job_id, deadlineUnix: 1, timeoutS: 1, bundleSha256: check.bundle_sha256, entitlementsSha256: check.entitlements_sha256, mode: 'check', expectPlanSha256: '-' };
+  assert.doesNotThrow(() => lease.convergeJobPayload(ok));
+  for (const bad of [
+    { mode: 'check', expectPlanSha256: 'a'.repeat(64) }, { mode: 'apply', expectPlanSha256: '-' }, { mode: 'apply', expectPlanSha256: 'A'.repeat(64) },
+    { mode: 'verify' }, { mode: 'check\n' }, { expectPlanSha256: '' }, { bundleSha256: 'a'.repeat(63) }, { jobId: 'sjb_x' }, { timeoutS: 3601 }
+  ]) {
+    assert.throws(() => lease.convergeJobPayload({ ...ok, ...bad }), /bad_payload/, JSON.stringify(bad));
+  }
+  const fresh = lease.issueLease(sig, { hostId: HOST_A, action: 'converge_job', payload: check.payload, now });
+  assert.equal(lease.verifyLease(pub, fresh, check.payload, now).ok, true);
+});
+
 test('audit hash chain detects a tampered payload', async () => {
   const reg = new MemoryRegistry({});
   await reg.appendAudit({ tenant_id: 'acme', action: 'sysscript', payload: { n: 1 } });

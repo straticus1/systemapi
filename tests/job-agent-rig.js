@@ -15,7 +15,7 @@ const WebSocket = require('ws');
 
 const FleetManager = require('../playground/fleet');
 const { mount } = require('../controlplane/router');
-const { verifyLease, sysscriptJobPayload, sha256Hex } = require('../controlplane/lease');
+const { verifyLease, sysscriptJobPayload, convergeJobPayload, sha256Hex } = require('../controlplane/lease');
 const { entitlementsSha256 } = require('../controlplane/entitlements');
 const { TEST_SEED, privateKeyFromSeed, rawPublicKey, buildSigner } = require('../controlplane/keys');
 
@@ -135,16 +135,22 @@ async function connectAgent(r, hostId, opts = {}) {
     }
     if (f.type === 'sysscript_job') {
       let check;
+      // A converge frame (kind converge) is checked as the Go agent does:
+      // a converge_job lease over the bundle, mode and plan hash.
+      const converge = f.kind === 'converge';
       try {
-        const payload = sysscriptJobPayload({
+        const fields = {
           jobId: f.job_id,
           deadlineUnix: f.deadline_unix,
           timeoutS: f.timeout_s,
-          scriptSha256: sha256Hex(Buffer.from(f.script, 'utf8')),
           entitlementsSha256: entitlementsSha256(f.entitlements)
-        });
+        };
+        const payload = converge
+          ? convergeJobPayload({ ...fields, bundleSha256: sha256Hex(Buffer.from(f.bundle_json, 'utf8')), mode: f.mode, expectPlanSha256: f.expect_plan_sha256 })
+          : sysscriptJobPayload({ ...fields, scriptSha256: sha256Hex(Buffer.from(f.script, 'utf8')) });
         check = verifyLease(pub, f.lease, payload);
-        if (check.ok && (f.lease.host_id !== hostId || f.lease.action !== 'sysscript_job')) check = { ok: false, error: 'bad_host' };
+        const action = converge ? 'converge_job' : 'sysscript_job';
+        if (check.ok && (f.lease.host_id !== hostId || f.lease.action !== action)) check = { ok: false, error: 'bad_host' };
       } catch (err) {
         check = { ok: false, error: err.message };
       }

@@ -34,18 +34,25 @@
 // <sha256_hex(canonical entitlements v1)>" (controlplane/entitlements.js),
 // so the agent runs only the signed script under the signed entitlements and
 // time limits, and a sysscript lease cannot start a job (or the reverse).
+// A converge job (action converge_job, .omc/plans/convergence-drift.md §7.1)
+// signs "converge_job\n<job_id>\n<deadline_unix>\n<timeout_s>\n
+// <sha256_hex(bundle_json)>\n<sha256_hex(canonical entitlements v1)>\n
+// <check|apply>\n<expect_plan_sha256|->": the mode and the approved plan hash
+// are bound, check always signs "-" and apply always a plan hash, and a
+// sysscript_job lease cannot start a converge job (or the reverse). Shared
+// vectors: controlplane/testdata/converge-job-lease-vectors.json.
 'use strict';
 
 const crypto = require('node:crypto');
 const { validateFileRoot } = require('./channels');
 const { randomBytes, timingSafeEqual } = crypto;
 
-const ACTIONS = new Set(['sysscript', 'sysscript_job', 'pty', 'pty_root', 'breakglass', 'tcp', 'file', 'file_root', 'xfer', 'xfer_root']);
+const ACTIONS = new Set(['sysscript', 'sysscript_job', 'converge_job', 'pty', 'pty_root', 'breakglass', 'tcp', 'file', 'file_root', 'xfer', 'xfer_root']);
 const TERMINAL_ACTIONS = new Set(['pty', 'pty_root', 'breakglass']);
 const CHANNEL_ACTIONS = new Set(['tcp', 'file', 'file_root']);
 const XFER_ACTIONS = new Set(['xfer', 'xfer_root']);
 // Actions whose hash covers "<action>\n<payload>".
-const SESSION_ACTIONS = new Set([...TERMINAL_ACTIONS, ...CHANNEL_ACTIONS, ...XFER_ACTIONS, 'sysscript_job']);
+const SESSION_ACTIONS = new Set([...TERMINAL_ACTIONS, ...CHANNEL_ACTIONS, ...XFER_ACTIONS, 'sysscript_job', 'converge_job']);
 const SYSSCRIPT_JOB_RE = /^sjb_[A-Za-z0-9_-]{22}$/;
 const SYSSCRIPT_JOB_TIMEOUT_MAX = 3600;
 const TCP_SESSION_RE = /^tcs_[A-Za-z0-9_-]{16,64}$/;
@@ -268,8 +275,22 @@ function sysscriptJobPayload({ jobId, deadlineUnix, timeoutS, scriptSha256, enti
   return `${jobId}\n${deadlineUnix}\n${timeoutS}\n${scriptSha256}\n${entitlementsSha256}`;
 }
 
+// The converge_job payload (seven lines, no trailing newline): the
+// sysscript_job fields with bundleSha256 (sha256 of the bundle_json string's
+// UTF-8 bytes) in the script hash's place, then the mode and the plan hash.
+// mode check takes expectPlanSha256 "-" and mode apply a 64 lowercase hex
+// plan hash; anything else is bad_payload.
+function convergeJobPayload({ jobId, deadlineUnix, timeoutS, bundleSha256, entitlementsSha256, mode, expectPlanSha256 } = {}) {
+  const base = sysscriptJobPayload({ jobId, deadlineUnix, timeoutS, scriptSha256: bundleSha256, entitlementsSha256 });
+  const ok = (mode === 'check' && expectPlanSha256 === '-')
+    || (mode === 'apply' && typeof expectPlanSha256 === 'string' && SHA256_HEX_RE.test(expectPlanSha256));
+  if (!ok) throw badPayload();
+  return `${base}\n${mode}\n${expectPlanSha256}`;
+}
+
 module.exports = {
   TERMINAL_ACTIONS,
+  convergeJobPayload,
   SYSSCRIPT_JOB_RE,
   SYSSCRIPT_JOB_TIMEOUT_MAX,
   sysscriptJobPayload,

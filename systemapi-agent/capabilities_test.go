@@ -96,3 +96,25 @@ func TestSysscriptJobsCapabilitySwitch(t *testing.T) {
 		t.Fatal("--sysscript-jobs=false must not touch other capabilities")
 	}
 }
+
+// converge: off by default; --converge (convergeOn) advertises it only on
+// Linux and macOS, and only while async jobs are advertised.
+func TestConvergeCapabilitySwitch(t *testing.T) {
+	defer func(prevJobs, prevConv bool) { sysscriptJobsOn, convergeOn = prevJobs, prevConv }(sysscriptJobsOn, convergeOn)
+	if convergeOn {
+		t.Fatal("--converge must default to off")
+	}
+	sysscriptJobsOn = true
+	if hasCap("converge") {
+		t.Fatal("converge advertised without --converge")
+	}
+	convergeOn = true
+	groupKill := runtime.GOOS == "linux" || runtime.GOOS == "darwin"
+	if got := hasCap("converge"); got != groupKill {
+		t.Fatalf("GOOS=%s: converge advertised=%v, want %v", runtime.GOOS, got, groupKill)
+	}
+	sysscriptJobsOn = false
+	if hasCap("converge") {
+		t.Fatal("--sysscript-jobs=false still advertises converge")
+	}
+}

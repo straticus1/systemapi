@@ -7,8 +7,9 @@ package main
 // every resource through a ReadOnlyHost, builds the plan and its hash, and,
 // in apply mode only, re-checks the plan hash against the signed one before
 // it applies the drifted resources in order, stopping on the first failure.
-// This file is not reachable from a frame: no lease action, capability or
-// job kind calls convergeRun yet.
+// A sysscript_job frame of kind "converge" under a converge_job lease
+// reaches convergeRun through the job manager (sysscript_jobs.go), only
+// with --converge.
 //
 // Threats: the bundle is untrusted. The declaration has no sys, clock, env,
 // disk or network: its predeclared names are state (resource builtins,

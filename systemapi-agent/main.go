@@ -41,6 +41,11 @@ type CommandMessage struct {
 	Mode         string        `json:"mode,omitempty"`
 	Reason       string        `json:"reason,omitempty"`
 	Override     bool          `json:"override,omitempty"`
+	// A sysscript_job frame with kind "converge" carries the bundle and,
+	// in Mode, check or apply; ExpectPlan is "-" for check.
+	Kind       string `json:"kind,omitempty"`
+	BundleJSON string `json:"bundle_json,omitempty"`
+	ExpectPlan string `json:"expect_plan_sha256,omitempty"`
 }
 
 // ResponseMessage is an outgoing WebSocket message.
@@ -83,6 +88,7 @@ func main() {
 	sysscriptWorkersFlag := flag.Int("sysscript-workers", jobWorkersDefault, fmt.Sprintf("sysscripts run at once (1..%d); %d more may wait, then agent_busy", jobWorkersMax, jobPendingMax))
 	sysscriptLegacyFlag := flag.Int("sysscript-legacy-seconds", jobLegacyDefaultSec, fmt.Sprintf("whole-script deadline of a legacy sysscript frame (1..%d, at most --sysscript-max-seconds)", jobMaxSecondsMax))
 	sysscriptJobsFlag := flag.Bool("sysscript-jobs", true, "advertise async sysscript jobs (sysscript_jobs, Linux and macOS only); =false makes the server send this host's scripts the legacy way")
+	convergeFlag := flag.Bool("converge", false, "advertise desired-state converge jobs (converge, Linux and macOS only, needs --sysscript-jobs); enable only after every server replica runs the converge wiring")
 	sysscriptMaxFlag := flag.Int("sysscript-max-seconds", jobMaxSecondsMax, fmt.Sprintf("ceiling for any sysscript deadline (1..%d)", jobMaxSecondsMax))
 	stateBackupDirFlag := flag.String("state-backup-dir", stateBackupDir, "directory for desired-state file backups (absolute, root-only; must not overlap any write grant, or file changes that need a backup fail)")
 	flag.Parse()
@@ -93,6 +99,7 @@ func main() {
 		os.Exit(2)
 	}
 	sysscriptJobsOn = *sysscriptJobsFlag
+	convergeOn = *convergeFlag
 	jc, err := parseJobFlags(*sysscriptWorkersFlag, *sysscriptLegacyFlag, *sysscriptMaxFlag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)

@@ -1130,3 +1130,170 @@ test('POST /jobs for an agent on another instance whose presence is older than 9
     await one.r.close();
   }
 });
+
+// Converge jobs on the job pipeline (.omc/plans/convergence-drift.md §7,
+// commit 4): the submit, the dispatch frame, the capability and
+// SYSTEMAPI_CONVERGE gates, and the report through the transition and a
+// re-send. No routes yet: jobs.submit is driven directly.
+const CONV_BUNDLE = JSON.stringify({ v: 1, files: { 'main.star': 'state.file("/etc/x", "x")' }, vars: {}, host: {} });
+const CONV_SHA = require('node:crypto').createHash('sha256').update(CONV_BUNDLE, 'utf8').digest('hex');
+
+function convReport({ drift = 1 } = {}) {
+  return {
+    v: 1,
+    mode: 'check',
+    bundle_sha256: CONV_SHA,
+    plan_sha256: 'c'.repeat(64),
+    truncated: false,
+    summary: { total: 1, ok: drift ? 0 : 1, drift, changed: 0, failed: 0, denied: 0, skipped: 0 },
+    plan: drift ? [{ key: 'file:/etc/x', status: 'drift' }] : [],
+    resources: [{ key: 'file:/etc/x', kind: 'file', status: drift ? 'drift' : 'ok', sensitive: false, before: { exists: true }, desired: { mode: '0644' }, diff: '', error: '', backup_id: null }]
+  };
+}
+
+// A host assignment of a published state on HOST_A; returns the submit
+// arguments of a check job for it.
+async function convergeSetup(reg) {
+  const st = await reg.createState({ tenantId: 'acme', name: 'web', actor: 'user-1' });
+  const v = await reg.publishVersion({ tenantId: 'acme', stateId: st.state_id, files: { 'main.star': 'x = 1' }, entitlements: { allow_fs_write: ['/etc/'] }, actor: 'user-1' });
+  const a = await reg.createAssignment({ tenantId: 'acme', stateId: st.state_id, versionId: v.version_id, targetKind: 'host', targetValue: HOST_A, actor: 'user-1' });
+  return {
+    host: { host_id: HOST_A, tenant_id: 'acme' },
+    actor: 'user-1',
+    source: 'converge_check',
+    kind: 'converge',
+    mode: 'check',
+    expectPlanSha: '-',
+    bundleJson: CONV_BUNDLE,
+    entitlements: v.entitlements,
+    timeoutS: 300,
+    converge: { kind: 'check', stateId: st.state_id, assignmentId: a.assignment_id, versionId: v.version_id }
+  };
+}
+
+test('converge: the frame carries kind, mode, bundle and plan under a converge_job lease; the report is ingested before the ack', async () => {
+  const { r, reg, a } = await world({ env: { SYSTEMAPI_CONVERGE: '1' }, caps: 'sysscript_jobs,converge' });
+  try {
+    const args = await convergeSetup(reg);
+    const { job } = await r.fm.jobs.submit(args);
+    assert.equal(job.script_sha256, CONV_SHA);
+    const { frame, lease } = await a.waitJob(job.job_id);
+    assert.equal(lease.ok, true, lease.error);
+    assert.equal(frame.lease.action, 'converge_job');
+    assert.equal(frame.kind, 'converge');
+    assert.equal(frame.mode, 'check');
+    assert.equal(frame.bundle_json, CONV_BUNDLE);
+    assert.equal(frame.expect_plan_sha256, '-');
+    assert.equal('script' in frame, false);
+    assert.deepEqual(frame.entitlements, args.entitlements);
+    assert.equal((await row(reg, job.job_id)).dispatch, null);
+
+    a.status(job.job_id, { status: 'running' });
+    a.result(job.job_id, { status: 'succeeded', report: convReport() });
+    await a.waitFor('sysscript_job_ack', job.job_id);
+    const run = reg.convergeRuns.get(job.job_id);
+    assert.match(run.report_sha256, /^[0-9a-f]{64}$/);
+    assert.equal(run.summary.drift, 1);
+    assert.equal(reg.hostStates.get(`${HOST_A}\u0000${args.converge.stateId}`).status, 'drifted');
+    assert.equal((await row(reg, job.job_id)).status, 'succeeded');
+
+    // A malformed report ends the job failed[bad_report], still acked.
+    const bad = await r.fm.jobs.submit(args);
+    await a.waitJob(bad.job.job_id);
+    a.result(bad.job.job_id, { status: 'succeeded', report: { ...convReport(), bundle_sha256: 'f'.repeat(64) } });
+    await a.waitFor('sysscript_job_ack', bad.job.job_id);
+    const badRow = await row(reg, bad.job.job_id);
+    assert.equal(badRow.status, 'failed');
+    assert.equal(badRow.error, 'bad_report');
+  } finally {
+    await r.close();
+  }
+});
+
+test('converge: a report re-sent for a row already ended without one is ingested once, then acked', async () => {
+  const { r, reg, a } = await world({ env: { SYSTEMAPI_CONVERGE: '1' }, caps: 'sysscript_jobs,converge' });
+  try {
+    const args = await convergeSetup(reg);
+    const { job } = await r.fm.jobs.submit(args);
+    await a.waitJob(job.job_id);
+    // Ended elsewhere (a sweep) with no report.
+    const swept = await reg.transitionJob(job.job_id, HOST_A, ['submitted', 'accepted', 'running'], { status: 'failed', error: 'result_lost' });
+    assert.equal(swept.status, 'failed');
+    assert.equal(reg.convergeRuns.get(job.job_id).report_sha256, null);
+    a.result(job.job_id, { status: 'succeeded', report: convReport({ drift: 0 }) });
+    await a.waitFor('sysscript_job_ack', job.job_id);
+    const sha = reg.convergeRuns.get(job.job_id).report_sha256;
+    assert.match(sha, /^[0-9a-f]{64}$/);
+    // A second re-send changes nothing and is acked again.
+    a.result(job.job_id, { status: 'succeeded', report: convReport({ drift: 1 }) });
+    await waitUntil('second ack', () => a.of('sysscript_job_ack', job.job_id).length === 2);
+    assert.equal(reg.convergeRuns.get(job.job_id).report_sha256, sha);
+  } finally {
+    await r.close();
+  }
+});
+
+test('converge: never dispatched to an agent without converge, nor while SYSTEMAPI_CONVERGE is off; submit refuses off and bad modes', async () => {
+  const { r, reg, a } = await world({ env: { SYSTEMAPI_CONVERGE: '1' } });
+  try {
+    const args = await convergeSetup(reg);
+    const { job } = await r.fm.jobs.submit(args);
+    // A plain job after it is still sent; the converge row is not claimed.
+    const plain = await dispatched(r, a);
+    assert.ok(plain);
+    assert.equal(await r.fm.jobs.pump(HOST_A), 0);
+    assert.equal(await r.fm.jobs.deliverDispatch(HOST_A, job.job_id), false);
+    const stored = await row(reg, job.job_id);
+    assert.equal(stored.status, 'submitted');
+    assert.equal(stored.dispatch.kind, 'converge', 'the payload is left for a capable agent');
+    assert.equal(a.jobs.has(job.job_id), false);
+
+    // Submit refusals.
+    const refuse = (over, code) => assert.rejects(r.fm.jobs.submit({ ...args, ...over }), (e) => e.code === code, code);
+    await refuse({ expectPlanSha: 'a'.repeat(64) }, 'bad_mode');
+    await refuse({ mode: 'apply', expectPlanSha: 'a'.repeat(64) }, 'bad_mode');
+    await refuse({ mode: 'apply', expectPlanSha: '-', source: 'converge_apply' }, 'bad_mode');
+    await refuse({ mode: 'verify' }, 'bad_mode');
+    await refuse({ bundleJson: 'x'.repeat(64 * 1024 + 1) }, 'bad_bundle');
+    await refuse({ bundleJson: '' }, 'bad_bundle');
+    await refuse({ kind: 'shell' }, 'bad_kind');
+    r.fm.env.SYSTEMAPI_CONVERGE = '0';
+    await assert.rejects(r.fm.jobs.submit(args), (e) => e.status === 503 && e.code === 'converge_disabled');
+  } finally {
+    await r.close();
+  }
+});
+
+test('converge: SYSTEMAPI_CONVERGE off leaves a converge row unsent even to a converge agent; results still land', async () => {
+  const { r, reg, a } = await world({ env: { SYSTEMAPI_CONVERGE: '1' }, caps: 'sysscript_jobs,converge' });
+  try {
+    const args = await convergeSetup(reg);
+    // Sent while on; the switch goes off while it runs: its result is
+    // still stored and acked.
+    const { job } = await r.fm.jobs.submit(args);
+    await a.waitJob(job.job_id);
+    r.fm.env.SYSTEMAPI_CONVERGE = '0';
+    a.result(job.job_id, { status: 'succeeded', report: convReport() });
+    await a.waitFor('sysscript_job_ack', job.job_id);
+    assert.match(reg.convergeRuns.get(job.job_id).report_sha256, /^[0-9a-f]{64}$/);
+    // A converge row still queued is not sent while off.
+    r.fm.env.SYSTEMAPI_CONVERGE = '1';
+    r.fm.jobs.events = false;
+    r.fm.jobs.stop();
+    const capable = r.fm.jobs.capable;
+    r.fm.jobs.capable = () => false; // keep submit from sending it at once
+    const queued = await r.fm.jobs.submit(args);
+    r.fm.jobs.capable = capable;
+    r.fm.env.SYSTEMAPI_CONVERGE = '0';
+    assert.equal(await r.fm.jobs.pump(HOST_A), 0);
+    assert.equal(await r.fm.jobs.deliverDispatch(HOST_A, queued.job.job_id), false);
+    assert.notEqual((await row(reg, queued.job.job_id)).dispatch, null);
+    // On again, the same row goes out.
+    r.fm.env.SYSTEMAPI_CONVERGE = '1';
+    assert.equal(await r.fm.jobs.pump(HOST_A), 1);
+    const { lease } = await a.waitJob(queued.job.job_id);
+    assert.equal(lease.ok, true, lease.error);
+  } finally {
+    await r.close();
+  }
+});

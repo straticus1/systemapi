@@ -20,6 +20,13 @@
 // parse of the frame (canonicalEntitlements), so entitlements changed in
 // transit fail as payload_mismatch; the shared vectors are
 // controlplane/testdata/sysscript-job-lease-vectors.json.
+// A converge job (converge_job) signs "converge_job\n<job_id>\n
+// <deadline_unix>\n<timeout_s>\n<sha256(bundle_json)>\n<sha256(canonical
+// entitlements v1)>\n<check|apply>\n<expect_plan_sha256|->", so the mode and
+// the approved plan hash cannot be swapped in transit, a check lease cannot
+// run an apply, and neither a sysscript_job nor a converge_job lease verifies
+// as the other (the action is in the hash). The shared vectors are
+// controlplane/testdata/converge-job-lease-vectors.json.
 package main
 
 import (
@@ -78,7 +85,7 @@ func payloadHash(action, payload string) string {
 }
 
 func payloadFor(action, payload string) string {
-	if terminalAction(action) || channelAction(action) || xferAction(action) || action == "sysscript_job" {
+	if terminalAction(action) || channelAction(action) || xferAction(action) || action == "sysscript_job" || action == "converge_job" {
 		return action + "\n" + payload
 	}
 	return payload
@@ -102,7 +109,7 @@ func hashEqual(a, b string) bool {
 }
 
 func knownAction(action string) bool {
-	return action == "sysscript" || action == "sysscript_job" || terminalAction(action) || channelAction(action) || xferAction(action)
+	return action == "sysscript" || action == "sysscript_job" || action == "converge_job" || terminalAction(action) || channelAction(action) || xferAction(action)
 }
 
 // xferAction reports the sahxfer grant lease actions.
@@ -445,6 +452,28 @@ func sysscriptJobLeasePayload(jobID string, deadlineUnix int64, timeoutS int, sc
 		return "", errors.New("bad_payload")
 	}
 	return jobID + "\n" + strconv.FormatInt(deadlineUnix, 10) + "\n" + strconv.Itoa(timeoutS) + "\n" + scriptSHA + "\n" + entsSHA, nil
+}
+
+// convergeModeOK reports whether mode and expectPlan agree: check with "-",
+// apply with a 64-hex plan hash.
+func convergeModeOK(mode, expectPlan string) bool {
+	return (mode == "check" && expectPlan == "-") || (mode == "apply" && hashHexRe.MatchString(expectPlan))
+}
+
+// convergeJobLeasePayload is the signed payload of a converge_job lease:
+// "<job_id>\n<deadline_unix>\n<timeout_s>\n<bundle_sha256>\n
+// <entitlements_sha256>\n<check|apply>\n<expect_plan_sha256|->". It refuses
+// what the server's lease.js convergeJobPayload would never sign; a mode and
+// plan hash that disagree are bad_mode.
+func convergeJobLeasePayload(jobID string, deadlineUnix int64, timeoutS int, bundleSHA, entsSHA, mode, expectPlan string) (string, error) {
+	base, err := sysscriptJobLeasePayload(jobID, deadlineUnix, timeoutS, bundleSHA, entsSHA)
+	if err != nil {
+		return "", err
+	}
+	if !convergeModeOK(mode, expectPlan) {
+		return "", errors.New("bad_mode")
+	}
+	return base + "\n" + mode + "\n" + expectPlan, nil
 }
 
 // verifyLease checks the signature and the time window. It does not record

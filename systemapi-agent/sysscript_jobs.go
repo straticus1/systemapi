@@ -45,9 +45,20 @@ package main
 // result, not a rejection.
 // Cancel and ack are unsigned: cancel can only shorten work and ack only
 // frees memory; ids the agent does not hold are ignored.
+// A converge job is a sysscript_job frame with kind "converge"
+// (.omc/plans/convergence-drift.md §7): it carries bundle_json, mode and
+// expect_plan_sha256 instead of a script, under a converge_job lease that
+// binds the bundle hash, the canonical entitlements hash, the mode and the
+// plan hash, so a check cannot be turned into an apply or pointed at another
+// plan. It is refused as converge_unsupported unless --converge is on, as
+// bad_mode unless mode=apply goes with a plan hash and mode=check with "-",
+// and as bundle_too_large over the bundle cap. convergeRun's capped report
+// rides in the result frame next to the capped output. Any other kind is
+// bad_kind.
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -144,6 +155,10 @@ type sysscriptJob struct {
 	runAt    time.Time
 	// running, when set, is called as a worker picks the job up.
 	running func()
+	// conv, when set, makes this a converge job: run calls convergeRun and
+	// leaves its report in report before finish.
+	conv   *convergeRequest
+	report json.RawMessage
 	// finish reports the outcome. It is called exactly once, from a worker.
 	finish func(output string, truncated bool, err error)
 }
@@ -448,10 +463,16 @@ func (m *jobManager) run(j *sysscriptJob) {
 	if j.running != nil {
 		j.running()
 	}
-	engine := NewSysscriptEngine(j.ctx, j.ents)
-	engine.alerts = &alertSink{send: j.alerts, scriptID: j.id, job: j.job}
-	output, err = engine.Execute(j.script)
-	truncated = engine.outputTruncated
+	if j.conv != nil {
+		res := convergeRun(j.ctx, *j.conv, convergeBackend())
+		output, truncated, j.report = res.Output, res.OutputTruncated, res.Report
+		err = convergeJobErr(res)
+	} else {
+		engine := NewSysscriptEngine(j.ctx, j.ents)
+		engine.alerts = &alertSink{send: j.alerts, scriptID: j.id, job: j.job}
+		output, err = engine.Execute(j.script)
+		truncated = engine.outputTruncated
+	}
 	if err != nil && errors.Is(context.Cause(j.ctx), errAgentStopped) {
 		err = errAgentStopped
 	}
@@ -544,28 +565,68 @@ type jobStatusPayload struct {
 	StartedUnix  int64  `json:"started_unix,omitempty"`
 }
 
-// jobResultPayload is the payload of sysscript_job_result.
+// jobResultPayload is the payload of sysscript_job_result. Report is a
+// converge job's report (absent for a script).
 type jobResultPayload struct {
-	Status          string `json:"status"`
-	Error           string `json:"error"`
-	Output          string `json:"output"`
-	OutputTruncated bool   `json:"output_truncated"`
-	DurationMS      int64  `json:"duration_ms"`
+	Status          string          `json:"status"`
+	Error           string          `json:"error"`
+	Output          string          `json:"output"`
+	OutputTruncated bool            `json:"output_truncated"`
+	DurationMS      int64           `json:"duration_ms"`
+	Report          json.RawMessage `json:"report,omitempty"`
 }
 
 // jobResultFrame encodes a sysscript_job_result, its encoded size capped at
-// jobFrameMax (encodeOutputFrame).
-func jobResultFrame(id, status, errText, output string, truncated bool, dur time.Duration) ([]byte, error) {
+// jobFrameMax (encodeOutputFrame): the output is cut to fit; the report is
+// already capped at convergeReportMax, far under the frame cap.
+func jobResultFrame(id, status, errText, output string, truncated bool, dur time.Duration, report json.RawMessage) ([]byte, error) {
 	errText, _ = frameText(errText, frameErrMax)
 	return encodeOutputFrame(func(o string, tr bool) interface{} {
 		return ResponseMessage{
 			Type:  "sysscript_job_result",
 			JobID: id,
 			Payload: jobResultPayload{
-				Status: status, Error: errText, Output: o, OutputTruncated: tr, DurationMS: dur.Milliseconds(),
+				Status: status, Error: errText, Output: o, OutputTruncated: tr, DurationMS: dur.Milliseconds(), Report: report,
 			},
 		}
 	}, output, truncated)
+}
+
+// convergeBackend is the host converge jobs run against; tests replace it.
+var convergeBackend = osHostBackend
+
+// convergeJobError carries a converge run's (already masked) error text and
+// the sentinel jobOutcome maps to the job status.
+type convergeJobError struct {
+	text string
+	kind error
+}
+
+func (e *convergeJobError) Error() string { return e.text }
+func (e *convergeJobError) Unwrap() error { return e.kind }
+
+// convergeJobErr maps a converge result to the error jobOutcome reads: nil
+// when it succeeded, timed_out and cancelled to their sentinels, and a run
+// that failed only because resources failed or were denied to
+// resources_failed.
+func convergeJobErr(res convergeResult) error {
+	if res.Status == "succeeded" {
+		return nil
+	}
+	e := &convergeJobError{text: res.Error}
+	if e.text == "" {
+		e.text = res.ErrorCode
+	}
+	if e.text == "" {
+		e.text = "resources_failed"
+	}
+	switch res.ErrorCode {
+	case "timed_out":
+		e.kind = errScriptTimedOut
+	case "cancelled":
+		e.kind = errScriptCancelled
+	}
+	return e
 }
 
 // jobOutcome maps a script's end to a job status and error text.
@@ -591,7 +652,7 @@ func (m *jobManager) rejectJob(id, code string) {
 		id = ""
 	}
 	log.Printf("sysscript job %s rejected: %s", id, code)
-	b, err := jobResultFrame(id, "rejected", code, "", false, 0)
+	b, err := jobResultFrame(id, "rejected", code, "", false, 0, nil)
 	if err != nil {
 		log.Printf("sysscript job %s rejection not encoded: %v", id, err)
 		return
@@ -605,9 +666,11 @@ func (m *jobManager) rejectJob(id, code string) {
 }
 
 // startJob checks a sysscript_job frame on the read loop and queues it:
-// job id, script size, canonical entitlements, the lease (which binds the
-// job id, deadline, timeout, script and entitlements) and its nonce, then
-// duplicate id, timeout and deadline. A refusal is answered as
+// job id, kind, script or bundle size (and, for converge, the capability and
+// the mode and plan pairing), canonical entitlements, the lease (which binds
+// the job id, deadline, timeout, script or bundle and entitlements, and for
+// converge the mode and plan hash) and its nonce, then duplicate id, timeout
+// and deadline. A refusal is answered as
 // sysscript_job_result{status:rejected}. now is the receipt time; it must
 // carry a monotonic reading (time.Now).
 func (m *jobManager) startJob(hostID string, cmd *CommandMessage, now time.Time) {
@@ -616,8 +679,31 @@ func (m *jobManager) startJob(hostID string, cmd *CommandMessage, now time.Time)
 		m.rejectJob(id, "bad_job_id")
 		return
 	}
-	if len(cmd.Script) > scriptMaxBytes {
-		m.rejectJob(id, "script_too_large")
+	var conv *convergeRequest
+	switch cmd.Kind {
+	case "", "sysscript":
+		if len(cmd.Script) > scriptMaxBytes {
+			m.rejectJob(id, "script_too_large")
+			return
+		}
+	case "converge":
+		switch {
+		case !convergeCapable():
+			m.rejectJob(id, "converge_unsupported")
+			return
+		case cmd.Script != "":
+			m.rejectJob(id, "bad_payload")
+			return
+		case len(cmd.BundleJSON) > convergeBundleMax:
+			m.rejectJob(id, "bundle_too_large")
+			return
+		case !convergeModeOK(cmd.Mode, cmd.ExpectPlan):
+			m.rejectJob(id, "bad_mode")
+			return
+		}
+		conv = &convergeRequest{BundleJSON: cmd.BundleJSON, Ents: cmd.Entitlements, Mode: cmd.Mode, ExpectPlan: cmd.ExpectPlan}
+	default:
+		m.rejectJob(id, "bad_kind")
 		return
 	}
 	canon, err := canonicalEntitlements(cmd.Entitlements)
@@ -625,12 +711,18 @@ func (m *jobManager) startJob(hostID string, cmd *CommandMessage, now time.Time)
 		m.rejectJob(id, err.Error())
 		return
 	}
-	payload, err := sysscriptJobLeasePayload(id, cmd.DeadlineUnix, cmd.TimeoutS, sha256Hex(cmd.Script), sha256Hex(canon))
+	action, payload := "sysscript_job", ""
+	if conv != nil {
+		action = "converge_job"
+		payload, err = convergeJobLeasePayload(id, cmd.DeadlineUnix, cmd.TimeoutS, sha256Hex(cmd.BundleJSON), sha256Hex(canon), cmd.Mode, cmd.ExpectPlan)
+	} else {
+		payload, err = sysscriptJobLeasePayload(id, cmd.DeadlineUnix, cmd.TimeoutS, sha256Hex(cmd.Script), sha256Hex(canon))
+	}
 	if err != nil {
 		m.rejectJob(id, err.Error())
 		return
 	}
-	if err := authorizeCommand(hostID, "sysscript_job", payload, cmd.Lease, now); err != nil {
+	if err := authorizeCommand(hostID, action, payload, cmd.Lease, now); err != nil {
 		if err.Error() == "replay" && m.answerHeld(id) {
 			return
 		}
@@ -654,7 +746,7 @@ func (m *jobManager) startJob(hostID string, cmd *CommandMessage, now time.Time)
 	deadline := now.Add(limit)
 	base, cancel := context.WithCancelCause(context.Background())
 	ctx, stopTimer := context.WithDeadline(base, deadline)
-	j := &sysscriptJob{id: id, job: true, script: cmd.Script, ents: cmd.Entitlements, ctx: ctx, started: now, deadline: deadline}
+	j := &sysscriptJob{id: id, job: true, script: cmd.Script, ents: cmd.Entitlements, conv: conv, ctx: ctx, started: now, deadline: deadline}
 	j.cancel = func(cause error) {
 		cancel(cause)
 		stopTimer()
@@ -668,10 +760,10 @@ func (m *jobManager) startJob(hostID string, cmd *CommandMessage, now time.Time)
 	}
 	j.finish = func(output string, truncated bool, err error) {
 		status, errText := jobOutcome(err)
-		b, encErr := jobResultFrame(id, status, errText, output, truncated, time.Since(j.started))
+		b, encErr := jobResultFrame(id, status, errText, output, truncated, time.Since(j.started), j.report)
 		if encErr != nil {
 			log.Printf("sysscript job %s result not encoded: %v", id, encErr)
-			b, _ = jobResultFrame(id, "failed", "internal", "", false, time.Since(j.started))
+			b, _ = jobResultFrame(id, "failed", "internal", "", false, time.Since(j.started), nil)
 			status = "failed"
 		}
 		m.finishJob(id, status, b)

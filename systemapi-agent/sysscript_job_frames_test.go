@@ -454,7 +454,7 @@ func TestJobAttachOrderingRace(t *testing.T) {
 	m := newJobManager(1, 1)
 	defer m.stopAll(5 * time.Second)
 	frame := func(id string) []byte {
-		b, err := jobResultFrame(id, "succeeded", "", "x", false, time.Millisecond)
+		b, err := jobResultFrame(id, "succeeded", "", "x", false, time.Millisecond, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -652,7 +652,7 @@ func TestJobControlLaneBeforeBulk(t *testing.T) {
 	big := strings.Repeat("a", 1<<20-8<<10)
 	for i := 0; i < 16; i++ {
 		id := fmt.Sprintf("sjb_bulk%014d", i)
-		b, err := jobResultFrame(id, "succeeded", "", big, false, time.Second)
+		b, err := jobResultFrame(id, "succeeded", "", big, false, time.Second, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

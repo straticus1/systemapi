@@ -1,0 +1,148 @@
+{
+  "seed_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+  "public_raw_b64": "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc=",
+  "host_id": "11111111-1111-4111-8111-111111111111",
+  "now_ms": 1700000000000,
+  "vectors": [
+    {
+      "name": "check_clamped",
+      "job_id": "sjb_Q29udmVyZ2UtY2hlY2stMQ",
+      "deadline_unix": 1700000300,
+      "timeout_s": 300,
+      "bundle_json": "{\"v\":1,\"files\":{\"main.star\":\"state.file(\\\"/etc/motd\\\", \\\"hello\\\\n\\\", mode=\\\"0644\\\")\\n\"},\"vars\":{\"listen_port\":8080},\"host\":{\"host_id\":\"11111111-1111-4111-8111-111111111111\",\"hostname\":\"web-1\",\"os\":\"linux\",\"tags\":[\"web\"]}}",
+      "entitlements": {
+        "allow_fs_write": false,
+        "allow_fs_read": true,
+        "allow_net_outbound": false,
+        "allow_exec": true,
+        "allow_config_write": false,
+        "allow_service_reload": false,
+        "allow_containers": true,
+        "allow_k3s": false,
+        "allow_linux": true,
+        "allow_k8s": false,
+        "allow_packages": [
+          "nginx",
+          "curl",
+          "nginx"
+        ],
+        "allow_images": [
+          "nginx:1.27"
+        ],
+        "allow_k3s_namespaces": [],
+        "allow_k8s_namespaces": [
+          "default"
+        ],
+        "allow_net_manage": [
+          "eth0"
+        ],
+        "allow_mount_targets": [
+          "/mnt/data"
+        ],
+        "allow_sysctl": [
+          "net.ipv4.ip_forward",
+          "kernel.core_pattern",
+          "vm.swappiness"
+        ]
+      },
+      "mode": "check",
+      "expect_plan_sha256": "-",
+      "canonical_entitlements": "systemapi-entitlements-v1\nallow_fs_write#0\nallow_fs_read#0\nallow_net_outbound#0\nallow_exec=true\nallow_config_write#0\nallow_service_reload#0\nallow_containers=true\nallow_k3s=false\nallow_linux=true\nallow_k8s=false\nallow_packages#2\ncurl\nnginx\nallow_images#1\nnginx:1.27\nallow_k3s_namespaces#0\nallow_k8s_namespaces#1\ndefault\nallow_net_manage#1\neth0\nallow_mount_targets#1\n/mnt/data\nallow_sysctl#2\nnet.ipv4.ip_forward\nvm.swappiness\n",
+      "entitlements_sha256": "6f014aec524ceb3a0d0502f1c0ee2e32fee0601531fa7ae095b2ada6317717ec",
+      "bundle_sha256": "a4ff6d9c8e96e234cf9641f92df64684d1c976bbbc569e05395ba84311fb38a7",
+      "payload": "sjb_Q29udmVyZ2UtY2hlY2stMQ\n1700000300\n300\na4ff6d9c8e96e234cf9641f92df64684d1c976bbbc569e05395ba84311fb38a7\n6f014aec524ceb3a0d0502f1c0ee2e32fee0601531fa7ae095b2ada6317717ec\ncheck\n-",
+      "message": "systemapi-lease-v1\n11111111-1111-4111-8111-111111111111\nconverge_job\n1700000060\nefefefefefefefefefefefefefefefef\na4412f471e11ccbdfb0f6392280445d316ee6978ece315bd3fc5a541fd614503\n",
+      "lease": {
+        "v": 1,
+        "host_id": "11111111-1111-4111-8111-111111111111",
+        "action": "converge_job",
+        "expires_unix": 1700000060,
+        "nonce_hex": "efefefefefefefefefefefefefefefef",
+        "payload_sha256": "a4412f471e11ccbdfb0f6392280445d316ee6978ece315bd3fc5a541fd614503",
+        "signature": "eihZIVA96Y7Kn6iE7TkRWl5lUdv/xl4LbWnnKpKWoBFGQ/nxQwD0hx7eape4sdnmjcqtzkHkLlBSghREJR8tBg=="
+      }
+    },
+    {
+      "name": "apply_plan",
+      "job_id": "sjb_Q29udmVyZ2UtYXBwbHktMQ",
+      "deadline_unix": 1700000900,
+      "timeout_s": 900,
+      "bundle_json": "{\"v\":1,\"files\":{\"main.star\":\"state.file(\\\"/etc/motd\\\", \\\"hello\\\\n\\\", mode=\\\"0644\\\")\\n\"},\"vars\":{\"listen_port\":8080},\"host\":{\"host_id\":\"11111111-1111-4111-8111-111111111111\",\"hostname\":\"web-1\",\"os\":\"linux\",\"tags\":[\"web\"]}}",
+      "entitlements": {
+        "allow_fs_write": false,
+        "allow_fs_read": true,
+        "allow_net_outbound": false,
+        "allow_exec": true,
+        "allow_config_write": false,
+        "allow_service_reload": false,
+        "allow_containers": true,
+        "allow_k3s": false,
+        "allow_linux": true,
+        "allow_k8s": false,
+        "allow_packages": [
+          "nginx",
+          "curl",
+          "nginx"
+        ],
+        "allow_images": [
+          "nginx:1.27"
+        ],
+        "allow_k3s_namespaces": [],
+        "allow_k8s_namespaces": [
+          "default"
+        ],
+        "allow_net_manage": [
+          "eth0"
+        ],
+        "allow_mount_targets": [
+          "/mnt/data"
+        ],
+        "allow_sysctl": [
+          "net.ipv4.ip_forward",
+          "kernel.core_pattern",
+          "vm.swappiness"
+        ]
+      },
+      "mode": "apply",
+      "expect_plan_sha256": "64879f7d6b960a01909762d911a32d4582c20010c5641ee90278b644a9e3b525",
+      "canonical_entitlements": "systemapi-entitlements-v1\nallow_fs_write#0\nallow_fs_read#0\nallow_net_outbound#0\nallow_exec=true\nallow_config_write#0\nallow_service_reload#0\nallow_containers=true\nallow_k3s=false\nallow_linux=true\nallow_k8s=false\nallow_packages#2\ncurl\nnginx\nallow_images#1\nnginx:1.27\nallow_k3s_namespaces#0\nallow_k8s_namespaces#1\ndefault\nallow_net_manage#1\neth0\nallow_mount_targets#1\n/mnt/data\nallow_sysctl#2\nnet.ipv4.ip_forward\nvm.swappiness\n",
+      "entitlements_sha256": "6f014aec524ceb3a0d0502f1c0ee2e32fee0601531fa7ae095b2ada6317717ec",
+      "bundle_sha256": "a4ff6d9c8e96e234cf9641f92df64684d1c976bbbc569e05395ba84311fb38a7",
+      "payload": "sjb_Q29udmVyZ2UtYXBwbHktMQ\n1700000900\n900\na4ff6d9c8e96e234cf9641f92df64684d1c976bbbc569e05395ba84311fb38a7\n6f014aec524ceb3a0d0502f1c0ee2e32fee0601531fa7ae095b2ada6317717ec\napply\n64879f7d6b960a01909762d911a32d4582c20010c5641ee90278b644a9e3b525",
+      "message": "systemapi-lease-v1\n11111111-1111-4111-8111-111111111111\nconverge_job\n1700000060\nefefefefefefefefefefefefefefefef\n9c4e2437e9ae6ba049437a0f495c5572c0c6237622189445c558475fa4b43ddc\n",
+      "lease": {
+        "v": 1,
+        "host_id": "11111111-1111-4111-8111-111111111111",
+        "action": "converge_job",
+        "expires_unix": 1700000060,
+        "nonce_hex": "efefefefefefefefefefefefefefefef",
+        "payload_sha256": "9c4e2437e9ae6ba049437a0f495c5572c0c6237622189445c558475fa4b43ddc",
+        "signature": "tuNFtATvDaF6azJbKqljTlT8HjdADQ70WzhiwRHsR2E9l45it42uFrnA42fOyhFqKwVOe0BOcjgUS5IvGfAOCg=="
+      }
+    },
+    {
+      "name": "check_default_deny_utf8",
+      "job_id": "sjb_AAAAAAAAAAAAAAAAAAAAAB",
+      "deadline_unix": 1700003600,
+      "timeout_s": 3600,
+      "bundle_json": "{\"v\":1,\"files\":{\"main.star\":\"state.sysctl(\\\"vm.swappiness\\\", \\\"10\\\")\\n\",\"nginx.conf.tmpl\":\"listen {{.port}}; # é ﬀ 😀\\n\"},\"vars\":{},\"host\":{\"host_id\":\"11111111-1111-4111-8111-111111111111\",\"hostname\":\"db-1\",\"os\":\"linux\",\"tags\":[]}}",
+      "entitlements": {},
+      "mode": "check",
+      "expect_plan_sha256": "-",
+      "canonical_entitlements": "systemapi-entitlements-v1\nallow_fs_write#0\nallow_fs_read#0\nallow_net_outbound#0\nallow_exec=false\nallow_config_write#0\nallow_service_reload#0\nallow_containers=false\nallow_k3s=false\nallow_linux=false\nallow_k8s=false\nallow_packages#0\nallow_images#0\nallow_k3s_namespaces#0\nallow_k8s_namespaces#0\nallow_net_manage#0\nallow_mount_targets#0\nallow_sysctl#0\n",
+      "entitlements_sha256": "820086f68bf69da046c20e3d18aceef4d2fcd53dfb0ba3b27384d9be16f619bd",
+      "bundle_sha256": "9258f7fbd326333ab88766e1c25c6482371edc58d25ac8170cd795fd134e9c1a",
+      "payload": "sjb_AAAAAAAAAAAAAAAAAAAAAB\n1700003600\n3600\n9258f7fbd326333ab88766e1c25c6482371edc58d25ac8170cd795fd134e9c1a\n820086f68bf69da046c20e3d18aceef4d2fcd53dfb0ba3b27384d9be16f619bd\ncheck\n-",
+      "message": "systemapi-lease-v1\n11111111-1111-4111-8111-111111111111\nconverge_job\n1700000060\nefefefefefefefefefefefefefefefef\n4a5582f7c946a3fc561085b67649b0a15cf10ae29193a5da0f164798f2f7cecb\n",
+      "lease": {
+        "v": 1,
+        "host_id": "11111111-1111-4111-8111-111111111111",
+        "action": "converge_job",
+        "expires_unix": 1700000060,
+        "nonce_hex": "efefefefefefefefefefefefefefefef",
+        "payload_sha256": "4a5582f7c946a3fc561085b67649b0a15cf10ae29193a5da0f164798f2f7cecb",
+        "signature": "1W0HwTUmcW519bi76myWHXOwd8r930zUDBxmN5reWr32isLNW6Bvpz+cyzD9k5zH7H8Qk1NmPYyBYxEgxI8lBA=="
+      }
+    }
+  ]
+}
