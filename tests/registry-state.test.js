@@ -565,3 +565,33 @@ test('memory: claim ties break on (next_check_at, host_id, state_id); a concurre
   const cur = await reg.getAssignment(['acme'], a.assignment_id);
   assert.deepEqual([cur.drift_threshold, cur.check_interval_s], [won[0].value.drift_threshold, won[0].value.check_interval_s]);
 });
+
+test('memory: a check that ends without a report is next due one interval later, not at the claim expiry', async () => {
+  const reg = await rig();
+  const t = await published(reg);
+  const a = await reg.createAssignment({ tenantId: 'acme', stateId: t.st.state_id, versionId: t.v.version_id, actor: 'u-a', targetKind: 'host', targetValue: H1, checkIntervalS: 3600 });
+  hs(reg, H1, t.st.state_id).next_check_at = new Date(Date.now() - 1000);
+  await reg.setAgentPresence(H1, { caps: ['converge'], instance: 'i', connId: 'c1', enrolledAt: new Date() });
+  assert.equal((await reg.claimDueChecks({ replicaBudget: 5, perTenantCap: 5, claimExpiryS: 420 })).length, 1);
+  const j = await submit(reg, t, a);
+  await reg.transitionJob(j.job_id, H1, ['submitted'], { status: 'failed', error: 'bad_payload' }, { converge: {} });
+  const row = hs(reg, H1, t.st.state_id);
+  assert.equal(row.check_claimed_at, null);
+  assert.ok(row.next_check_at.getTime() >= Date.now() + 0.9 * 3600000 - 1000, 'one interval (± 10%) ahead');
+});
+
+test('memory: the undo of a failed ingest removes only the alert it added', async () => {
+  const reg = await rig();
+  const t = await published(reg);
+  const a = await reg.createAssignment({ tenantId: 'acme', stateId: t.st.state_id, versionId: t.v.version_id, actor: 'u-a', targetKind: 'host', targetValue: H1 });
+  const real = reg.appendAudit.bind(reg);
+  const j = await submit(reg, t, a);
+  // While the audit append is pending, another writer opens an alert.
+  reg.appendAudit = async () => {
+    await reg.openAlert({ tenant_id: 'acme', host_id: H2, rule_name: 'cpu' });
+    throw new Error('audit refused');
+  };
+  await assert.rejects(finish(reg, j, report('check', { drift: 1 })), /audit refused/);
+  reg.appendAudit = real;
+  assert.deepEqual(reg.alerts.map((x) => x.rule_name), ['cpu']);
+});

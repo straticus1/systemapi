@@ -956,6 +956,9 @@ test('converge: a sweep releases the claim, a swept apply is partial, and a re-s
   assert.equal(row.check_job_id, null);
   assert.equal(row.last_error, 'result_lost');
   assert.equal(row.status, 'unknown');
+  const due = (await pool.query('SELECT extract(epoch FROM next_check_at - now())::float8 AS s FROM cp_host_state WHERE host_id = $1 AND state_id = $2',
+    [A.hosts[0], A.st.state_id])).rows[0].s;
+  assert.ok(due > 0.9 * 3600 - 5, `a run ended without a report is next due one interval later (${due} s)`);
   const [r1, r2] = await Promise.all([
     registry.ingestConvergeResend(j.job_id, A.hosts[0], creport('check', { drift: 1 })),
     registry.ingestConvergeResend(j.job_id, A.hosts[0], creport('check', { drift: 1 }))
@@ -1129,11 +1132,13 @@ test('converge: a sweep finalizing runs in reverse host order never deadlocks ag
       W.hosts.push(hostId);
     }
     for (const h of W.hosts) await registry.createJob(cjob(W, 'check', { host_id: h, deadline_at: new Date(Date.now() + 600) }), copts(W));
+    await pool.query("UPDATE cp_host_state SET status = 'compliant', last_check_at = now() - interval '10 days' WHERE tenant_id = $1", [W.tenant]);
     await sleep(700);
     const res = await Promise.allSettled([
       registry.sweepJobs(Date.now(), { graceMs: 0 }),
       registry.updateAssignment({ tenantId: W.tenant, assignmentId: W.a.assignment_id, patch: { driftThreshold: 2 }, actor: W.user }),
-      registry.syncHostStates(W.tenant)
+      registry.syncHostStates(W.tenant),
+      registry.markStaleHostStates()
     ]);
     assert.deepEqual(res.filter((r) => r.status === 'rejected').map((r) => r.reason.code), [], `round ${k}`);
   }
@@ -1203,4 +1208,69 @@ test('boot: three replicas running createRegistry at once on a fresh database, a
     }
   }
   await admin.end();
+});
+
+test('converge: markStaleHostStates skips rows another transaction holds and never waits on them', async () => {
+  const [A] = await cworld(1, 'tenant');
+  await pool.query("UPDATE cp_host_state SET status = 'compliant', last_check_at = now() - interval '10 days' WHERE tenant_id = $1", [A.tenant]);
+  const [lo, hi] = [...A.hosts].sort();
+  const x = await pool.connect();
+  try {
+    await x.query('BEGIN');
+    await x.query('SELECT 1 FROM cp_host_state WHERE host_id = $1 FOR UPDATE', [lo]);
+    await registry.markStaleHostStates();
+    const st = async (h) => (await pool.query('SELECT status FROM cp_host_state WHERE host_id = $1', [h])).rows[0].status;
+    assert.equal(await st(hi), 'stale');
+    assert.equal(await st(lo), 'compliant', 'held: left for the next tick');
+    await x.query('COMMIT');
+  } finally {
+    x.release();
+  }
+  await registry.markStaleHostStates();
+  assert.equal((await pool.query('SELECT status FROM cp_host_state WHERE host_id = $1', [lo])).rows[0].status, 'stale');
+});
+
+test('boot: a table lock held by a long transaction fails the boot after bounded retries, and a boot retrying succeeds once it is released', async () => {
+  const quiet = { log() {}, warn() {}, error() {} };
+  const env = { NODE_ENV: 'production', SYSTEMAPI_BOOT_LOCK_TIMEOUT_MS: '100' };
+  const name = `bootlk_${crypto.randomBytes(5).toString('hex')}`;
+  const admin = new Pool({ connectionString: BASE });
+  await admin.query(`CREATE DATABASE ${name}`);
+  const p = new Pool({ connectionString: withDatabase(BASE, name), max: 3 });
+  p.on('error', () => {});
+  const holder = new Pool({ connectionString: withDatabase(BASE, name), max: 1 });
+  holder.on('error', () => {});
+  try {
+    await createRegistry({ pool: p, env, logger: quiet });
+    const h = await holder.connect();
+    try {
+      await h.query('BEGIN');
+      // An open write transaction on cp_hosts (boot ALTERs it: ADD COLUMN IF NOT EXISTS).
+      await h.query('LOCK TABLE cp_hosts IN ROW EXCLUSIVE MODE');
+      const t0 = Date.now();
+      await assert.rejects(createRegistry({ pool: p, env, logger: quiet }), (e) => e.code === '55P03');
+      assert.ok(Date.now() - t0 < 10000, 'bounded');
+      // Released while a boot is retrying: that boot succeeds.
+      const boot = createRegistry({ pool: p, env, logger: quiet });
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      await h.query('COMMIT');
+      assert.ok((await boot) instanceof PgRegistry);
+    } finally {
+      h.release();
+    }
+    // No pooled connection keeps the boot lock_timeout or the boot lock.
+    const c = await p.connect();
+    try {
+      assert.equal((await c.query('SHOW lock_timeout')).rows[0].lock_timeout, '0');
+    } finally {
+      c.release();
+    }
+    const held = await p.query("SELECT count(*)::int AS n FROM pg_locks WHERE locktype = 'advisory' AND classid = 1396789321 AND objid = 2");
+    assert.equal(held.rows[0].n, 0);
+  } finally {
+    await p.end();
+    await holder.end();
+    await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
+    await admin.end();
+  }
 });

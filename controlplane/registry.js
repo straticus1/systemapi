@@ -740,7 +740,10 @@ function driftAlertEntry(run, rep) {
 // finalize (v null) on the row hs this run still owns; clash is a resource
 // key also declared by another state on the host. Returns {set, now,
 // nextCheck}: set the column values, now the columns set to the clock,
-// nextCheck whether next_check_at moves one interval (± 10%) ahead.
+// nextCheck whether next_check_at moves one interval (± 10%) ahead: after
+// any check or plan run that ended, with or without a report (a run that
+// keeps ending without one is retried once per interval, not at every claim
+// expiry; the expiry is the due time only of a claim that never got a job).
 function hostStateUpdate(run, job, v, hs, clash) {
   const rep = v ? v.report : null;
   const out = convergeOutcome(run.kind, job.status, rep, hs);
@@ -774,6 +777,7 @@ function hostStateUpdate(run, job, v, hs, clash) {
     nextCheck = true;
   } else {
     Object.assign(set, { check_claimed_at: null, check_job_id: null, last_error: lastError });
+    nextCheck = true;
   }
   return { set, now, nextCheck };
 }
@@ -2088,13 +2092,18 @@ class MemoryRegistry {
     // Everything this writes, for undo when the audit append fails.
     const runBefore = { ...run };
     const hsBefore = hs ? { ...hs } : null;
-    const alertCount = this.alerts.length;
-    const alertStatus = this.alerts.map((x) => x.status);
+    // The alerts this ingest adds and resolves, by id: undo touches only
+    // those.
+    const added = [];
+    const resolvedBefore = [];
     const undo = () => {
       Object.assign(run, runBefore);
       if (hs) Object.assign(hs, hsBefore);
-      this.alerts.length = alertCount;
-      alertStatus.forEach((st, i) => { this.alerts[i].status = st; });
+      if (added.length > 0) this.alerts = this.alerts.filter((x) => !added.includes(x.id));
+      for (const { id, status } of resolvedBefore) {
+        const x = this.alerts.find((y) => y.id === id);
+        if (x) x.status = status;
+      }
     };
     if (v) {
       const body = run.kind !== 'check' || !hs || hs.last_report_sha256 !== v.sha256
@@ -2135,10 +2144,14 @@ class MemoryRegistry {
         const e = driftAlertEntry(run, rep);
         const id = this.alertSeq++;
         this.alerts.push({ id, ...e, metric: null, status: 'open', created_at: now.toISOString() });
+        added.push(id);
         result.alerts.push({ type: 'drift', alert_id: id, summary: rep.summary });
       }
     } else if (rep && hs.status === 'compliant') {
+      const open = this.alerts.filter((x) => x.tenant_id === run.tenant_id && x.host_id === run.host_id
+        && x.rule_name === driftRule(run.state_id)).map((x) => ({ id: x.id, status: x.status }));
       for (const id of this.memResolveDrift(run.tenant_id, run.host_id, run.state_id)) {
+        resolvedBefore.push(open.find((x) => x.id === id));
         result.alerts.push({ type: 'drift_resolved', alert_id: id, summary: rep.summary });
       }
     }
@@ -3306,14 +3319,22 @@ class PgRegistry {
        WHERE output IS NOT NULL AND finished_at < now() - make_interval(hours => $1::int)`,
       [n]
     );
+    // Run rows are locked in run_id order; one a transaction holds (an
+    // ingest, a consume) is left for the next tick.
     await this.pool.query(
-      `UPDATE cp_converge_runs SET report = NULL, report_expired = true
-       WHERE report IS NOT NULL AND finished_at < now() - make_interval(hours => $1::int)`,
+      `WITH l AS (
+         SELECT run_id FROM cp_converge_runs
+         WHERE report IS NOT NULL AND finished_at < now() - make_interval(hours => $1::int)
+         ORDER BY run_id FOR UPDATE SKIP LOCKED)
+       UPDATE cp_converge_runs c SET report = NULL, report_expired = true FROM l WHERE c.run_id = l.run_id`,
       [n]
     );
     await this.pool.query(
-      `UPDATE cp_converge_runs SET bundle_json = NULL
-       WHERE kind = 'plan' AND bundle_json IS NOT NULL AND created_at < now() - make_interval(secs => $1::int)`,
+      `WITH l AS (
+         SELECT run_id FROM cp_converge_runs
+         WHERE kind = 'plan' AND bundle_json IS NOT NULL AND created_at < now() - make_interval(secs => $1::int)
+         ORDER BY run_id FOR UPDATE SKIP LOCKED)
+       UPDATE cp_converge_runs c SET bundle_json = NULL FROM l WHERE c.run_id = l.run_id`,
       [planMaxAgeS(this.env)]
     );
     return res.rowCount;
@@ -3329,12 +3350,19 @@ class PgRegistry {
          WHERE NOT (status = ANY($2::text[])) AND finished_at < now() - make_interval(days => $1::int)
          RETURNING job_id),
        runs AS (
-         DELETE FROM cp_converge_runs c USING gone WHERE c.run_id = gone.job_id AND c.kind = 'check')
+         DELETE FROM cp_converge_runs c
+         USING (SELECT r.run_id FROM cp_converge_runs r JOIN gone ON r.run_id = gone.job_id
+                WHERE r.kind = 'check' ORDER BY r.run_id FOR UPDATE OF r SKIP LOCKED) l
+         WHERE c.run_id = l.run_id)
        SELECT count(*)::int AS n FROM gone`,
       [n, JOB_ACTIVE]
     );
     await this.pool.query(
-      `DELETE FROM cp_converge_runs WHERE kind IN ('plan', 'apply') AND created_at < now() - make_interval(days => $1::int)`,
+      `WITH l AS (
+         SELECT run_id FROM cp_converge_runs
+         WHERE kind IN ('plan', 'apply') AND created_at < now() - make_interval(days => $1::int)
+         ORDER BY run_id FOR UPDATE SKIP LOCKED)
+       DELETE FROM cp_converge_runs c USING l WHERE c.run_id = l.run_id`,
       [applyRunRetentionDays(this.env)]
     );
     return res.rows[0].n;
@@ -3862,13 +3890,19 @@ class PgRegistry {
 
   // Rows not checked for 3 intervals become stale (the next report
   // replaces it with the real status).
+  // The rows are locked in (host_id, state_id) order, the order every
+  // multi-row writer keeps, and a row another transaction holds is left for
+  // the next tick (SKIP LOCKED).
   async markStaleHostStates() {
     const res = await this.pool.query(
-      `UPDATE cp_host_state hs SET status = 'stale'
-       FROM cp_state_assignments a
-       WHERE a.assignment_id = hs.assignment_id AND a.check_interval_s > 0
-         AND hs.status NOT IN ('stale', 'conflict')
-         AND hs.last_check_at < now() - make_interval(secs => a.check_interval_s * 3)`
+      `WITH due AS (
+         SELECT hs.host_id, hs.state_id FROM cp_host_state hs
+         JOIN cp_state_assignments a ON a.assignment_id = hs.assignment_id
+         WHERE a.check_interval_s > 0 AND hs.status NOT IN ('stale', 'conflict')
+           AND hs.last_check_at < now() - make_interval(secs => a.check_interval_s * 3)
+         ORDER BY hs.host_id, hs.state_id FOR UPDATE OF hs SKIP LOCKED)
+       UPDATE cp_host_state hs SET status = 'stale' FROM due
+       WHERE hs.host_id = due.host_id AND hs.state_id = due.state_id`
     );
     return res.rowCount;
   }
@@ -4200,17 +4234,43 @@ function bucketKey(ts, bucket) {
 // CREATE IF NOT EXISTS of one type or table fails 23505, and CREATE INDEX
 // then ALTER TABLE on one table deadlocks). The lock is released in finally;
 // a connection whose unlock fails is destroyed, which releases it too.
-async function applySchema(pool) {
+// lock_timeout (SYSTEMAPI_BOOT_LOCK_TIMEOUT_MS, default 10 s) bounds every
+// lock wait of the boot connection, the boot lock included: a long-running
+// transaction holding a table lock fails the attempt (55P03, rolled back)
+// instead of wedging every booting replica behind the boot lock. A timed-out
+// attempt is retried up to BOOT_ATTEMPTS times, then the error is thrown.
+const BOOT_ATTEMPTS = 5;
+
+function bootLockTimeoutMs(env) {
+  const n = Number(env && env.SYSTEMAPI_BOOT_LOCK_TIMEOUT_MS);
+  return Number.isInteger(n) && n >= 50 && n <= 600000 ? n : 10000;
+}
+
+// The boot lock_timeout is set in the statement that takes the boot lock
+// (the FROM subquery runs first) and reset in the one that releases it. A
+// connection whose lock wait fails is destroyed, never pooled with it.
+async function applySchemaOnce(pool, timeoutMs) {
   const client = await pool.connect();
   let broken;
   try {
-    await client.query('SELECT pg_advisory_lock($1::int, $2::int)', [AUDIT_LOCK_NS, BOOT_LOCK_KEY]);
+    try {
+      await client.query(
+        `SELECT pg_advisory_lock($1::int, $2::int) FROM (SELECT set_config('lock_timeout', $3, false)) AS t`,
+        [AUDIT_LOCK_NS, BOOT_LOCK_KEY, `${timeoutMs}ms`]
+      );
+    } catch (err) {
+      broken = err;
+      throw err;
+    }
     try {
       await client.query(SCHEMA_SQL);
       for (const sql of PLAYGROUND_SQL) await client.query(sql);
     } finally {
       try {
-        await client.query('SELECT pg_advisory_unlock($1::int, $2::int)', [AUDIT_LOCK_NS, BOOT_LOCK_KEY]);
+        await client.query(
+          "SELECT pg_advisory_unlock($1::int, $2::int), set_config('lock_timeout', '0', false)",
+          [AUDIT_LOCK_NS, BOOT_LOCK_KEY]
+        );
       } catch (err) {
         broken = err;
       }
@@ -4220,13 +4280,26 @@ async function applySchema(pool) {
   }
 }
 
+async function applySchema(pool, env) {
+  const timeoutMs = bootLockTimeoutMs(env);
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await applySchemaOnce(pool, timeoutMs);
+      return;
+    } catch (err) {
+      if (err.code !== '55P03' || attempt >= BOOT_ATTEMPTS) throw err;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(timeoutMs, 1000)));
+    }
+  }
+}
+
 async function createRegistry({ pool, env, logger = console }) {
   if (env.NODE_ENV === 'production' && !pool) {
     throw http(503, 'registry_unavailable');
   }
   if (pool) {
     try {
-      await applySchema(pool);
+      await applySchema(pool, env);
       logger.log('[control] cp schema ready');
       return new PgRegistry(pool, env);
     } catch (err) {
