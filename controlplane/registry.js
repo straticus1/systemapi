@@ -81,6 +81,15 @@ function publicWebhook(row) {
 // apart from the hashtext single-key locks), namespace 'SAPI', key 1.
 const AUDIT_LOCK_NS = 0x53415049;
 const AUDIT_LOCK_KEY = 1;
+// The same namespace: the boot lock (createRegistry runs every schema file
+// under it; schema.sql takes it again inside its own transaction) and the
+// drift claim lock (claimDueChecks).
+const BOOT_LOCK_KEY = 2;
+const DRIFT_CLAIM_LOCK_KEY = 3;
+// The per-tenant desired-state lock (assignment changes, tag changes,
+// enroll, retire: every syncHostStates): namespace 'STAT', key
+// hashtext(tenant_id).
+const STATE_LOCK_NS = 0x53544154;
 
 // Appends one chained audit row inside the caller's transaction. The tail is
 // read only under the chain-wide transaction lock: a row lock alone (FOR
@@ -606,8 +615,10 @@ function assignmentAuditPayload(row, op) {
 }
 
 // createJob's opts.converge: {kind, stateId, assignmentId, versionId,
-// planRunId (apply), bundleJson (plan), parentJobId}. The job source must
-// be the kind's; a converge source needs opts.converge.
+// planRunId (apply), bundleJson (plan; optional for check), parentJobId}.
+// The job source must be the kind's; a converge source needs
+// opts.converge; a bundleJson given must hash to the job's script_sha256
+// (only a plan run keeps it).
 function convergeJobInput(r, c) {
   if (c === undefined || c === null) {
     if (isConvergeSource(r.source)) throw http(400, 'bad_job');
@@ -617,7 +628,10 @@ function convergeJobInput(r, c) {
     && nonEmpty(c.stateId)
     && (c.kind === 'apply' ? nonEmpty(c.planRunId) : nonEmpty(c.assignmentId) && nonEmpty(c.versionId))
     && (c.parentJobId === undefined || c.parentJobId === null || nonEmpty(c.parentJobId))
-    && (c.kind !== 'plan' || (typeof c.bundleJson === 'string' && sha256Hex(c.bundleJson) === r.script_sha256));
+    && (c.kind !== 'plan' || typeof c.bundleJson === 'string')
+    && (c.bundleJson === undefined || c.bundleJson === null || c.kind === 'apply'
+      || (typeof c.bundleJson === 'string' && sha256Hex(c.bundleJson) === r.script_sha256))
+    && (c.kind !== 'apply' || c.bundleJson === undefined || c.bundleJson === null);
   if (!ok) throw http(400, 'bad_job');
   return {
     kind: c.kind,
@@ -633,10 +647,16 @@ function convergeJobInput(r, c) {
 // The checks createJob makes on a converge job against the rows it read
 // (and locked) in its transaction: hs the host's cp_host_state row,
 // version the effective version, assignment the effective assignment,
-// plan (apply) the plan run with its job's status and age in seconds.
+// plan (apply) the plan run with its job's status and age in seconds,
+// active the ids among hs.check_job_id and hs.last_apply_run_id whose job
+// is not terminal. One apply at a time per (host, state), and no apply
+// beside a check or plan: 409 apply_in_progress / check_in_progress.
 // Returns the run's assignment and version.
-function convergeCreateCheck(r, c, { hs, version, assignment, plan, planJobStatus, planAgeS, maxAgeS }) {
+function convergeCreateCheck(r, c, { hs, version, assignment, plan, planJobStatus, planAgeS, maxAgeS, active }) {
   if (!hs || hs.tenant_id !== r.tenant_id || hs.assignment_id == null || !assignment) throw http(409, 'state_not_assigned');
+  const live = new Set(active || []);
+  if (hs.last_apply_run_id && live.has(hs.last_apply_run_id)) throw http(409, 'apply_in_progress');
+  if (c.kind === 'apply' && hs.check_job_id && live.has(hs.check_job_id)) throw http(409, 'check_in_progress');
   if (c.kind !== 'apply') {
     if (hs.assignment_id !== c.assignment_id || hs.version_id !== c.version_id) throw http(409, 'assignment_changed');
   } else {
@@ -1395,17 +1415,21 @@ class MemoryRegistry {
   // fails, only the fields change wrote are put back (a concurrent write to
   // another field, such as alert_count, survives). The event is published
   // only once both are in. change runs before the first await, so a guard
-  // checked by the caller in the same turn still holds when it runs.
+  // checked by the caller in the same turn still holds when it runs. A
+  // function change returns is called on failure too (it undoes what change
+  // wrote outside the row: a converge run, host state, alerts).
   async jobWrite(row, change, auditOf, eventOf) {
     const before = { ...row };
     let written = [];
+    let undo = null;
     try {
-      change(row);
+      undo = change(row);
       written = Object.keys(row).filter((k) => row[k] !== before[k]);
       for (const entry of auditOf ? auditOf(row) : []) await this.appendAudit(entry);
     } catch (err) {
       if (written.length === 0) written = Object.keys(row).filter((k) => row[k] !== before[k]);
       for (const k of written) row[k] = before[k];
+      if (typeof undo === 'function') undo();
       throw err;
     }
     if (eventOf) this.publishJobEvent(eventOf(row));
@@ -1448,6 +1472,7 @@ class MemoryRegistry {
       (r) => {
         applyJobSet(r, set, new Date());
         if (isTerminal(r.status) && isConvergeSource(r.source)) conv = this.memConvergeIngest(r, rep);
+        return conv ? conv.undo : null;
       },
       (r) => [...(conv ? conv.audits : []), transitionAuditEntry(r, opts.audit)].filter(Boolean),
       opts.notify ? (r) => transitionNotify(r, opts.notify) : null
@@ -1489,8 +1514,9 @@ class MemoryRegistry {
         r.cancel_actor = actor;
         if (never) {
           applyJobSet(r, { status: 'cancelled', error: 'cancelled_before_dispatch' }, now);
-          if (isConvergeSource(r.source)) this.memConvergeIngest(r, null);
+          if (isConvergeSource(r.source)) return (this.memConvergeIngest(r, null) || {}).undo;
         }
+        return null;
       },
       (r) => [jobCancelAuditEntry(r, actor, reason), ...(never ? [jobEndAuditEntry(r, 'system')] : [])],
       (r) => stateEvent(r, never ? 'state' : 'cancel')
@@ -1542,7 +1568,7 @@ class MemoryRegistry {
         row,
         (r) => {
           applyJobSet(r, { status: 'failed', error: 'agent_lost_job' }, new Date());
-          if (isConvergeSource(r.source)) this.memConvergeIngest(r, null);
+          return isConvergeSource(r.source) ? (this.memConvergeIngest(r, null) || {}).undo : null;
         },
         (r) => [jobEndAuditEntry(r, 'system')],
         (r) => stateEvent(r)
@@ -1592,7 +1618,7 @@ class MemoryRegistry {
         row,
         (r) => {
           applyJobSet(r, { status: 'failed', error }, new Date());
-          if (isConvergeSource(r.source)) this.memConvergeIngest(r, null);
+          return isConvergeSource(r.source) ? (this.memConvergeIngest(r, null) || {}).undo : null;
         },
         (r) => [jobEndAuditEntry(r, 'system')],
         (r) => stateEvent(r)
@@ -1758,9 +1784,11 @@ class MemoryRegistry {
     if (!cur || cur.tenant_id !== tenantId) throw http(404, 'not_found');
     const next = assignmentPatch(publicAssignment(cur), patch);
     this.assignmentRefs(next);
+    const seen = cur.updated_at;
     await this.appendAudit(stateAuditEntry(tenantId, next.target_kind === 'host' ? next.target_value : null, actor,
       'state_assign', assignmentAuditPayload(next, 'update')));
-    if (this.assignments.get(assignmentId) !== cur) throw http(409, 'conflict');
+    // Another update landed during the await: refused, never overwritten.
+    if (this.assignments.get(assignmentId) !== cur || cur.updated_at !== seen) throw http(409, 'conflict');
     this.assignmentRefs(next);
     const intervalChanged = next.check_interval_s !== cur.check_interval_s;
     Object.assign(cur, next, { updated_at: new Date() });
@@ -1905,8 +1933,10 @@ class MemoryRegistry {
       const h = this.hosts.get(r.host_id);
       return h && h.tenant_id === r.tenant_id && !h.retired_at && h.agent_seen_at
         && h.agent_seen_at.getTime() > now - presenceFreshS * 1000 && (h.agent_caps || []).includes('converge')
-        && r.next_check_at && r.next_check_at.getTime() <= now && r.status !== 'conflict' && r.assignment_id && expired(r);
-    }).sort((a, b) => a.next_check_at - b.next_check_at);
+        && r.next_check_at && r.next_check_at.getTime() <= now && r.assignment_id && expired(r)
+        && !(r.last_apply_run_id && this.jobs.get(r.last_apply_run_id) && JOB_ACTIVE.includes(this.jobs.get(r.last_apply_run_id).status));
+    }).sort((a, b) => a.next_check_at - b.next_check_at
+      || (a.host_id < b.host_id ? -1 : a.host_id > b.host_id ? 1 : (a.state_id < b.state_id ? -1 : a.state_id > b.state_id ? 1 : 0)));
     const rank = new Map();
     const pickRows = [];
     for (const r of due) {
@@ -1916,10 +1946,8 @@ class MemoryRegistry {
     }
     const out = [];
     for (const r of pickRows.slice(0, replicaBudget)) {
-      const a = this.assignments.get(r.assignment_id);
-      if (!a) continue;
       r.check_claimed_at = new Date(now);
-      r.next_check_at = new Date(now + a.check_interval_s * (0.9 + Math.random() * 0.2) * 1000);
+      r.next_check_at = new Date(now + claimExpiryS * 1000);
       out.push(publicHostState(r));
     }
     return out;
@@ -2009,7 +2037,11 @@ class MemoryRegistry {
     }
     const assignment = hs && hs.assignment_id ? this.assignments.get(hs.assignment_id) : null;
     const version = hs && hs.version_id ? this.stateVersions.get(hs.version_id) : null;
-    const eff = convergeCreateCheck(r, c, { hs, version, assignment, plan, planJobStatus, planAgeS, maxAgeS: planMaxAgeS(this.env) });
+    const active = hs ? [hs.check_job_id, hs.last_apply_run_id].filter((id) => {
+      const j = id ? this.jobs.get(id) : null;
+      return j && JOB_ACTIVE.includes(j.status);
+    }) : [];
+    const eff = convergeCreateCheck(r, c, { hs, version, assignment, plan, planJobStatus, planAgeS, maxAgeS: planMaxAgeS(this.env), active });
     return () => {
       const run = {
         run_id: r.job_id, tenant_id: r.tenant_id, host_id: r.host_id, state_id: c.state_id,
@@ -2053,6 +2085,17 @@ class MemoryRegistry {
       && (run.kind === 'apply' ? cur.last_apply_run_id === run.run_id : cur.check_job_id === run.run_id) ? cur : null;
     const now = new Date();
     const rep = v ? v.report : null;
+    // Everything this writes, for undo when the audit append fails.
+    const runBefore = { ...run };
+    const hsBefore = hs ? { ...hs } : null;
+    const alertCount = this.alerts.length;
+    const alertStatus = this.alerts.map((x) => x.status);
+    const undo = () => {
+      Object.assign(run, runBefore);
+      if (hs) Object.assign(hs, hsBefore);
+      this.alerts.length = alertCount;
+      alertStatus.forEach((st, i) => { this.alerts[i].status = st; });
+    };
     if (v) {
       const body = run.kind !== 'check' || !hs || hs.last_report_sha256 !== v.sha256
         || ![...this.convergeRuns.values()].some((x) => x.kind === 'check' && x.host_id === run.host_id
@@ -2071,7 +2114,7 @@ class MemoryRegistry {
         const entry = reportAuditEntry(run, job, v.sha256, rep, null, null);
         if (entry) audits.push(entry);
       }
-      return { result, audits };
+      return { result, audits, undo };
     }
     const prev = hs.status;
     const keys = rep ? Object.keys(v.facts) : [];
@@ -2103,7 +2146,7 @@ class MemoryRegistry {
       const entry = reportAuditEntry(run, job, v.sha256, rep, prev, hs.status);
       if (entry) audits.push(entry);
     }
-    return { result, audits };
+    return { result, audits, undo };
   }
 
   // A result re-sent for a converge job that is already terminal and whose
@@ -2121,7 +2164,12 @@ class MemoryRegistry {
     }
     const out = this.memConvergeIngest(job, v);
     if (!out) return { ingested: false, reason: 'already_ingested' };
-    for (const entry of out.audits) await this.appendAudit(entry);
+    try {
+      for (const entry of out.audits) await this.appendAudit(entry);
+    } catch (err) {
+      out.undo();
+      throw err;
+    }
     return { ingested: true, converge: out.result };
   }
 
@@ -2904,8 +2952,27 @@ class PgRegistry {
     const sorted = [...rows].sort((a, b) => (a.job_id < b.job_id ? -1 : 1));
     // A converge run ended here has no report: its claim is released and its
     // host state finalized (an apply becomes partial) before any audit row.
-    for (const row of sorted) {
-      if (isConvergeSource(row.source)) await this.convergeIngestInTx(client, row, null);
+    // The lock order is the one every other writer keeps: the run rows in
+    // run_id order, then their host-state rows in (host_id, state_id) order
+    // in one statement (syncHostStatesInTx locks in that order too), then
+    // each run is finalized in host-state key order.
+    const conv = sorted.filter((row) => isConvergeSource(row.source));
+    if (conv.length > 0) {
+      const ids = conv.map((row) => row.job_id);
+      const runs = await client.query(
+        'SELECT run_id, host_id, state_id FROM cp_converge_runs WHERE run_id = ANY($1::text[]) ORDER BY run_id FOR UPDATE',
+        [ids]
+      );
+      await client.query(
+        `SELECT hs.host_id FROM cp_host_state hs
+         JOIN cp_converge_runs r ON r.host_id = hs.host_id AND r.state_id = hs.state_id AND r.tenant_id = hs.tenant_id
+         WHERE r.run_id = ANY($1::text[]) ORDER BY hs.host_id, hs.state_id FOR UPDATE OF hs`,
+        [ids]
+      );
+      const byId = new Map(conv.map((row) => [row.job_id, row]));
+      const order = [...runs.rows].sort((a, b) => (hsKey(a.host_id, a.state_id) < hsKey(b.host_id, b.state_id) ? -1
+        : hsKey(a.host_id, a.state_id) > hsKey(b.host_id, b.state_id) ? 1 : (a.run_id < b.run_id ? -1 : 1)));
+      for (const r of order) await this.convergeIngestInTx(client, byId.get(r.run_id), null);
     }
     for (const row of sorted) {
       await auditInsert(client, jobEndAuditEntry(row, 'system'));
@@ -3510,7 +3577,7 @@ class PgRegistry {
     const a = assignmentInput(input);
     try {
       return await this.inTx(async (client) => {
-        await client.query("SELECT pg_advisory_xact_lock(hashtext('state:t:' || $1))", [a.tenant_id]);
+        await client.query('SELECT pg_advisory_xact_lock($1::int, hashtext($2))', [STATE_LOCK_NS, a.tenant_id]);
         await this.assignmentRefsInTx(client, a);
         const ins = await client.query(
           `INSERT INTO cp_state_assignments (assignment_id, tenant_id, state_id, version_id, target_kind, target_value, vars,
@@ -3537,7 +3604,7 @@ class PgRegistry {
     if (!nonEmpty(actor) || typeof assignmentId !== 'string' || typeof tenantId !== 'string') throw http(400, 'bad_assignment');
     try {
       return await this.inTx(async (client) => {
-        await client.query("SELECT pg_advisory_xact_lock(hashtext('state:t:' || $1))", [tenantId]);
+        await client.query('SELECT pg_advisory_xact_lock($1::int, hashtext($2))', [STATE_LOCK_NS, tenantId]);
         const cur = await client.query(
           `SELECT ${cols(ASSIGNMENT_COLS)} FROM cp_state_assignments WHERE assignment_id = $1 AND tenant_id = $2 FOR UPDATE`,
           [assignmentId, tenantId]
@@ -3583,7 +3650,7 @@ class PgRegistry {
   async deleteAssignment({ tenantId, assignmentId, actor }) {
     if (!nonEmpty(actor) || typeof assignmentId !== 'string' || typeof tenantId !== 'string') throw http(400, 'bad_assignment');
     return this.inTx(async (client) => {
-      await client.query("SELECT pg_advisory_xact_lock(hashtext('state:t:' || $1))", [tenantId]);
+      await client.query('SELECT pg_advisory_xact_lock($1::int, hashtext($2))', [STATE_LOCK_NS, tenantId]);
       const del = await client.query(
         `DELETE FROM cp_state_assignments WHERE assignment_id = $1 AND tenant_id = $2 RETURNING ${cols(ASSIGNMENT_COLS)}`,
         [assignmentId, tenantId]
@@ -3652,7 +3719,7 @@ class PgRegistry {
       const h = await client.query('SELECT tenant_id FROM cp_hosts WHERE host_id = $1', [hostId]);
       if (h.rows[0]) tenant = h.rows[0].tenant_id;
     }
-    await client.query("SELECT pg_advisory_xact_lock(hashtext('state:t:' || $1))", [tenant]);
+    await client.query('SELECT pg_advisory_xact_lock($1::int, hashtext($2))', [STATE_LOCK_NS, tenant]);
     const hosts = hostId
       ? (await client.query('SELECT host_id, tags FROM cp_hosts WHERE host_id = $1 AND tenant_id = $2 AND retired_at IS NULL', [hostId, tenant])).rows
       : (await client.query('SELECT host_id, tags FROM cp_hosts WHERE tenant_id = $1 AND retired_at IS NULL', [tenant])).rows;
@@ -3733,16 +3800,18 @@ class PgRegistry {
     return res.rows.map(publicHostState);
   }
 
-  // §8.2: due rows of live, fresh, converge-capable hosts, ranked per tenant
-  // without locks, the per-tenant cap (counting every replica's unexpired
+  // §8.2: due rows (with an effective assignment and no apply in flight)
+  // of live, fresh, converge-capable hosts, ranked per tenant without locks, the per-tenant cap (counting every replica's unexpired
   // claims) applied before the replica budget, then the chosen rows locked
   // by key with SKIP LOCKED and the claim predicate re-checked under the
   // lock. The drift:claim lock serializes claim transactions, so the cap is
-  // exact across replicas.
+  // exact across replicas. A claim moves next_check_at to the claim expiry:
+  // the run's report sets the real next check; a claim whose run never
+  // reports (a crashed replica, a lost job) is due again when it expires.
   async claimDueChecks(opts) {
     const { replicaBudget, perTenantCap, claimExpiryS, presenceFreshS } = claimInput(opts);
     return this.inTx(async (client) => {
-      await client.query("SELECT pg_advisory_xact_lock(hashtext('drift:claim'))");
+      await client.query('SELECT pg_advisory_xact_lock($1::int, $2::int)', [AUDIT_LOCK_NS, DRIFT_CLAIM_LOCK_KEY]);
       const res = await client.query(
         `WITH inflight AS (
            SELECT tenant_id, count(*) AS n FROM cp_host_state
@@ -3755,8 +3824,10 @@ class PgRegistry {
            JOIN cp_hosts h ON h.host_id = hs.host_id AND h.tenant_id = hs.tenant_id AND h.retired_at IS NULL
             AND h.agent_seen_at > now() - make_interval(secs => $4)
             AND 'converge' = ANY(h.agent_caps)
-           WHERE hs.next_check_at <= now() AND hs.status <> 'conflict' AND hs.assignment_id IS NOT NULL
-             AND (hs.check_claimed_at IS NULL OR hs.check_claimed_at <= now() - make_interval(secs => $3))),
+           WHERE hs.next_check_at <= now() AND hs.assignment_id IS NOT NULL
+             AND (hs.check_claimed_at IS NULL OR hs.check_claimed_at <= now() - make_interval(secs => $3))
+             AND NOT EXISTS (SELECT 1 FROM cp_sysscript_jobs j
+                             WHERE j.job_id = hs.last_apply_run_id AND j.status = ANY($5::text[]))),
          pick AS (
            SELECT r.host_id, r.state_id FROM ranked r LEFT JOIN inflight i USING (tenant_id)
            WHERE r.rk + coalesce(i.n, 0) <= $2
@@ -3766,12 +3837,11 @@ class PgRegistry {
            WHERE (hs.check_claimed_at IS NULL OR hs.check_claimed_at <= now() - make_interval(secs => $3))
              AND hs.next_check_at <= now()
            FOR UPDATE OF hs SKIP LOCKED)
-         UPDATE cp_host_state hs SET check_claimed_at = now(),
-           next_check_at = now() + make_interval(secs => a.check_interval_s * (0.9 + random() * 0.2))
-         FROM locked l, cp_state_assignments a
-         WHERE hs.host_id = l.host_id AND hs.state_id = l.state_id AND a.assignment_id = hs.assignment_id
+         UPDATE cp_host_state hs SET check_claimed_at = now(), next_check_at = now() + make_interval(secs => $3)
+         FROM locked l
+         WHERE hs.host_id = l.host_id AND hs.state_id = l.state_id
          RETURNING ${cols(HOST_STATE_COLS, 'hs.')}`,
-        [replicaBudget, perTenantCap, claimExpiryS, presenceFreshS]
+        [replicaBudget, perTenantCap, claimExpiryS, presenceFreshS, JOB_ACTIVE]
       );
       return res.rows.map(publicHostState);
     });
@@ -3891,8 +3961,13 @@ class PgRegistry {
         [hs.version_id, r.tenant_id]
       )).rows[0] || null;
     }
+    const ids = hs ? [hs.check_job_id, hs.last_apply_run_id].filter(Boolean) : [];
+    const active = ids.length === 0 ? [] : (await client.query(
+      'SELECT job_id FROM cp_sysscript_jobs WHERE job_id = ANY($1::text[]) AND status = ANY($2::text[])',
+      [ids, JOB_ACTIVE]
+    )).rows.map((x) => x.job_id);
     return convergeCreateCheck(r, c, {
-      hs, version, assignment, plan,
+      hs, version, assignment, plan, active,
       planJobStatus: plan ? plan.job_status : null,
       planAgeS: plan ? plan.age_s : 0,
       maxAgeS: planMaxAgeS(this.env)
@@ -4120,14 +4195,38 @@ function bucketKey(ts, bucket) {
   return d.toISOString().slice(0, 16);
 }
 
+// Every boot SQL file runs on one connection under the session-level boot
+// lock, so replicas booting together run them one at a time (concurrent
+// CREATE IF NOT EXISTS of one type or table fails 23505, and CREATE INDEX
+// then ALTER TABLE on one table deadlocks). The lock is released in finally;
+// a connection whose unlock fails is destroyed, which releases it too.
+async function applySchema(pool) {
+  const client = await pool.connect();
+  let broken;
+  try {
+    await client.query('SELECT pg_advisory_lock($1::int, $2::int)', [AUDIT_LOCK_NS, BOOT_LOCK_KEY]);
+    try {
+      await client.query(SCHEMA_SQL);
+      for (const sql of PLAYGROUND_SQL) await client.query(sql);
+    } finally {
+      try {
+        await client.query('SELECT pg_advisory_unlock($1::int, $2::int)', [AUDIT_LOCK_NS, BOOT_LOCK_KEY]);
+      } catch (err) {
+        broken = err;
+      }
+    }
+  } finally {
+    client.release(broken);
+  }
+}
+
 async function createRegistry({ pool, env, logger = console }) {
   if (env.NODE_ENV === 'production' && !pool) {
     throw http(503, 'registry_unavailable');
   }
   if (pool) {
     try {
-      await pool.query(SCHEMA_SQL);
-      for (const sql of PLAYGROUND_SQL) await pool.query(sql);
+      await applySchema(pool);
       logger.log('[control] cp schema ready');
       return new PgRegistry(pool, env);
     } catch (err) {

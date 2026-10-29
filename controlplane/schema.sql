@@ -3,12 +3,13 @@
 -- Threats: tenant isolation and audit integrity live in the application
 -- queries (parameterized, tenant predicate). This file does not grant roles.
 
--- createRegistry sends this whole file as one simple query, which Postgres
--- runs as one implicit transaction. Replicas booting together would each take
--- a share lock (CREATE INDEX IF NOT EXISTS) and then need an exclusive one
--- (ALTER TABLE) on the same table, and deadlock; this lock, held to the end of
--- that transaction, runs the file one boot at a time.
-SELECT pg_advisory_xact_lock(hashtext('cp_schema_boot'));
+-- This file is sent as one simple query, which Postgres runs as one implicit
+-- transaction. Two of them at once would each take a share lock (CREATE INDEX
+-- IF NOT EXISTS) and then need an exclusive one (ALTER TABLE) on one table,
+-- and deadlock. createRegistry runs it under the session-level boot lock
+-- (two-int form: namespace 'SAPI' = 1396789321, key 2); this transaction
+-- lock on the same key covers any other caller of the file.
+SELECT pg_advisory_xact_lock(1396789321, 2);
 
 CREATE TABLE IF NOT EXISTS cp_tenants (
   tenant_id TEXT PRIMARY KEY,
@@ -388,11 +389,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS cp_alert_events_active_drift_idx ON cp_alert_e
   WHERE status IN ('open', 'ack') AND rule_name LIKE 'drift:%';
 
 -- The job source CHECK gains the converge sources. Every replica runs this
--- file at boot: the advisory lock serializes concurrent boots, and the swap
--- runs only while the v2 constraint is absent (NOT VALID, then VALIDATE, so
--- existing rows are checked without a long exclusive scan under the ALTER).
+-- file at boot under the boot lock (taken again here, a no-op for the same
+-- session), and the swap runs only while the v2 constraint is absent. NOT
+-- VALID then VALIDATE in one transaction is no cheaper than a plain ADD
+-- CONSTRAINT: the ALTER's ACCESS EXCLUSIVE lock is held to the end of the
+-- transaction while VALIDATE scans the existing rows once. That scan is
+-- bounded by the job retention, and it runs once per database.
 DO $$ BEGIN
-  PERFORM pg_advisory_xact_lock(hashtext('cp_sysscript_jobs_source_check_v2'));
+  PERFORM pg_advisory_xact_lock(1396789321, 2);
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'cp_sysscript_jobs_source_check_v2') THEN
     ALTER TABLE cp_sysscript_jobs DROP CONSTRAINT IF EXISTS cp_sysscript_jobs_source_check;
     ALTER TABLE cp_sysscript_jobs ADD CONSTRAINT cp_sysscript_jobs_source_check_v2

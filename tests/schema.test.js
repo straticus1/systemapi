@@ -16,16 +16,29 @@ const KEYS = fs.readFileSync(path.join(ROOT, 'playground', 'playground_schema.sq
 const FLEET = fs.readFileSync(path.join(ROOT, 'playground', 'playground_fleet_schema.sql'), 'utf8');
 const quiet = { log() {}, warn() {}, error() {} };
 
+// createRegistry runs the files on one client under the boot advisory lock;
+// seen records the files, locks records the lock and unlock calls.
 function fakePool(failOn = null) {
   const seen = [];
-  return {
+  const locks = [];
+  const pool = {
     seen,
+    locks,
+    released: 0,
     async query(sql) {
+      if (/pg_advisory_(un)?lock/.test(sql)) {
+        locks.push(sql.includes('unlock') ? 'unlock' : 'lock');
+        return { rows: [], rowCount: 1 };
+      }
       seen.push(sql);
       if (failOn && sql === failOn) throw new Error('permission denied for table playground_credits');
       return { rows: [], rowCount: 0 };
+    },
+    async connect() {
+      return { query: (sql, params) => pool.query(sql, params), release() { pool.released += 1; } };
     }
   };
+  return pool;
 }
 
 test('createRegistry applies the control-plane schema, then the playground keys schema, then the fleet schema', async () => {
@@ -33,6 +46,8 @@ test('createRegistry applies the control-plane schema, then the playground keys 
   const registry = await createRegistry({ pool, env: { NODE_ENV: 'production' }, logger: quiet });
   assert.ok(registry instanceof PgRegistry);
   assert.deepEqual(pool.seen, [CP, KEYS, FLEET]);
+  assert.deepEqual(pool.locks, ['lock', 'unlock']);
+  assert.equal(pool.released, 1);
 });
 
 test('a playground schema failure is fatal in production', async () => {
@@ -42,6 +57,7 @@ test('a playground schema failure is fatal in production', async () => {
       createRegistry({ pool, env: { NODE_ENV: 'production' }, logger: quiet }),
       /permission denied/
     );
+    assert.deepEqual(pool.locks, ['lock', 'unlock'], 'the boot lock is released on failure');
   }
 });
 

@@ -101,6 +101,18 @@ Run `GET /api/v1/audit/verify` again and compare it with the result from
 step 1 of the rollout. A break that appears only in rows from before d8c8342
 is the known fork, not a new one.
 
+## Desired-state locks (convergence)
+
+The control plane boots every schema file under one session advisory lock
+(`pg_locks`: `classid = 1396789321, objid = 2`), so replicas starting together
+apply them one at a time; a boot that hangs is waiting for that lock. Every
+enroll (each agent reconnect), retire, tag change and assignment change takes
+the tenant-wide desired-state lock (`classid = 1398030676`, `objid` =
+`hashtext(tenant_id)`) for its transaction to re-sync that tenant's host
+states. A reconnect storm in one large tenant therefore serializes on that
+lock; other tenants are not affected. The drift claim lock is
+`classid = 1396789321, objid = 3`.
+
 # Protocol reference
 
 Sources: `playground/jobs.js` (server engine), `controlplane/registry.js`

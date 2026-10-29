@@ -358,8 +358,10 @@ test('plan, approve, apply: self-approval, truncation, 429 does not burn the pla
   const ap = await submit(reg, apply, a, {}, applyOpts);
   assert.equal(reg.convergeRuns.get(p.job_id).consumed_by_run_id, ap.job_id);
   assert.equal(reg.convergeRuns.get(p.job_id).bundle_json, null);
-  await assert.rejects(submit(reg, apply, a, {}, applyOpts), (e) => e.code === 'plan_consumed');
+  await assert.rejects(submit(reg, apply, a, {}, applyOpts), (e) => e.code === 'apply_in_progress');
+  await assert.rejects(submit(reg, t, a), (e) => e.code === 'apply_in_progress', 'no check beside an apply');
   const done = await finish(reg, ap, report('apply', { changed: 1 }));
+  await assert.rejects(submit(reg, apply, a, {}, applyOpts), (e) => e.code === 'plan_consumed');
   assert.equal(done.converge.status, 'compliant');
   const row = hs(reg, H1, t.st.state_id);
   assert.equal(row.last_applied_version_id, t.v.version_id);
@@ -401,20 +403,36 @@ test('claimDueChecks: per-tenant cap counts in-flight claims, budget, presence a
   await reg.createAssignment({ tenantId: 'acme', stateId: t.st.state_id, versionId: t.v.version_id, actor: 'u-a', targetKind: 'tenant', checkIntervalS: 300 });
   const tb = await published(reg, 'beta', 'web', 'u-b');
   await reg.createAssignment({ tenantId: 'beta', stateId: tb.st.state_id, versionId: tb.v.version_id, actor: 'u-b', targetKind: 'tenant', checkIntervalS: 300 });
+  // First checks are spread over the interval; make every row due now.
   const past = new Date(Date.now() - 1000);
   for (const r of reg.hostStates.values()) r.next_check_at = past;
   const opts = { replicaBudget: 50, perTenantCap: 1, claimExpiryS: 420 };
   assert.deepEqual(await reg.claimDueChecks(opts), [], 'no live converge agents');
-  for (const h of [H1, H2, HB]) await reg.setAgentPresence(h, { caps: ['sysscript_jobs', 'converge'], instance: 'i', connId: `c-${h}`, enrolledAt: new Date() });
+  for (const h of [H1, HB]) await reg.setAgentPresence(h, { caps: ['sysscript_jobs', 'converge'], instance: 'i', connId: `c-${h}`, enrolledAt: new Date() });
   await reg.setAgentPresence(H2, { caps: ['sysscript_jobs'], instance: 'i', connId: 'c-x', enrolledAt: new Date() });
   const first = await reg.claimDueChecks(opts);
   assert.deepEqual(first.map((r) => r.host_id).sort(), [H1, HB]);
-  for (const r of reg.hostStates.values()) r.next_check_at = past;
-  assert.deepEqual(await reg.claimDueChecks(opts), [], 'cap 1 per tenant is held by the unexpired claims');
-  assert.equal((await reg.claimDueChecks({ ...opts, perTenantCap: 2 })).length, 0, 'H2 is not converge-capable');
-  // Expiry: a dead replica's claim is reclaimed.
-  hs(reg, H1, t.st.state_id).check_claimed_at = new Date(Date.now() - 421000);
-  assert.deepEqual((await reg.claimDueChecks(opts)).map((r) => r.host_id), [H1]);
+  assert.ok(first.every((r) => r.next_check_at.getTime() >= Date.now() + 419000), 'next_check_at moves to the claim expiry');
+  assert.equal((await reg.claimDueChecks({ ...opts, perTenantCap: 2 })).length, 0, 'H2 is not converge-capable; claimed rows are not due');
+  await reg.setAgentPresence(H2, { caps: ['sysscript_jobs', 'converge'], instance: 'i', connId: 'c-y', enrolledAt: new Date() });
+  assert.deepEqual(await reg.claimDueChecks(opts), [], 'cap 1 per tenant is held by the unexpired H1 claim');
+  assert.deepEqual((await reg.claimDueChecks({ ...opts, perTenantCap: 2 })).map((r) => r.host_id), [H2]);
+  // Expiry, untouched rows: a claim whose run never reports is due again
+  // when it expires (here after 1 s), and it is reclaimed.
+  const reg2 = await rig();
+  const t2 = await published(reg2);
+  await reg2.createAssignment({ tenantId: 'acme', stateId: t2.st.state_id, versionId: t2.v.version_id, actor: 'u-a', targetKind: 'host', targetValue: H1, checkIntervalS: 300 });
+  hs(reg2, H1, t2.st.state_id).next_check_at = past;
+  await reg2.setAgentPresence(H1, { caps: ['converge'], instance: 'i', connId: 'c1', enrolledAt: new Date() });
+  const short = { replicaBudget: 5, perTenantCap: 5, claimExpiryS: 1 };
+  assert.equal((await reg2.claimDueChecks(short)).length, 1);
+  assert.equal((await reg2.claimDueChecks(short)).length, 0);
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  assert.equal((await reg2.claimDueChecks(short)).length, 1, 'reclaimed after expiry');
+  // A conflict row with an assignment (a resource-key clash) stays claimable.
+  hs(reg2, H1, t2.st.state_id).status = 'conflict';
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  assert.equal((await reg2.claimDueChecks(short)).length, 1);
   assert.equal(await reg.releaseCheckClaim(H1, t.st.state_id), true);
   assert.equal(hs(reg, H1, t.st.state_id).check_claimed_at, null);
   assert.ok(hs(reg, H1, t.st.state_id).next_check_at > new Date());
@@ -451,4 +469,99 @@ test('retention: check runs go with their job, reports expire with the output, p
   assert.equal(await reg.pruneJobs(30), 2);
   assert.equal(reg.convergeRuns.has(c.job_id), false);
   assert.equal(reg.convergeRuns.has(p.job_id), true);
+});
+
+test('memory: a failed audit append undoes the ingest (job, run, host state, alert), the finalize and the re-send', async () => {
+  const reg = await rig();
+  const t = await published(reg);
+  const a = await reg.createAssignment({ tenantId: 'acme', stateId: t.st.state_id, versionId: t.v.version_id, actor: 'u-a', targetKind: 'host', targetValue: H1 });
+  const real = reg.appendAudit.bind(reg);
+  const refuse = () => { reg.appendAudit = async () => { throw new Error('audit refused'); }; };
+  const allow = () => { reg.appendAudit = real; };
+  const j = await submit(reg, t, a);
+  const before = JSON.stringify(hs(reg, H1, t.st.state_id));
+  refuse();
+  await assert.rejects(finish(reg, j, report('check', { drift: 1 })), /audit refused/);
+  allow();
+  assert.equal(reg.jobs.get(j.job_id).status, 'submitted');
+  assert.equal(reg.convergeRuns.get(j.job_id).report_sha256, null);
+  assert.equal(reg.convergeRuns.get(j.job_id).finished_at, null);
+  assert.equal(JSON.stringify(hs(reg, H1, t.st.state_id)), before);
+  assert.equal(reg.alerts.length, 0);
+  const ok = await finish(reg, j, report('check', { drift: 1 }));
+  assert.equal(ok.converge.alerts.length, 1, 'the retry ingests');
+
+  // A clean check that would resolve the alert: undone, the alert stays open.
+  const j2 = await submit(reg, t, a);
+  refuse();
+  await assert.rejects(finish(reg, j2, report('check')), /audit refused/);
+  allow();
+  assert.equal(reg.alerts[0].status, 'open');
+  assert.equal(hs(reg, H1, t.st.state_id).status, 'drifted');
+  assert.equal(hs(reg, H1, t.st.state_id).check_job_id, j2.job_id);
+
+  // Sweep finalize.
+  const j3 = jobRow(t, { deadline_at: new Date(Date.now() + 1000) });
+  reg.jobs.get(j2.job_id).status = 'cancelled';
+  await reg.createJob(j3, { converge: convOpts(t, a) });
+  refuse();
+  await assert.rejects(reg.sweepJobs(Date.now() + 70000), /audit refused/);
+  allow();
+  assert.equal(hs(reg, H1, t.st.state_id).check_job_id, j3.job_id);
+  assert.equal(reg.convergeRuns.get(j3.job_id).finished_at, null);
+
+  // Re-send of a swept plan (a plan report is always audited).
+  await reg.sweepJobs(Date.now() + 70000);
+  const p = jobRow({ ...t, kind: 'plan' }, { deadline_at: new Date(Date.now() + 1000) });
+  await reg.createJob(p, { converge: convOpts({ ...t, kind: 'plan' }, a) });
+  await reg.sweepJobs(Date.now() + 70000);
+  refuse();
+  await assert.rejects(reg.ingestConvergeResend(p.job_id, H1, report('plan')), /audit refused/);
+  allow();
+  assert.equal(reg.convergeRuns.get(p.job_id).report_sha256, null);
+  assert.equal((await reg.ingestConvergeResend(p.job_id, H1, report('plan'))).ingested, true);
+});
+
+test('memory: one apply at a time, no apply beside a check, no check beside an apply; check bundleJson must match', async () => {
+  const reg = await rig();
+  const t = await published(reg);
+  const a = await reg.createAssignment({ tenantId: 'acme', stateId: t.st.state_id, versionId: t.v.version_id, actor: 'u-a', targetKind: 'host', targetValue: H1 });
+  await assert.rejects(reg.createJob(jobRow(t), { converge: convOpts(t, a, { bundleJson: '{"v":1}' }) }), (e) => e.code === 'bad_job');
+  const plans = [];
+  for (let i = 0; i < 2; i += 1) {
+    const p = await submit(reg, { ...t, kind: 'plan' }, a);
+    await finish(reg, p, report('plan', { drift: 1 }));
+    plans.push(p);
+  }
+  const chk = await submit(reg, t, a, {}, { conv: { bundleJson: BUNDLE } });
+  await assert.rejects(submit(reg, { ...t, kind: 'apply' }, a, {}, { conv: { planRunId: plans[0].job_id } }), (e) => e.code === 'check_in_progress');
+  await finish(reg, chk, report('check', { drift: 1 }));
+  const ap = await submit(reg, { ...t, kind: 'apply' }, a, {}, { conv: { planRunId: plans[0].job_id } });
+  await assert.rejects(submit(reg, { ...t, kind: 'apply' }, a, {}, { conv: { planRunId: plans[1].job_id } }), (e) => e.code === 'apply_in_progress');
+  await assert.rejects(submit(reg, { ...t, kind: 'plan' }, a), (e) => e.code === 'apply_in_progress');
+  // A due row whose apply is in flight is not claimed.
+  hs(reg, H1, t.st.state_id).next_check_at = new Date(Date.now() - 1000);
+  await reg.setAgentPresence(H1, { caps: ['converge'], instance: 'i', connId: 'c9', enrolledAt: new Date() });
+  assert.deepEqual(await reg.claimDueChecks({ replicaBudget: 5, perTenantCap: 5, claimExpiryS: 420 }), []);
+  await finish(reg, ap, report('apply', { changed: 1 }));
+  assert.equal((await reg.claimDueChecks({ replicaBudget: 5, perTenantCap: 5, claimExpiryS: 420 })).length, 1);
+});
+
+test('memory: claim ties break on (next_check_at, host_id, state_id); a concurrent assignment update is refused, not lost', async () => {
+  const reg = await rig();
+  const t = await published(reg);
+  const a = await reg.createAssignment({ tenantId: 'acme', stateId: t.st.state_id, versionId: t.v.version_id, actor: 'u-a', targetKind: 'tenant' });
+  const at = new Date(Date.now() - 1000);
+  for (const r of reg.hostStates.values()) r.next_check_at = at;
+  for (const h of [H2, H1]) await reg.setAgentPresence(h, { caps: ['converge'], instance: 'i', connId: `c-${h}`, enrolledAt: new Date() });
+  assert.deepEqual((await reg.claimDueChecks({ replicaBudget: 1, perTenantCap: 5, claimExpiryS: 420 })).map((r) => r.host_id), [H1]);
+  const out = await Promise.allSettled([
+    reg.updateAssignment({ tenantId: 'acme', assignmentId: a.assignment_id, patch: { driftThreshold: 2 }, actor: 'u-a' }),
+    reg.updateAssignment({ tenantId: 'acme', assignmentId: a.assignment_id, patch: { checkIntervalS: 600 }, actor: 'u-a' })
+  ]);
+  const won = out.filter((x) => x.status === 'fulfilled');
+  assert.equal(won.length, 1);
+  assert.equal(out.find((x) => x.status === 'rejected').reason.code, 'conflict');
+  const cur = await reg.getAssignment(['acme'], a.assignment_id);
+  assert.deepEqual([cur.drift_threshold, cur.check_interval_s], [won[0].value.drift_threshold, won[0].value.check_interval_s]);
 });
