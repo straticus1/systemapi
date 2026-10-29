@@ -596,9 +596,13 @@ func TestPTYRecorderOverflowEndsSession(t *testing.T) {
 	h := newPTYHarness(t)
 	ptyCfg.Record = true
 	ptyCfg.RecordDir = filepath.Join(h.dir, "rec")
+	// Set before the session starts: the recorder goroutine reads it, so
+	// changing it mid-session is a data race.
+	oldQueueMax := recordQueueMax
+	recordQueueMax = 64
+	t.Cleanup(func() { recordQueueMax = oldQueueMax })
 	sid := h.start(t, "pty", inFuture(60*time.Second), inFuture(time.Hour))
 	startedPayload(t, h, sid)
-	recordQueueMax = 64
 	handlePTYInput(sid, []byte(strings.Repeat("x", 200)))
 	p := exitPayload(t, h, sid, 5*time.Second)
 	if p["reason"] != "stopped" || p["record_error"] != "recording_failed" {
