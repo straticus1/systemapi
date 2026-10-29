@@ -24,6 +24,11 @@ const { fingerprint } = require('./token');
 const { assertPolicyShape } = require('./channels');
 const { demoKeyAllowed } = require('./httpauth');
 const { sshKeyMaterial } = require('./sshkey');
+const {
+  AUTO_ACTOR, CONVERGE_SOURCES, HOST_STATE_STATUSES, RUN_KINDS, applyRunRetentionDays, assignmentInput, assignmentPatch, convergeOutcome,
+  convergeReport, driftRule, effectiveAssignments, firstCheckOffsetS, hostStateDiff, isConvergeSource, newId,
+  planMaxAgeS, sha256Hex, stateInput, tagsInput, versionInput
+} = require('./statestore');
 
 const METRICS = new Set(['cpu.usage_percent', 'memory.used_percent', 'disk.used_percent']);
 const ROLES = new Set(['admin', 'operator', 'viewer']);
@@ -203,7 +208,8 @@ function retireReason(reason) {
 // decide who may see output or cancel: the routes do.
 const JOB_STATUSES = new Set(['submitted', 'accepted', 'running', 'succeeded', 'failed', 'cancelled', 'timed_out']);
 const JOB_ACTIVE = ['submitted', 'accepted', 'running'];
-const JOB_SOURCES = new Set(['api', 'execute', 'fleet_execute', 'playbook', 'schedule', 'rule']);
+const JOB_SOURCES = new Set(['api', 'execute', 'fleet_execute', 'playbook', 'schedule', 'rule',
+  'converge_check', 'converge_plan', 'converge_apply']);
 const JOB_ID_RE = /^sjb_[A-Za-z0-9_-]{22}$/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const NONCE_RE = /^[0-9a-f]{32}$/;
@@ -503,6 +509,281 @@ function deliverJobEvent(emitter, evt) {
   }
 }
 
+// Desired state and converge runs (cp_states, cp_state_versions,
+// cp_state_assignments, cp_host_state, cp_converge_runs;
+// .omc/plans/convergence-drift.md §5-§8; pure rules in statestore.js).
+// Threats: a state, version, assignment, host state or run read or written
+// from another tenant (every read and user write carries a tenant
+// predicate; agent-driven writes go through the job row, matched on
+// host_id), a late or duplicate result overwriting a newer run (host-state
+// writes are conditional on check_job_id for check and plan runs and on
+// last_apply_run_id for apply runs; a run's report is written once, guarded
+// by report_sha256 IS NULL), a plan burned by a refused submit (consumed in
+// the createJob transaction, after the caps), a plan applied stale,
+// truncated, unapproved, superseded or twice, and duplicate drift alerts
+// across replicas (ON CONFLICT on the active-drift unique index). Lock
+// order: job rows, then converge run rows, then cp_host_state rows (in
+// (host_id, state_id) order), then alert rows, then the audit chain lock
+// last. Does NOT decide scopes, roles or who may see diffs, source or vars:
+// the routes do.
+const RUN_LIST_MAX = 200;
+const RUN_COLS = ['run_id', 'tenant_id', 'host_id', 'state_id', 'assignment_id', 'version_id', 'kind', 'actor',
+  'plan_run_id', 'parent_job_id', 'plan_sha256', 'plan_truncated', 'report_sha256', 'summary', 'report_expired',
+  'approved_by', 'approved_at', 'consumed_by_run_id', 'created_at', 'finished_at'];
+const HOST_STATE_COLS = ['host_id', 'state_id', 'tenant_id', 'assignment_id', 'version_id', 'status', 'facts',
+  'consecutive_drift', 'last_error', 'last_check_run_id', 'last_check_at', 'last_apply_run_id',
+  'last_applied_version_id', 'last_applied_at', 'manual_apply_assignment_id', 'manual_apply_version_id',
+  'auto_apply_failures', 'last_report_sha256', 'next_check_at', 'check_claimed_at', 'check_job_id'];
+const ASSIGNMENT_COLS = ['assignment_id', 'tenant_id', 'state_id', 'version_id', 'target_kind', 'target_value', 'vars',
+  'check_interval_s', 'drift_threshold', 'auto_remediate', 'require_approval', 'created_by', 'created_at', 'updated_at'];
+
+// SECURITY-RULES rule 7: column lists interpolated into SQL come only from
+// the constant arrays above and a constant prefix, never from input.
+function cols(list, prefix = '') {
+  return list.map((c) => prefix + c).join(', ');
+}
+
+function copyValue(v) {
+  if (v instanceof Date) return new Date(v.getTime());
+  if (v !== null && typeof v === 'object') return JSON.parse(JSON.stringify(v));
+  return v === undefined ? null : v;
+}
+
+function pick(row, list) {
+  if (!row) return null;
+  const out = {};
+  for (const c of list) out[c] = copyValue(row[c]);
+  return out;
+}
+
+function publicState(row) {
+  return pick(row, ['state_id', 'tenant_id', 'name', 'description', 'created_by', 'created_at', 'archived_at']);
+}
+
+// Without files unless withFiles (the source is for state:write holders).
+function publicVersion(row, { withFiles = false } = {}) {
+  const out = pick(row, ['version_id', 'state_id', 'tenant_id', 'version', 'files_sha256', 'entitlements',
+    'entitlements_sha256', 'published_by', 'notes', 'published_at']);
+  if (out && withFiles) out.files = copyValue(row.files);
+  return out;
+}
+
+function publicAssignment(row) {
+  return pick(row, ASSIGNMENT_COLS);
+}
+
+function publicHostState(row) {
+  return pick(row, HOST_STATE_COLS);
+}
+
+// Never bundle_json unless withBundle (the apply route needs the plan's
+// exact bytes), never report unless withReport.
+function publicRun(row, { withReport = false, withBundle = false } = {}) {
+  const out = pick(row, RUN_COLS);
+  if (!out) return null;
+  if (withReport) out.report = copyValue(row.report);
+  if (withBundle) out.bundle_json = row.bundle_json == null ? null : row.bundle_json;
+  return out;
+}
+
+function stateAuditEntry(tenantId, hostId, actor, action, payload) {
+  return { tenant_id: tenantId, host_id: hostId || null, actor, action, payload };
+}
+
+function assignmentAuditPayload(row, op) {
+  return {
+    op,
+    assignment_id: row.assignment_id,
+    state_id: row.state_id,
+    version_id: row.version_id,
+    target_kind: row.target_kind,
+    target_value: row.target_value,
+    check_interval_s: row.check_interval_s,
+    drift_threshold: row.drift_threshold,
+    auto_remediate: row.auto_remediate,
+    require_approval: row.require_approval
+  };
+}
+
+// createJob's opts.converge: {kind, stateId, assignmentId, versionId,
+// planRunId (apply), bundleJson (plan), parentJobId}. The job source must
+// be the kind's; a converge source needs opts.converge.
+function convergeJobInput(r, c) {
+  if (c === undefined || c === null) {
+    if (isConvergeSource(r.source)) throw http(400, 'bad_job');
+    return null;
+  }
+  const ok = c !== null && typeof c === 'object' && r.source === CONVERGE_SOURCES[c.kind]
+    && nonEmpty(c.stateId)
+    && (c.kind === 'apply' ? nonEmpty(c.planRunId) : nonEmpty(c.assignmentId) && nonEmpty(c.versionId))
+    && (c.parentJobId === undefined || c.parentJobId === null || nonEmpty(c.parentJobId))
+    && (c.kind !== 'plan' || (typeof c.bundleJson === 'string' && sha256Hex(c.bundleJson) === r.script_sha256));
+  if (!ok) throw http(400, 'bad_job');
+  return {
+    kind: c.kind,
+    state_id: c.stateId,
+    assignment_id: c.kind === 'apply' ? null : c.assignmentId,
+    version_id: c.kind === 'apply' ? null : c.versionId,
+    plan_run_id: c.kind === 'apply' ? c.planRunId : null,
+    bundle_json: c.kind === 'plan' ? c.bundleJson : null,
+    parent_job_id: c.parentJobId || null
+  };
+}
+
+// The checks createJob makes on a converge job against the rows it read
+// (and locked) in its transaction: hs the host's cp_host_state row,
+// version the effective version, assignment the effective assignment,
+// plan (apply) the plan run with its job's status and age in seconds.
+// Returns the run's assignment and version.
+function convergeCreateCheck(r, c, { hs, version, assignment, plan, planJobStatus, planAgeS, maxAgeS }) {
+  if (!hs || hs.tenant_id !== r.tenant_id || hs.assignment_id == null || !assignment) throw http(409, 'state_not_assigned');
+  if (c.kind !== 'apply') {
+    if (hs.assignment_id !== c.assignment_id || hs.version_id !== c.version_id) throw http(409, 'assignment_changed');
+  } else {
+    if (!plan || plan.kind !== 'plan' || plan.tenant_id !== r.tenant_id || plan.host_id !== r.host_id
+      || plan.state_id !== c.state_id || planJobStatus !== 'succeeded' || plan.report_sha256 == null || plan.plan_sha256 == null) {
+      throw http(409, 'plan_required');
+    }
+    if (plan.consumed_by_run_id) throw http(409, 'plan_consumed');
+    if (plan.plan_truncated) throw http(409, 'plan_truncated');
+    if (planAgeS > maxAgeS || plan.bundle_json == null) throw http(409, 'plan_expired');
+    if (hs.assignment_id !== plan.assignment_id || hs.version_id !== plan.version_id) throw http(409, 'plan_superseded');
+    if (assignment.require_approval && !plan.approved_by) throw http(409, 'approval_required');
+    if (sha256Hex(plan.bundle_json) !== r.script_sha256) throw http(409, 'plan_bundle_mismatch');
+  }
+  if (!version || version.version_id !== hs.version_id || version.entitlements_sha256 !== r.entitlements_sha256) {
+    throw http(409, 'entitlements_mismatch');
+  }
+  return { assignment_id: hs.assignment_id, version_id: hs.version_id };
+}
+
+// transitionJob on a converge row: the report is validated before the
+// UPDATE. Returns {set, rep, bad}: a terminal status with a malformed (or,
+// for succeeded, missing) report becomes failed[bad_report].
+function convergeVerdict(from, fields, set, opts, job) {
+  if (!isTerminal(set.status) || !job || !isConvergeSource(job.source)) return { set, rep: null, bad: null };
+  const report = opts.converge ? opts.converge.report : undefined;
+  let bad = null;
+  let rep = null;
+  if (report === undefined || report === null) {
+    if (set.status === 'succeeded') bad = 'missing';
+  } else {
+    const kind = job.source.slice('converge_'.length);
+    const v = convergeReport(report, kind, job.script_sha256);
+    if (!v.ok) bad = v.reason;
+    else if (set.status === 'succeeded' && v.report.summary.failed + v.report.summary.denied > 0) bad = 'status_mismatch';
+    else rep = v;
+  }
+  if (!bad) return { set, rep, bad: null };
+  const { set: failed } = jobTransition(from, { ...fields, status: 'failed', error: 'bad_report' });
+  return { set: failed, rep: null, bad };
+}
+
+function badReportEvent(job, reason) {
+  return {
+    tenant_id: job.tenant_id,
+    kind: 'converge_bad_report',
+    actor_fingerprint: null,
+    detail: { job_id: job.job_id, host_id: job.host_id, reason }
+  };
+}
+
+// The audit row of an ingested report: always for plan and apply, for a
+// check only when the host status changed.
+function reportAuditEntry(run, job, sha, rep, prevStatus, status) {
+  if (run.kind === 'check' && (status === null || status === prevStatus)) return null;
+  return stateAuditEntry(run.tenant_id, run.host_id, 'system', 'state_report', {
+    run_id: run.run_id,
+    state_id: run.state_id,
+    version_id: run.version_id,
+    kind: run.kind,
+    job_status: job.status,
+    report_sha256: sha,
+    summary: rep.summary,
+    prev_status: prevStatus,
+    status
+  });
+}
+
+function driftAlertEntry(run, rep) {
+  return {
+    tenant_id: run.tenant_id,
+    host_id: run.host_id,
+    rule_name: driftRule(run.state_id),
+    value: rep.summary.drift,
+    severity: 'warning',
+    message: `drift: ${rep.summary.drift} resource(s)`
+  };
+}
+
+// The cp_host_state change of an ingest (v a convergeReport result) or a
+// finalize (v null) on the row hs this run still owns; clash is a resource
+// key also declared by another state on the host. Returns {set, now,
+// nextCheck}: set the column values, now the columns set to the clock,
+// nextCheck whether next_check_at moves one interval (± 10%) ahead.
+function hostStateUpdate(run, job, v, hs, clash) {
+  const rep = v ? v.report : null;
+  const out = convergeOutcome(run.kind, job.status, rep, hs);
+  let status = out.status;
+  let lastError = job.error == null ? null : noNul(String(job.error)).slice(0, JOB_ERROR_MAX);
+  if (clash) {
+    status = 'conflict';
+    lastError = 'resource_key_conflict';
+  }
+  const auto = run.actor === AUTO_ACTOR;
+  const set = {};
+  const now = [];
+  let nextCheck = false;
+  if (run.kind === 'apply') {
+    Object.assign(set, { status, consecutive_drift: out.consecutive_drift, last_error: lastError });
+    if (rep) set.facts = v.facts;
+    if (status === 'compliant') {
+      set.last_applied_version_id = run.version_id;
+      now.push('last_applied_at');
+      if (!auto) Object.assign(set, { manual_apply_assignment_id: run.assignment_id, manual_apply_version_id: run.version_id, auto_apply_failures: 0 });
+    } else if (auto) {
+      set.auto_apply_failures = (hs.auto_apply_failures || 0) + 1;
+    }
+  } else if (rep) {
+    Object.assign(set, {
+      status, facts: v.facts, consecutive_drift: out.consecutive_drift, last_error: lastError,
+      last_check_run_id: run.run_id, check_claimed_at: null, check_job_id: null
+    });
+    if (run.kind === 'check') set.last_report_sha256 = v.sha256;
+    now.push('last_check_at');
+    nextCheck = true;
+  } else {
+    Object.assign(set, { check_claimed_at: null, check_job_id: null, last_error: lastError });
+  }
+  return { set, now, nextCheck };
+}
+
+function claimInput({ replicaBudget, perTenantCap, claimExpiryS, presenceFreshS = 90 } = {}) {
+  const ok = [replicaBudget, perTenantCap, claimExpiryS, presenceFreshS].every((n) => Number.isInteger(n) && n >= 1)
+    && replicaBudget <= 1000 && perTenantCap <= 1000 && claimExpiryS <= 86400 && presenceFreshS <= 3600;
+  if (!ok) throw http(500, 'bad_claim');
+  return { replicaBudget, perTenantCap, claimExpiryS, presenceFreshS };
+}
+
+function runListQuery(opts = {}) {
+  const hostId = opts.hostId == null ? null : String(opts.hostId);
+  const stateId = opts.stateId == null ? null : String(opts.stateId);
+  const kind = opts.kind == null ? null : opts.kind;
+  if (kind !== null && !RUN_KINDS.has(kind)) throw http(400, 'bad_kind');
+  const n = opts.limit === undefined ? 50 : Number(opts.limit);
+  const limit = Number.isInteger(n) && n >= 1 ? Math.min(n, RUN_LIST_MAX) : 50;
+  return { hostId, stateId, kind, limit };
+}
+
+function hostStateQuery({ hostId = null, stateId = null, status = null } = {}) {
+  if (status !== null && !HOST_STATE_STATUSES.has(status)) throw http(400, 'bad_status');
+  return { hostId: hostId == null ? null : String(hostId), stateId: stateId == null ? null : String(stateId), status };
+}
+
+function hsKey(hostId, stateId) {
+  return `${hostId}\u0000${stateId}`;
+}
+
 class MemoryRegistry {
   constructor(env = {}) {
     this.env = env;
@@ -531,6 +812,11 @@ class MemoryRegistry {
     this.tenantPolicies = new Map();
     this.jobs = new Map();
     this.jobBus = new EventEmitter();
+    this.states = new Map();
+    this.stateVersions = new Map();
+    this.assignments = new Map();
+    this.hostStates = new Map();
+    this.convergeRuns = new Map();
   }
 
   async enroll({ tenantId, userId, keyId, hostId, hostname, os, platform, sshPubkey }) {
@@ -571,6 +857,7 @@ class MemoryRegistry {
       created_at: prev ? prev.created_at : now,
       retired_at: null
     });
+    this.memSync(tenantId, hostId);
     return this.getHost([tenantId], hostId);
   }
 
@@ -785,6 +1072,7 @@ class MemoryRegistry {
     await this.appendAudit(hostRetiredAuditEntry(row, actor, text, forced));
     row.retired_at = new Date().toISOString();
     row.status = 'offline';
+    this.memSync(tenantId, hostId);
     return this.decorate(row);
   }
 
@@ -1057,6 +1345,7 @@ class MemoryRegistry {
   // if the submit audit row fails (the Pg transaction rolls back).
   async createJob(row, opts = {}) {
     const r = jobInsertRow(row);
+    const conv = convergeJobInput(r, opts.converge);
     const { hostCap, tenantCap } = jobCaps(opts);
     const host = this.hosts.get(r.host_id);
     if (!host || host.tenant_id !== r.tenant_id || host.retired_at) throw http(404, 'not_found');
@@ -1069,6 +1358,7 @@ class MemoryRegistry {
       if (j.tenant_id === r.tenant_id) onTenant += 1;
     }
     if (onHost >= hostCap || onTenant >= tenantCap) throw http(429, 'too_many_jobs');
+    const convChange = conv ? this.memConvergePrepare(r, conv) : null;
     const stored = {
       ...r,
       status: 'submitted',
@@ -1089,10 +1379,12 @@ class MemoryRegistry {
       duration_ms: null
     };
     this.jobs.set(r.job_id, stored);
+    const convUndo = convChange ? convChange() : null;
     try {
       await this.appendAudit(jobSubmitAuditEntry(stored));
     } catch (err) {
       this.jobs.delete(r.job_id);
+      if (convUndo) convUndo();
       throw err;
     }
     this.publishJobEvent(stateEvent(stored, 'dispatch'));
@@ -1138,20 +1430,32 @@ class MemoryRegistry {
 
   // Guarded: the row must be this host's, in one of fromStatuses, and (with
   // opts.connId) sent on that connection. Null when the guard does not hold.
+  // A converge row's terminal transition also ingests opts.converge.report
+  // (validated first: a malformed one ends the job failed[bad_report] with a
+  // security event), or finalizes the run without one; the result carries
+  // .converge (see memConvergeIngest).
   async transitionJob(jobId, hostId, fromStatuses, fields, opts = {}) {
-    const { from, set } = jobTransition(fromStatuses, fields);
+    const { from, set: asked } = jobTransition(fromStatuses, fields);
     const guardConn = 'connId' in opts;
     if (guardConn && !nonEmpty(opts.connId)) throw http(500, 'bad_conn_id');
     const row = this.jobs.get(jobId);
     if (!row || row.host_id !== hostId || !from.includes(row.status)) return null;
     if (guardConn && row.conn_id !== opts.connId) return null;
+    const { set, rep, bad } = convergeVerdict(from, fields, asked, opts, row);
+    let conv = null;
     await this.jobWrite(
       row,
-      (r) => applyJobSet(r, set, new Date()),
-      (r) => [transitionAuditEntry(r, opts.audit)].filter(Boolean),
+      (r) => {
+        applyJobSet(r, set, new Date());
+        if (isTerminal(r.status) && isConvergeSource(r.source)) conv = this.memConvergeIngest(r, rep);
+      },
+      (r) => [...(conv ? conv.audits : []), transitionAuditEntry(r, opts.audit)].filter(Boolean),
       opts.notify ? (r) => transitionNotify(r, opts.notify) : null
     );
-    return publicJob(row);
+    if (bad) await this.recordSecurity(badReportEvent(row, bad));
+    const out = publicJob(row);
+    if (conv) out.converge = conv.result;
+    return out;
   }
 
   // Claims the dispatch payload once: it is returned to this caller and
@@ -1183,7 +1487,10 @@ class MemoryRegistry {
         const now = new Date();
         r.cancel_requested_at = now;
         r.cancel_actor = actor;
-        if (never) applyJobSet(r, { status: 'cancelled', error: 'cancelled_before_dispatch' }, now);
+        if (never) {
+          applyJobSet(r, { status: 'cancelled', error: 'cancelled_before_dispatch' }, now);
+          if (isConvergeSource(r.source)) this.memConvergeIngest(r, null);
+        }
       },
       (r) => [jobCancelAuditEntry(r, actor, reason), ...(never ? [jobEndAuditEntry(r, 'system')] : [])],
       (r) => stateEvent(r, never ? 'state' : 'cancel')
@@ -1233,7 +1540,10 @@ class MemoryRegistry {
       if (!lost(row)) continue;
       await this.jobWrite(
         row,
-        (r) => applyJobSet(r, { status: 'failed', error: 'agent_lost_job' }, new Date()),
+        (r) => {
+          applyJobSet(r, { status: 'failed', error: 'agent_lost_job' }, new Date());
+          if (isConvergeSource(r.source)) this.memConvergeIngest(r, null);
+        },
         (r) => [jobEndAuditEntry(r, 'system')],
         (r) => stateEvent(r)
       );
@@ -1280,7 +1590,10 @@ class MemoryRegistry {
       if (ended.length >= JOB_SWEEP_BATCH) break;
       await this.jobWrite(
         row,
-        (r) => applyJobSet(r, { status: 'failed', error }, new Date()),
+        (r) => {
+          applyJobSet(r, { status: 'failed', error }, new Date());
+          if (isConvergeSource(r.source)) this.memConvergeIngest(r, null);
+        },
         (r) => [jobEndAuditEntry(r, 'system')],
         (r) => stateEvent(r)
       );
@@ -1300,6 +1613,14 @@ class MemoryRegistry {
         count += 1;
       }
     }
+    const planCutoff = Date.now() - planMaxAgeS(this.env) * 1000;
+    for (const run of this.convergeRuns.values()) {
+      if (run.report != null && run.finished_at && run.finished_at.getTime() < cutoff) {
+        run.report = null;
+        run.report_expired = true;
+      }
+      if (run.kind === 'plan' && run.bundle_json != null && run.created_at.getTime() < planCutoff) run.bundle_json = null;
+    }
     return count;
   }
 
@@ -1310,8 +1631,14 @@ class MemoryRegistry {
     for (const [id, row] of this.jobs) {
       if (isTerminal(row.status) && row.finished_at && row.finished_at.getTime() < cutoff) {
         this.jobs.delete(id);
+        const run = this.convergeRuns.get(id);
+        if (run && run.kind === 'check') this.convergeRuns.delete(id);
         count += 1;
       }
+    }
+    const runCutoff = Date.now() - applyRunRetentionDays(this.env) * 86400000;
+    for (const [id, run] of this.convergeRuns) {
+      if (run.kind !== 'check' && run.created_at.getTime() < runCutoff) this.convergeRuns.delete(id);
     }
     return count;
   }
@@ -1335,6 +1662,467 @@ class MemoryRegistry {
 
   async closeJobEvents() {
     this.jobBus.removeAllListeners('event');
+  }
+
+  // --- desired state (see the Threats note above convergeJobInput) --------
+  // MemoryRegistry writes the audit row first and changes the store only
+  // once it is in (re-checking what it checked before the await).
+
+  async createState(input) {
+    const s = stateInput(input);
+    const check = () => {
+      if (!this.tenants.has(s.tenant_id)) throw http(404, 'not_found');
+      if ([...this.states.values()].some((x) => x.tenant_id === s.tenant_id && x.name === s.name)) throw http(409, 'state_exists');
+    };
+    check();
+    const row = { state_id: newId('st'), ...s, created_at: new Date(), archived_at: null };
+    await this.appendAudit(stateAuditEntry(row.tenant_id, null, row.created_by, 'state_create', { state_id: row.state_id, name: row.name }));
+    check();
+    this.states.set(row.state_id, row);
+    return publicState(row);
+  }
+
+  async getState(tenantIds, stateId) {
+    const row = this.states.get(stateId);
+    return row && (tenantIds || []).includes(row.tenant_id) ? publicState(row) : null;
+  }
+
+  async listStates(tenantIds) {
+    const allow = new Set(tenantIds || []);
+    return [...this.states.values()].filter((s) => allow.has(s.tenant_id))
+      .sort((a, b) => (a.name < b.name ? -1 : 1)).map(publicState);
+  }
+
+  async publishVersion(input) {
+    const v = versionInput(input);
+    const state = () => {
+      const st = this.states.get(v.state_id);
+      if (!st || st.tenant_id !== v.tenant_id || st.archived_at) throw http(404, 'not_found');
+    };
+    state();
+    const next = () => 1 + Math.max(0, ...[...this.stateVersions.values()].filter((x) => x.state_id === v.state_id).map((x) => x.version));
+    const row = { version_id: newId('stv'), ...v, version: next(), published_at: new Date() };
+    await this.appendAudit(stateAuditEntry(v.tenant_id, null, v.published_by, 'state_publish', {
+      state_id: v.state_id, version_id: row.version_id, version: row.version,
+      files_sha256: v.files_sha256, entitlements_sha256: v.entitlements_sha256
+    }));
+    state();
+    row.version = next();
+    this.stateVersions.set(row.version_id, row);
+    return publicVersion(row);
+  }
+
+  async getVersion(tenantIds, versionId, { withFiles = false } = {}) {
+    const row = this.stateVersions.get(versionId);
+    return row && (tenantIds || []).includes(row.tenant_id) ? publicVersion(row, { withFiles }) : null;
+  }
+
+  async listVersions(tenantIds, stateId) {
+    const allow = new Set(tenantIds || []);
+    return [...this.stateVersions.values()].filter((v) => v.state_id === stateId && allow.has(v.tenant_id))
+      .sort((a, b) => b.version - a.version).map((v) => publicVersion(v));
+  }
+
+  assignmentRefs(a) {
+    const st = this.states.get(a.state_id);
+    if (!st || st.tenant_id !== a.tenant_id || st.archived_at) throw http(404, 'not_found');
+    const v = this.stateVersions.get(a.version_id);
+    if (!v || v.state_id !== a.state_id || v.tenant_id !== a.tenant_id) throw http(404, 'version_not_found');
+    if (a.target_kind === 'host') {
+      const h = this.hosts.get(a.target_value);
+      if (!h || h.tenant_id !== a.tenant_id || h.retired_at) throw http(404, 'host_not_found');
+    }
+  }
+
+  async createAssignment(input) {
+    const a = assignmentInput(input);
+    const check = () => {
+      this.assignmentRefs(a);
+      if ([...this.assignments.values()].some((x) => x.tenant_id === a.tenant_id && x.state_id === a.state_id
+        && x.target_kind === a.target_kind && x.target_value === a.target_value)) throw http(409, 'assignment_exists');
+    };
+    check();
+    const now = new Date();
+    const row = { assignment_id: newId('sta'), ...a, created_at: now, updated_at: now };
+    await this.appendAudit(stateAuditEntry(a.tenant_id, a.target_kind === 'host' ? a.target_value : null, a.created_by,
+      'state_assign', assignmentAuditPayload(row, 'create')));
+    check();
+    this.assignments.set(row.assignment_id, row);
+    this.memSync(a.tenant_id);
+    return publicAssignment(row);
+  }
+
+  async updateAssignment({ tenantId, assignmentId, patch, actor }) {
+    if (!nonEmpty(actor)) throw http(400, 'bad_assignment');
+    const cur = this.assignments.get(assignmentId);
+    if (!cur || cur.tenant_id !== tenantId) throw http(404, 'not_found');
+    const next = assignmentPatch(publicAssignment(cur), patch);
+    this.assignmentRefs(next);
+    await this.appendAudit(stateAuditEntry(tenantId, next.target_kind === 'host' ? next.target_value : null, actor,
+      'state_assign', assignmentAuditPayload(next, 'update')));
+    if (this.assignments.get(assignmentId) !== cur) throw http(409, 'conflict');
+    this.assignmentRefs(next);
+    const intervalChanged = next.check_interval_s !== cur.check_interval_s;
+    Object.assign(cur, next, { updated_at: new Date() });
+    this.memSync(tenantId);
+    if (intervalChanged) {
+      for (const hs of this.hostStates.values()) {
+        if (hs.assignment_id !== assignmentId) continue;
+        const off = firstCheckOffsetS(hs.host_id, hs.state_id, cur.check_interval_s);
+        hs.next_check_at = off === null ? null : new Date(Date.now() + off * 1000);
+      }
+    }
+    return publicAssignment(cur);
+  }
+
+  async deleteAssignment({ tenantId, assignmentId, actor }) {
+    if (!nonEmpty(actor)) throw http(400, 'bad_assignment');
+    const cur = this.assignments.get(assignmentId);
+    if (!cur || cur.tenant_id !== tenantId) throw http(404, 'not_found');
+    await this.appendAudit(stateAuditEntry(tenantId, cur.target_kind === 'host' ? cur.target_value : null, actor,
+      'state_unassign', assignmentAuditPayload(cur, 'delete')));
+    if (!this.assignments.delete(assignmentId)) throw http(404, 'not_found');
+    this.memSync(tenantId);
+    return true;
+  }
+
+  async getAssignment(tenantIds, assignmentId) {
+    const row = this.assignments.get(assignmentId);
+    return row && (tenantIds || []).includes(row.tenant_id) ? publicAssignment(row) : null;
+  }
+
+  async listAssignments(tenantIds, { stateId = null } = {}) {
+    const allow = new Set(tenantIds || []);
+    return [...this.assignments.values()].filter((a) => allow.has(a.tenant_id) && (stateId === null || a.state_id === stateId))
+      .sort((a, b) => a.created_at - b.created_at).map(publicAssignment);
+  }
+
+  // Replaces the host's tags (audited) and re-syncs its host states.
+  async setHostTags({ tenantId, hostId, tags, actor }) {
+    const next = tagsInput(tags);
+    if (!nonEmpty(actor)) throw http(400, 'bad_tags');
+    const row = this.hosts.get(hostId);
+    if (!row || row.tenant_id !== tenantId || row.retired_at) throw http(404, 'not_found');
+    await this.appendAudit(stateAuditEntry(tenantId, hostId, actor, 'host_tags', { tags: next, previous: [...(row.tags || [])] }));
+    row.tags = next;
+    this.memSync(tenantId, hostId);
+    return this.decorate(row);
+  }
+
+  // The effective assignment per (host, state), applied: new rows, changed
+  // assignments, conflicts, and rows the host no longer matches deleted
+  // with their drift alerts resolved. With hostId, that host only (in its
+  // current tenant: rows under another tenant are deleted).
+  async syncHostStates(tenantId, { hostId = null } = {}) {
+    return this.memSync(tenantId, hostId);
+  }
+
+  memSync(tenantId, hostId = null) {
+    let tenant = tenantId;
+    let hosts;
+    if (hostId) {
+      const h = this.hosts.get(hostId);
+      if (h) tenant = h.tenant_id;
+      hosts = h && !h.retired_at ? [h] : [];
+    } else {
+      hosts = [...this.hosts.values()].filter((h) => h.tenant_id === tenant && !h.retired_at);
+    }
+    const assigns = [...this.assignments.values()].filter((a) => {
+      const st = this.states.get(a.state_id);
+      return a.tenant_id === tenant && st && !st.archived_at;
+    });
+    const existing = [...this.hostStates.values()].filter((r) => (hostId ? r.host_id === hostId : r.tenant_id === tenant));
+    const d = hostStateDiff(existing, effectiveAssignments(hosts, assigns), tenant);
+    const now = Date.now();
+    const at = (off) => (off === null ? null : new Date(now + off * 1000));
+    const resolved = [];
+    for (const row of d.deletes) {
+      this.hostStates.delete(hsKey(row.host_id, row.state_id));
+      resolved.push(...this.memResolveDrift(row.tenant_id, row.host_id, row.state_id));
+    }
+    for (const u of d.updates) {
+      Object.assign(this.hostStates.get(hsKey(u.host_id, u.state_id)), {
+        assignment_id: u.assignment_id,
+        version_id: u.version_id,
+        status: u.status,
+        consecutive_drift: 0,
+        check_claimed_at: null,
+        check_job_id: null,
+        last_apply_run_id: null,
+        next_check_at: at(u.next_offset_s)
+      });
+    }
+    for (const i of d.inserts) {
+      this.hostStates.set(hsKey(i.host_id, i.state_id), {
+        host_id: i.host_id, state_id: i.state_id, tenant_id: i.tenant_id,
+        assignment_id: i.assignment_id, version_id: i.version_id, status: i.status, facts: {},
+        consecutive_drift: 0, last_error: null, last_check_run_id: null, last_check_at: null,
+        last_apply_run_id: null, last_applied_version_id: null, last_applied_at: null,
+        manual_apply_assignment_id: null, manual_apply_version_id: null, auto_apply_failures: 0,
+        last_report_sha256: null, next_check_at: at(i.next_offset_s), check_claimed_at: null, check_job_id: null
+      });
+    }
+    return { inserted: d.inserts.length, updated: d.updates.length, deleted: d.deletes.length, resolved };
+  }
+
+  memResolveDrift(tenantId, hostId, stateId) {
+    const out = [];
+    for (const a of this.alerts) {
+      if (a.tenant_id === tenantId && a.host_id === hostId && a.rule_name === driftRule(stateId)
+        && (a.status === 'open' || a.status === 'ack')) {
+        a.status = 'resolved';
+        out.push(a.id);
+      }
+    }
+    return out;
+  }
+
+  async getHostState(tenantIds, hostId, stateId) {
+    const row = this.hostStates.get(hsKey(hostId, stateId));
+    return row && (tenantIds || []).includes(row.tenant_id) ? publicHostState(row) : null;
+  }
+
+  async listHostStates(tenantIds, opts = {}) {
+    const { hostId, stateId, status } = hostStateQuery(opts);
+    const allow = new Set(tenantIds || []);
+    return [...this.hostStates.values()]
+      .filter((r) => allow.has(r.tenant_id) && (hostId === null || r.host_id === hostId)
+        && (stateId === null || r.state_id === stateId) && (status === null || r.status === status))
+      .sort((a, b) => (hsKey(a.host_id, a.state_id) < hsKey(b.host_id, b.state_id) ? -1 : 1))
+      .map(publicHostState);
+  }
+
+  // The memory mirror of PgRegistry.claimDueChecks (§8.2).
+  async claimDueChecks(opts) {
+    const { replicaBudget, perTenantCap, claimExpiryS, presenceFreshS } = claimInput(opts);
+    const now = Date.now();
+    const expired = (r) => r.check_claimed_at == null || r.check_claimed_at.getTime() <= now - claimExpiryS * 1000;
+    const inflight = new Map();
+    for (const r of this.hostStates.values()) {
+      if (!expired(r)) inflight.set(r.tenant_id, (inflight.get(r.tenant_id) || 0) + 1);
+    }
+    const due = [...this.hostStates.values()].filter((r) => {
+      const h = this.hosts.get(r.host_id);
+      return h && h.tenant_id === r.tenant_id && !h.retired_at && h.agent_seen_at
+        && h.agent_seen_at.getTime() > now - presenceFreshS * 1000 && (h.agent_caps || []).includes('converge')
+        && r.next_check_at && r.next_check_at.getTime() <= now && r.status !== 'conflict' && r.assignment_id && expired(r);
+    }).sort((a, b) => a.next_check_at - b.next_check_at);
+    const rank = new Map();
+    const pickRows = [];
+    for (const r of due) {
+      const rk = (rank.get(r.tenant_id) || 0) + 1;
+      rank.set(r.tenant_id, rk);
+      if (rk + (inflight.get(r.tenant_id) || 0) <= perTenantCap) pickRows.push(r);
+    }
+    const out = [];
+    for (const r of pickRows.slice(0, replicaBudget)) {
+      const a = this.assignments.get(r.assignment_id);
+      if (!a) continue;
+      r.check_claimed_at = new Date(now);
+      r.next_check_at = new Date(now + a.check_interval_s * (0.9 + Math.random() * 0.2) * 1000);
+      out.push(publicHostState(r));
+    }
+    return out;
+  }
+
+  // A claim that got no job (429 too_many_jobs): released, retried after
+  // retryInS.
+  async releaseCheckClaim(hostId, stateId, { retryInS = 60 } = {}) {
+    if (!Number.isInteger(retryInS) || retryInS < 0 || retryInS > 86400) throw http(500, 'bad_claim');
+    const r = this.hostStates.get(hsKey(hostId, stateId));
+    if (!r || r.check_claimed_at == null || r.check_job_id != null) return false;
+    r.check_claimed_at = null;
+    r.next_check_at = new Date(Date.now() + retryInS * 1000);
+    return true;
+  }
+
+  // Rows not checked for 3 intervals become stale.
+  async markStaleHostStates() {
+    const now = Date.now();
+    let n = 0;
+    for (const r of this.hostStates.values()) {
+      const a = r.assignment_id ? this.assignments.get(r.assignment_id) : null;
+      if (!a || a.check_interval_s === 0 || r.status === 'stale' || r.status === 'conflict' || !r.last_check_at) continue;
+      if (r.last_check_at.getTime() < now - 3 * a.check_interval_s * 1000) {
+        r.status = 'stale';
+        n += 1;
+      }
+    }
+    return n;
+  }
+
+  async getConvergeRun(tenantIds, runId, { withReport = false, withBundle = false } = {}) {
+    const row = this.convergeRuns.get(runId);
+    return row && (tenantIds || []).includes(row.tenant_id) ? publicRun(row, { withReport, withBundle }) : null;
+  }
+
+  async listConvergeRuns(tenantIds, opts = {}) {
+    const { hostId, stateId, kind, limit } = runListQuery(opts);
+    const allow = new Set(tenantIds || []);
+    return [...this.convergeRuns.values()]
+      .filter((r) => allow.has(r.tenant_id) && (hostId === null || r.host_id === hostId)
+        && (stateId === null || r.state_id === stateId) && (kind === null || r.kind === kind))
+      .sort((a, b) => b.created_at - a.created_at || (a.run_id < b.run_id ? 1 : -1))
+      .slice(0, limit).map((r) => publicRun(r));
+  }
+
+  // Approval by a principal other than the plan's actor (the route checks
+  // state:apply). The approval does not extend the plan's age.
+  async approvePlan({ tenantIds, runId, actor }) {
+    if (!nonEmpty(actor)) throw http(400, 'bad_approval');
+    const check = () => {
+      const run = this.convergeRuns.get(runId);
+      if (!run || run.kind !== 'plan' || !(tenantIds || []).includes(run.tenant_id)) return null;
+      const job = this.jobs.get(run.run_id);
+      if (!job || job.status !== 'succeeded' || run.report_sha256 == null || run.plan_sha256 == null) throw http(409, 'plan_required');
+      if (run.plan_truncated) throw http(409, 'plan_truncated');
+      if (run.consumed_by_run_id) throw http(409, 'plan_consumed');
+      if ((Date.now() - run.created_at.getTime()) / 1000 > planMaxAgeS(this.env)) throw http(409, 'plan_expired');
+      if (run.actor === actor) throw http(409, 'self_approval');
+      if (run.approved_by) throw http(409, 'plan_approved');
+      return run;
+    };
+    const run = check();
+    if (!run) return null;
+    await this.appendAudit(stateAuditEntry(run.tenant_id, run.host_id, actor, 'state_approve', {
+      run_id: run.run_id, state_id: run.state_id, version_id: run.version_id, plan_sha256: run.plan_sha256
+    }));
+    check();
+    run.approved_by = actor;
+    run.approved_at = new Date();
+    return publicRun(run);
+  }
+
+  // createJob's converge part, before the job row goes in: checks, and
+  // returns the change to make (which returns its undo). Nothing is
+  // written here.
+  memConvergePrepare(r, c) {
+    const hs = this.hostStates.get(hsKey(r.host_id, c.state_id));
+    let plan = null;
+    let planJobStatus = null;
+    let planAgeS = 0;
+    if (c.kind === 'apply') {
+      plan = this.convergeRuns.get(c.plan_run_id) || null;
+      const pj = plan ? this.jobs.get(plan.run_id) : null;
+      planJobStatus = pj ? pj.status : null;
+      planAgeS = plan ? (Date.now() - plan.created_at.getTime()) / 1000 : 0;
+    }
+    const assignment = hs && hs.assignment_id ? this.assignments.get(hs.assignment_id) : null;
+    const version = hs && hs.version_id ? this.stateVersions.get(hs.version_id) : null;
+    const eff = convergeCreateCheck(r, c, { hs, version, assignment, plan, planJobStatus, planAgeS, maxAgeS: planMaxAgeS(this.env) });
+    return () => {
+      const run = {
+        run_id: r.job_id, tenant_id: r.tenant_id, host_id: r.host_id, state_id: c.state_id,
+        assignment_id: eff.assignment_id, version_id: eff.version_id, kind: c.kind, actor: r.actor,
+        plan_run_id: c.plan_run_id, parent_job_id: c.parent_job_id, bundle_json: c.bundle_json,
+        plan_sha256: null, plan_truncated: false, report_sha256: null, summary: null, report: null,
+        report_expired: false, approved_by: null, approved_at: null, consumed_by_run_id: null,
+        created_at: new Date(), finished_at: null
+      };
+      const hsBefore = { ...hs };
+      const planBefore = plan ? { ...plan } : null;
+      this.convergeRuns.set(run.run_id, run);
+      if (c.kind === 'apply') {
+        hs.last_apply_run_id = run.run_id;
+        plan.consumed_by_run_id = run.run_id;
+        plan.bundle_json = null;
+      } else {
+        hs.check_job_id = run.run_id;
+        hs.check_claimed_at = new Date();
+      }
+      return () => {
+        this.convergeRuns.delete(run.run_id);
+        Object.assign(hs, hsBefore);
+        if (plan) Object.assign(plan, planBefore);
+      };
+    };
+  }
+
+  // The report ingestion (§7.5) of a converge job that just ended (or a
+  // re-send), synchronous so it lands with the job's transition: v is a
+  // convergeReport result, or null to finalize a run that ended without
+  // one. Returns {result, audits}, or null when there is no run or the run
+  // already has its report.
+  memConvergeIngest(job, v) {
+    const run = this.convergeRuns.get(job.job_id);
+    if (!run || run.tenant_id !== job.tenant_id || run.host_id !== job.host_id) return null;
+    if (v && run.report_sha256 != null) return null;
+    const a = this.assignments.get(run.assignment_id) || null;
+    const cur = this.hostStates.get(hsKey(run.host_id, run.state_id));
+    const hs = cur && cur.tenant_id === run.tenant_id
+      && (run.kind === 'apply' ? cur.last_apply_run_id === run.run_id : cur.check_job_id === run.run_id) ? cur : null;
+    const now = new Date();
+    const rep = v ? v.report : null;
+    if (v) {
+      const body = run.kind !== 'check' || !hs || hs.last_report_sha256 !== v.sha256
+        || ![...this.convergeRuns.values()].some((x) => x.kind === 'check' && x.host_id === run.host_id
+          && x.state_id === run.state_id && x.report_sha256 === v.sha256 && x.report != null);
+      Object.assign(run, {
+        report_sha256: v.sha256, summary: rep.summary, report: body ? rep : null,
+        plan_sha256: rep.plan_sha256, plan_truncated: rep.truncated
+      });
+    }
+    run.finished_at = run.finished_at || now;
+    const result = { run_id: run.run_id, kind: run.kind, host_id: run.host_id, state_id: run.state_id,
+      version_id: run.version_id, host_state_updated: false, prev_status: null, status: null, alerts: [] };
+    const audits = [];
+    if (!hs) {
+      if (rep) {
+        const entry = reportAuditEntry(run, job, v.sha256, rep, null, null);
+        if (entry) audits.push(entry);
+      }
+      return { result, audits };
+    }
+    const prev = hs.status;
+    const keys = rep ? Object.keys(v.facts) : [];
+    const clash = keys.length > 0 && [...this.hostStates.values()].some((x) => x.host_id === hs.host_id
+      && x.state_id !== hs.state_id && keys.some((k) => Object.hasOwn(x.facts || {}, k)));
+    const upd = hostStateUpdate(run, job, v, hs, clash);
+    Object.assign(hs, JSON.parse(JSON.stringify(upd.set)));
+    for (const c of upd.now) hs[c] = now;
+    if (upd.nextCheck) {
+      const interval = a ? a.check_interval_s : 0;
+      hs.next_check_at = interval ? new Date(now.getTime() + interval * (0.9 + Math.random() * 0.2) * 1000) : null;
+    }
+    Object.assign(result, { host_state_updated: true, prev_status: prev, status: hs.status });
+    if (rep && hs.status === 'drifted' && a && hs.consecutive_drift >= a.drift_threshold) {
+      const rule = driftRule(run.state_id);
+      const active = this.alerts.some((x) => x.host_id === run.host_id && x.rule_name === rule && (x.status === 'open' || x.status === 'ack'));
+      if (!active) {
+        const e = driftAlertEntry(run, rep);
+        const id = this.alertSeq++;
+        this.alerts.push({ id, ...e, metric: null, status: 'open', created_at: now.toISOString() });
+        result.alerts.push({ type: 'drift', alert_id: id, summary: rep.summary });
+      }
+    } else if (rep && hs.status === 'compliant') {
+      for (const id of this.memResolveDrift(run.tenant_id, run.host_id, run.state_id)) {
+        result.alerts.push({ type: 'drift_resolved', alert_id: id, summary: rep.summary });
+      }
+    }
+    if (rep) {
+      const entry = reportAuditEntry(run, job, v.sha256, rep, prev, hs.status);
+      if (entry) audits.push(entry);
+    }
+    return { result, audits };
+  }
+
+  // A result re-sent for a converge job that is already terminal and whose
+  // run has no report yet (§7.5): ingested once, with the same conditional
+  // host-state write. {ingested, reason?, converge?}.
+  async ingestConvergeResend(jobId, hostId, report) {
+    const job = this.jobs.get(jobId);
+    if (!job || job.host_id !== hostId || !isTerminal(job.status) || !isConvergeSource(job.source)) return { ingested: false, reason: 'unknown_job' };
+    const run = this.convergeRuns.get(jobId);
+    if (!run || run.report_sha256 != null) return { ingested: false, reason: 'already_ingested' };
+    const v = convergeReport(report, run.kind, job.script_sha256);
+    if (!v.ok) {
+      await this.recordSecurity(badReportEvent(job, v.reason));
+      return { ingested: false, reason: 'bad_report' };
+    }
+    const out = this.memConvergeIngest(job, v);
+    if (!out) return { ingested: false, reason: 'already_ingested' };
+    for (const entry of out.audits) await this.appendAudit(entry);
+    return { ingested: true, converge: out.result };
   }
 
   async efficiency(tenantIds) {
@@ -1418,6 +2206,7 @@ class PgRegistry {
         [hostId, tenantId, keyId, hostname, os || '', platform || '', pubkey]
       );
       if (host.rowCount === 0) throw http(403, 'host_rejected');
+      await this.syncHostStatesInTx(client, tenantId, hostId);
       await client.query('COMMIT');
     } catch (err) {
       try { await client.query('ROLLBACK'); } catch { /* connection already failed */ }
@@ -1753,6 +2542,7 @@ class PgRegistry {
         `UPDATE cp_hosts SET retired_at = now(), status = 'offline' WHERE host_id = $1`,
         [hostId]
       );
+      await this.syncHostStatesInTx(client, tenantId, hostId);
       await auditInsert(client, hostRetiredAuditEntry(cur.rows[0], actor, text, forced));
       await client.query('COMMIT');
     } catch (err) {
@@ -2108,10 +2898,15 @@ class PgRegistry {
     await client.query('SELECT pg_notify($1, $2)', [JOB_CHANNEL, JSON.stringify(e)]);
   }
 
-  // Ends rows already updated in this transaction: end audit and state
-  // notify for each.
+  // Ends rows already updated in this transaction: converge finalize, then
+  // end audit and state notify for each.
   async endedInTx(client, rows) {
     const sorted = [...rows].sort((a, b) => (a.job_id < b.job_id ? -1 : 1));
+    // A converge run ended here has no report: its claim is released and its
+    // host state finalized (an apply becomes partial) before any audit row.
+    for (const row of sorted) {
+      if (isConvergeSource(row.source)) await this.convergeIngestInTx(client, row, null);
+    }
     for (const row of sorted) {
       await auditInsert(client, jobEndAuditEntry(row, 'system'));
       await this.notifyInTx(client, stateEvent(row));
@@ -2122,8 +2917,14 @@ class PgRegistry {
   // One transaction: the tenant then the host advisory lock (fixed order),
   // the host must be this tenant's and live, count the non-terminal rows,
   // insert, the submit audit row, NOTIFY dispatch.
+  // A converge job (opts.converge) also locks and checks its plan run
+  // (apply) and host-state row after the caps, inserts its cp_converge_runs
+  // row, and claims the host state (check_job_id) or consumes the plan
+  // (last_apply_run_id): a 429 or any refusal rolls all of it back, so it
+  // never burns a plan.
   async createJob(row, opts = {}) {
     const r = jobInsertRow(row);
+    const conv = convergeJobInput(r, opts.converge);
     const { hostCap, tenantCap } = jobCaps(opts);
     try {
       return await this.inTx(async (client) => {
@@ -2146,6 +2947,7 @@ class PgRegistry {
         );
         const { on_host: onHost, on_tenant: onTenant } = counts.rows[0];
         if (onHost >= hostCap || onTenant >= tenantCap) throw http(429, 'too_many_jobs');
+        const eff = conv ? await this.convergeCheckInTx(client, r, conv) : null;
         const ins = await client.query(
           `INSERT INTO cp_sysscript_jobs (job_id, tenant_id, host_id, actor, source, script_sha256, entitlements_sha256,
              entitlements, status, timeout_s, deadline_at, lease_nonce, dispatch)
@@ -2155,6 +2957,7 @@ class PgRegistry {
             JSON.stringify(r.entitlements), r.timeout_s, r.deadline_at, r.lease_nonce, JSON.stringify(r.dispatch)]
         );
         const stored = ins.rows[0];
+        if (conv) await this.convergeCreateInTx(client, r, conv, eff);
         await auditInsert(client, jobSubmitAuditEntry(stored));
         await this.notifyInTx(client, stateEvent(stored, 'dispatch'));
         return publicJob(stored);
@@ -2194,27 +2997,42 @@ class PgRegistry {
   // same transaction. Null when the guard does not hold. SECURITY-RULES rule
   // 7: the interpolated SET column names and $n placeholders come from the
   // fixed key list below and a counter, never from input; values are bound.
+  // A terminal transition locks the row first: on a converge row,
+  // opts.converge.report is validated before the UPDATE (a malformed one ends
+  // the job failed[bad_report] with a security event) and ingested after it
+  // (convergeIngestInTx: run, host state, drift alert, state_report audit),
+  // all before the job's own audit row and the commit; the result carries
+  // .converge. A converge row ended without a report is finalized.
   async transitionJob(jobId, hostId, fromStatuses, fields, opts = {}) {
-    const { from, set } = jobTransition(fromStatuses, fields);
+    const { from, set: asked } = jobTransition(fromStatuses, fields);
     const guardConn = 'connId' in opts;
     if (guardConn && !nonEmpty(opts.connId)) throw http(500, 'bad_conn_id');
     if (typeof jobId !== 'string' || typeof hostId !== 'string') return null;
-    const values = [jobId, hostId, from, set.status];
-    const sets = ['status = $4'];
-    for (const key of ['error', 'output', 'output_truncated', 'duration_ms']) {
-      if (!(key in set)) continue;
-      values.push(set[key]);
-      sets.push(`${key} = $${values.length}`);
-    }
-    if (set.status === 'accepted' || set.status === 'running') sets.push('accepted_at = COALESCE(accepted_at, now())');
-    if (set.status === 'running') sets.push('started_at = COALESCE(started_at, now())');
-    if (isTerminal(set.status)) sets.push('finished_at = now()', 'dispatch = NULL');
-    let guard = '';
-    if (guardConn) {
-      values.push(opts.connId);
-      guard = ` AND conn_id = $${values.length}`;
-    }
     return this.inTx(async (client) => {
+      let verdict = { set: asked, rep: null, bad: null };
+      if (isTerminal(asked.status)) {
+        const cur = await client.query(
+          'SELECT job_id, tenant_id, host_id, source, script_sha256 FROM cp_sysscript_jobs WHERE job_id = $1 AND host_id = $2 FOR UPDATE',
+          [jobId, hostId]
+        );
+        verdict = convergeVerdict(from, fields, asked, opts, cur.rows[0]);
+      }
+      const { set } = verdict;
+      const values = [jobId, hostId, from, set.status];
+      const sets = ['status = $4'];
+      for (const key of ['error', 'output', 'output_truncated', 'duration_ms']) {
+        if (!(key in set)) continue;
+        values.push(set[key]);
+        sets.push(`${key} = $${values.length}`);
+      }
+      if (set.status === 'accepted' || set.status === 'running') sets.push('accepted_at = COALESCE(accepted_at, now())');
+      if (set.status === 'running') sets.push('started_at = COALESCE(started_at, now())');
+      if (isTerminal(set.status)) sets.push('finished_at = now()', 'dispatch = NULL');
+      let guard = '';
+      if (guardConn) {
+        values.push(opts.connId);
+        guard = ` AND conn_id = $${values.length}`;
+      }
       const res = await client.query(
         `UPDATE cp_sysscript_jobs SET ${sets.join(', ')}
          WHERE job_id = $1 AND host_id = $2 AND status = ANY($3::text[])${guard}
@@ -2223,11 +3041,16 @@ class PgRegistry {
       );
       const row = res.rows[0];
       if (!row) return null;
+      if (verdict.bad) await this.securityInTx(client, badReportEvent(row, verdict.bad));
+      const conv = isTerminal(row.status) && isConvergeSource(row.source)
+        ? await this.convergeIngestInTx(client, row, verdict.rep) : null;
       const entry = transitionAuditEntry(row, opts.audit);
       if (entry) await auditInsert(client, entry);
       const evt = transitionNotify(row, opts.notify);
       if (evt) await this.notifyInTx(client, evt);
-      return publicJob(row);
+      const out = publicJob(row);
+      if (conv) out.converge = conv;
+      return out;
     });
   }
 
@@ -2280,6 +3103,7 @@ class PgRegistry {
         [jobId, actor]
       );
       const out = upd.rows[0];
+      if (never && isConvergeSource(out.source)) await this.convergeIngestInTx(client, out, null);
       await auditInsert(client, jobCancelAuditEntry(out, actor, reason));
       if (never) await auditInsert(client, jobEndAuditEntry(out, 'system'));
       await this.notifyInTx(client, stateEvent(out, never ? 'state' : 'cancel'));
@@ -2405,6 +3229,9 @@ class PgRegistry {
     });
   }
 
+  // Also nulls converge run reports on the same retention (summary and
+  // report_sha256 stay) and plan bundles older than the plan max age.
+  // Returns the count of job rows.
   async expireOutput(hours) {
     const n = jobOutputRetentionHours({ SYSTEMAPI_JOB_OUTPUT_RETENTION_HOURS: String(hours) });
     const res = await this.pool.query(
@@ -2412,17 +3239,38 @@ class PgRegistry {
        WHERE output IS NOT NULL AND finished_at < now() - make_interval(hours => $1::int)`,
       [n]
     );
+    await this.pool.query(
+      `UPDATE cp_converge_runs SET report = NULL, report_expired = true
+       WHERE report IS NOT NULL AND finished_at < now() - make_interval(hours => $1::int)`,
+      [n]
+    );
+    await this.pool.query(
+      `UPDATE cp_converge_runs SET bundle_json = NULL
+       WHERE kind = 'plan' AND bundle_json IS NOT NULL AND created_at < now() - make_interval(secs => $1::int)`,
+      [planMaxAgeS(this.env)]
+    );
     return res.rowCount;
   }
 
+  // Check runs go with their job row; plan and apply runs are kept
+  // SYSTEMAPI_APPLY_RUN_RETENTION_DAYS (365). Returns the count of job rows.
   async pruneJobs(days) {
     const n = jobRetentionDays({ SYSTEMAPI_JOB_RETENTION_DAYS: String(days) });
     const res = await this.pool.query(
-      `DELETE FROM cp_sysscript_jobs
-       WHERE NOT (status = ANY($2::text[])) AND finished_at < now() - make_interval(days => $1::int)`,
+      `WITH gone AS (
+         DELETE FROM cp_sysscript_jobs
+         WHERE NOT (status = ANY($2::text[])) AND finished_at < now() - make_interval(days => $1::int)
+         RETURNING job_id),
+       runs AS (
+         DELETE FROM cp_converge_runs c USING gone WHERE c.run_id = gone.job_id AND c.kind = 'check')
+       SELECT count(*)::int AS n FROM gone`,
       [n, JOB_ACTIVE]
     );
-    return res.rowCount;
+    await this.pool.query(
+      `DELETE FROM cp_converge_runs WHERE kind IN ('plan', 'apply') AND created_at < now() - make_interval(days => $1::int)`,
+      [applyRunRetentionDays(this.env)]
+    );
+    return res.rows[0].n;
   }
 
   // A NOTIFY outside any write (the writes above notify in their own
@@ -2540,6 +3388,686 @@ class PgRegistry {
     detach();
     // Destroyed, not returned to the pool: it is still LISTENing.
     client.release(true);
+  }
+
+  // --- desired state (see the Threats note above convergeJobInput) --------
+  // Every write runs in one transaction with its audit row, which is
+  // written last (the chain lock is the last lock taken).
+
+  async createState(input) {
+    const s = stateInput(input);
+    try {
+      return await this.inTx(async (client) => {
+        const t = await client.query('SELECT 1 FROM cp_tenants WHERE tenant_id = $1', [s.tenant_id]);
+        if (t.rowCount === 0) throw http(404, 'not_found');
+        const ins = await client.query(
+          `INSERT INTO cp_states (state_id, tenant_id, name, description, created_by)
+           VALUES ($1, $2, $3, $4, $5)
+           RETURNING state_id, tenant_id, name, description, created_by, created_at, archived_at`,
+          [newId('st'), s.tenant_id, s.name, s.description, s.created_by]
+        );
+        const row = ins.rows[0];
+        await auditInsert(client, stateAuditEntry(row.tenant_id, null, row.created_by, 'state_create', { state_id: row.state_id, name: row.name }));
+        return publicState(row);
+      });
+    } catch (err) {
+      if (err.code === '23505') throw http(409, 'state_exists');
+      throw err;
+    }
+  }
+
+  async getState(tenantIds, stateId) {
+    if (!tenantIds || tenantIds.length === 0 || typeof stateId !== 'string') return null;
+    const res = await this.pool.query(
+      `SELECT state_id, tenant_id, name, description, created_by, created_at, archived_at
+       FROM cp_states WHERE state_id = $1 AND tenant_id = ANY($2::text[])`,
+      [stateId, tenantIds]
+    );
+    return publicState(res.rows[0] || null);
+  }
+
+  async listStates(tenantIds) {
+    if (!tenantIds || tenantIds.length === 0) return [];
+    const res = await this.pool.query(
+      `SELECT state_id, tenant_id, name, description, created_by, created_at, archived_at
+       FROM cp_states WHERE tenant_id = ANY($1::text[]) ORDER BY name, state_id`,
+      [tenantIds]
+    );
+    return res.rows.map(publicState);
+  }
+
+  // The state row is locked, so two publishes get consecutive numbers.
+  async publishVersion(input) {
+    const v = versionInput(input);
+    return this.inTx(async (client) => {
+      const st = await client.query(
+        'SELECT 1 FROM cp_states WHERE state_id = $1 AND tenant_id = $2 AND archived_at IS NULL FOR UPDATE',
+        [v.state_id, v.tenant_id]
+      );
+      if (st.rowCount === 0) throw http(404, 'not_found');
+      const ins = await client.query(
+        `INSERT INTO cp_state_versions (version_id, state_id, tenant_id, version, files, files_sha256, entitlements,
+           entitlements_sha256, published_by, notes)
+         SELECT $1, $2, $3, COALESCE(max(version), 0) + 1, $4::jsonb, $5, $6::jsonb, $7, $8, $9
+         FROM cp_state_versions WHERE state_id = $2
+         RETURNING version_id, state_id, tenant_id, version, files_sha256, entitlements, entitlements_sha256,
+           published_by, notes, published_at`,
+        [newId('stv'), v.state_id, v.tenant_id, JSON.stringify(v.files), v.files_sha256, JSON.stringify(v.entitlements),
+          v.entitlements_sha256, v.published_by, v.notes]
+      );
+      const row = ins.rows[0];
+      await auditInsert(client, stateAuditEntry(v.tenant_id, null, v.published_by, 'state_publish', {
+        state_id: v.state_id, version_id: row.version_id, version: row.version,
+        files_sha256: v.files_sha256, entitlements_sha256: v.entitlements_sha256
+      }));
+      return publicVersion(row);
+    });
+  }
+
+  async getVersion(tenantIds, versionId, { withFiles = false } = {}) {
+    if (!tenantIds || tenantIds.length === 0 || typeof versionId !== 'string') return null;
+    const res = await this.pool.query(
+      `SELECT version_id, state_id, tenant_id, version, files, files_sha256, entitlements, entitlements_sha256,
+         published_by, notes, published_at
+       FROM cp_state_versions WHERE version_id = $1 AND tenant_id = ANY($2::text[])`,
+      [versionId, tenantIds]
+    );
+    return res.rows[0] ? publicVersion(res.rows[0], { withFiles }) : null;
+  }
+
+  async listVersions(tenantIds, stateId) {
+    if (!tenantIds || tenantIds.length === 0 || typeof stateId !== 'string') return [];
+    const res = await this.pool.query(
+      `SELECT version_id, state_id, tenant_id, version, files_sha256, entitlements, entitlements_sha256,
+         published_by, notes, published_at
+       FROM cp_state_versions WHERE state_id = $1 AND tenant_id = ANY($2::text[]) ORDER BY version DESC`,
+      [stateId, tenantIds]
+    );
+    return res.rows.map((r) => publicVersion(r));
+  }
+
+  async assignmentRefsInTx(client, a) {
+    const st = await client.query(
+      'SELECT 1 FROM cp_states WHERE state_id = $1 AND tenant_id = $2 AND archived_at IS NULL',
+      [a.state_id, a.tenant_id]
+    );
+    if (st.rowCount === 0) throw http(404, 'not_found');
+    const v = await client.query(
+      'SELECT 1 FROM cp_state_versions WHERE version_id = $1 AND state_id = $2 AND tenant_id = $3',
+      [a.version_id, a.state_id, a.tenant_id]
+    );
+    if (v.rowCount === 0) throw http(404, 'version_not_found');
+    if (a.target_kind === 'host') {
+      const h = await client.query(
+        'SELECT 1 FROM cp_hosts WHERE host_id = $1 AND tenant_id = $2 AND retired_at IS NULL',
+        [a.target_value, a.tenant_id]
+      );
+      if (h.rowCount === 0) throw http(404, 'host_not_found');
+    }
+  }
+
+  async createAssignment(input) {
+    const a = assignmentInput(input);
+    try {
+      return await this.inTx(async (client) => {
+        await client.query("SELECT pg_advisory_xact_lock(hashtext('state:t:' || $1))", [a.tenant_id]);
+        await this.assignmentRefsInTx(client, a);
+        const ins = await client.query(
+          `INSERT INTO cp_state_assignments (assignment_id, tenant_id, state_id, version_id, target_kind, target_value, vars,
+             check_interval_s, drift_threshold, auto_remediate, require_approval, created_by)
+           VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12)
+           RETURNING ${cols(ASSIGNMENT_COLS)}`,
+          [newId('sta'), a.tenant_id, a.state_id, a.version_id, a.target_kind, a.target_value, JSON.stringify(a.vars),
+            a.check_interval_s, a.drift_threshold, a.auto_remediate, a.require_approval, a.created_by]
+        );
+        const row = ins.rows[0];
+        await this.syncHostStatesInTx(client, a.tenant_id, null);
+        await auditInsert(client, stateAuditEntry(a.tenant_id, a.target_kind === 'host' ? a.target_value : null, a.created_by,
+          'state_assign', assignmentAuditPayload(row, 'create')));
+        return publicAssignment(row);
+      });
+    } catch (err) {
+      if (err.code === '23505') throw http(409, 'assignment_exists');
+      if (err.code === '23514') throw http(400, 'auto_remediate_host_only');
+      throw err;
+    }
+  }
+
+  async updateAssignment({ tenantId, assignmentId, patch, actor }) {
+    if (!nonEmpty(actor) || typeof assignmentId !== 'string' || typeof tenantId !== 'string') throw http(400, 'bad_assignment');
+    try {
+      return await this.inTx(async (client) => {
+        await client.query("SELECT pg_advisory_xact_lock(hashtext('state:t:' || $1))", [tenantId]);
+        const cur = await client.query(
+          `SELECT ${cols(ASSIGNMENT_COLS)} FROM cp_state_assignments WHERE assignment_id = $1 AND tenant_id = $2 FOR UPDATE`,
+          [assignmentId, tenantId]
+        );
+        if (cur.rowCount === 0) throw http(404, 'not_found');
+        const before = cur.rows[0];
+        const next = assignmentPatch(publicAssignment(before), patch);
+        await this.assignmentRefsInTx(client, next);
+        const upd = await client.query(
+          `UPDATE cp_state_assignments SET version_id = $3, vars = $4::jsonb, check_interval_s = $5, drift_threshold = $6,
+             auto_remediate = $7, require_approval = $8, updated_at = now()
+           WHERE assignment_id = $1 AND tenant_id = $2
+           RETURNING ${cols(ASSIGNMENT_COLS)}`,
+          [assignmentId, tenantId, next.version_id, JSON.stringify(next.vars), next.check_interval_s, next.drift_threshold,
+            next.auto_remediate, next.require_approval]
+        );
+        const row = upd.rows[0];
+        await this.syncHostStatesInTx(client, tenantId, null);
+        if (row.check_interval_s !== before.check_interval_s) {
+          const rows = await client.query(
+            'SELECT host_id, state_id FROM cp_host_state WHERE assignment_id = $1 AND tenant_id = $2 ORDER BY host_id, state_id FOR UPDATE',
+            [assignmentId, tenantId]
+          );
+          const offs = rows.rows.map((r) => firstCheckOffsetS(r.host_id, r.state_id, row.check_interval_s));
+          await client.query(
+            `UPDATE cp_host_state hs SET next_check_at = CASE WHEN u.o IS NULL THEN NULL
+               ELSE now() + make_interval(secs => u.o::double precision) END
+             FROM unnest($1::text[], $2::text[], $3::int[]) AS u(h, s, o)
+             WHERE hs.host_id = u.h AND hs.state_id = u.s`,
+            [rows.rows.map((r) => r.host_id), rows.rows.map((r) => r.state_id), offs]
+          );
+        }
+        await auditInsert(client, stateAuditEntry(tenantId, row.target_kind === 'host' ? row.target_value : null, actor,
+          'state_assign', assignmentAuditPayload(row, 'update')));
+        return publicAssignment(row);
+      });
+    } catch (err) {
+      if (err.code === '23514') throw http(400, 'auto_remediate_host_only');
+      throw err;
+    }
+  }
+
+  async deleteAssignment({ tenantId, assignmentId, actor }) {
+    if (!nonEmpty(actor) || typeof assignmentId !== 'string' || typeof tenantId !== 'string') throw http(400, 'bad_assignment');
+    return this.inTx(async (client) => {
+      await client.query("SELECT pg_advisory_xact_lock(hashtext('state:t:' || $1))", [tenantId]);
+      const del = await client.query(
+        `DELETE FROM cp_state_assignments WHERE assignment_id = $1 AND tenant_id = $2 RETURNING ${cols(ASSIGNMENT_COLS)}`,
+        [assignmentId, tenantId]
+      );
+      if (del.rowCount === 0) throw http(404, 'not_found');
+      const row = del.rows[0];
+      await this.syncHostStatesInTx(client, tenantId, null);
+      await auditInsert(client, stateAuditEntry(tenantId, row.target_kind === 'host' ? row.target_value : null, actor,
+        'state_unassign', assignmentAuditPayload(row, 'delete')));
+      return true;
+    });
+  }
+
+  async getAssignment(tenantIds, assignmentId) {
+    if (!tenantIds || tenantIds.length === 0 || typeof assignmentId !== 'string') return null;
+    const res = await this.pool.query(
+      `SELECT ${cols(ASSIGNMENT_COLS)} FROM cp_state_assignments WHERE assignment_id = $1 AND tenant_id = ANY($2::text[])`,
+      [assignmentId, tenantIds]
+    );
+    return publicAssignment(res.rows[0] || null);
+  }
+
+  async listAssignments(tenantIds, { stateId = null } = {}) {
+    if (!tenantIds || tenantIds.length === 0) return [];
+    const res = await this.pool.query(
+      `SELECT ${cols(ASSIGNMENT_COLS)} FROM cp_state_assignments
+       WHERE tenant_id = ANY($1::text[]) AND ($2::text IS NULL OR state_id = $2)
+       ORDER BY created_at, assignment_id`,
+      [tenantIds, stateId]
+    );
+    return res.rows.map(publicAssignment);
+  }
+
+  // Replaces the host's tags and re-syncs its host states, with the
+  // host_tags audit row, in one transaction.
+  async setHostTags({ tenantId, hostId, tags, actor }) {
+    const next = tagsInput(tags);
+    if (!nonEmpty(actor)) throw http(400, 'bad_tags');
+    await this.inTx(async (client) => {
+      const cur = await client.query(
+        'SELECT tags FROM cp_hosts WHERE host_id = $1 AND tenant_id = $2 AND retired_at IS NULL FOR UPDATE',
+        [hostId, tenantId]
+      );
+      if (cur.rowCount === 0) throw http(404, 'not_found');
+      await client.query('UPDATE cp_hosts SET tags = $2::text[] WHERE host_id = $1', [hostId, next]);
+      await this.syncHostStatesInTx(client, tenantId, hostId);
+      await auditInsert(client, stateAuditEntry(tenantId, hostId, actor, 'host_tags', { tags: next, previous: cur.rows[0].tags || [] }));
+    });
+    return this.getHost([tenantId], hostId);
+  }
+
+  async syncHostStates(tenantId, { hostId = null } = {}) {
+    return this.inTx((client) => this.syncHostStatesInTx(client, tenantId, hostId));
+  }
+
+  // The effective assignment per (host, state), applied inside the
+  // caller's transaction (statestore.effectiveAssignments/hostStateDiff).
+  // With hostId, that host only, in its current tenant: rows under another
+  // tenant (a moved host) and every row of a retired or missing host are
+  // deleted. Deleted rows have their drift alerts resolved. A per-tenant
+  // advisory lock serializes syncs of one tenant; the host-state rows are
+  // locked in key order before they change.
+  async syncHostStatesInTx(client, tenantId, hostId) {
+    let tenant = tenantId;
+    if (hostId) {
+      const h = await client.query('SELECT tenant_id FROM cp_hosts WHERE host_id = $1', [hostId]);
+      if (h.rows[0]) tenant = h.rows[0].tenant_id;
+    }
+    await client.query("SELECT pg_advisory_xact_lock(hashtext('state:t:' || $1))", [tenant]);
+    const hosts = hostId
+      ? (await client.query('SELECT host_id, tags FROM cp_hosts WHERE host_id = $1 AND tenant_id = $2 AND retired_at IS NULL', [hostId, tenant])).rows
+      : (await client.query('SELECT host_id, tags FROM cp_hosts WHERE tenant_id = $1 AND retired_at IS NULL', [tenant])).rows;
+    const assigns = (await client.query(
+      `SELECT a.assignment_id, a.state_id, a.version_id, a.target_kind, a.target_value, a.check_interval_s
+       FROM cp_state_assignments a JOIN cp_states s ON s.state_id = a.state_id AND s.tenant_id = a.tenant_id
+       WHERE a.tenant_id = $1 AND s.archived_at IS NULL`,
+      [tenant]
+    )).rows;
+    const existing = (await client.query(
+      hostId
+        ? 'SELECT host_id, state_id, tenant_id, assignment_id, version_id, status FROM cp_host_state WHERE host_id = $1 ORDER BY host_id, state_id FOR UPDATE'
+        : 'SELECT host_id, state_id, tenant_id, assignment_id, version_id, status FROM cp_host_state WHERE tenant_id = $1 ORDER BY host_id, state_id FOR UPDATE',
+      [hostId || tenant]
+    )).rows;
+    const d = hostStateDiff(existing, effectiveAssignments(hosts, assigns), tenant);
+    let resolved = [];
+    if (d.deletes.length > 0) {
+      await client.query(
+        `DELETE FROM cp_host_state WHERE (host_id, state_id) IN (SELECT * FROM unnest($1::text[], $2::text[]))`,
+        [d.deletes.map((r) => r.host_id), d.deletes.map((r) => r.state_id)]
+      );
+      const res = await client.query(
+        `UPDATE cp_alert_events SET status = 'resolved'
+         WHERE status IN ('open', 'ack')
+           AND (tenant_id, host_id, rule_name) IN (SELECT * FROM unnest($1::text[], $2::text[], $3::text[]))
+         RETURNING id`,
+        [d.deletes.map((r) => r.tenant_id), d.deletes.map((r) => r.host_id), d.deletes.map((r) => driftRule(r.state_id))]
+      );
+      resolved = res.rows.map((r) => r.id);
+    }
+    if (d.updates.length > 0) {
+      const u = d.updates;
+      await client.query(
+        `UPDATE cp_host_state hs SET assignment_id = u.a, version_id = u.v, status = u.st, consecutive_drift = 0,
+           check_claimed_at = NULL, check_job_id = NULL, last_apply_run_id = NULL,
+           next_check_at = CASE WHEN u.o IS NULL THEN NULL ELSE now() + make_interval(secs => u.o::double precision) END
+         FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::int[]) AS u(h, s, a, v, st, o)
+         WHERE hs.host_id = u.h AND hs.state_id = u.s`,
+        [u.map((x) => x.host_id), u.map((x) => x.state_id), u.map((x) => x.assignment_id), u.map((x) => x.version_id),
+          u.map((x) => x.status), u.map((x) => x.next_offset_s)]
+      );
+    }
+    if (d.inserts.length > 0) {
+      const i = d.inserts;
+      await client.query(
+        `INSERT INTO cp_host_state (host_id, state_id, tenant_id, assignment_id, version_id, status, next_check_at)
+         SELECT u.h, u.s, u.t, u.a, u.v, u.st,
+           CASE WHEN u.o IS NULL THEN NULL ELSE now() + make_interval(secs => u.o::double precision) END
+         FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::int[]) AS u(h, s, t, a, v, st, o)
+         ON CONFLICT (host_id, state_id) DO NOTHING`,
+        [i.map((x) => x.host_id), i.map((x) => x.state_id), i.map((x) => x.tenant_id), i.map((x) => x.assignment_id),
+          i.map((x) => x.version_id), i.map((x) => x.status), i.map((x) => x.next_offset_s)]
+      );
+    }
+    return { inserted: d.inserts.length, updated: d.updates.length, deleted: d.deletes.length, resolved };
+  }
+
+  async getHostState(tenantIds, hostId, stateId) {
+    if (!tenantIds || tenantIds.length === 0 || typeof hostId !== 'string' || typeof stateId !== 'string') return null;
+    const res = await this.pool.query(
+      `SELECT ${cols(HOST_STATE_COLS)} FROM cp_host_state WHERE host_id = $1 AND state_id = $2 AND tenant_id = ANY($3::text[])`,
+      [hostId, stateId, tenantIds]
+    );
+    return publicHostState(res.rows[0] || null);
+  }
+
+  async listHostStates(tenantIds, opts = {}) {
+    const { hostId, stateId, status } = hostStateQuery(opts);
+    if (!tenantIds || tenantIds.length === 0) return [];
+    const res = await this.pool.query(
+      `SELECT ${cols(HOST_STATE_COLS)} FROM cp_host_state
+       WHERE tenant_id = ANY($1::text[]) AND ($2::text IS NULL OR host_id = $2)
+         AND ($3::text IS NULL OR state_id = $3) AND ($4::text IS NULL OR status = $4)
+       ORDER BY host_id, state_id LIMIT 5000`,
+      [tenantIds, hostId, stateId, status]
+    );
+    return res.rows.map(publicHostState);
+  }
+
+  // §8.2: due rows of live, fresh, converge-capable hosts, ranked per tenant
+  // without locks, the per-tenant cap (counting every replica's unexpired
+  // claims) applied before the replica budget, then the chosen rows locked
+  // by key with SKIP LOCKED and the claim predicate re-checked under the
+  // lock. The drift:claim lock serializes claim transactions, so the cap is
+  // exact across replicas.
+  async claimDueChecks(opts) {
+    const { replicaBudget, perTenantCap, claimExpiryS, presenceFreshS } = claimInput(opts);
+    return this.inTx(async (client) => {
+      await client.query("SELECT pg_advisory_xact_lock(hashtext('drift:claim'))");
+      const res = await client.query(
+        `WITH inflight AS (
+           SELECT tenant_id, count(*) AS n FROM cp_host_state
+           WHERE check_claimed_at > now() - make_interval(secs => $3)
+           GROUP BY tenant_id),
+         ranked AS (
+           SELECT hs.host_id, hs.state_id, hs.tenant_id, hs.next_check_at,
+                  row_number() OVER (PARTITION BY hs.tenant_id ORDER BY hs.next_check_at, hs.host_id, hs.state_id) AS rk
+           FROM cp_host_state hs
+           JOIN cp_hosts h ON h.host_id = hs.host_id AND h.tenant_id = hs.tenant_id AND h.retired_at IS NULL
+            AND h.agent_seen_at > now() - make_interval(secs => $4)
+            AND 'converge' = ANY(h.agent_caps)
+           WHERE hs.next_check_at <= now() AND hs.status <> 'conflict' AND hs.assignment_id IS NOT NULL
+             AND (hs.check_claimed_at IS NULL OR hs.check_claimed_at <= now() - make_interval(secs => $3))),
+         pick AS (
+           SELECT r.host_id, r.state_id FROM ranked r LEFT JOIN inflight i USING (tenant_id)
+           WHERE r.rk + coalesce(i.n, 0) <= $2
+           ORDER BY r.next_check_at, r.host_id, r.state_id LIMIT $1),
+         locked AS (
+           SELECT hs.host_id, hs.state_id FROM cp_host_state hs JOIN pick p USING (host_id, state_id)
+           WHERE (hs.check_claimed_at IS NULL OR hs.check_claimed_at <= now() - make_interval(secs => $3))
+             AND hs.next_check_at <= now()
+           FOR UPDATE OF hs SKIP LOCKED)
+         UPDATE cp_host_state hs SET check_claimed_at = now(),
+           next_check_at = now() + make_interval(secs => a.check_interval_s * (0.9 + random() * 0.2))
+         FROM locked l, cp_state_assignments a
+         WHERE hs.host_id = l.host_id AND hs.state_id = l.state_id AND a.assignment_id = hs.assignment_id
+         RETURNING ${cols(HOST_STATE_COLS, 'hs.')}`,
+        [replicaBudget, perTenantCap, claimExpiryS, presenceFreshS]
+      );
+      return res.rows.map(publicHostState);
+    });
+  }
+
+  // A claim that got no job (429 too_many_jobs): released, retried after
+  // retryInS. Only while no job owns the row.
+  async releaseCheckClaim(hostId, stateId, { retryInS = 60 } = {}) {
+    if (!Number.isInteger(retryInS) || retryInS < 0 || retryInS > 86400) throw http(500, 'bad_claim');
+    if (typeof hostId !== 'string' || typeof stateId !== 'string') return false;
+    const res = await this.pool.query(
+      `UPDATE cp_host_state SET check_claimed_at = NULL, next_check_at = now() + make_interval(secs => $3)
+       WHERE host_id = $1 AND state_id = $2 AND check_claimed_at IS NOT NULL AND check_job_id IS NULL`,
+      [hostId, stateId, retryInS]
+    );
+    return res.rowCount > 0;
+  }
+
+  // Rows not checked for 3 intervals become stale (the next report
+  // replaces it with the real status).
+  async markStaleHostStates() {
+    const res = await this.pool.query(
+      `UPDATE cp_host_state hs SET status = 'stale'
+       FROM cp_state_assignments a
+       WHERE a.assignment_id = hs.assignment_id AND a.check_interval_s > 0
+         AND hs.status NOT IN ('stale', 'conflict')
+         AND hs.last_check_at < now() - make_interval(secs => a.check_interval_s * 3)`
+    );
+    return res.rowCount;
+  }
+
+  async getConvergeRun(tenantIds, runId, { withReport = false, withBundle = false } = {}) {
+    if (!tenantIds || tenantIds.length === 0 || typeof runId !== 'string') return null;
+    const res = await this.pool.query(
+      `SELECT ${cols(RUN_COLS)}, report, bundle_json FROM cp_converge_runs WHERE run_id = $1 AND tenant_id = ANY($2::text[])`,
+      [runId, tenantIds]
+    );
+    return res.rows[0] ? publicRun(res.rows[0], { withReport, withBundle }) : null;
+  }
+
+  async listConvergeRuns(tenantIds, opts = {}) {
+    const { hostId, stateId, kind, limit } = runListQuery(opts);
+    if (!tenantIds || tenantIds.length === 0) return [];
+    const res = await this.pool.query(
+      `SELECT ${cols(RUN_COLS)} FROM cp_converge_runs
+       WHERE tenant_id = ANY($1::text[]) AND ($2::text IS NULL OR host_id = $2)
+         AND ($3::text IS NULL OR state_id = $3) AND ($4::text IS NULL OR kind = $4)
+       ORDER BY created_at DESC, run_id DESC LIMIT $5`,
+      [tenantIds, hostId, stateId, kind, limit]
+    );
+    return res.rows.map((r) => publicRun(r));
+  }
+
+  // Approval by a principal other than the plan's actor (the route checks
+  // state:apply), with its audit row. The approval does not extend the
+  // plan's age. Null when the run is not a plan in tenantIds.
+  async approvePlan({ tenantIds, runId, actor }) {
+    if (!nonEmpty(actor)) throw http(400, 'bad_approval');
+    if (!tenantIds || tenantIds.length === 0 || typeof runId !== 'string') return null;
+    return this.inTx(async (client) => {
+      const cur = await client.query(
+        `SELECT ${cols(RUN_COLS, 'r.')}, j.status AS job_status,
+           extract(epoch FROM now() - r.created_at)::float8 AS age_s
+         FROM cp_converge_runs r LEFT JOIN cp_sysscript_jobs j ON j.job_id = r.run_id
+         WHERE r.run_id = $1 AND r.tenant_id = ANY($2::text[]) FOR UPDATE OF r`,
+        [runId, tenantIds]
+      );
+      const run = cur.rows[0];
+      if (!run || run.kind !== 'plan') return null;
+      if (run.job_status !== 'succeeded' || run.report_sha256 == null || run.plan_sha256 == null) throw http(409, 'plan_required');
+      if (run.plan_truncated) throw http(409, 'plan_truncated');
+      if (run.consumed_by_run_id) throw http(409, 'plan_consumed');
+      if (run.age_s > planMaxAgeS(this.env)) throw http(409, 'plan_expired');
+      if (run.actor === actor) throw http(409, 'self_approval');
+      if (run.approved_by) throw http(409, 'plan_approved');
+      const upd = await client.query(
+        `UPDATE cp_converge_runs SET approved_by = $2, approved_at = now() WHERE run_id = $1 RETURNING ${cols(RUN_COLS)}`,
+        [runId, actor]
+      );
+      await auditInsert(client, stateAuditEntry(run.tenant_id, run.host_id, actor, 'state_approve', {
+        run_id: run.run_id, state_id: run.state_id, version_id: run.version_id, plan_sha256: run.plan_sha256
+      }));
+      return publicRun(upd.rows[0]);
+    });
+  }
+
+  // createJob's converge part, inside its transaction after the caps: the
+  // plan run (apply) and then the host-state row are locked and checked
+  // (statestore rules in convergeCreateCheck). Returns the run's effective
+  // assignment and version.
+  async convergeCheckInTx(client, r, c) {
+    let plan = null;
+    if (c.kind === 'apply') {
+      const p = await client.query(
+        `SELECT ${cols(RUN_COLS, 'r.')}, r.bundle_json, j.status AS job_status,
+           extract(epoch FROM now() - r.created_at)::float8 AS age_s
+         FROM cp_converge_runs r LEFT JOIN cp_sysscript_jobs j ON j.job_id = r.run_id
+         WHERE r.run_id = $1 AND r.tenant_id = $2 FOR UPDATE OF r`,
+        [c.plan_run_id, r.tenant_id]
+      );
+      plan = p.rows[0] || null;
+    }
+    const hsRes = await client.query(
+      `SELECT ${cols(HOST_STATE_COLS)} FROM cp_host_state WHERE host_id = $1 AND state_id = $2 AND tenant_id = $3 FOR UPDATE`,
+      [r.host_id, c.state_id, r.tenant_id]
+    );
+    const hs = hsRes.rows[0] || null;
+    let assignment = null;
+    let version = null;
+    if (hs && hs.assignment_id) {
+      assignment = (await client.query(
+        'SELECT assignment_id, require_approval FROM cp_state_assignments WHERE assignment_id = $1 AND tenant_id = $2',
+        [hs.assignment_id, r.tenant_id]
+      )).rows[0] || null;
+      version = (await client.query(
+        'SELECT version_id, entitlements_sha256 FROM cp_state_versions WHERE version_id = $1 AND tenant_id = $2',
+        [hs.version_id, r.tenant_id]
+      )).rows[0] || null;
+    }
+    return convergeCreateCheck(r, c, {
+      hs, version, assignment, plan,
+      planJobStatus: plan ? plan.job_status : null,
+      planAgeS: plan ? plan.age_s : 0,
+      maxAgeS: planMaxAgeS(this.env)
+    });
+  }
+
+  async convergeCreateInTx(client, r, c, eff) {
+    await client.query(
+      `INSERT INTO cp_converge_runs (run_id, tenant_id, host_id, state_id, assignment_id, version_id, kind, actor,
+         plan_run_id, parent_job_id, bundle_json)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+      [r.job_id, r.tenant_id, r.host_id, c.state_id, eff.assignment_id, eff.version_id, c.kind, r.actor,
+        c.plan_run_id, c.parent_job_id, c.bundle_json]
+    );
+    if (c.kind === 'apply') {
+      await client.query(
+        'UPDATE cp_host_state SET last_apply_run_id = $3 WHERE host_id = $1 AND state_id = $2',
+        [r.host_id, c.state_id, r.job_id]
+      );
+      const used = await client.query(
+        `UPDATE cp_converge_runs SET consumed_by_run_id = $2, bundle_json = NULL
+         WHERE run_id = $1 AND consumed_by_run_id IS NULL`,
+        [c.plan_run_id, r.job_id]
+      );
+      if (used.rowCount !== 1) throw http(409, 'plan_consumed');
+    } else {
+      await client.query(
+        'UPDATE cp_host_state SET check_job_id = $3, check_claimed_at = now() WHERE host_id = $1 AND state_id = $2',
+        [r.host_id, c.state_id, r.job_id]
+      );
+    }
+  }
+
+  // The report ingestion (§7.5) of a converge job inside the transaction
+  // that ended it (or a re-send): v is a convergeReport result, or null to
+  // finalize a run that ended without one. The run is updated once
+  // (report_sha256 IS NULL); the host state only while this run still owns
+  // it (check_job_id, or last_apply_run_id for apply); the drift alert is
+  // opened (ON CONFLICT DO NOTHING) or resolved here; the state_report
+  // audit row is written last. Returns the result for webhooks, or null
+  // when there is no run or it already has its report.
+  async convergeIngestInTx(client, job, v) {
+    const runRes = await client.query(
+      `SELECT ${cols(RUN_COLS, 'r.')}, a.drift_threshold, a.check_interval_s
+       FROM cp_converge_runs r
+       LEFT JOIN cp_state_assignments a ON a.assignment_id = r.assignment_id AND a.tenant_id = r.tenant_id
+       WHERE r.run_id = $1 AND r.tenant_id = $2 AND r.host_id = $3 FOR UPDATE OF r`,
+      [job.job_id, job.tenant_id, job.host_id]
+    );
+    const run = runRes.rows[0];
+    if (!run || (v && run.report_sha256 != null)) return null;
+    // SECURITY-RULES rule 7: the guard column is one of two constants chosen
+    // by the run kind; every value is bound.
+    const guardCol = run.kind === 'apply' ? 'last_apply_run_id' : 'check_job_id';
+    const hsRes = await client.query(
+      `SELECT ${cols(HOST_STATE_COLS)} FROM cp_host_state
+       WHERE host_id = $1 AND state_id = $2 AND tenant_id = $3 AND ${guardCol} = $4 FOR UPDATE`,
+      [run.host_id, run.state_id, run.tenant_id, run.run_id]
+    );
+    const hs = hsRes.rows[0] || null;
+    const rep = v ? v.report : null;
+    if (v) {
+      let body = run.kind !== 'check' || !hs || hs.last_report_sha256 !== v.sha256;
+      if (!body) {
+        const kept = await client.query(
+          `SELECT 1 FROM cp_converge_runs WHERE tenant_id = $1 AND host_id = $2 AND state_id = $3 AND kind = 'check'
+             AND report_sha256 = $4 AND report IS NOT NULL LIMIT 1`,
+          [run.tenant_id, run.host_id, run.state_id, v.sha256]
+        );
+        body = kept.rowCount === 0;
+      }
+      const upd = await client.query(
+        `UPDATE cp_converge_runs SET report_sha256 = $2, summary = $3::jsonb, report = $4::jsonb, plan_sha256 = $5,
+           plan_truncated = $6, finished_at = COALESCE(finished_at, now())
+         WHERE run_id = $1 AND report_sha256 IS NULL`,
+        [run.run_id, v.sha256, JSON.stringify(rep.summary), body ? JSON.stringify(rep) : null, rep.plan_sha256, rep.truncated]
+      );
+      if (upd.rowCount === 0) return null;
+    } else {
+      await client.query('UPDATE cp_converge_runs SET finished_at = COALESCE(finished_at, now()) WHERE run_id = $1', [run.run_id]);
+    }
+    const result = { run_id: run.run_id, kind: run.kind, host_id: run.host_id, state_id: run.state_id,
+      version_id: run.version_id, host_state_updated: false, prev_status: null, status: null, alerts: [] };
+    if (hs) {
+      const keys = rep ? Object.keys(v.facts) : [];
+      let clash = false;
+      if (keys.length > 0) {
+        const other = await client.query(
+          'SELECT 1 FROM cp_host_state WHERE host_id = $1 AND state_id <> $2 AND facts ?| $3::text[] LIMIT 1',
+          [run.host_id, run.state_id, keys]
+        );
+        clash = other.rowCount > 0;
+      }
+      const upd = hostStateUpdate(run, job, v, hs, clash);
+      // SECURITY-RULES rule 7: the SET column names come from hostStateUpdate,
+      // which only ever uses fixed HOST_STATE_COLS names (checked here); the
+      // values are bound.
+      const values = [run.host_id, run.state_id];
+      const sets = [];
+      for (const [col, val] of Object.entries(upd.set)) {
+        if (!HOST_STATE_COLS.includes(col)) throw http(500, 'bad_host_state_column');
+        values.push(col === 'facts' ? JSON.stringify(val) : val);
+        sets.push(`${col} = $${values.length}${col === 'facts' ? '::jsonb' : ''}`);
+      }
+      for (const col of upd.now) {
+        if (!HOST_STATE_COLS.includes(col)) throw http(500, 'bad_host_state_column');
+        sets.push(`${col} = now()`);
+      }
+      if (upd.nextCheck) {
+        values.push(run.check_interval_s || 0);
+        const n = values.length;
+        sets.push(`next_check_at = CASE WHEN $${n}::int > 0 THEN now() + make_interval(secs => $${n}::int * (0.9 + random() * 0.2)) ELSE NULL END`);
+      }
+      const after = await client.query(
+        `UPDATE cp_host_state SET ${sets.join(', ')} WHERE host_id = $1 AND state_id = $2 RETURNING status, consecutive_drift`,
+        values
+      );
+      const now = after.rows[0];
+      Object.assign(result, { host_state_updated: true, prev_status: hs.status, status: now.status });
+      if (rep && now.status === 'drifted' && run.drift_threshold != null && now.consecutive_drift >= run.drift_threshold) {
+        const e = driftAlertEntry(run, rep);
+        const ins = await client.query(
+          `INSERT INTO cp_alert_events (tenant_id, host_id, rule_name, value, severity, message, status)
+           VALUES ($1, $2, $3, $4, $5, $6, 'open')
+           ON CONFLICT (host_id, rule_name) WHERE status IN ('open', 'ack') AND rule_name LIKE 'drift:%' DO NOTHING
+           RETURNING id`,
+          [e.tenant_id, e.host_id, e.rule_name, e.value, e.severity, e.message]
+        );
+        if (ins.rows[0]) result.alerts.push({ type: 'drift', alert_id: ins.rows[0].id, summary: rep.summary });
+      } else if (rep && now.status === 'compliant') {
+        const res = await client.query(
+          `UPDATE cp_alert_events SET status = 'resolved'
+           WHERE tenant_id = $1 AND host_id = $2 AND rule_name = $3 AND status IN ('open', 'ack') RETURNING id`,
+          [run.tenant_id, run.host_id, driftRule(run.state_id)]
+        );
+        for (const row of res.rows) result.alerts.push({ type: 'drift_resolved', alert_id: row.id, summary: rep.summary });
+      }
+    }
+    if (rep) {
+      const entry = reportAuditEntry(run, job, v.sha256, rep, result.prev_status, result.status);
+      if (entry) await auditInsert(client, entry);
+    }
+    return result;
+  }
+
+  async securityInTx(client, event) {
+    await client.query(
+      `INSERT INTO cp_security_events (tenant_id, kind, actor_fingerprint, detail) VALUES ($1, $2, $3, $4::jsonb)`,
+      [event.tenant_id || null, event.kind, event.actor_fingerprint || null, JSON.stringify(event.detail || {})]
+    );
+  }
+
+  // A result re-sent for a converge job that is already terminal and whose
+  // run has no report yet (§7.5): ingested once in one transaction, with
+  // the same conditional host-state write. {ingested, reason?, converge?}.
+  async ingestConvergeResend(jobId, hostId, report) {
+    if (typeof jobId !== 'string' || typeof hostId !== 'string') return { ingested: false, reason: 'unknown_job' };
+    return this.inTx(async (client) => {
+      const cur = await client.query(
+        `SELECT ${jobCols()} FROM cp_sysscript_jobs WHERE job_id = $1 AND host_id = $2 FOR UPDATE`,
+        [jobId, hostId]
+      );
+      const job = cur.rows[0];
+      if (!job || !isTerminal(job.status) || !isConvergeSource(job.source)) return { ingested: false, reason: 'unknown_job' };
+      const run = (await client.query('SELECT kind, report_sha256 FROM cp_converge_runs WHERE run_id = $1', [jobId])).rows[0];
+      if (!run || run.report_sha256 != null) return { ingested: false, reason: 'already_ingested' };
+      const v = convergeReport(report, run.kind, job.script_sha256);
+      if (!v.ok) {
+        await this.securityInTx(client, badReportEvent(job, v.reason));
+        return { ingested: false, reason: 'bad_report' };
+      }
+      const out = await this.convergeIngestInTx(client, job, v);
+      if (!out) return { ingested: false, reason: 'already_ingested' };
+      return { ingested: true, converge: out };
+    });
   }
 
   async efficiency(tenantIds) {

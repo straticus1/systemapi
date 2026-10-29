@@ -726,3 +726,351 @@ test('jobs: two FleetManagers on one database: submit on one, the agent on the o
     await two.close();
   }
 });
+
+// --- desired state and converge runs (.omc/plans/convergence-drift.md §8) --
+// Each test makes its own tenants, hosts, states and assignments.
+
+const SCHEMA_PATH = require('node:path').join(__dirname, '..', 'controlplane', 'schema.sql');
+const CONV_BUNDLE = JSON.stringify({ v: 1, files: { 'main.star': 'state.file("/etc/x", "x")' }, vars: {}, host: {} });
+const CONV_SHA = crypto.createHash('sha256').update(CONV_BUNDLE, 'utf8').digest('hex');
+
+// A tenant world with one state, one version and a host assignment on host 0.
+async function cworld(n = 2, target = 'host') {
+  const ts = await world(n);
+  for (const t of ts) {
+    t.st = await registry.createState({ tenantId: t.tenant, name: 'web', actor: t.user });
+    t.v = await registry.publishVersion({ tenantId: t.tenant, stateId: t.st.state_id, files: { 'main.star': 'x = 1' }, entitlements: { allow_fs_write: ['/etc/'] }, actor: t.user });
+    t.a = await registry.createAssignment({ tenantId: t.tenant, stateId: t.st.state_id, versionId: t.v.version_id, actor: t.user,
+      targetKind: target, targetValue: target === 'host' ? t.hosts[0] : target === 'tag' ? 'web' : undefined });
+  }
+  return ts;
+}
+
+function cjob(t, kind = 'check', over = {}) {
+  return jobRow(t, 0, {
+    source: `converge_${kind}`,
+    script_sha256: CONV_SHA,
+    entitlements_sha256: t.v.entitlements_sha256,
+    entitlements: t.v.entitlements,
+    dispatch: { kind: 'converge', bundle_json: CONV_BUNDLE },
+    ...over
+  });
+}
+
+function copts(t, kind = 'check', over = {}) {
+  return {
+    converge: {
+      kind,
+      stateId: t.st.state_id,
+      assignmentId: t.a.assignment_id,
+      versionId: t.v.version_id,
+      bundleJson: kind === 'plan' ? CONV_BUNDLE : undefined,
+      ...over
+    }
+  };
+}
+
+function creport(kind, { drift = 0, changed = 0, truncated = false } = {}) {
+  const key = 'file:/etc/x';
+  const status = drift ? 'drift' : changed ? 'changed' : 'ok';
+  return {
+    v: 1,
+    mode: kind === 'apply' ? 'apply' : 'check',
+    bundle_sha256: CONV_SHA,
+    plan_sha256: 'c'.repeat(64),
+    truncated,
+    summary: { total: 1, ok: status === 'ok' ? 1 : 0, drift: drift ? 1 : 0, changed: changed ? 1 : 0, failed: 0, denied: 0, skipped: 0 },
+    plan: drift ? [{ key, status: 'drift' }] : [],
+    resources: [{ key, kind: 'file', status, sensitive: false, before: { exists: true, sha256: 'd'.repeat(64) }, desired: { sha256: 'e'.repeat(64) }, diff: '', error: '', backup_id: null }]
+  };
+}
+
+async function csubmit(reg, t, kind = 'check', over = {}, opts = {}) {
+  const row = cjob(t, kind, over);
+  await reg.createJob(row, { ...copts(t, kind, opts.conv), ...(opts.caps || {}) });
+  assert.ok(await reg.markDispatched(row.job_id, row.host_id, `c-${row.job_id}`));
+  return row;
+}
+
+async function cfinish(reg, row, rep, st = 'succeeded') {
+  return reg.transitionJob(row.job_id, row.host_id, ['submitted', 'accepted', 'running'],
+    { status: st, output: '' }, { audit: { actor: 'agent' }, converge: { report: rep } });
+}
+
+const hstate = async (t, host = 0) => (await pool.query(
+  'SELECT * FROM cp_host_state WHERE host_id = $1 AND state_id = $2', [t.hosts[host], t.st.state_id])).rows[0];
+
+test('converge: the schema migrates a database that already has cp_sysscript_jobs rows; the swap is idempotent and safe concurrently', async () => {
+  const full = require('node:fs').readFileSync(SCHEMA_PATH, 'utf8');
+  const cut = full.indexOf('-- Declarative convergence and drift');
+  assert.ok(cut > 0);
+  const old = full.slice(0, cut);
+  const names = [`mig_${crypto.randomBytes(5).toString('hex')}`, `mig_${crypto.randomBytes(5).toString('hex')}`];
+  const admin = new Pool({ connectionString: BASE });
+  for (const name of names) await admin.query(`CREATE DATABASE ${name}`);
+  const pools = [];
+  try {
+    for (const [i, name] of names.entries()) {
+      const p = new Pool({ connectionString: withDatabase(BASE, name) });
+      pools.push(p);
+      await p.query(old);
+      await p.query(`INSERT INTO cp_sysscript_jobs (job_id, tenant_id, host_id, actor, source, script_sha256, entitlements_sha256,
+          status, timeout_s, deadline_at, lease_nonce) VALUES ($1, 't', 'h', 'a', 'api', $2, $2, 'succeeded', 60, now(), 'n')`,
+      [`sjb_old_${i}`, 'a'.repeat(64)]);
+    }
+    const check = async (p) => {
+      const cons = (await p.query(
+        `SELECT conname, convalidated FROM pg_constraint
+         WHERE conrelid = 'cp_sysscript_jobs'::regclass AND contype = 'c' AND conname LIKE 'cp_sysscript_jobs_source%'`)).rows;
+      assert.deepEqual(cons, [{ conname: 'cp_sysscript_jobs_source_check_v2', convalidated: true }]);
+      assert.equal((await p.query("SELECT count(*)::int AS n FROM cp_sysscript_jobs WHERE job_id LIKE 'sjb_old_%'")).rows[0].n, 1);
+      const ins = (src) => p.query(`INSERT INTO cp_sysscript_jobs (job_id, tenant_id, host_id, actor, source, script_sha256,
+          entitlements_sha256, status, timeout_s, deadline_at, lease_nonce) VALUES ($1, 't', 'h', 'a', $2, $3, $3, 'submitted', 60, now(), 'n')`,
+      [`sjb_${crypto.randomBytes(8).toString('hex')}`, src, 'a'.repeat(64)]);
+      await ins('converge_apply');
+      await assert.rejects(ins('bogus'), (e) => e.code === '23514');
+    };
+    // Sequentially, twice, on the first database.
+    await pools[0].query(full);
+    await pools[0].query(full);
+    await check(pools[0]);
+    // Concurrently from two pools on the second.
+    const other = new Pool({ connectionString: withDatabase(BASE, names[1]) });
+    pools.push(other);
+    await Promise.all([pools[1].query(full), other.query(full), pools[1].query(full)]);
+    await check(pools[1]);
+    // createRegistry over the migrated database still boots.
+    const reg = await createRegistry({ pool: pools[1], env: { NODE_ENV: 'production' }, logger: { log() {}, warn() {}, error() {} } });
+    assert.ok(reg instanceof PgRegistry);
+  } finally {
+    for (const p of pools) await p.end();
+    for (const name of names) await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
+    await admin.end();
+  }
+});
+
+test('converge: the assignment CHECKs refuse what the registry refuses', async () => {
+  const [A] = await cworld(1);
+  const ins = (kind, value, auto, approval) => pool.query(
+    `INSERT INTO cp_state_assignments (assignment_id, tenant_id, state_id, version_id, target_kind, target_value,
+       auto_remediate, require_approval, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'x')`,
+    [`sta_${crypto.randomBytes(8).toString('hex')}`, A.tenant, A.st.state_id, A.v.version_id, kind, value, auto, approval]
+  );
+  await assert.rejects(ins('tag', 'a', false, false), (e) => e.code === '23514');
+  await assert.rejects(ins('tag', 'b', true, true), (e) => e.code === '23514');
+  await assert.rejects(ins('host', A.hosts[1], true, true), (e) => e.code === '23514');
+  await ins('host', A.hosts[1], true, false);
+  await assert.rejects(registry.createAssignment({ tenantId: A.tenant, stateId: A.st.state_id, versionId: A.v.version_id, actor: A.user,
+    targetKind: 'tenant', autoRemediate: true }), (e) => e.code === 'auto_remediate_host_only');
+});
+
+test('converge: states, versions, assignments, host states and runs never cross tenants', async () => {
+  const [A, B] = await cworld(2);
+  assert.equal(await registry.getState([B.tenant], A.st.state_id), null);
+  assert.equal(await registry.getVersion([B.tenant], A.v.version_id), null);
+  assert.deepEqual(await registry.listVersions([B.tenant], A.st.state_id), []);
+  assert.equal(await registry.getAssignment([B.tenant], A.a.assignment_id), null);
+  assert.ok((await registry.listAssignments([B.tenant])).every((x) => x.tenant_id === B.tenant));
+  assert.equal(await registry.getHostState([B.tenant], A.hosts[0], A.st.state_id), null);
+  assert.ok((await registry.listHostStates([B.tenant])).every((x) => x.tenant_id === B.tenant));
+  assert.equal((await registry.listHostStates([A.tenant], { hostId: A.hosts[0] })).length, 1);
+  await assert.rejects(registry.publishVersion({ tenantId: B.tenant, stateId: A.st.state_id, files: { 'main.star': '' }, actor: B.user }), (e) => e.status === 404);
+  await assert.rejects(registry.updateAssignment({ tenantId: B.tenant, assignmentId: A.a.assignment_id, patch: { driftThreshold: 3 }, actor: B.user }), (e) => e.status === 404);
+  await assert.rejects(registry.deleteAssignment({ tenantId: B.tenant, assignmentId: A.a.assignment_id, actor: B.user }), (e) => e.status === 404);
+  await assert.rejects(registry.createAssignment({ tenantId: B.tenant, stateId: B.st.state_id, versionId: A.v.version_id, actor: B.user,
+    targetKind: 'tag', targetValue: 'x' }), (e) => e.code === 'version_not_found');
+  await assert.rejects(registry.createAssignment({ tenantId: B.tenant, stateId: B.st.state_id, versionId: B.v.version_id, actor: B.user,
+    targetKind: 'host', targetValue: A.hosts[1] }), (e) => e.code === 'host_not_found');
+  await assert.rejects(registry.setHostTags({ tenantId: B.tenant, hostId: A.hosts[0], tags: ['web'], actor: B.user }), (e) => e.status === 404);
+  // A converge job for B's state on A's host, and A's state on B's host.
+  await assert.rejects(registry.createJob(cjob(A, 'check', { host_id: B.hosts[0] }), copts(A)), (e) => e.status === 404);
+  await assert.rejects(registry.createJob(cjob(A), copts(A, 'check', { stateId: B.st.state_id })), (e) => e.code === 'state_not_assigned');
+  const j = await csubmit(registry, A);
+  assert.equal(await registry.getConvergeRun([B.tenant], j.job_id), null);
+  assert.deepEqual(await registry.listConvergeRuns([B.tenant], { hostId: A.hosts[0] }), []);
+  // A result for A's job from B's host changes nothing.
+  assert.equal(await registry.transitionJob(j.job_id, B.hosts[0], ['submitted'], { status: 'succeeded' }, { converge: { report: creport('check') } }), null);
+  assert.equal((await registry.ingestConvergeResend(j.job_id, B.hosts[0], creport('check'))).ingested, false);
+  await cfinish(registry, j, creport('plan'));
+  assert.equal(await registry.approvePlan({ tenantIds: [B.tenant], runId: j.job_id, actor: B.user }), null);
+  assert.equal((await registry.getConvergeRun([A.tenant], j.job_id, { withReport: true })).report.summary.ok, 1);
+  assert.equal((await hstate(A)).status, 'compliant');
+});
+
+test('converge: a drifted ingest while an ack\'d drift alert exists commits, returns the row, and opens no duplicate', async () => {
+  const [A] = await cworld(1);
+  const j1 = await csubmit(registry, A);
+  const d1 = await cfinish(registry, j1, creport('check', { drift: 1 }));
+  assert.equal(d1.converge.status, 'drifted');
+  assert.equal(d1.converge.alerts.length, 1);
+  await registry.setAlertStatus([A.tenant], d1.converge.alerts[0].alert_id, 'ack');
+  const j2 = await csubmit(registry, A);
+  const d2 = await cfinish(registry, j2, creport('check', { drift: 1 }));
+  assert.ok(d2, 'the transition committed (the agent is acked)');
+  assert.equal(d2.status, 'succeeded');
+  assert.deepEqual(d2.converge.alerts, []);
+  const row = await hstate(A);
+  assert.equal(row.consecutive_drift, 2);
+  assert.equal(row.check_job_id, null);
+  assert.equal((await status(j2.job_id)).status, 'succeeded');
+  const active = (await pool.query("SELECT status FROM cp_alert_events WHERE host_id = $1 AND rule_name = $2 AND status IN ('open', 'ack')",
+    [A.hosts[0], `drift:${A.st.state_id}`])).rows;
+  assert.deepEqual(active, [{ status: 'ack' }]);
+  // A clean check resolves the ack'd alert.
+  const j3 = await csubmit(registry, A);
+  const d3 = await cfinish(registry, j3, creport('check'));
+  assert.deepEqual(d3.converge.alerts.map((x) => x.type), ['drift_resolved']);
+  // Removing the host from the assignment deletes its row.
+  const j4 = await csubmit(registry, A);
+  await cfinish(registry, j4, creport('check', { drift: 1 }));
+  await registry.deleteAssignment({ tenantId: A.tenant, assignmentId: A.a.assignment_id, actor: A.user });
+  assert.equal(await hstate(A), undefined);
+  assert.equal((await pool.query("SELECT count(*)::int AS n FROM cp_alert_events WHERE host_id = $1 AND rule_name = $2 AND status IN ('open', 'ack')",
+    [A.hosts[0], `drift:${A.st.state_id}`])).rows[0].n, 0);
+});
+
+test('converge: AC 18, a late result for job A after job B took the row records A\'s run and leaves the host state alone', async () => {
+  const [A] = await cworld(1);
+  const jA = await csubmit(registry, A);
+  const jB = await csubmit(registry, A);
+  const late = await cfinish(registry, jA, creport('check', { drift: 1 }));
+  assert.equal(late.converge.host_state_updated, false);
+  const row = await hstate(A);
+  assert.equal(row.status, 'unknown');
+  assert.equal(row.check_job_id, jB.job_id);
+  assert.ok((await registry.getConvergeRun([A.tenant], jA.job_id)).report_sha256);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM cp_alert_events WHERE host_id = $1', [A.hosts[0]])).rows[0].n, 0);
+  const own = await cfinish(registry, jB, creport('check'));
+  assert.equal(own.converge.status, 'compliant');
+});
+
+test('converge: a sweep releases the claim, a swept apply is partial, and a re-sent result is ingested once', async () => {
+  const [A] = await cworld(1);
+  const j = await csubmit(registry, A, 'check', { deadline_at: new Date(Date.now() + 1000) });
+  await registry.transitionJob(j.job_id, A.hosts[0], ['submitted'], { status: 'running' });
+  await new Promise((resolve) => setTimeout(resolve, 1200));
+  const ended = await registry.sweepJobs(Date.now(), { graceMs: 0 });
+  assert.ok(ended.some((x) => x.job_id === j.job_id && x.error === 'result_lost'));
+  let row = await hstate(A);
+  assert.equal(row.check_claimed_at, null);
+  assert.equal(row.check_job_id, null);
+  assert.equal(row.last_error, 'result_lost');
+  assert.equal(row.status, 'unknown');
+  const [r1, r2] = await Promise.all([
+    registry.ingestConvergeResend(j.job_id, A.hosts[0], creport('check', { drift: 1 })),
+    registry.ingestConvergeResend(j.job_id, A.hosts[0], creport('check', { drift: 1 }))
+  ]);
+  assert.deepEqual([r1.ingested, r2.ingested].sort(), [false, true], 'exactly once');
+  assert.equal((r1.ingested ? r1 : r2).converge.host_state_updated, false);
+  assert.ok((await registry.getConvergeRun([A.tenant], j.job_id)).report_sha256);
+
+  // Plan, then an apply swept past its deadline: partial.
+  const p = await csubmit(registry, A, 'plan');
+  await cfinish(registry, p, creport('plan', { drift: 1 }));
+  const ap = await csubmit(registry, A, 'apply', { deadline_at: new Date(Date.now() + 1000) }, { conv: { planRunId: p.job_id } });
+  await registry.transitionJob(ap.job_id, A.hosts[0], ['submitted'], { status: 'running' });
+  await new Promise((resolve) => setTimeout(resolve, 1200));
+  await registry.sweepJobs(Date.now(), { graceMs: 0 });
+  row = await hstate(A);
+  assert.equal(row.status, 'partial');
+  assert.equal(row.last_apply_run_id, ap.job_id);
+  // Cancel before dispatch releases a claim too.
+  const c = cjob(A);
+  await registry.createJob(c, copts(A));
+  assert.equal((await hstate(A)).check_job_id, c.job_id);
+  await registry.requestJobCancel([A.tenant], c.job_id, A.user);
+  assert.equal((await hstate(A)).check_job_id, null);
+  assert.equal((await registry.verifyAudit()).ok, true);
+});
+
+test('converge: a 429 does not burn the plan; approval, single consumption and the manual apply record', async () => {
+  const [A] = await cworld(1, 'tag');
+  await registry.setHostTags({ tenantId: A.tenant, hostId: A.hosts[0], tags: ['web'], actor: A.user });
+  await registry.addMember(A.tenant, `${A.user}-2`, 'admin');
+  const p = await csubmit(registry, A, 'plan');
+  await cfinish(registry, p, creport('plan', { drift: 1 }));
+  const applyOpts = { conv: { planRunId: p.job_id } };
+  await assert.rejects(csubmit(registry, A, 'apply', {}, applyOpts), (e) => e.code === 'approval_required');
+  await assert.rejects(registry.approvePlan({ tenantIds: [A.tenant], runId: p.job_id, actor: A.user }), (e) => e.code === 'self_approval');
+  assert.equal((await registry.approvePlan({ tenantIds: [A.tenant], runId: p.job_id, actor: `${A.user}-2` })).approved_by, `${A.user}-2`);
+  const filler = await csubmit(registry, A);
+  await assert.rejects(csubmit(registry, A, 'apply', {}, { ...applyOpts, caps: { hostCap: 1 } }), (e) => e.status === 429);
+  const plan = (await pool.query('SELECT consumed_by_run_id, bundle_json FROM cp_converge_runs WHERE run_id = $1', [p.job_id])).rows[0];
+  assert.equal(plan.consumed_by_run_id, null);
+  assert.equal(plan.bundle_json, CONV_BUNDLE);
+  assert.equal((await hstate(A)).last_apply_run_id, null);
+  assert.equal((await pool.query("SELECT count(*)::int AS n FROM cp_converge_runs WHERE plan_run_id = $1", [p.job_id])).rows[0].n, 0);
+  await cfinish(registry, filler, creport('check', { drift: 1 }));
+  // Two applies racing for one plan: exactly one wins.
+  const tries = await Promise.allSettled([csubmit(registry, A, 'apply', {}, applyOpts), csubmit(registry, A, 'apply', {}, applyOpts)]);
+  assert.equal(tries.filter((x) => x.status === 'fulfilled').length, 1);
+  assert.equal(tries.find((x) => x.status === 'rejected').reason.code, 'plan_consumed');
+  const ap = tries.find((x) => x.status === 'fulfilled').value;
+  const done = await cfinish(registry, ap, creport('apply', { changed: 1 }));
+  assert.equal(done.converge.status, 'compliant');
+  const row = await hstate(A);
+  assert.equal(row.manual_apply_assignment_id, A.a.assignment_id);
+  assert.equal(row.manual_apply_version_id, A.v.version_id);
+  assert.equal(row.last_applied_version_id, A.v.version_id);
+  const actions = (await pool.query("SELECT action FROM cp_audit WHERE tenant_id = $1 AND action LIKE 'state_%' ORDER BY seq", [A.tenant])).rows.map((r) => r.action);
+  for (const a of ['state_create', 'state_publish', 'state_assign', 'state_approve', 'state_report']) assert.ok(actions.includes(a), a);
+});
+
+test('converge: claimDueChecks holds the per-tenant cap exactly across two registries and skips stale or incapable agents', async () => {
+  const [A, B] = await cworld(2, 'tenant');
+  for (const t of [A, B]) {
+    for (let i = 0; i < 8; i += 1) {
+      const hostId = crypto.randomUUID();
+      await registry.enroll({ tenantId: t.tenant, userId: t.user, keyId: `k${t.tenant.slice(1)}`, hostId, hostname: `x${i}.${t.tenant}`, os: '', platform: '', sshPubkey: opensshEd25519(40 + i) });
+      t.hosts.push(hostId);
+    }
+  }
+  const enrolledAt = new Date();
+  for (const t of [A, B]) {
+    for (const [i, h] of t.hosts.entries()) {
+      await registry.setAgentPresence(h, { caps: i === 1 ? ['sysscript_jobs'] : ['sysscript_jobs', 'converge'], instance: 'i1', connId: `c-${h}`, enrolledAt });
+    }
+  }
+  await pool.query("UPDATE cp_hosts SET agent_seen_at = now() - interval '5 minutes' WHERE host_id = $1", [A.hosts[2]]);
+  await pool.query("UPDATE cp_host_state SET next_check_at = now() - interval '1 second' WHERE tenant_id = ANY($1::text[])", [[A.tenant, B.tenant]]);
+  const pool2 = new Pool({ connectionString: withDatabase(BASE, DB) });
+  try {
+    const other = new PgRegistry(pool2, { NODE_ENV: 'production' });
+    const opts = { replicaBudget: 50, perTenantCap: 3, claimExpiryS: 420 };
+    const runs = await Promise.all(Array.from({ length: 6 }, (_, i) => (i % 2 ? other : registry).claimDueChecks(opts)));
+    const claimed = runs.flat().filter((r) => r.tenant_id === A.tenant || r.tenant_id === B.tenant);
+    const per = (t) => claimed.filter((r) => r.tenant_id === t.tenant);
+    assert.equal(per(A).length, 3);
+    assert.equal(per(B).length, 3);
+    assert.equal(new Set(claimed.map((r) => `${r.host_id}/${r.state_id}`)).size, claimed.length, 'never double-claimed');
+    assert.ok(claimed.every((r) => r.host_id !== A.hosts[1] && r.host_id !== A.hosts[2] && r.host_id !== B.hosts[1]));
+    // Releasing one claim makes room for exactly one more.
+    await registry.releaseCheckClaim(per(A)[0].host_id, A.st.state_id, { retryInS: 0 });
+    const more = (await Promise.all([registry.claimDueChecks(opts), other.claimDueChecks(opts)])).flat().filter((r) => r.tenant_id === A.tenant);
+    assert.equal(more.length, 1);
+    // Expired claims are reclaimed; a replica budget of 2 is held.
+    await pool.query("UPDATE cp_host_state SET next_check_at = now() + interval '1 hour' WHERE tenant_id = $1", [A.tenant]);
+    await pool.query("UPDATE cp_host_state SET check_claimed_at = now() - interval '1 hour', next_check_at = now() - interval '1 second' WHERE tenant_id = $1", [B.tenant]);
+    assert.equal((await registry.claimDueChecks({ ...opts, replicaBudget: 2, perTenantCap: 10 })).filter((r) => r.tenant_id === B.tenant).length, 2);
+    // Stale after three missed intervals.
+    await pool.query("UPDATE cp_host_state SET status = 'compliant', last_check_at = now() - interval '4 hours' WHERE host_id = $1", [A.hosts[3]]);
+    assert.ok(await registry.markStaleHostStates() >= 1);
+    assert.equal((await hstate(A, 3)).status, 'stale');
+  } finally {
+    await pool2.end();
+  }
+});
+
+test('converge: the audit chain verifies after concurrent assignment, tag, check and approval activity', async () => {
+  const ts = await cworld(6, 'tag');
+  await Promise.all(ts.map((t) => registry.setHostTags({ tenantId: t.tenant, hostId: t.hosts[0], tags: ['web'], actor: t.user })));
+  const jobs = await Promise.all(ts.map((t) => csubmit(registry, t)));
+  await Promise.all([
+    ...ts.map((t, i) => cfinish(registry, jobs[i], creport('check', { drift: i % 2 }))),
+    ...ts.map((t) => registry.createAssignment({ tenantId: t.tenant, stateId: t.st.state_id, versionId: t.v.version_id, actor: t.user, targetKind: 'tag', targetValue: 'db' })),
+    ...ts.map((t) => registry.setHostTags({ tenantId: t.tenant, hostId: t.hosts[1], tags: ['web', 'db'], actor: t.user }))
+  ]);
+  for (const t of ts) assert.equal((await hstate(t, 1)).status, 'conflict');
+  const verdict = await registry.verifyAudit();
+  assert.equal(verdict.ok, true, JSON.stringify(verdict));
+});
