@@ -61,6 +61,9 @@ type ServiceManager interface {
 	Action(ctx context.Context, verb, service string) (output string, err error)
 	// Status returns a structured status for one service.
 	Status(ctx context.Context, service string) (ServiceStatus, error)
+	// IsEnabled reports whether the service is enabled to start at boot. It
+	// is read-only. A state the backend cannot classify is an error.
+	IsEnabled(ctx context.Context, service string) (bool, error)
 }
 
 // PackageManager builds fixed argv for a package manager and reports whether

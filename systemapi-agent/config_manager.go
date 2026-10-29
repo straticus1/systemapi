@@ -2,13 +2,17 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"text/template"
@@ -37,6 +41,127 @@ type ConfigManager struct{}
 // backupSuffixRE matches the timestamp of a backup name written by
 // newBackupName (unix nanoseconds) or by older agents (unix seconds).
 var backupSuffixRE = regexp.MustCompile(`^[0-9]{1,19}$`)
+
+// stateBackupDir holds the desired-state file backups, outside every target
+// directory: <dir>/<sha256(path)>/<unix_ns>, dirs 0700, files 0600. It must
+// not overlap a write grant (WriteHost refuses a backup otherwise). A var so
+// tests can point it at a temp dir.
+var stateBackupDir = "/var/lib/systemapi/backups"
+
+// stateBackupKeep is how many backups are kept per path.
+const stateBackupKeep = 5
+
+// atomicReplaceMode replaces path, which fsGrantPath resolved under the
+// grant root root, with data, mode and owner (-1 leaves an id as created):
+// a fresh temp file in the same directory, opened beneath root, renamed over
+// path (replaceBeneath). Unlike atomicReplace it sets the mode and owner it
+// is given instead of keeping the old file's. mode may not carry setuid,
+// setgid or sticky bits. Nothing is written beside path except the temp file,
+// which is gone on success and on failure.
+func atomicReplaceMode(root, path string, data []byte, mode os.FileMode, uid, gid int) error {
+	if mode&^os.ModePerm != 0 {
+		return fmt.Errorf("atomic replace: mode %v not allowed", mode)
+	}
+	if err := replaceBeneath(root, path, data, mode, uid, gid); err != nil {
+		return fmt.Errorf("atomic replace: %w", err)
+	}
+	return nil
+}
+
+// replaceTempName is a random hidden temp name beside base.
+func replaceTempName(base string) (string, error) {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("temp name: %w", err)
+	}
+	return "." + base + ".systemapi-" + hex.EncodeToString(b[:]) + ".tmp", nil
+}
+
+// backupOutside stores data, the current content of path, as
+// stateBackupDir/<sha256(path)>/<unix_ns> (created O_EXCL|O_NOFOLLOW, 0600)
+// and keeps the newest stateBackupKeep there. It returns the basename.
+func backupOutside(path string, data []byte) (string, error) {
+	sum := sha256.Sum256([]byte(path))
+	dir := filepath.Join(filepath.Clean(stateBackupDir), hex.EncodeToString(sum[:]))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return "", err
+	}
+	if !fi.IsDir() {
+		return "", fmt.Errorf("backup dir is not a directory")
+	}
+	if fi.Mode().Perm() != 0o700 {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return "", err
+		}
+	}
+	ts := time.Now().UnixNano()
+	for i := int64(0); i < 16; i++ {
+		name := strconv.FormatInt(ts+i, 10)
+		dst := filepath.Join(dir, name)
+		f, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL|openNoFollow, 0o600)
+		if errors.Is(err, fs.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		if _, err := f.Write(data); err != nil {
+			_ = f.Close()
+			_ = os.Remove(dst)
+			return "", err
+		}
+		if err := f.Sync(); err != nil {
+			_ = f.Close()
+			_ = os.Remove(dst)
+			return "", err
+		}
+		if err := f.Close(); err != nil {
+			_ = os.Remove(dst)
+			return "", err
+		}
+		if err := pruneBackups(dir, stateBackupKeep); err != nil {
+			return "", fmt.Errorf("prune: %w", err)
+		}
+		return name, nil
+	}
+	return "", fmt.Errorf("no free backup name")
+}
+
+// pruneBackups removes all but the newest keep backups (regular files named
+// by digits) in dir.
+func pruneBackups(dir string, keep int) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	type stamped struct {
+		name string
+		ts   int64
+	}
+	var all []stamped
+	for _, e := range entries {
+		if !e.Type().IsRegular() || !backupSuffixRE.MatchString(e.Name()) {
+			continue
+		}
+		ts, err := strconv.ParseInt(e.Name(), 10, 64)
+		if err != nil {
+			continue
+		}
+		all = append(all, stamped{e.Name(), ts})
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].ts < all[j].ts })
+	for len(all) > keep {
+		if err := os.Remove(filepath.Join(dir, all[0].name)); err != nil {
+			return err
+		}
+		all = all[1:]
+	}
+	return nil
+}
 
 // AtomicWrite safely replaces path with content:
 //  1. Write content to a new random temp file beside path

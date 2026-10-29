@@ -14,6 +14,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"strings"
 )
 
@@ -65,4 +66,16 @@ func (m launchdServiceManager) Status(ctx context.Context, service string) (Serv
 		state = "active"
 	}
 	return ServiceStatus{Active: err == nil, State: state, Output: text}, nil
+}
+
+// IsEnabled reads the system domain's disabled list.
+func (m launchdServiceManager) IsEnabled(ctx context.Context, service string) (bool, error) {
+	if !serviceNameRE.MatchString(service) {
+		return false, fmt.Errorf("service not allowed")
+	}
+	out, err := jobCommand(ctx, "launchctl", "print-disabled", "system").Output()
+	if err != nil {
+		return false, fmt.Errorf("launchctl print-disabled failed")
+	}
+	return launchdEnabledFrom(string(out), service), nil
 }

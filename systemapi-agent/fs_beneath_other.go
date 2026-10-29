@@ -3,7 +3,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 )
@@ -76,6 +78,104 @@ func recheckBeneath(root, target string) error {
 	real, err := filepath.EvalSymlinks(target)
 	if err != nil || real != target || !pathWithin(root, real) {
 		return fmt.Errorf("path changed during operation")
+	}
+	return nil
+}
+
+// statBeneath lstat's target, then re-checks that its parent (the root for
+// the root itself) still resolves to itself under root. A missing target is
+// reported as not existing.
+func statBeneath(root, target string) (pathFacts, error) {
+	fi, err := os.Lstat(target)
+	if errors.Is(err, fs.ErrNotExist) {
+		return missingPath, nil
+	}
+	if err != nil {
+		return pathFacts{}, err
+	}
+	dir := target
+	if target != root {
+		dir = filepath.Dir(target)
+	}
+	if err := recheckBeneath(root, dir); err != nil {
+		return pathFacts{}, err
+	}
+	return pathFactsOf(fi), nil
+}
+
+// readBeneath reads a regular file with a single link (readFileCappedLinks),
+// then re-checks it resolves to itself under root.
+func readBeneath(root, target string, max int) ([]byte, error) {
+	data, err := readFileCappedLinks(target, max, true)
+	if err != nil {
+		return nil, err
+	}
+	if err := recheckBeneath(root, target); err != nil {
+		return nil, err
+	}
+	return []byte(data), nil
+}
+
+// removeBeneath removes target (a file, a link or an empty directory) after
+// re-checking its parent; never recursive, never the root itself.
+func removeBeneath(root, target string) error {
+	if target == root {
+		return fmt.Errorf("refusing to remove the grant root")
+	}
+	if err := recheckBeneath(root, filepath.Dir(target)); err != nil {
+		return err
+	}
+	return os.Remove(target)
+}
+
+// replaceBeneath writes a fresh temp file beside target (os.CreateTemp:
+// random name, O_EXCL), sets owner and mode, syncs and renames it over
+// target, re-checking the directory before the create and the rename.
+// Residual race as for the other helpers here: the directory swapped for a
+// symlink between the re-check and the syscall.
+func replaceBeneath(root, target string, data []byte, mode os.FileMode, uid, gid int) error {
+	if target == root {
+		return fmt.Errorf("is a directory")
+	}
+	dir := filepath.Dir(target)
+	if err := recheckBeneath(root, dir); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, "."+filepath.Base(target)+".systemapi-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create tmp: %w", err)
+	}
+	tmp := f.Name()
+	fail := func(err error) error {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if uid >= 0 || gid >= 0 {
+		if err := f.Chown(uid, gid); err != nil {
+			return fail(fmt.Errorf("chown tmp: %w", err))
+		}
+	}
+	if err := f.Chmod(mode.Perm()); err != nil {
+		return fail(fmt.Errorf("chmod tmp: %w", err))
+	}
+	if _, err := f.Write(data); err != nil {
+		return fail(fmt.Errorf("write tmp: %w", err))
+	}
+	if err := f.Sync(); err != nil {
+		return fail(fmt.Errorf("sync tmp: %w", err))
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("close tmp: %w", err)
+	}
+	if err := recheckBeneath(root, dir); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, target); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("rename: %w", err)
 	}
 	return nil
 }

@@ -14,7 +14,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -112,6 +114,34 @@ func (m systemdServiceManager) Status(ctx context.Context, service string) (Serv
 	}, nil
 }
 
+// IsEnabled runs `systemctl is-enabled`. Only enabled and enabled-runtime
+// count as enabled; static, indirect, masked and the like are not enabled,
+// and an empty or unknown answer (a missing unit) is an error.
+func (m systemdServiceManager) IsEnabled(ctx context.Context, service string) (bool, error) {
+	if !serviceNameRE.MatchString(service) {
+		return false, fmt.Errorf("service not allowed")
+	}
+	out, _ := jobCommand(ctx, "systemctl", "is-enabled", service).Output()
+	if ctx.Err() != nil {
+		return false, fmt.Errorf("service is-enabled %s", jobCtxReason(ctx))
+	}
+	return systemdEnabledState(strings.TrimSpace(string(out)))
+}
+
+// systemdEnabledState maps a `systemctl is-enabled` answer. The exit code is
+// not used: it is non-zero for both "disabled" and a missing unit.
+func systemdEnabledState(state string) (bool, error) {
+	switch state {
+	case "enabled", "enabled-runtime":
+		return true, nil
+	case "disabled", "static", "indirect", "masked", "masked-runtime", "linked", "linked-runtime",
+		"alias", "generated", "transient":
+		return false, nil
+	default:
+		return false, fmt.Errorf("service enabled state unknown")
+	}
+}
+
 // --- openrc ---
 
 type openrcServiceManager struct{}
@@ -155,6 +185,41 @@ func (m openrcServiceManager) Status(ctx context.Context, service string) (Servi
 	return ServiceStatus{Active: active, State: state, Output: text}, nil
 }
 
+// IsEnabled reports whether the service is in the default or boot
+// runlevel, which is what `rc-update add` creates.
+func (m openrcServiceManager) IsEnabled(ctx context.Context, service string) (bool, error) {
+	if !serviceNameRE.MatchString(service) {
+		return false, fmt.Errorf("service not allowed")
+	}
+	for _, level := range []string{"default", "boot"} {
+		_, err := os.Lstat(filepath.Join("/etc/runlevels", level, service))
+		if err == nil {
+			return true, nil
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+// launchdEnabledFrom reads `launchctl print-disabled system` output. A
+// label is enabled unless it is listed as disabled ("disabled" or, on older
+// macOS, "true"). The output's own "disabled services = {" header is not a
+// label line and is skipped.
+func launchdEnabledFrom(out, label string) bool {
+	want := "\"" + label + "\""
+	for _, line := range strings.Split(out, "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(line), "=>")
+		if !ok || strings.TrimSpace(k) != want {
+			continue
+		}
+		v = strings.TrimSpace(v)
+		return v != "disabled" && v != "true"
+	}
+	return true
+}
+
 // --- none (unsupported platform) ---
 
 type noneServiceManager struct{ reason string }
@@ -172,4 +237,7 @@ func (n noneServiceManager) Action(ctx context.Context, verb, service string) (s
 }
 func (n noneServiceManager) Status(ctx context.Context, service string) (ServiceStatus, error) {
 	return ServiceStatus{}, n.errReason()
+}
+func (n noneServiceManager) IsEnabled(ctx context.Context, service string) (bool, error) {
+	return false, n.errReason()
 }
