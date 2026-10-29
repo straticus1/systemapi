@@ -27,7 +27,7 @@ SYSTEMAPI_API_KEY=<key> ./systemapi-agent \
 | `--pty-record-max-bytes` | 1 GiB | A session ends (`pty_exit` reason `stopped`, `record_error` `recording_size_limit`) once it has recorded this many bytes. |
 | `--pty-record-min-free` | 1 GiB | A session is refused (`recording_unavailable`) when the recording filesystem has less free space than this. |
 | `--sysscript-jobs` | `true` | Advertise the `sysscript_jobs` capability (Linux and macOS). `false` stops advertising it, so the server sends this host's scripts the legacy way. Windows agents never advertise it. |
-| `--state-backup-dir` | `/var/lib/systemapi/backups` | Where `sys.state` keeps file backups. Checked at startup, which fails if it does not pass: absolute and clean, every existing component (of the path as given and with symlinks resolved) a directory owned by root and not writable by group or other, a symlink allowed only inside such a directory; the resolved path is used. It must also not overlap any write grant, or file changes that need a backup fail. |
+| `--state-backup-dir` | `/var/lib/systemapi/backups` | Where `sys.state` keeps file backups. Checked at startup: absolute and clean, every existing component (of the path as given and with symlinks resolved) a directory owned by root and not writable by group or other, a symlink allowed only inside such a directory; the resolved path is used. An explicit value that fails stops the agent from starting; the default that fails only logs a warning and disables backups, so file changes that need one fail. Not supported on Windows (an explicit value is refused; backups are off). It must also not overlap any write grant, or file changes that need a backup fail. |
 | `--sysscript-workers` | 4 | Scripts that run at once (1 to 16), jobs and legacy scripts together. 8 more may wait for a worker; beyond that a script is refused `agent_busy`. |
 | `--sysscript-legacy-seconds` | 300 | Whole-script deadline of a legacy (non-job) script, 1 to 3600, cut to `--sysscript-max-seconds`. |
 | `--sysscript-max-seconds` | 3600 | Ceiling for any script deadline (1 to 3600). A job deadline beyond it is cut to it. |
@@ -264,8 +264,9 @@ takes the same arguments and only checks; it never changes the host.
 - On OpenRC, `ensure_service(..., enabled=...)` and `sys.services.enable`
   / `disable` add to and remove from the `default` runlevel only (they now
   name it; before they used `rc-update`'s own default). A service counts as
-  enabled when it is in `default` or `boot`, so disabling one that is in
-  `boot` reports `non_idempotent`.
+  enabled when it is in `default` or `boot`, so disabling one that is only
+  in `boot` most likely fails (`rc-update del <svc> default` exits non-zero)
+  and it stays enabled.
 
 `ensure_*` returns `{"changed", "status", "before", "after", "backup_id",
 "error"}` and `check_*` returns `{"status", "before", "desired", "diff",

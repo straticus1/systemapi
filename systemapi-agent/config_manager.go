@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -47,6 +48,34 @@ var backupSuffixRE = regexp.MustCompile(`^[0-9]{1,19}$`)
 // not overlap a write grant (WriteHost refuses a backup otherwise). A var so
 // tests can point it at a temp dir.
 var stateBackupDir = "/var/lib/systemapi/backups"
+
+// configureStateBackupDir sets stateBackupDir from --state-backup-dir at
+// startup. An explicit value (set) must pass checkStateBackupDir, or the
+// agent does not start; on Windows, where owners cannot be checked, an
+// explicit value is refused. The default is not worth an outage: when it
+// fails the check (or on Windows) backups are disabled with a warning, and
+// a file change that needs a backup then fails with a clear error. Nothing
+// else in the agent depends on it.
+func configureStateBackupDir(value string, set bool, goos string) error {
+	if goos == "windows" {
+		if set {
+			return fmt.Errorf("not supported on windows")
+		}
+		stateBackupDir = ""
+		return nil
+	}
+	dir, err := checkStateBackupDir(value)
+	if err != nil {
+		if set {
+			return err
+		}
+		log.Printf("WARNING: desired-state backups disabled: default backup dir %s: %v (file changes that need a backup will fail; set --state-backup-dir)", value, err)
+		stateBackupDir = ""
+		return nil
+	}
+	stateBackupDir = dir
+	return nil
+}
 
 // checkStateBackupDir validates --state-backup-dir at startup and returns
 // the path to use, its symlinks resolved so backups never go through a link

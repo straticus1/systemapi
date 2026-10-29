@@ -346,6 +346,9 @@ func (rw WriteHost) Sysctl(key, value string) error {
 // backup refuses a backup dir that overlaps a write grant, then copies the
 // current file there.
 func (rw WriteHost) backup(root, target string) error {
+	if stateBackupDir == "" {
+		return fmt.Errorf("backup: backups are disabled (the backup dir failed its startup check; see --state-backup-dir)")
+	}
 	dir := filepath.Clean(stateBackupDir)
 	if !filepath.IsAbs(dir) || writeGrantOverlaps(rw.ents.AllowFSWrite, dir) || writeGrantOverlaps(rw.ents.AllowConfigWrite, dir) {
 		return fmt.Errorf("backup: backup dir overlaps a write grant")

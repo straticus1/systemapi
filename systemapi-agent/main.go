@@ -86,14 +86,11 @@ func main() {
 	sysscriptMaxFlag := flag.Int("sysscript-max-seconds", jobMaxSecondsMax, fmt.Sprintf("ceiling for any sysscript deadline (1..%d)", jobMaxSecondsMax))
 	stateBackupDirFlag := flag.String("state-backup-dir", stateBackupDir, "directory for desired-state file backups (absolute, root-only; must not overlap any write grant, or file changes that need a backup fail)")
 	flag.Parse()
-	// Windows has no default backup dir path to check; an explicit one is.
-	if runtime.GOOS != "windows" || *stateBackupDirFlag != stateBackupDir {
-		backupDir, err := checkStateBackupDir(*stateBackupDirFlag)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: --state-backup-dir: %v\n", err)
-			os.Exit(2)
-		}
-		stateBackupDir = backupDir
+	backupDirSet := false
+	flag.Visit(func(f *flag.Flag) { backupDirSet = backupDirSet || f.Name == "state-backup-dir" })
+	if err := configureStateBackupDir(*stateBackupDirFlag, backupDirSet, runtime.GOOS); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: --state-backup-dir: %v\n", err)
+		os.Exit(2)
 	}
 	sysscriptJobsOn = *sysscriptJobsFlag
 	jc, err := parseJobFlags(*sysscriptWorkersFlag, *sysscriptLegacyFlag, *sysscriptMaxFlag)

@@ -191,8 +191,9 @@ func (m openrcServiceManager) Status(ctx context.Context, service string) (Servi
 
 // IsEnabled reports whether the service is in the default or the boot
 // runlevel: either starts it at boot. Action's enable and disable add to and
-// remove from default only, so a service enabled in boot stays enabled
-// after a disable (reported honestly as non_idempotent by sys.state).
+// remove from default only, so disabling a service that is only in boot
+// most likely fails (rc-update del <svc> default exits non-zero) and the
+// service stays enabled.
 func (m openrcServiceManager) IsEnabled(ctx context.Context, service string) (bool, error) {
 	if !serviceNameRE.MatchString(service) {
 		return false, fmt.Errorf("service not allowed")

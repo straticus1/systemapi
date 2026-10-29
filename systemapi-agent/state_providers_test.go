@@ -692,3 +692,42 @@ func TestCheckStateBackupDir(t *testing.T) {
 		t.Fatalf("resolved to %q", got)
 	}
 }
+
+func TestConfigureStateBackupDir(t *testing.T) {
+	old := stateBackupDir
+	t.Cleanup(func() { stateBackupDir = old })
+	open := realTempDir(t)
+	if err := os.Chmod(open, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	bad := filepath.Join(open, "backups")
+	// Explicit and failing: the agent must not start.
+	if err := configureStateBackupDir(bad, true, "linux"); err == nil {
+		t.Fatal("explicit bad dir accepted")
+	}
+	// Default and failing: warn, disable backups, keep running.
+	stateBackupDir = old
+	if err := configureStateBackupDir(bad, false, "linux"); err != nil {
+		t.Fatalf("default bad dir stopped startup: %v", err)
+	}
+	if stateBackupDir != "" {
+		t.Fatalf("backups not disabled: %q", stateBackupDir)
+	}
+	err := newWriteHost(&Entitlements{}, newFakeHost()).backup("/srv", "/srv/a")
+	if err == nil || !strings.Contains(err.Error(), "backups are disabled") {
+		t.Fatalf("backup with backups disabled: %v", err)
+	}
+	// A good dir is used resolved, whether explicit or default.
+	for _, set := range []bool{true, false} {
+		if err := configureStateBackupDir("/var/lib/systemapi-test-missing/backups", set, "linux"); err != nil || stateBackupDir == "" {
+			t.Fatalf("set=%v: %v %q", set, err, stateBackupDir)
+		}
+	}
+	// Windows: explicit refused, default disabled.
+	if err := configureStateBackupDir(`C:\backups`, true, "windows"); err == nil {
+		t.Fatal("explicit windows dir accepted")
+	}
+	if err := configureStateBackupDir(old, false, "windows"); err != nil || stateBackupDir != "" {
+		t.Fatalf("windows default: %v %q", err, stateBackupDir)
+	}
+}
