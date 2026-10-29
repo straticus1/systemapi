@@ -154,18 +154,18 @@ anything not granted is refused. The control plane clamps them first:
 | --- | --- | --- |
 | `allow_exec` | bool | `sys.exec.run`, `sys.proc.kill` |
 | `allow_fs_read` | path list | `sys.fs.read`, `stat`, `glob`; `sys.config.backup` |
-| `allow_fs_write` | path list | `sys.fs.write`, `mkdir`, `rm`, `chmod`; `sys.config.restore` |
+| `allow_fs_write` | path list | `sys.fs.write`, `mkdir`, `rm`, `chmod`; `sys.config.restore`; `sys.state` file, directory, absent |
 | `allow_net_outbound` | host list | `sys.net.http_get` |
-| `allow_config_write` | path list | `sys.config.write`, `restore` |
-| `allow_service_reload` | name list | `sys.config.reload`, `sys.services.*` actions |
-| `allow_packages` | exact list | `sys.packages.install` |
+| `allow_config_write` | path list | `sys.config.write`, `restore`; `sys.state` file |
+| `allow_service_reload` | name list | `sys.config.reload`, `sys.services.*` actions; `sys.state` service (exact names only) |
+| `allow_packages` | exact list | `sys.packages.install`; `sys.state` package |
 | `allow_containers` | bool | the `sys.containers` module |
 | `allow_images` | exact list | `sys.containers.run` |
 | `allow_k3s`, `allow_k8s` | bool | the `sys.k3s` / `sys.k8s` modules |
 | `allow_k3s_namespaces`, `allow_k8s_namespaces` | exact list | namespaces those modules may touch |
 | `allow_linux` | bool | `sys.linux`, `sys.disk`, `sys.procfs` (Linux hosts only) |
 | `allow_mount_targets` | exact list | `sys.disk.mount`, `umount` |
-| `allow_sysctl` | exact list | `sys.procfs.sysctl_get`, `sysctl_set` (some keys are always denied) |
+| `allow_sysctl` | exact list | `sys.procfs.sysctl_get`, `sysctl_set`, `sys.state` sysctl (some keys are always denied) |
 | `allow_net_manage` | exact list | `sys.net.set_address`, `set_route`, `link_up`, `link_down`, `set_dns` |
 
 A JSON boolean in a list field grants nothing, and `"*"` is dropped.
@@ -193,6 +193,7 @@ The other list fields are passed through for admins.
 | `sys.linux` | `os_release`, `uname`, `hostname`, `uptime`, `users`, `groups` |
 | `sys.disk` | `mounts`, `usage`, `block_devices`, `mount`, `umount` |
 | `sys.procfs` | `read`, `sysctl_get`, `sysctl_set` |
+| `sys.state` | `ensure_file`, `ensure_directory`, `ensure_absent`, `ensure_package`, `ensure_service`, `ensure_sysctl`, and a `check_` form of each (see below) |
 
 Not implemented:
 
@@ -206,4 +207,60 @@ Example:
 ```python
 r = sys.exec.run("df", "-h")
 print(r["output"])
+```
+
+### `sys.state`: idempotent resources
+
+`sys.state.ensure_<kind>(...)` checks one resource and, only when it differs
+from the arguments, changes it and checks it again. `sys.state.check_<kind>(...)`
+takes the same arguments and only checks; it never changes the host.
+
+| Verb | Arguments | Grant (checked for check and ensure) |
+| --- | --- | --- |
+| `file` | `path, content, mode="0644", owner="", group="", sensitive=False` | path under `allow_config_write` or `allow_fs_write` |
+| `directory` | `path, mode="0755", owner="", group=""` | path under `allow_fs_write` |
+| `absent` | `path` | path under `allow_fs_write` |
+| `package` | `name, present=True, version=None` | `name` in `allow_packages` |
+| `service` | `name, running=True, enabled=True` | `name` in `allow_service_reload` (exactly; `"*"` does not count) |
+| `sysctl` | `key, value` | `key` in `allow_sysctl`, plus `allow_linux` |
+
+- Paths must be absolute and clean. A mode is octal, at most `0777`. `owner`
+  and `group` are names or numeric ids; empty leaves them as they are.
+- `file` compares content, mode and owner. It replaces the file atomically
+  (a temp file in the same directory, renamed over it) with the given mode
+  and owner. A symlink at the path is replaced, never followed. A file with
+  more than one hard link is not read and the call fails.
+- Before a file is replaced or removed, its content is copied to
+  `/var/lib/systemapi/backups/<sha256 of the path>/<unix ns>` (directory
+  0700, file 0600); the newest 5 are kept per path. Nothing is written beside
+  the target. The backup directory may not overlap a write grant; if it
+  does, the change fails.
+- `absent` removes a file, a symlink or an empty directory, never
+  recursively.
+- `sensitive=True` reports only whether the content matches: no hash, size
+  or diff.
+- `version=` is check-only: a different installed version is reported as
+  drift, and `ensure_package` then fails with `version_pin_unsupported`
+  without calling the package manager.
+- `directory` creates missing parents.
+
+`ensure_*` returns `{"changed", "status", "before", "after", "backup_id",
+"error"}` and `check_*` returns `{"status", "before", "desired", "diff",
+"error"}`. `status` is one of:
+
+| Status | Meaning |
+| --- | --- |
+| `ok` | already as declared |
+| `drift` | differs (check) |
+| `changed` | changed, and the check after the change found nothing left (ensure) |
+| `denied` | outside the grants; the host was not touched |
+| `failed` | an error, or `non_idempotent` when the check after the change still found a difference |
+| `skipped` | the script's deadline or cancel came first |
+
+Invalid arguments (a relative path, a bad mode, an invalid name) raise an
+error instead.
+
+```python
+r = sys.state.ensure_file("/etc/app/app.conf", "port=8080\n", mode="0640", owner="app")
+print(r["status"], r["changed"], r["error"])
 ```

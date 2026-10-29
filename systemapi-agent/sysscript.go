@@ -174,6 +174,9 @@ type SysscriptEngine struct {
 	k3sClient    *K3sClient
 	k8sClient    *K3sClient
 	alerts       *alertSink // sys.alerts.push delivery; nil means not connected
+	// stateBackend is the host sys.state acts on; nil is the real host.
+	// Tests set a fake.
+	stateBackend *hostBackend
 	// outputTruncated is set by Execute when printed output passed
 	// scriptOutputMax.
 	outputTruncated bool
@@ -416,6 +419,7 @@ func (engine *SysscriptEngine) buildSysModule() *starlarkstruct.Struct {
 		"json":     starlarkstruct.FromStringDict(starlark.String("json"), sysJSON),
 		"ini":      starlarkstruct.FromStringDict(starlark.String("ini"), sysINI),
 		"services": starlarkstruct.FromStringDict(starlark.String("services"), sysSvc),
+		"state":    engine.stateModule(),
 	}
 
 	// D-11: containers namespace absent when not entitled
