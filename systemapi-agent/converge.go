@@ -22,8 +22,9 @@ package main
 // side-effect-free FuncMap: no now, env or file function, no define, block
 // or template action (so no recursion), a range iteration budget charged
 // before each range runs, a context check at every range iteration and
-// every write, an output cap per call and per run, and every text-producing
-// function (printf, print, join, indent, quote, ...) refusing a value over
+// every write, an output cap per call and per run, formatting functions
+// taking at most 64 scalar arguments (a list or map is refused before fmt
+// expands it), and every text-producing function refusing a value over
 // the per-call cap and charging its length to a per-run byte budget, so a
 // value doubled through a variable stays bounded although it is never
 // written; a top-level generated_at var is refused so no timestamp can enter
@@ -34,9 +35,12 @@ package main
 // a change to a sensitive file's content (whose facts carry no hash) changes
 // it. Starlark has no allocation accounting: starlark-go caps one allocation
 // at 1 GiB, and heapWatchdog cancels the declaration once the process heap
-// has grown by convergeHeapMax (512 MiB) since it started. Does NOT make that
-// exact: the heap is process-wide and sampled every 20 ms, so a single large
-// allocation lands before the cancel. Resource keys (paths, names) are the
+// has grown by convergeHeapMax (512 MiB) over the lowest heap it has seen
+// during the run. It is a backstop, not a bound: the heap is process-wide
+// and sampled every 20 ms, a single large allocation lands before the
+// cancel, and it cannot interrupt a Go builtin. Masking is best effort: a
+// shorter or transformed var, or one inside a resource key, is not masked;
+// error text is masked whole before it is capped. Resource keys (paths, names) are the
 // plan's identity and are reported as declared, even when built from vars.
 
 import (
@@ -83,6 +87,7 @@ const (
 	templateIndentMax       = 64
 	templatePrintfWidthMax  = 256
 	templateFuncBytesMax    = 4 << 20 // bytes FuncMap calls may produce per run
+	templateArgsMax         = 64
 	hostFieldMax            = 253
 	hostTagsMax             = 32
 )
@@ -566,7 +571,9 @@ func declare(ctx context.Context, b *convergeBundle, printer *maskedPrinter) ([]
 				code = "too_many_steps"
 			}
 		}
-		return nil, &codedError{code: code, detail: capText(err.Error(), stateErrorMax)}
+		// Not capped here: convergeRun masks the whole text, then caps it,
+		// so a var cut at the cap cannot leak a prefix.
+		return nil, &codedError{code: code, detail: err.Error()}
 	}
 	for _, r := range d.resources {
 		s, ok := r.(*serviceResource)
@@ -618,7 +625,11 @@ func heapWatchdog(threads *threadSet) func() bool {
 			case <-done:
 				return
 			case <-t.C:
-				if h := heapBytes(); h > base && h-base > convergeHeapMax {
+				h := heapBytes()
+				if h < base {
+					base = h // garbage collected since: a lower baseline
+				}
+				if h-base > convergeHeapMax {
 					fired.Store(true)
 					threads.cancelAll("memory budget exceeded")
 					return
@@ -765,6 +776,22 @@ func templatePrintf(format string, args ...any) (string, error) {
 	return fmt.Sprintf(format, args...), nil
 }
 
+// templateScalar reports whether fmt formats v in bounded space: nil, a
+// string (sized separately), a boolean or a number.
+func templateScalar(v any) bool {
+	if v == nil {
+		return true
+	}
+	switch reflect.ValueOf(v).Kind() {
+	case reflect.String, reflect.Bool,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64:
+		return true
+	}
+	return false
+}
+
 // templateFuncs is the fixed FuncMap. Every function that returns text
 // refuses a result over templateCallMax and charges its length to the run's
 // funcBytes budget, so a value grown through variables ($x = printf "%s%s"
@@ -786,11 +813,19 @@ func templateFuncs(ctx context.Context, budget *templateBudget) template.FuncMap
 		}
 		return s, nil
 	}
-	// argsFit refuses string arguments whose total is already over the cap,
-	// before any formatting allocates.
+	// argsFit refuses arguments that fmt could expand without bound before
+	// charge sees the result: more than templateArgsMax arguments, any that
+	// is not a scalar (a list or map of data could be formatted many times
+	// over), or strings over the cap in total.
 	argsFit := func(args []any) error {
+		if len(args) > templateArgsMax {
+			return &codedError{code: "template_bad_arg", detail: fmt.Sprintf("more than %d arguments", templateArgsMax)}
+		}
 		n := 0
 		for _, a := range args {
+			if !templateScalar(a) {
+				return &codedError{code: "template_bad_arg", detail: "only strings, numbers, booleans and nil can be formatted"}
+			}
 			if s, ok := a.(string); ok {
 				n += len(s)
 			}
@@ -821,11 +856,20 @@ func templateFuncs(ctx context.Context, budget *templateBudget) template.FuncMap
 			parts := make([]string, rv.Len())
 			n := 0
 			for i := range parts {
-				parts[i] = fmt.Sprint(rv.Index(i).Interface())
-				n += len(parts[i]) + len(sep)
-				if n > templateCallMax {
-					return charge(strings.Repeat(" ", n))
+				e := rv.Index(i).Interface()
+				if !templateScalar(e) {
+					return "", &codedError{code: "template_bad_arg", detail: "join takes a list of strings, numbers or booleans"}
 				}
+				if s, ok := e.(string); ok {
+					n += len(s)
+				} else {
+					n += 32 // a formatted number or boolean
+				}
+				n += len(sep)
+				if n > templateCallMax {
+					return "", &codedError{code: "template_output_too_large", detail: fmt.Sprintf("a template value exceeds %d bytes", templateCallMax)}
+				}
+				parts[i] = fmt.Sprint(e)
 			}
 			return charge(strings.Join(parts, sep))
 		},
@@ -1032,6 +1076,7 @@ type planItem struct {
 	service int    // the service's index for a restart
 	status  string // for a restart line
 	errText string
+	errFull string
 }
 
 // buildPlan orders the resources and their restart lines. A service's
@@ -1139,6 +1184,7 @@ type reportResource struct {
 	Diff      string  `json:"diff"`
 	Error     string  `json:"error"`
 	BackupID  *string `json:"backup_id"`
+	errFull   string  // uncapped error, for masking; not reported
 }
 
 type convergeReport struct {
@@ -1164,7 +1210,7 @@ func convergeRun(ctx context.Context, req convergeRequest, b hostBackend) conver
 		s := rep.Summary
 		if err != nil {
 			res.Status = "failed"
-			res.ErrorCode, res.Error = "error", capText(err.Error(), stateErrorMax)
+			res.ErrorCode = "error"
 			var ce *codedError
 			switch {
 			case errors.As(err, &ce):
@@ -1178,12 +1224,17 @@ func convergeRun(ctx context.Context, req convergeRequest, b hostBackend) conver
 			res.Status = "failed"
 		}
 		// Error text can quote a vars value (fail(state.vars["pw"]), a
-		// missing dict key, a path built from vars): mask it as print is.
-		if printer.masks(res.Error) {
-			res.Error = res.ErrorCode + ": [masked]"
+		// missing dict key, a path built from vars): mask it as print is,
+		// on the whole text before it is capped.
+		if err != nil {
+			if full := err.Error(); printer.masks(full) {
+				res.Error = res.ErrorCode + ": [masked]"
+			} else {
+				res.Error = capText(full, stateErrorMax)
+			}
 		}
 		for i := range rep.Resources {
-			if printer.masks(rep.Resources[i].Error) {
+			if printer.masks(rep.Resources[i].errFull) || printer.masks(rep.Resources[i].Error) {
 				rep.Resources[i].Error = "[masked]"
 			}
 		}
@@ -1274,7 +1325,7 @@ func applyPlan(ctx context.Context, req convergeRequest, b hostBackend, ro ReadO
 			continue
 		}
 		if err := rw.Service(ctx, "restart", svc.name); err != nil {
-			p.status, p.errText, stopped = statusFailed, stateErrText(err), true
+			p.status, p.errText, p.errFull, stopped = statusFailed, stateErrText(err), err.Error(), true
 			if errors.Is(err, errStateDenied) {
 				p.status = statusDenied
 			}
@@ -1292,12 +1343,12 @@ func applyPlan(ctx context.Context, req convergeRequest, b hostBackend, ro ReadO
 func fillReport(rep *convergeReport, plan []planItem, resources []Applier, results []resourceResult) {
 	for _, p := range plan {
 		line := reportPlanLine{Key: p.key(resources), Status: p.status}
-		rr := reportResource{Key: line.Key, Kind: "restart", Status: p.status, Error: p.errText}
+		rr := reportResource{Key: line.Key, Kind: "restart", Status: p.status, Error: p.errText, errFull: p.errFull}
 		if p.res >= 0 {
 			r := results[p.res]
 			line.Status = r.Status
 			rr = reportResource{Key: r.Key, Kind: r.Kind, Status: r.Status, Sensitive: r.Sensitive,
-				Before: r.Before, Desired: r.Desired, Error: r.Error}
+				Before: r.Before, Desired: r.Desired, Error: r.Error, errFull: r.errFull}
 			if !r.Sensitive {
 				rr.Diff = r.Diff
 			}

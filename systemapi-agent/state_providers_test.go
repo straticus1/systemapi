@@ -657,3 +657,38 @@ func TestNoneServiceManagerIsEnabledFailsClosed(t *testing.T) {
 		t.Fatal("none backend reported an enabled state")
 	}
 }
+
+func TestCheckStateBackupDir(t *testing.T) {
+	for _, bad := range []string{"", "relative", "/", "/var/../tmp"} {
+		if _, err := checkStateBackupDir(bad); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+	// A group/other-writable directory (or, when not root, one we own) is
+	// refused, as is a path through it.
+	open := realTempDir(t)
+	if err := os.Chmod(open, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{open, filepath.Join(open, "backups")} {
+		if _, err := checkStateBackupDir(p); err == nil {
+			t.Errorf("%s accepted", p)
+		}
+	}
+	// A symlink to an acceptable place is resolved, never kept.
+	link := filepath.Join(open, "link")
+	if err := os.Symlink("/", link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := checkStateBackupDir(filepath.Join(link, "var")); err == nil {
+		t.Error("a path through a link in an open dir accepted")
+	}
+	// Root-owned system directories with a missing tail are accepted.
+	got, err := checkStateBackupDir("/var/lib/systemapi-test-missing/backups")
+	if err != nil {
+		t.Fatalf("default-like dir refused: %v", err)
+	}
+	if !strings.HasSuffix(got, "/lib/systemapi-test-missing/backups") {
+		t.Fatalf("resolved to %q", got)
+	}
+}

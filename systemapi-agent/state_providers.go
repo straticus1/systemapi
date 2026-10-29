@@ -892,9 +892,17 @@ type resourceResult struct {
 	Error     string
 	BackupID  string
 	diff      Diff
+	// errFull is the uncapped error text, for masking before the cap.
+	errFull string
 }
 
 func stateErrText(err error) string { return capText(err.Error(), stateErrorMax) }
+
+// setErr records err as the result's status and error, capped for display
+// and kept whole in errFull.
+func (res *resourceResult) setErr(status string, err error) {
+	res.Status, res.Error, res.errFull = status, stateErrText(err), err.Error()
+}
 
 // checkResource runs Check and classifies it as ok, drift, failed or denied
 // (skipped once ctx has ended).
@@ -908,9 +916,9 @@ func checkResource(ctx context.Context, c Checker, ro ReadOnlyHost) resourceResu
 	res.Before, res.diff = before, d
 	switch {
 	case errors.Is(err, errStateDenied):
-		res.Status, res.Error = statusDenied, stateErrText(err)
+		res.setErr(statusDenied, err)
 	case err != nil:
-		res.Status, res.Error = statusFailed, stateErrText(err)
+		res.setErr(statusFailed, err)
 	case d.Empty():
 		res.Status = statusOK
 	default:
@@ -949,7 +957,7 @@ func applyChecked(ctx context.Context, a Applier, ro ReadOnlyHost, rw WriteHost,
 	err := a.Apply(ctx, rw, res.diff)
 	res.BackupID = backupID
 	if err != nil {
-		res.Status, res.Error = statusFailed, stateErrText(err)
+		res.setErr(statusFailed, err)
 		if errors.Is(err, errStateDenied) {
 			res.Status = statusDenied
 		}
@@ -959,7 +967,7 @@ func applyChecked(ctx context.Context, a Applier, ro ReadOnlyHost, rw WriteHost,
 	res.After = after
 	switch {
 	case err != nil:
-		res.Status, res.Error = statusFailed, stateErrText(fmt.Errorf("verify: %w", err))
+		res.setErr(statusFailed, fmt.Errorf("verify: %w", err))
 	case !d.Empty():
 		res.Status = statusFailed
 		res.Error = (&codedError{code: "non_idempotent", detail: strings.Join(d.Fields, ",") + " still differ"}).Error()

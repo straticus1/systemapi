@@ -48,6 +48,66 @@ var backupSuffixRE = regexp.MustCompile(`^[0-9]{1,19}$`)
 // tests can point it at a temp dir.
 var stateBackupDir = "/var/lib/systemapi/backups"
 
+// checkStateBackupDir validates --state-backup-dir at startup and returns
+// the path to use, its symlinks resolved so backups never go through a link
+// someone could later repoint. On unix, every existing component of both
+// the given and the resolved path must be a directory owned by root and not
+// writable by group or other; a symlink is accepted only inside such a
+// directory (as /var is on macOS). Components that do not exist yet are
+// created 0700 by the first backup. The agent runs as root in production.
+func checkStateBackupDir(dir string) (string, error) {
+	if !statePathOK(dir) {
+		return "", fmt.Errorf("must be an absolute, clean path other than /")
+	}
+	if err := checkRootOnlyPath(dir); err != nil {
+		return "", err
+	}
+	real, err := resolveExisting(dir)
+	if err != nil {
+		return "", fmt.Errorf("resolve %s: %w", dir, err)
+	}
+	if err := checkRootOnlyPath(real); err != nil {
+		return "", err
+	}
+	return real, nil
+}
+
+// checkRootOnlyPath walks the existing prefixes of p from the root, so each
+// one's parent was checked before it.
+func checkRootOnlyPath(p string) error {
+	var prefixes []string
+	for q := p; ; q = filepath.Dir(q) {
+		prefixes = append([]string{q}, prefixes...)
+		if filepath.Dir(q) == q {
+			break
+		}
+	}
+	for _, q := range prefixes {
+		fi, err := os.Lstat(q)
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			continue // its parent is root-only (checked), so is the link
+		}
+		if !fi.IsDir() {
+			return fmt.Errorf("%s is not a directory", q)
+		}
+		if uid, _, ok := fileOwnerIDs(fi); ok {
+			if uid != 0 {
+				return fmt.Errorf("%s is not owned by root", q)
+			}
+			if fi.Mode().Perm()&0o022 != 0 {
+				return fmt.Errorf("%s is writable by group or other", q)
+			}
+		}
+	}
+	return nil
+}
+
 // stateBackupKeep is how many backups are kept per path.
 const stateBackupKeep = 5
 

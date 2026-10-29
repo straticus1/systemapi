@@ -27,7 +27,7 @@ SYSTEMAPI_API_KEY=<key> ./systemapi-agent \
 | `--pty-record-max-bytes` | 1 GiB | A session ends (`pty_exit` reason `stopped`, `record_error` `recording_size_limit`) once it has recorded this many bytes. |
 | `--pty-record-min-free` | 1 GiB | A session is refused (`recording_unavailable`) when the recording filesystem has less free space than this. |
 | `--sysscript-jobs` | `true` | Advertise the `sysscript_jobs` capability (Linux and macOS). `false` stops advertising it, so the server sends this host's scripts the legacy way. Windows agents never advertise it. |
-| `--state-backup-dir` | `/var/lib/systemapi/backups` | Where `sys.state` keeps file backups (absolute, root-only). It must not overlap any write grant, or file changes that need a backup fail. |
+| `--state-backup-dir` | `/var/lib/systemapi/backups` | Where `sys.state` keeps file backups. Checked at startup, which fails if it does not pass: absolute and clean, every existing component (of the path as given and with symlinks resolved) a directory owned by root and not writable by group or other, a symlink allowed only inside such a directory; the resolved path is used. It must also not overlap any write grant, or file changes that need a backup fail. |
 | `--sysscript-workers` | 4 | Scripts that run at once (1 to 16), jobs and legacy scripts together. 8 more may wait for a worker; beyond that a script is refused `agent_busy`. |
 | `--sysscript-legacy-seconds` | 300 | Whole-script deadline of a legacy (non-job) script, 1 to 3600, cut to `--sysscript-max-seconds`. |
 | `--sysscript-max-seconds` | 3600 | Ceiling for any script deadline (1 to 3600). A job deadline beyond it is cut to it. |
@@ -249,11 +249,23 @@ takes the same arguments and only checks; it never changes the host.
 - `absent` removes a file, a symlink or an empty directory, never
   recursively.
 - `sensitive=True` reports only whether the content matches: no hash, size
-  or diff. Its mode defaults to `0600`.
+  or diff. Its mode defaults to `0600`. Use it for any file that holds a
+  secret; it is the only reliable protection.
+- Masking of vars in converge `print()` output and error text is best
+  effort: a line or error holding a vars value of 8 bytes or more (as is,
+  or in JSON form) is replaced by `[masked]`. A shorter value, a transformed
+  one (upper-cased, split, hashed, base64) and a value inside a resource key
+  or path are not masked. Keep secrets out of paths and names, and mark the
+  files that carry them `sensitive=True`.
 - `version=` is check-only: a different installed version is reported as
   drift, and `ensure_package` then fails with `version_pin_unsupported`
   without calling the package manager.
 - `directory` creates missing parents.
+- On OpenRC, `ensure_service(..., enabled=...)` and `sys.services.enable`
+  / `disable` add to and remove from the `default` runlevel only (they now
+  name it; before they used `rc-update`'s own default). A service counts as
+  enabled when it is in `default` or `boot`, so disabling one that is in
+  `boot` reports `non_idempotent`.
 
 `ensure_*` returns `{"changed", "status", "before", "after", "backup_id",
 "error"}` and `check_*` returns `{"status", "before", "desired", "diff",

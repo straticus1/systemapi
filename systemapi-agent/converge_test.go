@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -633,5 +634,82 @@ func TestConvergeDiffCapped(t *testing.T) {
 	d := rep.Resources[0].Diff
 	if len(d) > stateDiffMax+64 || !strings.HasSuffix(d, "[diff truncated]\n") {
 		t.Fatalf("diff %d bytes", len(d))
+	}
+}
+
+// allocDuring returns the bytes allocated while f runs.
+func allocDuring(f func()) uint64 {
+	var a, b runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&a)
+	f()
+	runtime.ReadMemStats(&b)
+	return b.TotalAlloc - a.TotalAlloc
+}
+
+// Re-review B1: a list or map argument is refused before fmt formats it,
+// so 1500 copies of a 900 KB value never get built.
+func TestTemplateContainerArgsRefusedCheaply(t *testing.T) {
+	big := strings.Repeat("x", 900000)
+	data := map[string]any{"l": []any{big}, "m": map[string]any{"k": big}, "s": big}
+	cases := map[string]string{
+		"printf list": `{{$x := printf "` + strings.Repeat("%v", 1500) + `" ` + strings.Repeat(".l ", 1500) + `}}ok`,
+		"print map":   `{{$x := print ` + strings.Repeat(".m ", 60) + `}}ok`,
+		"println":     `{{println .l}}`,
+		"html":        `{{html .m}}`,
+		"js":          `{{js .l}}`,
+		"urlquery":    `{{urlquery .l}}`,
+		"quote":       `{{quote .l}}`,
+		"join nested": `{{join (slice .ll 0) ","}}`,
+		"many args":   `{{print ` + strings.Repeat("1 ", 65) + `}}`,
+		"big strings": `{{printf "%s%s" .s .s}}`,
+	}
+	data["ll"] = []any{[]any{big}, []any{big}}
+	for name, src := range cases {
+		var err error
+		n := allocDuring(func() {
+			b := templateBudget{rangeLeft: templateRangeBudget}
+			_, err = renderTemplate(context.Background(), src, data, &b)
+		})
+		var ce *codedError
+		if err == nil || !errors.As(err, &ce) || (ce.code != "template_bad_arg" && ce.code != "template_output_too_large") {
+			t.Errorf("%s: %v", name, err)
+		}
+		if n > 10<<20 {
+			t.Errorf("%s: allocated %d bytes", name, n)
+		}
+	}
+	// Scalars still format.
+	b := templateBudget{rangeLeft: templateRangeBudget}
+	out, err := renderTemplate(context.Background(), `{{printf "%s-%d-%v-%.1f" "a" 1 true 2.5}} {{print 1 "b" nil}} {{join .j ","}}`,
+		map[string]any{"j": []any{"x", int64(2), true}}, &b)
+	if err != nil || out != "a-1-true-2.5 1b<nil> x,2,true" {
+		t.Fatalf("%q %v", out, err)
+	}
+}
+
+// Re-review 2: a var straddling the error cap is masked, not cut to a
+// leaking prefix.
+func TestConvergeErrorMaskedBeforeCap(t *testing.T) {
+	vars := map[string]any{"pw": "hunter2-supersecret"}
+	for k := 975; k <= 1005; k++ {
+		h := newFakeHost()
+		built := 0
+		main := fmt.Sprintf(`fail("A" * %d + state.vars["pw"])`, k)
+		res := runCheck(t, bundleJSON(t, map[string]string{"main.star": main}, vars), h, &built)
+		if strings.Contains(res.Error, "hunter") || !strings.HasSuffix(res.Error, "[masked]") {
+			t.Fatalf("k=%d: %q", k, res.Error[max(0, len(res.Error)-40):])
+		}
+	}
+	// A resource error longer than the cap, quoting a path from vars.
+	long := "/srv/app/" + strings.Repeat("d", 1000) + "/hunter2-supersecret"
+	h := newFakeHost()
+	built := 0
+	ents := convergeGrants()
+	ents.AllowFSWrite = nil
+	res := convergeRun(context.Background(), convergeRequest{BundleJSON: bundleJSON(t, map[string]string{"main.star": `state.file(state.vars["p"], "x")`},
+		map[string]any{"p": long}), Ents: ents, Mode: "check", ExpectPlan: "-"}, countingBackend(h, &built))
+	if !strings.Contains(string(res.Report), `"error":"[masked]"`) {
+		t.Fatalf("report %s", res.Report)
 	}
 }

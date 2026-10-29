@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -85,11 +86,15 @@ func main() {
 	sysscriptMaxFlag := flag.Int("sysscript-max-seconds", jobMaxSecondsMax, fmt.Sprintf("ceiling for any sysscript deadline (1..%d)", jobMaxSecondsMax))
 	stateBackupDirFlag := flag.String("state-backup-dir", stateBackupDir, "directory for desired-state file backups (absolute, root-only; must not overlap any write grant, or file changes that need a backup fail)")
 	flag.Parse()
-	if !statePathOK(*stateBackupDirFlag) {
-		fmt.Fprintln(os.Stderr, "Error: --state-backup-dir must be an absolute, clean path other than /")
-		os.Exit(2)
+	// Windows has no default backup dir path to check; an explicit one is.
+	if runtime.GOOS != "windows" || *stateBackupDirFlag != stateBackupDir {
+		backupDir, err := checkStateBackupDir(*stateBackupDirFlag)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: --state-backup-dir: %v\n", err)
+			os.Exit(2)
+		}
+		stateBackupDir = backupDir
 	}
-	stateBackupDir = *stateBackupDirFlag
 	sysscriptJobsOn = *sysscriptJobsFlag
 	jc, err := parseJobFlags(*sysscriptWorkersFlag, *sysscriptLegacyFlag, *sysscriptMaxFlag)
 	if err != nil {

@@ -189,20 +189,24 @@ func (m openrcServiceManager) Status(ctx context.Context, service string) (Servi
 	return ServiceStatus{Active: active, State: state, Output: text}, nil
 }
 
-// IsEnabled reports whether the service is in the default runlevel, the
-// level Action's enable and disable add to and remove from.
+// IsEnabled reports whether the service is in the default or the boot
+// runlevel: either starts it at boot. Action's enable and disable add to and
+// remove from default only, so a service enabled in boot stays enabled
+// after a disable (reported honestly as non_idempotent by sys.state).
 func (m openrcServiceManager) IsEnabled(ctx context.Context, service string) (bool, error) {
 	if !serviceNameRE.MatchString(service) {
 		return false, fmt.Errorf("service not allowed")
 	}
-	_, err := os.Lstat(filepath.Join("/etc/runlevels/default", service))
-	if err == nil {
-		return true, nil
+	for _, level := range []string{"default", "boot"} {
+		_, err := os.Lstat(filepath.Join("/etc/runlevels", level, service))
+		if err == nil {
+			return true, nil
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return false, err
+		}
 	}
-	if errors.Is(err, fs.ErrNotExist) {
-		return false, nil
-	}
-	return false, err
+	return false, nil
 }
 
 // launchdEnabledFrom reads `launchctl print-disabled system` output. A
