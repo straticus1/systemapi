@@ -34,6 +34,29 @@ cleanup() {
 trap cleanup EXIT
 trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
+
+# Preflight: the agent refuses a recorded PTY (recording_disk_low,
+# systemapi-agent/recorder.go) when the Docker VM has under its default
+# --pty-record-min-free (1 GiB), which otherwise shows up as an opaque
+# terminal timeout. Check free space on the same storage containers use by
+# running df inside the already-pinned agent image, and fail early with
+# room to spare.
+FREE_BYTES=$(docker run --rm --label "$LABEL" "$AGENT_IMAGE" df -B1 / | awk 'NR==2 {print $4}')
+case "$FREE_BYTES" in
+  '' | *[!0-9]*)
+    echo "could not read free disk space from the agent image ($AGENT_IMAGE); check Docker is running" >&2
+    exit 1
+    ;;
+esac
+MIN_FREE_BYTES=$((2 * 1024 * 1024 * 1024))
+if [ "$FREE_BYTES" -lt "$MIN_FREE_BYTES" ]; then
+  FREE_GIB=$(awk -v b="$FREE_BYTES" 'BEGIN { printf "%.2f", b / 1073741824 }')
+  echo "Docker VM disk has only ${FREE_GIB} GiB free; the agent needs >= 1 GiB free" \
+    "(--pty-record-min-free, systemapi-agent/recorder.go) to record a PTY and refuses" \
+    "with recording_disk_low below that. Free up Docker Desktop disk space and retry." >&2
+  exit 1
+fi
+
 WORK=$(mktemp -d)
 
 # Only systemapi-agent/ is mounted, read-only; the binary goes to /out.
