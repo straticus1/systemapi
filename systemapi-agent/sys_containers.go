@@ -538,22 +538,24 @@ func (w *capWriter) Write(p []byte) (int, error) {
 }
 
 // writeGrantOverlaps reports whether a write grant covers path or lies
-// inside it. Both sides are compared cleaned and with symlinks resolved.
+// inside it. Grants are read with the one grant rule's shape (fsGrantShape):
+// a malformed grant matches nothing in fsGrantRootPath, so nothing can be
+// written through it and it cannot overlap. Both sides are compared as given
+// and with symlinks resolved; a grant that cannot be resolved fails closed.
 func writeGrantOverlaps(allow []string, path string) bool {
 	for _, prefix := range allow {
 		if prefix == "*" {
 			return true
 		}
-		if prefix == "" || !filepath.IsAbs(prefix) {
+		prefix, ok := fsGrantShape(prefix)
+		if !ok {
 			continue
 		}
-		forms := []string{filepath.Clean(prefix)}
-		if real, err := resolveExisting(filepath.Clean(prefix)); err == nil {
-			forms = append(forms, real)
-		} else {
+		real, err := resolveExisting(prefix)
+		if err != nil {
 			return true // an unresolvable grant fails closed
 		}
-		for _, p := range forms {
+		for _, p := range []string{prefix, real} {
 			if pathWithin(p, path) || pathWithin(path, p) {
 				return true
 			}
@@ -570,24 +572,28 @@ func (engine *SysscriptEngine) composeDirPolicy(dir string) (string, error) {
 		return "", fmt.Errorf("project dir must be absolute and clean")
 	}
 	perms := engine.Entitlements
-	check := func(p string) error {
-		if !fsPrefixAllowed(perms.AllowFSRead, p) {
-			return fmt.Errorf("security exception: read to %s not granted", p)
-		}
-		if writeGrantOverlaps(perms.AllowFSWrite, p) || writeGrantOverlaps(perms.AllowConfigWrite, p) {
-			return fmt.Errorf("security exception: project dir is writable by scripts")
-		}
-		return nil
+	writable := func(p string) bool {
+		return writeGrantOverlaps(perms.AllowFSWrite, p) || writeGrantOverlaps(perms.AllowConfigWrite, p)
 	}
-	if err := check(dir); err != nil {
-		return "", err
+	// The read check is the one grant rule (fsPrefixAllowed resolves the
+	// symlinks and requires the real dir beneath the real grant), so it runs
+	// on dir as given; a dir under a grant that resolves outside it is
+	// reported as a symlink escape.
+	if !fsPrefixAllowed(perms.AllowFSRead, dir) {
+		if r, err := filepath.EvalSymlinks(dir); err == nil && filepath.Clean(r) != dir {
+			return "", fmt.Errorf("project dir symlink escape")
+		}
+		return "", fmt.Errorf("security exception: read to %s not granted", dir)
+	}
+	if writable(dir) {
+		return "", fmt.Errorf("security exception: project dir is writable by scripts")
 	}
 	resolved, err := filepath.EvalSymlinks(dir)
 	if err != nil {
 		return "", fmt.Errorf("project dir not found")
 	}
 	resolved = filepath.Clean(resolved)
-	if err := check(resolved); err != nil {
+	if writable(resolved) {
 		return "", fmt.Errorf("project dir symlink escape")
 	}
 	info, err := os.Stat(resolved)

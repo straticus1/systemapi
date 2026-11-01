@@ -23,7 +23,11 @@
 # The agent writes /var/lib/systemapi-agent/config-helper/<id>.req (0600, that it
 # owns), the helper reads it, independently re-validates the target (rootShapeOk
 # + self-root deny) and re-verifies the content's SHA-256 against the
-# lease-bound hash, writes the config atomically (temp file, fsync, rename), and
+# lease-bound hash, backs up the file it replaces to
+# /var/lib/sah-helper/config-backups/<sha256(target)>/<unix_ns> (0600, newest 5,
+# outside the target dir and the agent's writable paths), writes the config
+# atomically (temp file, fsync, rename; a replaced file keeps its mode and
+# owner), and
 # writes /var/lib/systemapi-agent/config-helper/<id>.res back. One request per
 # invocation; the agent cleans both files up.
 #
@@ -109,7 +113,14 @@ ProtectClock=yes
 ProtectHostname=yes
 RestrictNamespaces=yes
 RestrictRealtime=yes
-RestrictSUIDSGID=yes
+# RestrictSUIDSGID stays off: systemd 252 answers every openat2 with ENOSYS
+# under it (seccomp cannot inspect open_how), and the atomic /etc write
+# (writeFileAtomicSync, config_write_linux.go) opens the target's parent with
+# openat2, so every write would fail write_failed. NoNewPrivileges and the
+# bounding set remain, and the write never sets a setuid/setgid bit (it keeps
+# only the old file's permission bits). @system-service below permits openat2
+# (it includes @file-system; checked with systemd-analyze on systemd 252).
+RestrictSUIDSGID=no
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 ProtectProc=invisible

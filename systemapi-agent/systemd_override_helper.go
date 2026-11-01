@@ -199,7 +199,7 @@ var overrideHelperWrite = func(path, content string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	return writeFileAtomicSync(path, content, 0o644)
+	return writeFileAtomicSync(path, content, 0o644, nil)
 }
 
 // unitOverrideSetViaHelper is the agent-side handoff for sys:tweak
@@ -232,6 +232,9 @@ func overrideSetViaHelper(req overrideHelperReq) error {
 		return fmt.Errorf("unit override refused: lease_missing")
 	}
 	if err := os.MkdirAll(overrideHelperStateDir, 0o700); err != nil {
+		return fmt.Errorf("handoff dir: %w", err)
+	}
+	if err := checkHandoffDir(overrideHelperStateDir); err != nil {
 		return fmt.Errorf("handoff dir: %w", err)
 	}
 	idb := make([]byte, 16)
@@ -281,6 +284,10 @@ func runOverrideHelper(args []string) int {
 		return 2
 	}
 	id := args[0]
+	if err := checkHandoffDir(overrideHelperStateDir); err != nil {
+		fmt.Fprintf(os.Stderr, "override-helper: %v\n", err)
+		return 2
+	}
 	reqPath := filepath.Join(overrideHelperStateDir, id+".req")
 	resPath := filepath.Join(overrideHelperStateDir, id+".res")
 	res := doOverrideHelper(reqPath)

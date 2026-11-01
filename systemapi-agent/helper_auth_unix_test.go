@@ -53,3 +53,74 @@ func TestHelperAuthReplayLockHeldDuringPruneAndRecord(t *testing.T) {
 		t.Fatalf("hook stages seen: %v, want prune and record", seen)
 	}
 }
+
+// Each helper and its agent-side handoff refuse a handoff directory that is a
+// symlink, not a directory, not mode 0700, or not owned by root (the test's
+// uid here): request files are never read or written through it, and the
+// helper unit is never triggered.
+func TestHelpersRefuseUntrustedHandoffDir(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(t *testing.T, dir string) string
+	}{
+		{"symlink", func(t *testing.T, dir string) string {
+			link := filepath.Join(t.TempDir(), "link")
+			if err := os.Symlink(dir, link); err != nil {
+				t.Fatal(err)
+			}
+			return link
+		}},
+		{"not a directory", func(t *testing.T, dir string) string {
+			f := filepath.Join(t.TempDir(), "file")
+			if err := os.WriteFile(f, nil, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			return f
+		}},
+		{"mode 0755", func(t *testing.T, dir string) string {
+			if err := os.Chmod(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			return dir
+		}},
+		{"wrong owner", func(t *testing.T, dir string) string {
+			helperHandoffOwnerUID = uint32(os.Getuid()) + 1
+			return dir
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			lease := &Lease{}
+			// config helper
+			cdir := tc.setup(t, withConfigHelperStateDir(t))
+			configHelperStateDir = cdir
+			prevTrig := configHelperTrigger
+			configHelperTrigger = func(string) error { t.Error("config helper triggered"); return nil }
+			t.Cleanup(func() { configHelperTrigger = prevTrig })
+			if err := configWriteViaHelper("/etc/nginx/nginx.conf", "x\n", lease); err == nil {
+				t.Fatal("config: agent side accepted the handoff dir")
+			}
+			if code := runConfigHelper([]string{testHelperID}); code != 2 {
+				t.Fatalf("config: helper exit=%d, want 2", code)
+			}
+			// sysctl helper
+			sdir := tc.setup(t, withHelperStateDir(t))
+			sysctlHelperStateDir = sdir
+			prevS := sysctlHelperTrigger
+			sysctlHelperTrigger = func(string) error { t.Error("sysctl helper triggered"); return nil }
+			t.Cleanup(func() { sysctlHelperTrigger = prevS })
+			if err := sysctlSetViaHelper("vm.swappiness", "10", lease); err == nil {
+				t.Fatal("sysctl: agent side accepted the handoff dir")
+			}
+			if code := runSysctlHelper([]string{testHelperID}); code != 2 {
+				t.Fatalf("sysctl: helper exit=%d, want 2", code)
+			}
+			// systemd override helper
+			odir := tc.setup(t, withOverrideHelperStateDir(t))
+			overrideHelperStateDir = odir
+			if code := runOverrideHelper([]string{testHelperID}); code != 2 {
+				t.Fatalf("override: helper exit=%d, want 2", code)
+			}
+		})
+	}
+}

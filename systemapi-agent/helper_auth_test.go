@@ -232,6 +232,7 @@ func TestHelperAuthSubprocess(t *testing.T) {
 	helperTrustPath = os.Getenv("SAH_HELPER_TRUST")
 	helperReplayDir = os.Getenv("SAH_HELPER_REPLAY")
 	helperTrustOwnerUID = uint32(os.Getuid())
+	helperHandoffOwnerUID = uint32(os.Getuid())
 	configHelperWrite = func(path, content string) error {
 		t.Errorf("write reached in the subprocess for %s", path)
 		return nil

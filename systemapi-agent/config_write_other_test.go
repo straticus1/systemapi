@@ -12,7 +12,7 @@ import (
 // guarantee a symlink-free parent and must refuse outright.
 func TestWriteFileAtomicSyncRefusesOffLinux(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "x.conf")
-	if err := writeFileAtomicSync(path, "x\n", 0o644); err == nil {
+	if err := writeFileAtomicSync(path, "x\n", 0o644, nil); err == nil {
 		t.Fatal("writeFileAtomicSync must refuse off Linux")
 	}
 	if _, err := os.Lstat(path); !os.IsNotExist(err) {

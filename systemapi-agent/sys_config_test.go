@@ -92,6 +92,8 @@ func (h *sysCfgHarness) send(t *testing.T, v interface{}) {
 	if err != nil {
 		t.Fatalf("handle returned error: %v", err)
 	}
+	// sys frames run off the read goroutine; wait for this one's result.
+	h.ch.sysWait()
 }
 
 func (h *sysCfgHarness) result(t *testing.T, rid string) map[string]interface{} {
@@ -146,6 +148,29 @@ func TestSysConfigReadHappyPath(t *testing.T) {
 	}
 	if h.readPath != "/etc/nginx/nginx.conf" {
 		t.Fatalf("read path=%q", h.readPath)
+	}
+}
+
+// A read is denied at the agent's own gate for the same self-roots as a
+// write (configTargetDenied), even with a valid lease: a root read of the
+// agent's state or a helper's trust file never reaches the filesystem.
+func TestSysConfigReadRefusesSelfRoots(t *testing.T) {
+	h := newSysCfgHarness(t, true)
+	for _, target := range []string{
+		"/var/lib/systemapi-agent/agent.json",
+		"/etc/systemapi-agent/helper-trust.json",
+		"/var/lib/sah-helper/config-backups/x",
+		"/etc/systemd/system/systemapi-agent.service",
+		"/proc/self/environ",
+	} {
+		rid := newSysRequestID(t)
+		h.send(t, h.frame(t, rid, "read", target, "", "", "", "", inFuture(time.Minute)))
+		if p := h.result(t, rid); p["ok"] != false || p["error"] != "target_denied" {
+			t.Fatalf("%s: %v", target, p)
+		}
+	}
+	if h.readPath != "" {
+		t.Fatalf("read reached the filesystem for %q", h.readPath)
 	}
 }
 

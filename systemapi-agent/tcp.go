@@ -17,6 +17,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -68,6 +69,13 @@ type channelConn struct {
 	// tests that do not resume.
 	stateDir string
 
+	// sys frames run off the read goroutine (sys.go goSys): sysSem bounds
+	// them, sysCtx is cancelled by close, sysWG lets tests wait.
+	sysSem    chan struct{}
+	sysCtx    context.Context
+	sysCancel context.CancelFunc
+	sysWG     sync.WaitGroup
+
 	mu     sync.Mutex
 	tcp    map[string]*tcpStream
 	files  map[string]*fileSession
@@ -75,7 +83,9 @@ type channelConn struct {
 }
 
 func newChannelConn(out ptyOut, hostID string) *channelConn {
-	return &channelConn{out: out, hostID: hostID, mux: newCreditMux(out), tcp: map[string]*tcpStream{}, files: map[string]*fileSession{}}
+	sysCtx, sysCancel := context.WithCancel(context.Background())
+	return &channelConn{out: out, hostID: hostID, mux: newCreditMux(out), tcp: map[string]*tcpStream{}, files: map[string]*fileSession{},
+		sysSem: make(chan struct{}, sysMaxInFlight), sysCtx: sysCtx, sysCancel: sysCancel}
 }
 
 type tcpOpenMsg struct {
@@ -177,6 +187,9 @@ func (c *channelConn) lookup(id string) *tcpStream {
 // close ends every stream with reason (best effort tcp_closed) and stops
 // the mux. Safe to call more than once.
 func (c *channelConn) close(reason string) {
+	// Cancel running sys frames; they report on their own (the writer is
+	// closed with the connection) and are not waited for.
+	c.sysCancel()
 	c.mu.Lock()
 	c.closed = true
 	live := make([]*tcpStream, 0, len(c.tcp))

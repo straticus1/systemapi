@@ -95,6 +95,8 @@ func (h *sysHarness) send(t *testing.T, v interface{}) {
 	if err != nil {
 		t.Fatalf("handle returned error: %v", err)
 	}
+	// sys frames run off the read goroutine; wait for this one's result.
+	h.ch.sysWait()
 }
 
 // result returns the sys_result payload for rid.

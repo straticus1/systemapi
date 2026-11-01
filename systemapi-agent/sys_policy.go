@@ -55,7 +55,18 @@ func checkSysServicePolicy(unit, action string) error {
 	if !serviceNameRE.MatchString(unit) {
 		return errSysUnitDenied
 	}
+	// The channel never stops or disables the agent's own unit: that would
+	// cut the host off from the control plane with no way back over it.
+	if (action == "stop" || action == "disable") && sysSelfUnit(unit) {
+		return errSysUnitDenied
+	}
 	return nil
+}
+
+// sysSelfUnit reports whether unit names the agent's own service, with or
+// without the ".service" suffix systemctl implies.
+func sysSelfUnit(unit string) bool {
+	return unit == "systemapi-agent" || unit == "systemapi-agent.service"
 }
 
 // sysPackageActions is the closed set of sys:package channel verbs: query
@@ -96,8 +107,8 @@ var sysConfigActions = map[string]struct{}{
 // per-host path/unit allowlists are enforced by the control plane and the
 // lease binds the exact target (and, for a write, the content hash); the agent
 // refuses unless the host advertises the config capability, the verb is in the
-// closed set, and the target passes its shape guard (an absolute path for
-// read/write, a unit for reload).
+// closed set, and the target passes its shape guard (a rootShapeOk path that
+// is not a config self-root for read/write, a unit for reload).
 func checkSysConfigPolicy(action, target string) error {
 	if !sysConfig().Available() {
 		return errCfgUnsupported
@@ -111,7 +122,11 @@ func checkSysConfigPolicy(action, target string) error {
 		}
 		return nil
 	}
-	if target == "" || len(target) > 4096 || target == "/" || target[0] != '/' || !noControl(target) {
+	// read and write: the rootShapeOk shape, and never the agent's, server's
+	// or helpers' own config/state (configTargetDenied), for a read as well as
+	// a write: a root read of agent.json or a helper's trust file is as bad as
+	// rewriting it.
+	if !configTargetShapeOK(target) || configTargetDenied(target) {
 		return errCfgTargetBad
 	}
 	return nil

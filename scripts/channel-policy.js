@@ -13,7 +13,8 @@
 // server's own state and config, PostgreSQL's data), beneath one, nor a
 // parent of one (so /var/lib is refused too), and --service entries are unit
 // names on a per-host allowlist (deny by default; the sys:service channel may
-// act only on a listed unit), and --package entries are package names on a
+// act only on a listed unit; never the agent's own unit or a sah-*-helper@
+// unit), and --package entries are package names on a
 // per-host allowlist (deny by default; each must match the package-name shape
 // so "*" is never allow-all; the sys:package channel may act only on a listed
 // name),
@@ -50,7 +51,8 @@
 
 const path = require('node:path');
 const { validateTenant } = require('../controlplane/sshkey');
-const { validateFileRoot, effectivePolicies, SERVICE_UNIT_RE, PACKAGE_NAME_RE, SYSCTL_KEY_RE, sysctlDenied } = require('../controlplane/channels');
+const { validateFileRoot, effectivePolicies, SERVICE_UNIT_RE, PACKAGE_NAME_RE, SYSCTL_KEY_RE, sysctlDenied,
+  CONFIG_SELF_ROOTS, systemdSelfEntry, configSelfDenied, configPrefixProtected } = require('../controlplane/channels');
 
 const ACTOR = 'cli:channel-policy';
 const MAX_ENTRIES = 16;
@@ -69,49 +71,6 @@ const WRITES = {
 };
 const ONCE_FLAGS = new Set(['--tenant', '--host', '--reason']);
 const LIST_FLAGS = new Set(['--tcp-local', '--file-read', '--file-write', '--service', '--package', '--config', '--tweak-sysctl', '--tweak-unit']);
-// The agent's and server's own config/state: never an allowed sys:config path,
-// so the config channel can never rewrite the agent's own config (a lockout
-// risk the design calls out) or the server's.
-// Also the mutation helpers' replay store and trust file and the agent's unit,
-// /etc/ld.so.preload (loaded into every process, the agent's included) and the
-// system manager config system.conf(.d) (applies to every service).
-// Mirrors systemapi-agent/config_helper.go configSelfRoots; the shared vectors
-// in controlplane/testdata/config-self-vectors.json keep the two in parity.
-const CONFIG_SELF_ROOTS = ['/proc', '/sys', '/dev', '/boot', '/var/lib/systemapi-agent',
-  '/etc/systemapi-agent', '/var/lib/postgresql', '/etc/sahcore',
-  '/var/lib/sah-helper', '/etc/systemapi-agent/helper-trust.json',
-  '/etc/systemd/system/systemapi-agent.service', '/etc/systemd/system/systemapi-agent.service.d',
-  '/etc/ld.so.preload', '/etc/systemd/system.conf', '/etc/systemd/system.conf.d'];
-// Unit dirs whose entries systemd applies to the agent and helpers; entries
-// are matched by pattern (systemdSelfEntry), mirroring configSystemdUnitDirs,
-// configHelperUnitRE and configSystemdSelfEntry in config_helper.go.
-const SYSTEMD_UNIT_DIRS = ['/etc/systemd/system', '/etc/systemd/system.control'];
-const HELPER_UNIT_RE = /^sah-[^/]*-helper@[^/]*\.service$/;
-
-// systemdSelfEntry: name (one entry directly under a unit dir) is the agent's
-// or a helper's unit, or a drop-in dir that applies to one (<unit>.d, the
-// top-level service.d, or a prefix drop-in <p>-.service.d covering them).
-function systemdSelfEntry(name) {
-  const unit = name.endsWith('.d') ? name.slice(0, -2) : name;
-  if (unit === 'systemapi-agent.service' || unit === 'service' || HELPER_UNIT_RE.test(unit)) return true;
-  if (unit !== name && unit.endsWith('-.service')) {
-    const p = unit.slice(0, -'.service'.length);
-    return 'systemapi-agent'.startsWith(p) || p.startsWith('sah-');
-  }
-  return false;
-}
-
-// configSelfDenied: path is, or sits beneath, a self-root or a systemd entry
-// that applies to the agent or a helper. The same check the helper applies to
-// a write target (configTargetDenied).
-function configSelfDenied(path) {
-  if (CONFIG_SELF_ROOTS.some((s) => path === s || path.startsWith(`${s}/`))) return true;
-  for (const d of SYSTEMD_UNIT_DIRS) {
-    if (path.startsWith(`${d}/`) && systemdSelfEntry(path.slice(d.length + 1).split('/')[0])) return true;
-  }
-  return false;
-}
-
 function fail(code, message = code) {
   const err = new Error(message);
   err.code = code;
@@ -133,6 +92,12 @@ function parseUnit(text) {
   if (typeof text !== 'string' || !SERVICE_UNIT_RE.test(text)) {
     throw usage(`bad --service: ${JSON.stringify(text)} is not a unit name (letters, digits, "@._:-", at most 128)`);
   }
+  // Never the agent's own unit nor a mutation helper's: stopping or disabling
+  // the agent cuts the host off, and a helper unit is started only by the
+  // agent's handoff. systemctl reads a bare name as <name>.service.
+  if (systemdSelfEntry(text) || systemdSelfEntry(`${text}.service`)) {
+    throw usage(`bad --service: ${JSON.stringify(text)} is the agent's or a helper's unit`);
+  }
   return text;
 }
 
@@ -153,8 +118,7 @@ function parseConfigDir(text) {
   const root = checked.root;
   if (root.split('/').length - 1 < 2) throw usage(`bad --config: "${root}" is too wide; name a directory at least two levels down`);
   // A grant at or above a unit dir would contain the agent's and helpers' units.
-  const self = configSelfDenied(root) ? root
-    : [...CONFIG_SELF_ROOTS, ...SYSTEMD_UNIT_DIRS].find((s) => s === root || s.startsWith(`${root}/`));
+  const self = configPrefixProtected(root);
   if (self) throw usage(`bad --config: "${root}" is, sits in or contains the protected path ${self}`);
   return root;
 }

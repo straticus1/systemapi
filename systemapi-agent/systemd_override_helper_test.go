@@ -29,9 +29,11 @@ func withOverrideHelperStateDir(t *testing.T) string {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	prev := overrideHelperStateDir
+	prev, prevUID := overrideHelperStateDir, helperHandoffOwnerUID
 	overrideHelperStateDir = dir
-	t.Cleanup(func() { overrideHelperStateDir = prev })
+	// checkHandoffDir wants the owner root; the test owns its temp dir.
+	helperHandoffOwnerUID = uint32(os.Getuid())
+	t.Cleanup(func() { overrideHelperStateDir, helperHandoffOwnerUID = prev, prevUID })
 	return dir
 }
 

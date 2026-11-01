@@ -1426,8 +1426,10 @@ func TestWriteGrantOverlapsBoundaries(t *testing.T) {
 		{base, true},
 		{proj, true},
 		{filepath.Join(proj, "sub"), true},
-		{proj + "/../proj/sub", true},
-		{link, true}, // a symlinked grant that lands inside the project
+		// Unclean: fsGrantRootPath grants nothing through it, so no overlap.
+		{proj + "/../proj/sub", false},
+		{proj + "/", true}, // one trailing slash is trimmed, as fsGrantShape does
+		{link, true},       // a symlinked grant that lands inside the project
 		{proj + "-other", false},
 		{filepath.Join(base, "pro"), false},
 		{"*", true},

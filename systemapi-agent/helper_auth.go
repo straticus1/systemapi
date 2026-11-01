@@ -66,6 +66,10 @@ var (
 	// helperTrustOwnerUID is the owner the trust file and its directory must
 	// have. A var only so tests (not root) can use their own uid.
 	helperTrustOwnerUID uint32 = 0
+	// helperHandoffOwnerUID is the owner a helper handoff directory must
+	// have (checkHandoffDir). A var only so tests (not root) can use their
+	// own uid.
+	helperHandoffOwnerUID uint32 = 0
 	// helperReplayDir is the durable consumed-nonce store, in the helpers'
 	// own StateDirectory (sah-helper), outside the agent's writable paths.
 	helperReplayDir = "/var/lib/sah-helper/consumed"
@@ -134,6 +138,30 @@ func trustedNode(info os.FileInfo) error {
 	uid, _, ok := fileOwnerIDs(info)
 	if !ok || uid < 0 || uint32(uid) != helperTrustOwnerUID {
 		return errors.New("wrong owner")
+	}
+	return nil
+}
+
+// checkHandoffDir refuses a mutation helper's handoff directory unless it is
+// a real directory (Lstat: not a symlink), mode exactly 0700 and owned by
+// helperHandoffOwnerUID (root). Both the agent side (after creating it) and the
+// helper (before reading a request or writing a result) run it, so neither
+// reads or writes request files through a swapped, shared or foreign-owned
+// directory.
+func checkHandoffDir(dir string) error {
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return errors.New("handoff dir is not a directory")
+	}
+	if info.Mode().Perm() != 0o700 {
+		return errors.New("handoff dir is not mode 0700")
+	}
+	uid, _, ok := fileOwnerIDs(info)
+	if !ok || uid < 0 || uint32(uid) != helperHandoffOwnerUID {
+		return errors.New("handoff dir has the wrong owner")
 	}
 	return nil
 }

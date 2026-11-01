@@ -170,8 +170,18 @@ func replaceTempName(base string) (string, error) {
 // stateBackupDir/<sha256(path)>/<unix_ns> (created O_EXCL|O_NOFOLLOW, 0600)
 // and keeps the newest stateBackupKeep there. It returns the basename.
 func backupOutside(path string, data []byte) (string, error) {
+	return backupInto(stateBackupDir, path, data)
+}
+
+// backupInto is backupOutside under the backup root base: the same
+// <base>/<sha256(path)>/<unix_ns> layout, modes and retention. The config
+// helper uses it with its own root (configHelperBackupDir).
+func backupInto(base, path string, data []byte) (string, error) {
+	if base == "" {
+		return "", fmt.Errorf("backups disabled")
+	}
 	sum := sha256.Sum256([]byte(path))
-	dir := filepath.Join(filepath.Clean(stateBackupDir), hex.EncodeToString(sum[:]))
+	dir := filepath.Join(filepath.Clean(base), hex.EncodeToString(sum[:]))
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}

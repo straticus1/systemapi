@@ -143,12 +143,12 @@ func TestFsGlobDropsEscapes(t *testing.T) {
 			t.Errorf("%s: err=%v", pat, err)
 		}
 	}
-	// The pattern is inside the grant, but the matches resolve outside it.
-	out, err := engine.Execute(`print(sys.fs.glob(` + q(filepath.Join(r.link, "*")) + `))` + "\n")
-	if err != nil || strings.TrimSpace(out) != "[]" {
-		t.Fatalf("symlinked matches: out=%q err=%v", out, err)
+	// The pattern is inside the grant, but its directory resolves outside
+	// it: the one grant rule (fsGrantRootPath) refuses the pattern itself.
+	if _, err := engine.Execute(`print(sys.fs.glob(` + q(filepath.Join(r.link, "*")) + `))` + "\n"); err == nil || !strings.Contains(err.Error(), "not granted") {
+		t.Fatalf("symlinked pattern: err=%v", err)
 	}
-	out, err = engine.Execute(`print(sorted(sys.fs.glob(` + q(r.data+"/*") + `)))` + "\n")
+	out, err := engine.Execute(`print(sorted(sys.fs.glob(` + q(r.data+"/*") + `)))` + "\n")
 	if err != nil || strings.Contains(out, "linkfile") || strings.Contains(out, "dangle") || !strings.Contains(out, r.ok) {
 		t.Fatalf("grant glob: out=%q err=%v", out, err)
 	}

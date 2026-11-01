@@ -162,10 +162,11 @@ func configTargetShapeOK(p string) bool {
 
 // configTargetDenied reports whether target is, or sits beneath, a self-root
 // or a systemd unit/drop-in entry that applies to the agent or a helper.
-// It is a string check; it holds for the file actually written because the
-// write (writeFileAtomicSync, config_write_linux.go) opens the parent with
-// RESOLVE_NO_SYMLINKS and refuses any symlinked component, so a link such as
-// /etc/app -> /etc/systemapi-agent cannot carry the write into a self-root.
+// It is a string check; it holds for the file actually written or read
+// because the write (writeFileAtomicSync, config_write_linux.go) and the
+// sys:config read (sysConfigReadBeneath, sys_config_read_linux.go) resolve
+// with RESOLVE_NO_SYMLINKS and refuse any symlinked component, so a link such
+// as /etc/app -> /etc/systemapi-agent cannot carry either into a self-root.
 func configTargetDenied(target string) bool {
 	for _, s := range configSelfRoots {
 		if target == s || strings.HasPrefix(target, s+"/") {
@@ -209,12 +210,28 @@ var configHelperTrigger = func(id string) error {
 	return nil
 }
 
+// configHelperBackupDir is where the helper keeps the previous content of a
+// config it replaces: <dir>/<sha256(target)>/<unix_ns>, dirs 0700, files
+// 0600, the newest stateBackupKeep per target (backupInto, the desired-state
+// backup layout). It is in the helpers' own StateDirectory (sah-helper):
+// outside every target directory, never in the agent's writable paths, and a
+// config self-root (configSelfRoots), so the config channel can neither read
+// nor overwrite a backup. A var so tests can point it at a temp dir.
+var configHelperBackupDir = "/var/lib/sah-helper/config-backups"
+
 // configHelperWrite performs the actual /etc write: an atomic temp-file,
-// fsync, rename in the target's directory. It runs ONLY inside the helper
-// process (under the helper's sandbox). tests replace it so no real /etc write
-// happens. The raw error is returned so the caller can record its errno.
+// fsync, rename in the target's directory. A replaced regular file keeps its
+// permission bits and owner, and its previous bytes are backed up first (the
+// Phase 0 AtomicWrite kept a backup too); a backup failure fails the write
+// with the target untouched. A new file is 0644 (the request carries no
+// sensitivity flag). It runs ONLY inside the helper process (under the
+// helper's sandbox). tests replace it so no real /etc write happens. The raw
+// error is returned so the caller can record its errno.
 var configHelperWrite = func(path, content string) error {
-	return writeFileAtomicSync(path, content, 0o644)
+	return writeFileAtomicSync(path, content, 0o644, func(old []byte) error {
+		_, err := backupInto(configHelperBackupDir, path, old)
+		return err
+	})
 }
 
 // configWriteViaHelper is the agent-side handoff for sys:config write. The
@@ -231,6 +248,9 @@ func configWriteViaHelper(target, content string, lease *Lease) error {
 		return fmt.Errorf("config write refused: lease_missing")
 	}
 	if err := os.MkdirAll(configHelperStateDir, 0o700); err != nil {
+		return fmt.Errorf("handoff dir: %w", err)
+	}
+	if err := checkHandoffDir(configHelperStateDir); err != nil {
 		return fmt.Errorf("handoff dir: %w", err)
 	}
 	idb := make([]byte, 16)
@@ -282,6 +302,10 @@ func runConfigHelper(args []string) int {
 		return 2
 	}
 	id := args[0]
+	if err := checkHandoffDir(configHelperStateDir); err != nil {
+		fmt.Fprintf(os.Stderr, "config-helper: %v\n", err)
+		return 2
+	}
 	reqPath := filepath.Join(configHelperStateDir, id+".req")
 	resPath := filepath.Join(configHelperStateDir, id+".res")
 	res := doConfigHelper(reqPath)

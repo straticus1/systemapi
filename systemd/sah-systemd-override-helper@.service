@@ -116,7 +116,14 @@ ProtectClock=yes
 ProtectHostname=yes
 RestrictNamespaces=yes
 RestrictRealtime=yes
-RestrictSUIDSGID=yes
+# RestrictSUIDSGID stays off: systemd 252 answers every openat2 with ENOSYS
+# under it (seccomp cannot inspect open_how), and the atomic drop-in write
+# (writeFileAtomicSync, config_write_linux.go) opens the target's parent with
+# openat2, so every write would fail write_failed. NoNewPrivileges and the
+# bounding set remain, and the write never sets a setuid/setgid bit (it keeps
+# only the old file's permission bits). @system-service below permits openat2
+# (it includes @file-system; checked with systemd-analyze on systemd 252).
+RestrictSUIDSGID=no
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 ProtectProc=invisible

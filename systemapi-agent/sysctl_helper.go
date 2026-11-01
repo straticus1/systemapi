@@ -156,6 +156,9 @@ func sysctlSetViaHelper(key, value string, lease *Lease) error {
 	if err := os.MkdirAll(sysctlHelperStateDir, 0o700); err != nil {
 		return fmt.Errorf("handoff dir: %w", err)
 	}
+	if err := checkHandoffDir(sysctlHelperStateDir); err != nil {
+		return fmt.Errorf("handoff dir: %w", err)
+	}
 	idb := make([]byte, 16)
 	if _, err := rand.Read(idb); err != nil {
 		return err
@@ -206,6 +209,10 @@ func runSysctlHelper(args []string) int {
 		return 2
 	}
 	id := args[0]
+	if err := checkHandoffDir(sysctlHelperStateDir); err != nil {
+		fmt.Fprintf(os.Stderr, "sysctl-helper: %v\n", err)
+		return 2
+	}
 	reqPath := filepath.Join(sysctlHelperStateDir, id+".req")
 	resPath := filepath.Join(sysctlHelperStateDir, id+".res")
 	res := doSysctlHelper(reqPath)

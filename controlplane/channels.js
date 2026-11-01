@@ -62,7 +62,9 @@ const DENIED_SYSCTL = new Set(['kernel.core_pattern', 'kernel.modprobe', 'kernel
   'kernel.kptr_restrict', 'kernel.dmesg_restrict', 'kernel.unprivileged_bpf_disabled', 'kernel.kexec_load_disabled',
   'kernel.modules_disabled', 'kernel.sysrq', 'kernel.perf_event_paranoid', 'kernel.randomize_va_space',
   'kernel.unprivileged_userns_clone', 'kernel.io_uring_disabled', 'vm.mmap_min_addr', 'fs.suid_dumpable',
-  'net.core.bpf_jit_harden', 'user.max_user_namespaces']);
+  'net.core.bpf_jit_harden', 'user.max_user_namespaces', 'vm.unprivileged_userfaultfd',
+  'kernel.apparmor_restrict_unprivileged_userns', 'dev.tty.ldisc_autoload', 'kernel.ftrace_enabled',
+  'net.core.bpf_jit_enable']);
 // A prefix ending in "." also denies the bare subtree name (fs.binfmt_misc).
 const DENIED_SYSCTL_PREFIXES = ['fs.binfmt_misc.', 'kernel.usermodehelper.', 'fs.protected_', 'kernel.yama.'];
 function sysctlDenied(key) {
@@ -459,9 +461,65 @@ function validateConfigBinding(cfg) {
   return { ok: true, config: { action, target, content: cfg.content } };
 }
 
+// The agent's and server's own config/state: never an allowed sys:config path,
+// so the config channel can never rewrite the agent's own config (a lockout
+// risk the design calls out) or the server's.
+// Also the mutation helpers' replay store and trust file and the agent's unit,
+// /etc/ld.so.preload (loaded into every process, the agent's included) and the
+// system manager config system.conf(.d) (applies to every service).
+// Mirrors systemapi-agent/config_helper.go configSelfRoots; the shared vectors
+// in controlplane/testdata/config-self-vectors.json keep the two in parity.
+// parseConfigPolicy and configPolicyAllows enforce it here; the agent
+// (checkSysConfigPolicy) and the config helper enforce it again.
+const CONFIG_SELF_ROOTS = ['/proc', '/sys', '/dev', '/boot', '/var/lib/systemapi-agent',
+  '/etc/systemapi-agent', '/var/lib/postgresql', '/etc/sahcore',
+  '/var/lib/sah-helper', '/etc/systemapi-agent/helper-trust.json',
+  '/etc/systemd/system/systemapi-agent.service', '/etc/systemd/system/systemapi-agent.service.d',
+  '/etc/ld.so.preload', '/etc/systemd/system.conf', '/etc/systemd/system.conf.d'];
+// Unit dirs whose entries systemd applies to the agent and helpers; entries
+// are matched by pattern (systemdSelfEntry), mirroring configSystemdUnitDirs,
+// configHelperUnitRE and configSystemdSelfEntry in config_helper.go.
+const SYSTEMD_UNIT_DIRS = ['/etc/systemd/system', '/etc/systemd/system.control'];
+const HELPER_UNIT_RE = /^sah-[^/]*-helper@[^/]*\.service$/;
+
+// systemdSelfEntry: name (one entry directly under a unit dir) is the agent's
+// or a helper's unit, or a drop-in dir that applies to one (<unit>.d, the
+// top-level service.d, or a prefix drop-in <p>-.service.d covering them).
+function systemdSelfEntry(name) {
+  const unit = name.endsWith('.d') ? name.slice(0, -2) : name;
+  if (unit === 'systemapi-agent.service' || unit === 'service' || HELPER_UNIT_RE.test(unit)) return true;
+  if (unit !== name && unit.endsWith('-.service')) {
+    const p = unit.slice(0, -'.service'.length);
+    return 'systemapi-agent'.startsWith(p) || p.startsWith('sah-');
+  }
+  return false;
+}
+
+// configSelfDenied: path is, or sits beneath, a self-root or a systemd entry
+// that applies to the agent or a helper. The same check the agent applies to
+// a read or write target (configTargetDenied).
+function configSelfDenied(path) {
+  if (CONFIG_SELF_ROOTS.some((s) => path === s || path.startsWith(`${s}/`))) return true;
+  for (const d of SYSTEMD_UNIT_DIRS) {
+    if (path.startsWith(`${d}/`) && systemdSelfEntry(path.slice(d.length + 1).split('/')[0])) return true;
+  }
+  return false;
+}
+
+// configPrefixProtected: a config-path grant that is, sits in, or contains a
+// protected path (a self-root or a systemd unit dir); the grant rule of
+// scripts/channel-policy.js --config. Returns the protected path or null.
+function configPrefixProtected(root) {
+  if (configSelfDenied(root)) return root;
+  return [...CONFIG_SELF_ROOTS, ...SYSTEMD_UNIT_DIRS].find((s) => s === root || s.startsWith(`${root}/`)) || null;
+}
+
 // parseConfigPolicy returns the normalized config-path allowlist, or null when
 // malformed (deny-all). Each entry is an absolute path prefix (the file-root
 // allowlist shape); a requested read/write path must sit at or beneath one.
+// An entry that is, sits in or contains a config self-root or a systemd unit
+// dir (configPrefixProtected) makes the whole policy malformed, so a policy
+// written around the CLI can never grant the agent's own config or units.
 function parseConfigPolicy(raw) {
   if (raw === null || raw === undefined) return { paths: [] };
   if (typeof raw !== 'object' || Array.isArray(raw)) return null;
@@ -469,16 +527,18 @@ function parseConfigPolicy(raw) {
   if (!Array.isArray(paths) || paths.length > POLICY_MAX_ENTRIES) return null;
   const out = [];
   for (const p of paths) {
-    if (typeof p !== 'string' || !rootShapeOk(p)) return null;
+    if (typeof p !== 'string' || !rootShapeOk(p) || p === '/' || configPrefixProtected(p)) return null;
     out.push(p);
   }
   return { paths: out };
 }
 
 // configPolicyAllows: the requested path equals or sits beneath an allowed
-// prefix on a component boundary. Deny by default.
+// prefix on a component boundary and is not a config self-root. Deny by
+// default.
 function configPolicyAllows(policy, path) {
   if (!policy || !Array.isArray(policy.paths)) return false;
+  if (typeof path !== 'string' || configSelfDenied(path)) return false;
   return policy.paths.some((base) => beneath(path, base));
 }
 
@@ -720,6 +780,11 @@ module.exports = {
   validateConfigBinding,
   parseConfigPolicy,
   configPolicyAllows,
+  CONFIG_SELF_ROOTS,
+  SYSTEMD_UNIT_DIRS,
+  systemdSelfEntry,
+  configSelfDenied,
+  configPrefixProtected,
   OVERRIDE_CONTENT_MAX,
   SYSCTL_KEY_RE,
   DENIED_SYSCTL,

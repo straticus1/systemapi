@@ -94,6 +94,8 @@ func (h *sysTwkHarness) send(t *testing.T, v interface{}) {
 	if err != nil {
 		t.Fatalf("handle returned error: %v", err)
 	}
+	// sys frames run off the read goroutine; wait for this one's result.
+	h.ch.sysWait()
 }
 
 func (h *sysTwkHarness) result(t *testing.T, rid string) map[string]interface{} {

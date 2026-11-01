@@ -80,6 +80,12 @@ var deniedSysctlExact = map[string]struct{}{
 	"fs.suid_dumpable":                 {},
 	"net.core.bpf_jit_harden":          {},
 	"user.max_user_namespaces":         {},
+	// Hardening knobs an allowlist must not be able to weaken either.
+	"vm.unprivileged_userfaultfd":                  {},
+	"kernel.apparmor_restrict_unprivileged_userns": {},
+	"dev.tty.ldisc_autoload":                       {},
+	"kernel.ftrace_enabled":                        {},
+	"net.core.bpf_jit_enable":                      {},
 }
 
 // deniedSysctlPrefixes deny every key that starts with the prefix. A prefix

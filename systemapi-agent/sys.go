@@ -15,9 +15,17 @@
 // runs the PackageManager's fixed argv (platform_package.go) with a minimal
 // environment and no shell, so a name can never inject a flag or a command.
 // Command output is capped before it is returned and is never logged. Every
-// refusal is a sys_result with an error code, never a dropped connection. Does
-// NOT persist across a reconnect: a request whose connection drops is simply
-// retried by the caller.
+// refusal is a sys_result with an error code, never a dropped connection.
+// A sys frame never runs on the connection's read goroutine: handleSys starts
+// it on its own goroutine under a per-connection semaphore (sysMaxInFlight;
+// past it the frame is refused "busy", never queued), so a hung systemctl or
+// a long package operation cannot stall PTY, TCP, file or job frames. Results
+// go out through the connection's serialized writer. Every service action,
+// status read and reload is bounded by sysOpTimeout and every package verb by
+// sysPackageTimeout, and all are cancelled when the connection closes; a
+// timeout is reported as error "timeout". Does NOT persist across a
+// reconnect: a request whose connection drops is simply retried by the
+// caller.
 package main
 
 import (
@@ -26,10 +34,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
 	"log"
-	"os"
 	"os/exec"
 	"regexp"
 	"time"
@@ -47,36 +52,10 @@ var sysConfig = func() ConfigStore { return currentPlatform().Config }
 // sysTweaks returns the host's Tweaks backend; tests replace it.
 var sysTweaks = func() Tweaks { return currentPlatform().Tweaks }
 
-// sysConfigReadFile reads one config file for a sys:config read. It opens the
-// final component without following a symlink and refuses anything that is not
-// a regular file, so a planted symlink cannot redirect the read out of an
-// allowed prefix. tests replace it. Output is capped at sysConfigReadMax.
-var sysConfigReadFile = func(path string) (string, error) {
-	// openNoFollow is 0 where the OS has no O_NOFOLLOW; the Lstat refuses a
-	// final symlink there (and is redundant where the flag exists).
-	if li, err := os.Lstat(path); err != nil {
-		return "", err
-	} else if li.Mode()&os.ModeSymlink != 0 {
-		return "", fmt.Errorf("config read: symlink refused")
-	}
-	f, err := os.OpenFile(path, os.O_RDONLY|openNoFollow, 0)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return "", err
-	}
-	if !info.Mode().IsRegular() {
-		return "", errors.New("not a regular file")
-	}
-	buf, err := io.ReadAll(io.LimitReader(f, sysConfigReadMax))
-	if err != nil {
-		return "", err
-	}
-	return string(buf), nil
-}
+// sysConfigReadFile reads one config file for a sys:config read
+// (sysConfigReadBeneath: sys_config_read_linux.go, fail-closed elsewhere).
+// tests replace it. Output is capped at sysConfigReadMax.
+var sysConfigReadFile = sysConfigReadBeneath
 
 func sysSHA256Hex(s string) string {
 	sum := sha256.Sum256([]byte(s))
@@ -95,8 +74,50 @@ var sysServices = func() ServiceManager { return currentPlatform().Services }
 // sysPackages returns the host's PackageManager; tests replace it.
 var sysPackages = func() PackageManager { return currentPlatform().Packages }
 
-// sysPackageTimeout bounds one package operation.
-const sysPackageTimeout = 120 * time.Second
+// sysPackageTimeout bounds one package operation. A var only so tests can
+// shorten it.
+var sysPackageTimeout = 120 * time.Second
+
+// sysOpTimeout bounds one service action, its status read, and a config
+// reload. A var only so tests can shorten it.
+var sysOpTimeout = 90 * time.Second
+
+// sysMaxInFlight bounds the sys frames one connection runs at once.
+const sysMaxInFlight = 4
+
+// sysErrCode is the sys_result error for a failed operation: "timeout" when
+// ctx hit its deadline, else "action_failed".
+func sysErrCode(ctx context.Context) string {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return "timeout"
+	}
+	return "action_failed"
+}
+
+// goSys runs one sys frame off the read goroutine. It never blocks: when
+// sysMaxInFlight frames are already running the frame is refused "busy".
+func (c *channelConn) goSys(typ, rid string, run func(ctx context.Context)) {
+	select {
+	case c.sysSem <- struct{}{}:
+	default:
+		log.Printf("%s refused: busy", typ)
+		if !sysRequestRe.MatchString(rid) {
+			rid = ""
+		}
+		sysResultError(c.out, rid, "busy")
+		return
+	}
+	c.sysWG.Add(1)
+	go func() {
+		defer c.sysWG.Done()
+		defer func() { <-c.sysSem }()
+		run(c.sysCtx)
+	}()
+}
+
+// sysWait waits for the sys frames started so far. Tests use it; the
+// connection itself never waits (close cancels them instead).
+func (c *channelConn) sysWait() { c.sysWG.Wait() }
 
 // sysPackagePATH and sysPackageEnv are the fixed, minimal environment a
 // package command runs with: no inherited env, no shell.
@@ -139,7 +160,8 @@ func (c *channelConn) handleSys(typ string, message []byte) bool {
 			log.Printf("rejected malformed sys_service")
 			return true
 		}
-		c.sysService(msg, time.Now())
+		now := time.Now()
+		c.goSys(typ, msg.RequestID, func(ctx context.Context) { c.sysService(ctx, msg, now) })
 		return true
 	case "sys_package":
 		var msg sysPackageMsg
@@ -147,7 +169,8 @@ func (c *channelConn) handleSys(typ string, message []byte) bool {
 			log.Printf("rejected malformed sys_package")
 			return true
 		}
-		c.sysPackage(msg, time.Now())
+		now := time.Now()
+		c.goSys(typ, msg.RequestID, func(ctx context.Context) { c.sysPackage(ctx, msg, now) })
 		return true
 	case "sys_config":
 		var msg sysConfigMsg
@@ -155,7 +178,8 @@ func (c *channelConn) handleSys(typ string, message []byte) bool {
 			log.Printf("rejected malformed sys_config")
 			return true
 		}
-		c.sysConfig(msg, time.Now())
+		now := time.Now()
+		c.goSys(typ, msg.RequestID, func(ctx context.Context) { c.sysConfig(ctx, msg, now) })
 		return true
 	case "sys_tweak":
 		var msg sysTweakMsg
@@ -163,7 +187,8 @@ func (c *channelConn) handleSys(typ string, message []byte) bool {
 			log.Printf("rejected malformed sys_tweak")
 			return true
 		}
-		c.sysTweak(msg, time.Now())
+		now := time.Now()
+		c.goSys(typ, msg.RequestID, func(ctx context.Context) { c.sysTweak(ctx, msg, now) })
 		return true
 	default:
 		return false
@@ -186,7 +211,7 @@ func sysResultError(out ptyOut, rid, code string) {
 
 // sysService verifies the lease, applies the agent's own gate, then restarts
 // the unit and reads its status to confirm.
-func (c *channelConn) sysService(msg sysServiceMsg, now time.Time) {
+func (c *channelConn) sysService(ctx context.Context, msg sysServiceMsg, now time.Time) {
 	rid := msg.RequestID
 	if !sysRequestRe.MatchString(rid) {
 		log.Printf("sys_service refused: bad request id")
@@ -213,7 +238,8 @@ func (c *channelConn) sysService(msg sysServiceMsg, now time.Time) {
 		return
 	}
 	svc := sysServices()
-	output, actErr := svc.Action(context.Background(), msg.Action, msg.Unit)
+	actCtx, cancelAct := context.WithTimeout(ctx, sysOpTimeout)
+	output, actErr := svc.Action(actCtx, msg.Action, msg.Unit)
 	result := map[string]interface{}{
 		"ok":     actErr == nil,
 		"unit":   msg.Unit,
@@ -221,10 +247,14 @@ func (c *channelConn) sysService(msg sysServiceMsg, now time.Time) {
 		"output": capSysOutput(output),
 	}
 	if actErr != nil {
-		result["error"] = "action_failed"
+		result["error"] = sysErrCode(actCtx)
 	}
-	// Status is the confirm read (same unit, no separate lease).
-	if status, statusErr := svc.Status(context.Background(), msg.Unit); statusErr == nil {
+	cancelAct()
+	// Status is the confirm read (same unit, no separate lease), bounded on
+	// its own so a timed-out action still gets a status attempt.
+	statusCtx, cancelStatus := context.WithTimeout(ctx, sysOpTimeout)
+	defer cancelStatus()
+	if status, statusErr := svc.Status(statusCtx, msg.Unit); statusErr == nil {
 		result["active"] = status.Active
 		result["state"] = status.State
 		result["status_output"] = capSysOutput(status.Output)
@@ -263,7 +293,7 @@ func sysPackageArgv(pm PackageManager, action, name string) ([]string, error) {
 // sysPackage verifies the lease, applies the agent's own fail-closed gate,
 // then runs one package verb through the Phase 0 PackageManager with fixed
 // argv and no shell, and returns the capped combined output.
-func (c *channelConn) sysPackage(msg sysPackageMsg, now time.Time) {
+func (c *channelConn) sysPackage(ctx context.Context, msg sysPackageMsg, now time.Time) {
 	rid := msg.RequestID
 	if !sysRequestRe.MatchString(rid) {
 		log.Printf("sys_package refused: bad request id")
@@ -296,7 +326,7 @@ func (c *channelConn) sysPackage(msg sysPackageMsg, now time.Time) {
 		sysResultError(c.out, rid, "action_failed")
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), sysPackageTimeout)
+	ctx, cancel := context.WithTimeout(ctx, sysPackageTimeout)
 	defer cancel()
 	output, actErr := sysPackageRun(ctx, argv)
 	result := map[string]interface{}{
@@ -306,7 +336,7 @@ func (c *channelConn) sysPackage(msg sysPackageMsg, now time.Time) {
 		"output": capSysOutput(output),
 	}
 	if actErr != nil {
-		result["error"] = "action_failed"
+		result["error"] = sysErrCode(ctx)
 	}
 	_ = c.out.WriteJSON(ResponseMessage{Type: "sys_result", RequestID: rid, Payload: result})
 	log.Printf("sys_package %s name=%s action=%s ok=%t", rid, msg.Name, msg.Action, actErr == nil)
@@ -327,7 +357,7 @@ type sysConfigMsg struct {
 // content (symlink-guarded, capped); write rebuilds the signed payload from
 // the body's hash (so a tampered body is refused) and does an atomic write;
 // reload reloads a unit through the ConfigStore.
-func (c *channelConn) sysConfig(msg sysConfigMsg, now time.Time) {
+func (c *channelConn) sysConfig(ctx context.Context, msg sysConfigMsg, now time.Time) {
 	rid := msg.RequestID
 	if !sysRequestRe.MatchString(rid) {
 		log.Printf("sys_config refused: bad request id")
@@ -378,11 +408,16 @@ func (c *channelConn) sysConfig(msg sysConfigMsg, now time.Time) {
 		actErr = configWriteViaHelper(msg.Target, msg.Content, msg.Lease)
 	case "reload":
 		var out string
-		out, actErr = sysConfig().Reload(context.Background(), msg.Target)
+		reloadCtx, cancel := context.WithTimeout(ctx, sysOpTimeout)
+		out, actErr = sysConfig().Reload(reloadCtx, msg.Target)
+		if actErr != nil {
+			result["error"] = sysErrCode(reloadCtx)
+		}
+		cancel()
 		result["output"] = capSysOutput(out)
 	}
 	result["ok"] = actErr == nil
-	if actErr != nil {
+	if actErr != nil && result["error"] == nil {
 		result["error"] = "action_failed"
 	}
 	_ = c.out.WriteJSON(ResponseMessage{Type: "sys_result", RequestID: rid, Payload: result})
@@ -413,7 +448,7 @@ type sysTweakMsg struct {
 // privilege-separated through committed helper units
 // (sysctl_helper.go / systemd_override_helper.go), which re-validate the
 // request independently before the root-equivalent write.
-func (c *channelConn) sysTweak(msg sysTweakMsg, now time.Time) {
+func (c *channelConn) sysTweak(_ context.Context, msg sysTweakMsg, now time.Time) {
 	rid := msg.RequestID
 	if !sysRequestRe.MatchString(rid) {
 		log.Printf("sys_tweak refused: bad request id")

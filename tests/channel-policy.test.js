@@ -478,3 +478,15 @@ test('config self-roots match the agent helper (shared vectors)', async () => {
       (err) => err.code === 'usage', unit);
   }
 });
+
+test('--service refuses the agent and mutation helper units', async () => {
+  const reg = await fixture();
+  for (const unit of ['systemapi-agent.service', 'systemapi-agent', 'sah-config-helper@.service',
+    'sah-sysctl-helper@0123456789abcdef0123456789abcdef.service', 'sah-systemd-override-helper@x', 'sah-future-helper@.service']) {
+    await assert.rejects(run(['set', '--tenant', 'afterdark', '--host', 'miniapps1', '--reason', 'x', '--service', unit], { registry: reg }),
+      (err) => err.code === 'usage' && /agent's or a helper's unit/.test(err.message), unit);
+  }
+  const out = await run(['set', '--tenant', 'afterdark', '--host', 'miniapps1', '--reason', 'x',
+    '--service', 'nginx.service', '--service', 'systemapi-agent-other.service'], { registry: reg });
+  assert.deepEqual(out.host_service_policy, { units: ['nginx.service', 'systemapi-agent-other.service'] });
+});

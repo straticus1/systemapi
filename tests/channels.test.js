@@ -738,3 +738,52 @@ test('sysctl deny list matches the agent (shared vectors)', () => {
     assert.equal(ch.parseTweakPolicy({ sysctls: [k] }), null, k);
   }
 });
+
+test('sys leases: Node builders match the shared Go vectors', () => {
+  const crypto = require('node:crypto');
+  const lease = require('../controlplane/lease');
+  const key = privateKeyFromSeed(TEST_SEED);
+  const signer = buildSigner(key, rawPublicKey(key));
+  const pub = crypto.createPublicKey(key);
+  const sha = (s) => crypto.createHash('sha256').update(s, 'utf8').digest('hex');
+  const vec = require('../controlplane/testdata/sys-lease-vectors.json');
+  assert.equal(vec.public_raw_b64, rawPublicKey(key).toString('base64'));
+  const seen = new Set();
+  for (const v of vec.vectors) {
+    const i = v.inputs;
+    const built = v.action === 'sys_service' ? lease.sysServicePayload(i.unit, i.action)
+      : v.action === 'sys_package' ? lease.sysPackagePayload(i.name, i.action)
+        : v.action === 'sys_config' ? lease.sysConfigPayload(i.action, i.target, i.action === 'write' ? sha(i.content) : undefined)
+          : lease.sysTweakPayload(i, i.verb === 'unit-override-set' ? sha(i.content) : undefined);
+    assert.equal(built, v.payload, v.name);
+    assert.equal(lease.payloadHash(v.action, v.payload), v.lease.payload_sha256, v.name);
+    assert.equal(signer.sign(v.message), v.lease.signature, v.name);
+    assert.equal(lease.verifyLease(pub, v.lease, v.payload, vec.now_ms).ok, true, v.name);
+    for (const other of ['sys_service', 'sys_package', 'sys_config', 'sys_tweak'].filter((a) => a !== v.action)) {
+      assert.equal(lease.verifyLease(pub, { ...v.lease, action: other }, v.payload, vec.now_ms).ok, false, `${v.name} as ${other}`);
+    }
+    assert.equal(lease.verifyLease(pub, v.lease, `${v.payload}x`, vec.now_ms).error, 'payload_mismatch', v.name);
+    seen.add(v.action);
+  }
+  assert.deepEqual([...seen].sort(), ['sys_config', 'sys_package', 'sys_service', 'sys_tweak']);
+});
+
+test('config policy enforces the shared config self-root vectors', () => {
+  const vec = require('../controlplane/testdata/config-self-vectors.json');
+  for (const p of vec.denied) {
+    assert.equal(ch.configSelfDenied(p), true, p);
+    assert.equal(ch.parseConfigPolicy({ paths: [p] }), null, p);
+    assert.equal(ch.parseConfigPolicy({ paths: ['/etc/nginx', p] }), null, p);
+    // Even a hand-built policy object never allows a self-root target.
+    assert.equal(ch.configPolicyAllows({ paths: ['/etc', '/var', '/proc', '/dev', '/sys', '/boot'] }, p), false, p);
+  }
+  for (const p of vec.allowed) {
+    assert.equal(ch.configSelfDenied(p), false, p);
+    assert.deepEqual(ch.parseConfigPolicy({ paths: [p] }), { paths: [p] }, p);
+    assert.equal(ch.configPolicyAllows({ paths: [p] }, p), true, p);
+  }
+  // A prefix that contains a protected path (or a systemd unit dir) is refused.
+  for (const p of ['/etc', '/var/lib', '/etc/systemd', '/etc/systemd/system', '/']) {
+    assert.equal(ch.parseConfigPolicy({ paths: [p] }), null, p);
+  }
+});

@@ -1,0 +1,223 @@
+{
+  "comment": "Shared by tests/channels.test.js and systemapi-agent/lease_sys_test.go: the Node and Go sys_service/sys_package/sys_config/sys_tweak payload builders must produce payload from inputs (a write or unit-override binds sha256(content)), and the lease must verify on both sides. Signed with keys.js TEST_SEED.",
+  "public_raw_b64": "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc=",
+  "host_id": "11111111-1111-4111-8111-111111111111",
+  "now_ms": 1700000000000,
+  "vectors": [
+    {
+      "name": "service_restart",
+      "action": "sys_service",
+      "inputs": {
+        "unit": "nginx.service",
+        "action": "restart"
+      },
+      "payload": "nginx.service\nrestart",
+      "message": "systemapi-lease-v1\n11111111-1111-4111-8111-111111111111\nsys_service\n1700000060\nefefefefefefefefefefefefefefefef\n33e427b76ca61cc46ad05a77dfeabd99454270b961541aa294111715e7a36e04\n",
+      "lease": {
+        "v": 1,
+        "host_id": "11111111-1111-4111-8111-111111111111",
+        "action": "sys_service",
+        "expires_unix": 1700000060,
+        "nonce_hex": "efefefefefefefefefefefefefefefef",
+        "payload_sha256": "33e427b76ca61cc46ad05a77dfeabd99454270b961541aa294111715e7a36e04",
+        "signature": "b6XovPqBHjH4X9bKqv9Co3+ORlb3vCOrZJxA3PlUzXsnSi9UDLxjCVDonHCSL3rLR4ZCo+AQlWO5OeeBGLxwBQ=="
+      }
+    },
+    {
+      "name": "service_disable",
+      "action": "sys_service",
+      "inputs": {
+        "unit": "postgresql@16-main.service",
+        "action": "disable"
+      },
+      "payload": "postgresql@16-main.service\ndisable",
+      "message": "systemapi-lease-v1\n11111111-1111-4111-8111-111111111111\nsys_service\n1700000060\nefefefefefefefefefefefefefefefef\n1d91c4a6cf53a968aca66a33d9ff856d4ddd3fef7936808e96b4be2f73fadad5\n",
+      "lease": {
+        "v": 1,
+        "host_id": "11111111-1111-4111-8111-111111111111",
+        "action": "sys_service",
+        "expires_unix": 1700000060,
+        "nonce_hex": "efefefefefefefefefefefefefefefef",
+        "payload_sha256": "1d91c4a6cf53a968aca66a33d9ff856d4ddd3fef7936808e96b4be2f73fadad5",
+        "signature": "9Q0PBL1c36rjcCyEmy9Xk0883ELpLo7t6OW18GtO6cdsiU7gKsiFESAcHt86sIyehkMApFN50Pb2GlFSCqunDg=="
+      }
+    },
+    {
+      "name": "package_install",
+      "action": "sys_package",
+      "inputs": {
+        "name": "nginx",
+        "action": "install"
+      },
+      "payload": "nginx\ninstall",
+      "message": "systemapi-lease-v1\n11111111-1111-4111-8111-111111111111\nsys_package\n1700000060\nefefefefefefefefefefefefefefefef\n106b17b831e0af1e802f09399f2fc4248f9bd8708c6841d2e8e80935e1e50faf\n",
+      "lease": {
+        "v": 1,
+        "host_id": "11111111-1111-4111-8111-111111111111",
+        "action": "sys_package",
+        "expires_unix": 1700000060,
+        "nonce_hex": "efefefefefefefefefefefefefefefef",
+        "payload_sha256": "106b17b831e0af1e802f09399f2fc4248f9bd8708c6841d2e8e80935e1e50faf",
+        "signature": "QWBppBJNmYuUXWhhW8yB/ahpHtj8lVtCv7XdsNSsmK6/03YJF2rh7yiZ0hKUkXxfScaRyeYPko88bJ3HE5W0Cg=="
+      }
+    },
+    {
+      "name": "package_query",
+      "action": "sys_package",
+      "inputs": {
+        "name": "libc6-dev",
+        "action": "query"
+      },
+      "payload": "libc6-dev\nquery",
+      "message": "systemapi-lease-v1\n11111111-1111-4111-8111-111111111111\nsys_package\n1700000060\nefefefefefefefefefefefefefefefef\nec1d6bd308c08f967a69bdaaae7a342b2e11671f81174e8a010e54d1cd02b68c\n",
+      "lease": {
+        "v": 1,
+        "host_id": "11111111-1111-4111-8111-111111111111",
+        "action": "sys_package",
+        "expires_unix": 1700000060,
+        "nonce_hex": "efefefefefefefefefefefefefefefef",
+        "payload_sha256": "ec1d6bd308c08f967a69bdaaae7a342b2e11671f81174e8a010e54d1cd02b68c",
+        "signature": "IR7PFlFlbwcrQkjPd19Z1J5Bwjz2Bs1S51ZN6J2bcJTAWdjgvJtKlbyJqUcKAxG3uNrrwCSdJ/a69X9CiLS9DQ=="
+      }
+    },
+    {
+      "name": "config_read",
+      "action": "sys_config",
+      "inputs": {
+        "action": "read",
+        "target": "/etc/nginx/nginx.conf"
+      },
+      "payload": "read\n/etc/nginx/nginx.conf",
+      "message": "systemapi-lease-v1\n11111111-1111-4111-8111-111111111111\nsys_config\n1700000060\nefefefefefefefefefefefefefefefef\n92ca90d95e4505930ddb12f527900946a13dbee2940482098240515f5c56bc5b\n",
+      "lease": {
+        "v": 1,
+        "host_id": "11111111-1111-4111-8111-111111111111",
+        "action": "sys_config",
+        "expires_unix": 1700000060,
+        "nonce_hex": "efefefefefefefefefefefefefefefef",
+        "payload_sha256": "92ca90d95e4505930ddb12f527900946a13dbee2940482098240515f5c56bc5b",
+        "signature": "9o3xiclniicKpVXklPrVYacBCczp9D7L9YnDG7dN/fBOpyXrVHUcRwzWONNWdDXohJSAsj4km8i4fwyO/7TnCQ=="
+      }
+    },
+    {
+      "name": "config_write",
+      "action": "sys_config",
+      "inputs": {
+        "action": "write",
+        "target": "/etc/nginx/conf.d/app.conf",
+        "content": "server { listen 8080; }\n"
+      },
+      "payload": "write\n/etc/nginx/conf.d/app.conf\n909f64f9975b2daaa6daf221c2eb710c951d528b15c84f012a67489cc416dbef",
+      "message": "systemapi-lease-v1\n11111111-1111-4111-8111-111111111111\nsys_config\n1700000060\nefefefefefefefefefefefefefefefef\nd3f2e117445b850a505c76af7f275a58467d339f69e25767ab3c32c190a4e02c\n",
+      "lease": {
+        "v": 1,
+        "host_id": "11111111-1111-4111-8111-111111111111",
+        "action": "sys_config",
+        "expires_unix": 1700000060,
+        "nonce_hex": "efefefefefefefefefefefefefefefef",
+        "payload_sha256": "d3f2e117445b850a505c76af7f275a58467d339f69e25767ab3c32c190a4e02c",
+        "signature": "AtFmtpMAJ50xQuPrsjPJzoJQzt9yfjsqUsHpLInAkV7OIjDwJV+HuQDyF8K20y03iq5y0b/qR7sWsZ5zn7/0Bw=="
+      }
+    },
+    {
+      "name": "config_reload",
+      "action": "sys_config",
+      "inputs": {
+        "action": "reload",
+        "target": "nginx.service"
+      },
+      "payload": "reload\nnginx.service",
+      "message": "systemapi-lease-v1\n11111111-1111-4111-8111-111111111111\nsys_config\n1700000060\nefefefefefefefefefefefefefefefef\nd0fe9ab4535197ad404e6629fcde088c28ee53f45aa17b0f3165c34cc29a1fe4\n",
+      "lease": {
+        "v": 1,
+        "host_id": "11111111-1111-4111-8111-111111111111",
+        "action": "sys_config",
+        "expires_unix": 1700000060,
+        "nonce_hex": "efefefefefefefefefefefefefefefef",
+        "payload_sha256": "d0fe9ab4535197ad404e6629fcde088c28ee53f45aa17b0f3165c34cc29a1fe4",
+        "signature": "WzgDjtmD7nvY3ZX6NuCBndb2GdNWq5VdxIx7xj7cOUBP+djgHNAqkwv4i9CZ51NQLXN1sv+YO/m7l1Q3sGq3AA=="
+      }
+    },
+    {
+      "name": "tweak_sysctl_get",
+      "action": "sys_tweak",
+      "inputs": {
+        "verb": "sysctl-get",
+        "key": "vm.swappiness"
+      },
+      "payload": "sysctl-get\nvm.swappiness",
+      "message": "systemapi-lease-v1\n11111111-1111-4111-8111-111111111111\nsys_tweak\n1700000060\nefefefefefefefefefefefefefefefef\nf12f925009219e48710dca40749ea1ac7e88665f218af703709db7f8468e53c9\n",
+      "lease": {
+        "v": 1,
+        "host_id": "11111111-1111-4111-8111-111111111111",
+        "action": "sys_tweak",
+        "expires_unix": 1700000060,
+        "nonce_hex": "efefefefefefefefefefefefefefefef",
+        "payload_sha256": "f12f925009219e48710dca40749ea1ac7e88665f218af703709db7f8468e53c9",
+        "signature": "T2yCIYM4ZbIOLnd3sb07JZ8N3iVVrM1yRjQvR7a+Tf+d6QPqeJOa/Koio6qiXg78rnQhGsvPLWkV1way+V3oBQ=="
+      }
+    },
+    {
+      "name": "tweak_sysctl_set",
+      "action": "sys_tweak",
+      "inputs": {
+        "verb": "sysctl-set",
+        "key": "net.ipv4.ip_forward",
+        "value": "1"
+      },
+      "payload": "sysctl-set\nnet.ipv4.ip_forward\n1",
+      "message": "systemapi-lease-v1\n11111111-1111-4111-8111-111111111111\nsys_tweak\n1700000060\nefefefefefefefefefefefefefefefef\n577376b5a8ce7281f9c8c6207c988679d36b82158a5fce11f3df49629b15ec97\n",
+      "lease": {
+        "v": 1,
+        "host_id": "11111111-1111-4111-8111-111111111111",
+        "action": "sys_tweak",
+        "expires_unix": 1700000060,
+        "nonce_hex": "efefefefefefefefefefefefefefefef",
+        "payload_sha256": "577376b5a8ce7281f9c8c6207c988679d36b82158a5fce11f3df49629b15ec97",
+        "signature": "WS10rzcvrDQr4ArJUKFE/JMGHijhX18VZOjgSmsy/ZuacbM/6FfvPf0xmU08I0kRP9riH2QABFN1HdsWyYHMDQ=="
+      }
+    },
+    {
+      "name": "tweak_resource_limit",
+      "action": "sys_tweak",
+      "inputs": {
+        "verb": "resource-limit-set",
+        "unit": "nginx.service",
+        "limit": "LimitNOFILE",
+        "value": "65536"
+      },
+      "payload": "resource-limit-set\nnginx.service\nLimitNOFILE\n65536",
+      "message": "systemapi-lease-v1\n11111111-1111-4111-8111-111111111111\nsys_tweak\n1700000060\nefefefefefefefefefefefefefefefef\n2f28ec208d57ff421ed282335a6b94823bafdc47c49467f4b19b9013587e8567\n",
+      "lease": {
+        "v": 1,
+        "host_id": "11111111-1111-4111-8111-111111111111",
+        "action": "sys_tweak",
+        "expires_unix": 1700000060,
+        "nonce_hex": "efefefefefefefefefefefefefefefef",
+        "payload_sha256": "2f28ec208d57ff421ed282335a6b94823bafdc47c49467f4b19b9013587e8567",
+        "signature": "NvgzMYIDKHANdQ0Akel51HZigd45+JcOL2lkw/EIywntehF/+JeA7xz92GSvafdwlqIb/Qk/Fdq+IpbRw1hwCQ=="
+      }
+    },
+    {
+      "name": "tweak_unit_override",
+      "action": "sys_tweak",
+      "inputs": {
+        "verb": "unit-override-set",
+        "unit": "nginx.service",
+        "name": "50-restart",
+        "content": "[Service]\nRestart=always\n"
+      },
+      "payload": "unit-override-set\nnginx.service\n50-restart\n246fc4dc3218f56b4c70014df6801b10fc2a573d6545962b7fce05f16908c54e",
+      "message": "systemapi-lease-v1\n11111111-1111-4111-8111-111111111111\nsys_tweak\n1700000060\nefefefefefefefefefefefefefefefef\n99cbc79bec991f8fcb84ec5c4a06f337419ddf439225ccf134677e49e6d44f32\n",
+      "lease": {
+        "v": 1,
+        "host_id": "11111111-1111-4111-8111-111111111111",
+        "action": "sys_tweak",
+        "expires_unix": 1700000060,
+        "nonce_hex": "efefefefefefefefefefefefefefefef",
+        "payload_sha256": "99cbc79bec991f8fcb84ec5c4a06f337419ddf439225ccf134677e49e6d44f32",
+        "signature": "AcErRb39+q4kBvS83C0AP0HCQ+cCjWJB9H5QDZX4OAZdg3de6/YYpQ3Cc3cuKgOx00qyv1Wh5zct/X3BphuzCA=="
+      }
+    }
+  ]
+}

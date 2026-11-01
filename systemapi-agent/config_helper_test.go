@@ -28,9 +28,11 @@ func withConfigHelperStateDir(t *testing.T) string {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	prev := configHelperStateDir
+	prev, prevUID := configHelperStateDir, helperHandoffOwnerUID
 	configHelperStateDir = dir
-	t.Cleanup(func() { configHelperStateDir = prev })
+	// checkHandoffDir wants the owner root; the test owns its temp dir.
+	helperHandoffOwnerUID = uint32(os.Getuid())
+	t.Cleanup(func() { configHelperStateDir, helperHandoffOwnerUID = prev, prevUID })
 	return dir
 }
 

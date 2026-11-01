@@ -68,28 +68,15 @@ func fsPathShapeOK(p string) bool {
 	return p != "/" && xferRootOK(p)
 }
 
-// fsPrefixAllowed reports whether the absolute path p is within a grant:
-// "*", or a well-formed grant prefix on a component boundary, as given or
-// with its symlinks resolved. It is a pre-check only (glob patterns, the
-// compose project dir); a path that is then opened goes through
-// fsGrantRootPath.
+// fsPrefixAllowed reports whether the absolute path p is within a grant
+// under the one grant rule (fsGrantRootPath, following the final component):
+// p must have the rootShapeOk shape and sit at or beneath a well-formed grant
+// (or "*"), and its resolved path must sit beneath that same grant's resolved
+// root. It is a pre-check only (glob patterns, the compose project dir); a
+// path that is then opened goes through fsGrantRootPath again.
 func fsPrefixAllowed(allow []string, p string) bool {
-	for _, prefix := range allow {
-		if prefix == "*" {
-			return true
-		}
-		prefix, ok := fsGrantShape(prefix)
-		if !ok {
-			continue
-		}
-		if pathWithin(prefix, p) {
-			return true
-		}
-		if real, err := resolveExisting(prefix); err == nil && pathWithin(real, p) {
-			return true
-		}
-	}
-	return false
+	_, _, err := fsGrantRootPath(allow, p, "read", true)
+	return err == nil
 }
 
 // resolveExisting resolves the symlinks of p. A tail that does not exist yet
