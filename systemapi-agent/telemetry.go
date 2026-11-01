@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"strings"
 	"sync"
@@ -116,8 +117,8 @@ var telemetryClientsOnce sync.Once
 
 func ensureTelemetryClients() {
 	telemetryClientsOnce.Do(func() {
-		dockerClientTelemetry = NewDockerClient()
-		k3sClientTelemetry, _ = NewK3sClient() // nil if no kubeconfig (D-05: non-fatal)
+		dockerClientTelemetry = NewDockerClient(context.Background())
+		k3sClientTelemetry, _ = NewK3sClient(context.Background()) // nil if no kubeconfig (D-05: non-fatal)
 	})
 }
 

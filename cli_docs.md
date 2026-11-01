@@ -26,6 +26,11 @@ SYSTEMAPI_API_KEY=<key> ./systemapi-agent \
 | `--pty-record-dir` | `/var/lib/systemapi/recordings` as root, else `<state dir>/recordings` | One `<session_id>.rec` file per session, directory mode 0700. The HMAC key is `recording.key` (0600) in the state directory. |
 | `--pty-record-max-bytes` | 1 GiB | A session ends (`pty_exit` reason `stopped`, `record_error` `recording_size_limit`) once it has recorded this many bytes. |
 | `--pty-record-min-free` | 1 GiB | A session is refused (`recording_unavailable`) when the recording filesystem has less free space than this. |
+| `--sysscript-jobs` | `true` | Advertise the `sysscript_jobs` capability (Linux and macOS). `false` stops advertising it, so the server sends this host's scripts the legacy way. Windows agents never advertise it. |
+| `--state-backup-dir` | `/var/lib/systemapi/backups` | Where `sys.state` keeps file backups. Checked at startup: absolute and clean, every existing component (of the path as given and with symlinks resolved) a directory owned by root and not writable by group or other, a symlink allowed only inside such a directory; the resolved path is used. An explicit value that fails stops the agent from starting; the default that fails only logs a warning and disables backups, so file changes that need one fail. Not supported on Windows (an explicit value is refused; backups are off). It must also not overlap any write grant, or file changes that need a backup fail. |
+| `--sysscript-workers` | 4 | Scripts that run at once (1 to 16), jobs and legacy scripts together. 8 more may wait for a worker; beyond that a script is refused `agent_busy`. |
+| `--sysscript-legacy-seconds` | 300 | Whole-script deadline of a legacy (non-job) script, 1 to 3600, cut to `--sysscript-max-seconds`. |
+| `--sysscript-max-seconds` | 3600 | Ceiling for any script deadline (1 to 3600). A job deadline beyond it is cut to it. |
 
 `terminal:root` sessions use their own lease action (`pty_root`), run as root,
 and need an agent running as root. The agent keeps 4 of its 32 session slots
@@ -89,6 +94,11 @@ SYSTEMAPI_URL=https://api.systemapi.io SYSTEMAPI_API_KEY=<key> node cli/systemap
   breakglass-ticket --host <id>
   host-json --host <id>
   retire --host <id> --reason <text> [--force]
+  jobs submit <host> <script-file> [--timeout <s>] [--wait <s>]
+  jobs status <job-id>
+  jobs wait <job-id> [--wait <s>]
+  jobs cancel <job-id>
+  jobs list [--host <id>] [--status <status>]
   login <username>
 ```
 
@@ -97,6 +107,40 @@ SYSTEMAPI_URL=https://api.systemapi.io SYSTEMAPI_API_KEY=<key> node cli/systemap
 refused `host_online`. It prints the JSON response.
 
 The key is sent only as `X-API-Key`. A key in `SYSTEMAPI_URL` is refused.
+
+### Jobs
+
+`jobs` runs a script as an async sysscript job (`api_docs.md`, "Async
+sysscript jobs"). The host's agent must advertise `sysscript_jobs`;
+otherwise use `exec`.
+
+- `jobs submit <host> <file>` posts the script with `entitlements:
+  {allow_exec: true}` and `--timeout` as `timeout_s` (server default 300).
+  - Without `--wait` it prints the job id on stdout and exits 0. The job
+    runs on.
+  - With `--wait W` it prints `job <id>` on stderr once the job exists, then
+    waits up to W seconds in total. The first POST asks the server to wait
+    `min(W, 20)` s; after that it polls `GET /api/v1/jobs/<id>` every 2 s.
+    Network errors, timeouts, 429 and 5xx answers are retried until W runs
+    out.
+- `jobs wait <id> [--wait W]` waits the same way. Without `--wait` it waits
+  until the job's deadline + 90 s, counted on the server's clock.
+- A finished wait prints the job's output on stdout. On stderr it prints
+  `<status> <error>` when the job did not succeed, and says when the output
+  is hidden (only the submitter and tenant admins can read it), expired or
+  truncated.
+- `jobs status <id>` prints the job as one JSON line.
+- `jobs cancel <id>` prints `<id>\t<status>`. The job ends `cancelled` once
+  the agent stops it.
+- `jobs list` prints `job_id`, `host_id`, `status`, `source`, `created_at`
+  and `duration_ms`, tab-separated, newest first (at most 50).
+
+| Exit | `submit` (no `--wait`) | `submit --wait`, `wait`, `status` | `cancel`, `list` |
+| --- | --- | --- | --- |
+| 0 | job created | `succeeded` | done |
+| 1 | request refused or failed | `failed`, `timed_out`, `cancelled`, or the request refused or failed | request refused or failed (for example 409 `job_finished`) |
+| 2 | bad arguments or missing `SYSTEMAPI_URL`/`SYSTEMAPI_API_KEY` | same | same |
+| 3 | - | still running: for `submit --wait` and `wait`, when the wait ended (the job id is on stdout); for `status`, the job's JSON line is on stdout as always | - |
 
 ## Sysscript
 
@@ -111,18 +155,18 @@ anything not granted is refused. The control plane clamps them first:
 | --- | --- | --- |
 | `allow_exec` | bool | `sys.exec.run`, `sys.proc.kill` |
 | `allow_fs_read` | path list | `sys.fs.read`, `stat`, `glob`; `sys.config.backup` |
-| `allow_fs_write` | path list | `sys.fs.write`, `mkdir`, `rm`, `chmod`; `sys.config.restore` |
+| `allow_fs_write` | path list | `sys.fs.write`, `mkdir`, `rm`, `chmod`; `sys.config.restore`; `sys.state` file, directory, absent |
 | `allow_net_outbound` | host list | `sys.net.http_get` |
-| `allow_config_write` | path list | `sys.config.write`, `restore` |
-| `allow_service_reload` | name list | `sys.config.reload`, `sys.services.*` actions |
-| `allow_packages` | exact list | `sys.packages.install` |
+| `allow_config_write` | path list | `sys.config.write`, `restore`; `sys.state` file |
+| `allow_service_reload` | name list | `sys.config.reload`, `sys.services.*` actions; `sys.state` service (exact names only) |
+| `allow_packages` | exact list | `sys.packages.install`; `sys.state` package |
 | `allow_containers` | bool | the `sys.containers` module |
 | `allow_images` | exact list | `sys.containers.run` |
 | `allow_k3s`, `allow_k8s` | bool | the `sys.k3s` / `sys.k8s` modules |
 | `allow_k3s_namespaces`, `allow_k8s_namespaces` | exact list | namespaces those modules may touch |
 | `allow_linux` | bool | `sys.linux`, `sys.disk`, `sys.procfs` (Linux hosts only) |
 | `allow_mount_targets` | exact list | `sys.disk.mount`, `umount` |
-| `allow_sysctl` | exact list | `sys.procfs.sysctl_get`, `sysctl_set` (some keys are always denied) |
+| `allow_sysctl` | exact list | `sys.procfs.sysctl_get`, `sysctl_set`, `sys.state` sysctl (some keys are always denied) |
 | `allow_net_manage` | exact list | `sys.net.set_address`, `set_route`, `link_up`, `link_down`, `set_dns` |
 
 A JSON boolean in a list field grants nothing, and `"*"` is dropped.
@@ -150,10 +194,11 @@ The other list fields are passed through for admins.
 | `sys.linux` | `os_release`, `uname`, `hostname`, `uptime`, `users`, `groups` |
 | `sys.disk` | `mounts`, `usage`, `block_devices`, `mount`, `umount` |
 | `sys.procfs` | `read`, `sysctl_get`, `sysctl_set` |
+| `sys.state` | `ensure_file`, `ensure_directory`, `ensure_absent`, `ensure_package`, `ensure_service`, `ensure_sysctl`, and a `check_` form of each (see below) |
 
 Not implemented:
 
-- `sys.alerts.push(severity, message)` logs on the agent and returns `False`.
+- `sys.alerts.push(severity, message)` sends the alert to the control plane, which stores it as an alert event (`rule_name` `sysscript`) for the run's host and tenant and writes a `sysscript_alert` audit row. `severity` is `info`, `warning` or `critical` (anything else is an error); a message over 4096 bytes is cut. Returns `True` when the frame is handed to the connection, `False` when there is no connection or the run already pushed 20 alerts.
   Nothing forwards it to the control plane yet.
 - `sys.security.yara_scan`, `sys.security.scan_memory` and `sys.events.listen`
   raise a "not implemented" error.
@@ -163,4 +208,83 @@ Example:
 ```python
 r = sys.exec.run("df", "-h")
 print(r["output"])
+```
+
+### `sys.state`: idempotent resources
+
+`sys.state.ensure_<kind>(...)` checks one resource and, only when it differs
+from the arguments, changes it and checks it again. `sys.state.check_<kind>(...)`
+takes the same arguments and only checks; it never changes the host.
+
+| Verb | Arguments | Grant (checked for check and ensure) |
+| --- | --- | --- |
+| `file` | `path, content, mode="0644" (0600 when sensitive), owner="", group="", sensitive=False` | path under `allow_config_write` or `allow_fs_write`; check reads the current content under that write grant |
+| `directory` | `path, mode="0755", owner="", group=""` | path under `allow_fs_write` |
+| `absent` | `path` | path under `allow_fs_write` |
+| `package` | `name, present=True, version=None` | `name` in `allow_packages` |
+| `service` | `name, running=True, enabled=True` | `name` in `allow_service_reload` (exactly; `"*"` does not count) |
+| `sysctl` | `key, value` | `key` in `allow_sysctl`, plus `allow_linux` |
+
+- `check_file` and `ensure_file` read the file's current content under the
+  write grant (`allow_config_write` or `allow_fs_write`); no `allow_fs_read`
+  is needed. Holding the right to write a path implies reading it: the
+  result carries its sha256 and a unified diff (capped at 32 KiB) unless
+  `sensitive=True`. Do not grant write on a path whose current content the
+  script's reader must not see.
+- Paths must be absolute and clean. A mode is octal: at most `0777` for a
+  file; a directory may also carry setgid (`2000`) and sticky (`1000`), never
+  setuid. `owner` and `group` are names or numeric ids; empty leaves them as
+  they are.
+- `file` compares content, mode and owner. It replaces the file atomically
+  (a temp file in the same directory, renamed over it) with the given mode
+  and owner. A symlink at the path is replaced, never followed. A file with
+  more than one hard link is not read and the call fails.
+- Before a file is replaced or removed, its content is copied to
+  `/var/lib/systemapi/backups/<sha256 of the path>/<unix ns>` (directory
+  0700, file 0600); the newest 5 are kept per path. Nothing is written beside
+  the target. The backup directory may not overlap a write grant; if it
+  does, the change fails. A broad write grant (`/`, `/var`, `/var/lib` or
+  `"*"`) therefore makes every file change that needs a backup fail closed:
+  start the agent with `--state-backup-dir` pointing outside the grants.
+- `absent` removes a file, a symlink or an empty directory, never
+  recursively.
+- `sensitive=True` reports only whether the content matches: no hash, size
+  or diff. Its mode defaults to `0600`. Use it for any file that holds a
+  secret; it is the only reliable protection.
+- Masking of vars in converge `print()` output and error text is best
+  effort: a line or error holding a vars value of 8 bytes or more (as is,
+  or in JSON form) is replaced by `[masked]`. A shorter value, a transformed
+  one (upper-cased, split, hashed, base64) and a value inside a resource key
+  or path are not masked. Keep secrets out of paths and names, and mark the
+  files that carry them `sensitive=True`.
+- `version=` is check-only: a different installed version is reported as
+  drift, and `ensure_package` then fails with `version_pin_unsupported`
+  without calling the package manager.
+- `directory` creates missing parents.
+- On OpenRC, `ensure_service(..., enabled=...)` and `sys.services.enable`
+  / `disable` add to and remove from the `default` runlevel only (they now
+  name it; before they used `rc-update`'s own default). A service counts as
+  enabled when it is in `default` or `boot`, so disabling one that is only
+  in `boot` most likely fails (`rc-update del <svc> default` exits non-zero)
+  and it stays enabled.
+
+`ensure_*` returns `{"changed", "status", "before", "after", "backup_id",
+"error"}` and `check_*` returns `{"status", "before", "desired", "diff",
+"error"}`. `status` is one of:
+
+| Status | Meaning |
+| --- | --- |
+| `ok` | already as declared |
+| `drift` | differs (check) |
+| `changed` | changed, and the check after the change found nothing left (ensure) |
+| `denied` | outside the grants; the host was not touched |
+| `failed` | an error, or `non_idempotent` when the check after the change still found a difference |
+| `skipped` | the script's deadline or cancel came first |
+
+Invalid arguments (a relative path, a bad mode, an invalid name) raise an
+error instead.
+
+```python
+r = sys.state.ensure_file("/etc/app/app.conf", "port=8080\n", mode="0640", owner="app")
+print(r["status"], r["changed"], r["error"])
 ```

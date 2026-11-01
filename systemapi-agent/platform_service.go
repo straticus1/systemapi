@@ -13,9 +13,11 @@ package main
 // caller, which caps and does not log it.
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -90,26 +92,56 @@ func (systemdServiceManager) Available() bool {
 	return ok
 }
 
-func (m systemdServiceManager) Action(verb, service string) (string, error) {
+func (m systemdServiceManager) Action(ctx context.Context, verb, service string) (string, error) {
 	if err := validService(verb, service); err != nil {
 		return "", err
 	}
-	out, err := exec.Command("systemctl", verb, service).CombinedOutput()
+	out, err := jobCommand(ctx, "systemctl", verb, service).CombinedOutput()
 	return string(out), err
 }
 
-func (m systemdServiceManager) Status(service string) (ServiceStatus, error) {
+func (m systemdServiceManager) Status(ctx context.Context, service string) (ServiceStatus, error) {
 	if !serviceNameRE.MatchString(service) {
 		return ServiceStatus{}, fmt.Errorf("service not allowed")
 	}
-	out, err := exec.Command("systemctl", "is-active", service).Output()
+	out, err := jobCommand(ctx, "systemctl", "is-active", service).Output()
 	state := strings.TrimSpace(string(out))
-	full, _ := exec.Command("systemctl", "status", "--no-pager", "-n", "0", service).CombinedOutput()
+	full, _ := jobCommand(ctx, "systemctl", "status", "--no-pager", "-n", "0", service).CombinedOutput()
 	return ServiceStatus{
 		Active: err == nil && state == "active",
 		State:  state,
 		Output: strings.TrimSpace(string(full)),
 	}, nil
+}
+
+// IsEnabled runs `systemctl is-enabled`. Only enabled and enabled-runtime
+// count as enabled; static, indirect, masked and the like are not enabled,
+// and an empty or unknown answer (a missing unit) is an error.
+func (m systemdServiceManager) IsEnabled(ctx context.Context, service string) (bool, error) {
+	if !serviceNameRE.MatchString(service) {
+		return false, fmt.Errorf("service not allowed")
+	}
+	out, _ := jobCommand(ctx, "systemctl", "is-enabled", service).Output()
+	if ctx.Err() != nil {
+		return false, fmt.Errorf("service is-enabled %s", jobCtxReason(ctx))
+	}
+	return systemdEnabledState(strings.TrimSpace(string(out)))
+}
+
+// systemdEnabledState maps a `systemctl is-enabled` answer. The exit code is
+// not used: it is non-zero for both "disabled" and a missing unit.
+func systemdEnabledState(state string) (bool, error) {
+	switch state {
+	case "enabled", "enabled-runtime":
+		return true, nil
+	case "disabled", "static", "indirect", "masked", "masked-runtime", "linked", "linked-runtime",
+		"generated", "transient":
+		return false, nil
+	case "alias":
+		return false, fmt.Errorf("service is an alias; manage the unit it points to")
+	default:
+		return false, fmt.Errorf("service enabled state unknown")
+	}
 }
 
 // --- openrc ---
@@ -123,29 +155,31 @@ func (openrcServiceManager) Available() bool {
 	return ok
 }
 
-func (m openrcServiceManager) Action(verb, service string) (string, error) {
+func (m openrcServiceManager) Action(ctx context.Context, verb, service string) (string, error) {
 	if err := validService(verb, service); err != nil {
 		return "", err
 	}
-	// enable/disable are rc-update; the rest are rc-service verbs.
-	var cmd *exec.Cmd
+	// enable/disable are rc-update on the default runlevel, named
+	// explicitly so IsEnabled checks the same level; the rest are rc-service
+	// verbs.
+	var cmd *jobCmd
 	switch verb {
 	case "enable":
-		cmd = exec.Command("rc-update", "add", service)
+		cmd = jobCommand(ctx, "rc-update", "add", service, "default")
 	case "disable":
-		cmd = exec.Command("rc-update", "del", service)
+		cmd = jobCommand(ctx, "rc-update", "del", service, "default")
 	default:
-		cmd = exec.Command("rc-service", service, verb)
+		cmd = jobCommand(ctx, "rc-service", service, verb)
 	}
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
 
-func (m openrcServiceManager) Status(service string) (ServiceStatus, error) {
+func (m openrcServiceManager) Status(ctx context.Context, service string) (ServiceStatus, error) {
 	if !serviceNameRE.MatchString(service) {
 		return ServiceStatus{}, fmt.Errorf("service not allowed")
 	}
-	out, err := exec.Command("rc-service", service, "status").CombinedOutput()
+	out, err := jobCommand(ctx, "rc-service", service, "status").CombinedOutput()
 	text := strings.TrimSpace(string(out))
 	active := err == nil && strings.Contains(text, "started")
 	state := "stopped"
@@ -153,6 +187,44 @@ func (m openrcServiceManager) Status(service string) (ServiceStatus, error) {
 		state = "started"
 	}
 	return ServiceStatus{Active: active, State: state, Output: text}, nil
+}
+
+// IsEnabled reports whether the service is in the default or the boot
+// runlevel: either starts it at boot. Action's enable and disable add to and
+// remove from default only, so disabling a service that is only in boot
+// most likely fails (rc-update del <svc> default exits non-zero) and the
+// service stays enabled.
+func (m openrcServiceManager) IsEnabled(ctx context.Context, service string) (bool, error) {
+	if !serviceNameRE.MatchString(service) {
+		return false, fmt.Errorf("service not allowed")
+	}
+	for _, level := range []string{"default", "boot"} {
+		_, err := os.Lstat(filepath.Join("/etc/runlevels", level, service))
+		if err == nil {
+			return true, nil
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+// launchdEnabledFrom reads `launchctl print-disabled system` output. A
+// label is enabled unless it is listed as disabled ("disabled" or, on older
+// macOS, "true"). The output's own "disabled services = {" header is not a
+// label line and is skipped.
+func launchdEnabledFrom(out, label string) bool {
+	want := "\"" + label + "\""
+	for _, line := range strings.Split(out, "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(line), "=>")
+		if !ok || strings.TrimSpace(k) != want {
+			continue
+		}
+		v = strings.TrimSpace(v)
+		return v != "disabled" && v != "true"
+	}
+	return true
 }
 
 // --- none (unsupported platform) ---
@@ -167,9 +239,12 @@ func (n noneServiceManager) errReason() error {
 	}
 	return fmt.Errorf("no service manager on this host")
 }
-func (n noneServiceManager) Action(verb, service string) (string, error) {
+func (n noneServiceManager) Action(ctx context.Context, verb, service string) (string, error) {
 	return "", n.errReason()
 }
-func (n noneServiceManager) Status(service string) (ServiceStatus, error) {
+func (n noneServiceManager) Status(ctx context.Context, service string) (ServiceStatus, error) {
 	return ServiceStatus{}, n.errReason()
+}
+func (n noneServiceManager) IsEnabled(ctx context.Context, service string) (bool, error) {
+	return false, n.errReason()
 }

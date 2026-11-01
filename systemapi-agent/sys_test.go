@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 )
@@ -24,13 +26,16 @@ type fakeServiceMgr struct {
 
 func (f *fakeServiceMgr) Name() string    { return "fake" }
 func (f *fakeServiceMgr) Available() bool { return f.avail }
-func (f *fakeServiceMgr) Action(verb, service string) (string, error) {
+func (f *fakeServiceMgr) Action(_ context.Context, verb, service string) (string, error) {
 	f.actions = append(f.actions, [2]string{verb, service})
 	return "acted on " + service, f.actErr
 }
-func (f *fakeServiceMgr) Status(service string) (ServiceStatus, error) {
+func (f *fakeServiceMgr) Status(_ context.Context, service string) (ServiceStatus, error) {
 	f.statuses = append(f.statuses, service)
 	return f.status, f.statusErr
+}
+func (f *fakeServiceMgr) IsEnabled(context.Context, string) (bool, error) {
+	return false, errors.New("fake: is-enabled not used by the sys channel")
 }
 
 type sysHarness struct {

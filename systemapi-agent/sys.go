@@ -26,12 +26,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
 	"os/exec"
 	"regexp"
-	"syscall"
 	"time"
 )
 
@@ -52,7 +52,14 @@ var sysTweaks = func() Tweaks { return currentPlatform().Tweaks }
 // a regular file, so a planted symlink cannot redirect the read out of an
 // allowed prefix. tests replace it. Output is capped at sysConfigReadMax.
 var sysConfigReadFile = func(path string) (string, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	// openNoFollow is 0 where the OS has no O_NOFOLLOW; the Lstat refuses a
+	// final symlink there (and is redundant where the flag exists).
+	if li, err := os.Lstat(path); err != nil {
+		return "", err
+	} else if li.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("config read: symlink refused")
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY|openNoFollow, 0)
 	if err != nil {
 		return "", err
 	}
@@ -206,7 +213,7 @@ func (c *channelConn) sysService(msg sysServiceMsg, now time.Time) {
 		return
 	}
 	svc := sysServices()
-	output, actErr := svc.Action(msg.Action, msg.Unit)
+	output, actErr := svc.Action(context.Background(), msg.Action, msg.Unit)
 	result := map[string]interface{}{
 		"ok":     actErr == nil,
 		"unit":   msg.Unit,
@@ -217,7 +224,7 @@ func (c *channelConn) sysService(msg sysServiceMsg, now time.Time) {
 		result["error"] = "action_failed"
 	}
 	// Status is the confirm read (same unit, no separate lease).
-	if status, statusErr := svc.Status(msg.Unit); statusErr == nil {
+	if status, statusErr := svc.Status(context.Background(), msg.Unit); statusErr == nil {
 		result["active"] = status.Active
 		result["state"] = status.State
 		result["status_output"] = capSysOutput(status.Output)
@@ -371,7 +378,7 @@ func (c *channelConn) sysConfig(msg sysConfigMsg, now time.Time) {
 		actErr = configWriteViaHelper(msg.Target, msg.Content, msg.Lease)
 	case "reload":
 		var out string
-		out, actErr = sysConfig().Reload(msg.Target)
+		out, actErr = sysConfig().Reload(context.Background(), msg.Target)
 		result["output"] = capSysOutput(out)
 	}
 	result["ok"] = actErr == nil

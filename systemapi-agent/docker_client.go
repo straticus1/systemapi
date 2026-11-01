@@ -5,10 +5,15 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -17,6 +22,7 @@ const dockerAPIVersion = "v1.41"
 
 // DockerClient communicates with the Docker Engine API over a Unix socket.
 type DockerClient struct {
+	ctx        context.Context // parent of every call; nil refuses all calls
 	client     *http.Client
 	socketPath string
 	baseURL    string // default "http://localhost" for Unix socket; overridden in tests
@@ -71,7 +77,8 @@ type ContainerStats struct {
 
 // NewDockerClient creates a client that talks to the Docker Engine API.
 // Per D-01: reads DOCKER_HOST env var; falls back to /var/run/docker.sock.
-func NewDockerClient() *DockerClient {
+// Every call is bounded by ctx (the script's context) and a per-call timeout.
+func NewDockerClient(ctx context.Context) *DockerClient {
 	socketPath := "/var/run/docker.sock"
 	if h := os.Getenv("DOCKER_HOST"); h != "" {
 		if strings.HasPrefix(h, "unix://") {
@@ -86,6 +93,7 @@ func NewDockerClient() *DockerClient {
 		},
 	}
 	return &DockerClient{
+		ctx:        ctx,
 		client:     &http.Client{Transport: transport, Timeout: 10 * time.Second},
 		socketPath: socketPath,
 		baseURL:    "http://localhost",
@@ -109,7 +117,7 @@ func isValidContainerID(id string) bool {
 // ListContainers returns all containers (running and stopped) from the Docker API.
 func (dc *DockerClient) ListContainers() ([]DockerContainer, error) {
 	url := fmt.Sprintf("%s/%s/containers/json?all=true", dc.baseURL, dockerAPIVersion)
-	resp, err := dc.client.Get(url)
+	resp, err := dc.send(http.MethodGet, url, "", nil)
 	if err != nil {
 		return nil, fmt.Errorf("docker list: %w", err)
 	}
@@ -134,7 +142,7 @@ func (dc *DockerClient) GetContainerStats(id string) (*ContainerStats, error) {
 	}
 
 	url := fmt.Sprintf("%s/%s/containers/%s/stats?stream=false", dc.baseURL, dockerAPIVersion, id)
-	resp, err := dc.client.Get(url)
+	resp, err := dc.send(http.MethodGet, url, "", nil)
 	if err != nil {
 		return nil, fmt.Errorf("docker stats: %w", err)
 	}
@@ -211,7 +219,7 @@ func (dc *DockerClient) RestartContainer(id string) error {
 // doContainerPost sends a POST to a Docker container lifecycle endpoint and checks status.
 // 204 (No Content) and 304 (Not Modified / already in target state) are both success.
 func (dc *DockerClient) doContainerPost(url, op string) error {
-	resp, err := dc.client.Post(url, "application/json", nil)
+	resp, err := dc.send(http.MethodPost, url, "application/json", nil)
 	if err != nil {
 		return fmt.Errorf("docker %s: %w", op, err)
 	}
@@ -231,8 +239,8 @@ func (dc *DockerClient) doContainerPost(url, op string) error {
 // error. Bodies are not logged. A bad id never reaches HTTP.
 
 type dockerInspectBody struct {
-	Id   string `json:"Id"`
-	Name string `json:"Name"`
+	Id     string `json:"Id"`
+	Name   string `json:"Name"`
 	Config struct {
 		Image string `json:"Image"`
 	} `json:"Config"`
@@ -249,7 +257,7 @@ func (dc *DockerClient) Inspect(id string) (map[string]string, error) {
 		return nil, fmt.Errorf("invalid container id")
 	}
 	url := fmt.Sprintf("%s/%s/containers/%s/json", dc.baseURL, dockerAPIVersion, id)
-	resp, err := dc.client.Get(url)
+	resp, err := dc.send(http.MethodGet, url, "", nil)
 	if err != nil {
 		return nil, fmt.Errorf("docker inspect: %w", err)
 	}
@@ -283,7 +291,7 @@ func (dc *DockerClient) Logs(id string) (string, error) {
 		return "", fmt.Errorf("invalid container id")
 	}
 	url := fmt.Sprintf("%s/%s/containers/%s/logs?stdout=1&stderr=1&tail=200", dc.baseURL, dockerAPIVersion, id)
-	resp, err := dc.client.Get(url)
+	resp, err := dc.send(http.MethodGet, url, "", nil)
 	if err != nil {
 		return "", fmt.Errorf("docker logs: %w", err)
 	}
@@ -352,7 +360,7 @@ func (dc *DockerClient) createContainer(image string, cmd []string) (string, err
 		return "", err
 	}
 	url := fmt.Sprintf("%s/%s/containers/create", dc.baseURL, dockerAPIVersion)
-	resp, err := dc.client.Post(url, "application/json", bytes.NewReader(raw))
+	resp, err := dc.send(http.MethodPost, url, "application/json", bytes.NewReader(raw))
 	if err != nil {
 		return "", fmt.Errorf("docker create: %w", err)
 	}
@@ -396,7 +404,7 @@ func (dc *DockerClient) Exec(id string, cmd []string) (string, error) {
 		return "", err
 	}
 	createURL := fmt.Sprintf("%s/%s/containers/%s/exec", dc.baseURL, dockerAPIVersion, id)
-	resp, err := dc.client.Post(createURL, "application/json", bytes.NewReader(payload))
+	resp, err := dc.send(http.MethodPost, createURL, "application/json", bytes.NewReader(payload))
 	if err != nil {
 		return "", fmt.Errorf("docker exec: %w", err)
 	}
@@ -434,13 +442,44 @@ func (dc *DockerClient) Exec(id string, cmd []string) (string, error) {
 	return demuxDocker(stream)
 }
 
+func (dc *DockerClient) requireClient() error {
+	if dc == nil || dc.client == nil || dc.ctx == nil {
+		return fmt.Errorf("docker client not initialized")
+	}
+	return nil
+}
+
+// send makes one request bound to the client's context (the script's
+// deadline and cancel) and to the client's own timeout.
+func (dc *DockerClient) send(method, url, contentType string, body io.Reader) (*http.Response, error) {
+	if err := dc.requireClient(); err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(dc.ctx, method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	return dc.client.Do(req)
+}
+
 func (dc *DockerClient) useUnixExec() bool {
 	return dc.socketPath != "" && dc.baseURL == "http://localhost"
 }
 
 func (dc *DockerClient) execHTTP(url string, body []byte) ([]byte, error) {
+	if err := dc.requireClient(); err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(dc.ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("docker exec: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
 	client := &http.Client{Transport: dc.client.Transport, Timeout: 15 * time.Second}
-	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("docker exec: %w", err)
 	}
@@ -456,11 +495,17 @@ func (dc *DockerClient) execHTTP(url string, body []byte) ([]byte, error) {
 }
 
 func (dc *DockerClient) execUnix(path string, body []byte) ([]byte, error) {
-	conn, err := net.DialTimeout("unix", dc.socketPath, 15*time.Second)
+	if err := dc.requireClient(); err != nil {
+		return nil, err
+	}
+	conn, err := (&net.Dialer{Timeout: 15 * time.Second}).DialContext(dc.ctx, "unix", dc.socketPath)
 	if err != nil {
 		return nil, fmt.Errorf("docker exec: %w", err)
 	}
 	defer conn.Close()
+	// The script's deadline or cancel ends a read or write in progress.
+	stopClose := context.AfterFunc(dc.ctx, func() { _ = conn.Close() })
+	defer stopClose()
 	if err := conn.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
 		return nil, err
 	}
@@ -523,4 +568,292 @@ func demuxDocker(body []byte) (string, error) {
 		out = append(out, frame...)
 	}
 	return string(out), nil
+}
+
+// Threats: images, volumes, and networks. Every name or ref is checked
+// before it reaches a URL. Image refs follow the distribution grammar and
+// a pull with no tag pulls ":latest", never all tags. sys.containers.pull
+// and remove_image also need an exact allow_images grant (imageGranted). A
+// pull stops at the script's deadline or cancel. This code does not
+// send registry auth (no X-Registry-Auth); a pull uses only what the daemon
+// already has. Volumes are created with the local driver and no options, so
+// no bind of a host path. Networks take a fixed driver list and no options.
+// Response bodies are capped and never logged.
+
+const (
+	pullStreamCap = 32 << 20
+	imageRefMax   = 255
+)
+
+var (
+	dockerNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,127}$`)
+	imageRefRE   = regexp.MustCompile(
+		`^(?:(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9])(?:\.(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]))*(?::[0-9]{1,5})?/)?` +
+			`[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*` +
+			`(?::[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127})?` +
+			`(?:@sha256:[a-f0-9]{64})?$`)
+	networkDrivers  = map[string]struct{}{"bridge": {}, "overlay": {}}
+	builtinNetworks = map[string]struct{}{"bridge": {}, "host": {}, "none": {}}
+)
+
+// isValidDockerName matches Docker's name rule [a-zA-Z0-9][a-zA-Z0-9_.-]+.
+func isValidDockerName(name string) bool {
+	return !strings.Contains(name, "..") && dockerNameRE.MatchString(name)
+}
+
+// isValidImageRef accepts [registry[:port]/]path[:tag][@sha256:digest].
+func isValidImageRef(ref string) bool {
+	if len(ref) == 0 || len(ref) > imageRefMax || strings.Contains(ref, "..") {
+		return false
+	}
+	return imageRefRE.MatchString(ref)
+}
+
+// splitImageRef returns the repository and the tag or digest to pull.
+func splitImageRef(ref string) (string, string) {
+	if at := strings.Index(ref, "@"); at >= 0 {
+		return ref[:at], ref[at+1:]
+	}
+	slash := strings.LastIndex(ref, "/")
+	if colon := strings.LastIndex(ref, ":"); colon > slash {
+		return ref[:colon], ref[colon+1:]
+	}
+	return ref, "latest"
+}
+
+// doJSON sends one request, checks the status, and decodes a capped body.
+func (dc *DockerClient) doJSON(op, method, url string, body any, ok []int, out any) error {
+	if err := dc.requireClient(); err != nil {
+		return err
+	}
+	var reader io.Reader
+	if body != nil {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		reader = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequestWithContext(dc.ctx, method, url, reader)
+	if err != nil {
+		return fmt.Errorf("docker %s: %w", op, err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := dc.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("docker %s: %w", op, err)
+	}
+	defer resp.Body.Close()
+	respBody, err := readLimited(resp.Body, dockerBodyCap)
+	if err != nil {
+		return err
+	}
+	matched := false
+	for _, code := range ok {
+		if resp.StatusCode == code {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		return fmt.Errorf("docker %s: unexpected status %d", op, resp.StatusCode)
+	}
+	if out == nil || len(respBody) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(respBody, out); err != nil {
+		return fmt.Errorf("docker %s: decode: %w", op, err)
+	}
+	return nil
+}
+
+func (dc *DockerClient) apiURL(path string) string {
+	return fmt.Sprintf("%s/%s%s", dc.baseURL, dockerAPIVersion, path)
+}
+
+type DockerImage struct {
+	Id       string   `json:"Id"`
+	RepoTags []string `json:"RepoTags"`
+	Size     int64    `json:"Size"`
+	Created  int64    `json:"Created"`
+}
+
+func (dc *DockerClient) ListImages() ([]DockerImage, error) {
+	var images []DockerImage
+	if err := dc.doJSON("images", http.MethodGet, dc.apiURL("/images/json"), nil, []int{http.StatusOK}, &images); err != nil {
+		return nil, err
+	}
+	return images, nil
+}
+
+// PullImage pulls ref with the daemon's own credentials, if any, until ctx
+// ends. It returns the last status line of the progress stream.
+func (dc *DockerClient) PullImage(ctx context.Context, ref string) (string, error) {
+	if dc == nil || dc.client == nil {
+		return "", fmt.Errorf("docker client not initialized")
+	}
+	if !isValidImageRef(ref) {
+		return "", fmt.Errorf("invalid image reference")
+	}
+	repo, tag := splitImageRef(ref)
+	q := url.Values{}
+	q.Set("fromImage", repo)
+	q.Set("tag", tag)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, dc.apiURL("/images/create?"+q.Encode()), nil)
+	if err != nil {
+		return "", fmt.Errorf("docker pull: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	// No client Timeout: the pull may take the rest of the script's time.
+	client := &http.Client{Transport: dc.client.Transport}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", pullErr(ctx, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("docker pull: unexpected status %d", resp.StatusCode)
+	}
+	lr := &io.LimitedReader{R: resp.Body, N: pullStreamCap + 1}
+	dec := json.NewDecoder(lr)
+	last := ""
+	for {
+		var msg struct {
+			Status string `json:"status"`
+			Error  string `json:"error"`
+		}
+		if err := dec.Decode(&msg); err == io.EOF {
+			break
+		} else if err != nil {
+			if lr.N <= 0 {
+				return "", fmt.Errorf("body exceeds cap")
+			}
+			if ctx.Err() != nil || isTimeout(err) {
+				return "", pullErr(ctx, err)
+			}
+			return "", fmt.Errorf("docker pull: decode: %w", err)
+		}
+		if msg.Error != "" {
+			return "", fmt.Errorf("docker pull: %s", capText(msg.Error, 256))
+		}
+		if msg.Status != "" {
+			last = capText(msg.Status, 256)
+		}
+	}
+	if lr.N <= 0 {
+		return "", fmt.Errorf("body exceeds cap")
+	}
+	return last, nil
+}
+
+// pullErr reports the script's deadline or cancel, or a network timeout,
+// so a script sees why the pull stopped.
+func pullErr(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return fmt.Errorf("docker pull: %s", jobCtxReason(ctx))
+	}
+	if isTimeout(err) {
+		return fmt.Errorf("docker pull: timed out")
+	}
+	return fmt.Errorf("docker pull: %w", err)
+}
+
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout())
+}
+
+func (dc *DockerClient) RemoveImage(ref string, force bool) error {
+	if !isValidImageRef(ref) {
+		return fmt.Errorf("invalid image reference")
+	}
+	q := url.Values{}
+	q.Set("force", strconv.FormatBool(force))
+	return dc.doJSON("rmi", http.MethodDelete, dc.apiURL("/images/"+ref+"?"+q.Encode()), nil, []int{http.StatusOK}, nil)
+}
+
+type DockerVolume struct {
+	Name       string `json:"Name"`
+	Driver     string `json:"Driver"`
+	Mountpoint string `json:"Mountpoint"`
+	Scope      string `json:"Scope"`
+}
+
+func (dc *DockerClient) ListVolumes() ([]DockerVolume, error) {
+	var raw struct {
+		Volumes []DockerVolume `json:"Volumes"`
+	}
+	if err := dc.doJSON("volumes", http.MethodGet, dc.apiURL("/volumes"), nil, []int{http.StatusOK}, &raw); err != nil {
+		return nil, err
+	}
+	return raw.Volumes, nil
+}
+
+func (dc *DockerClient) CreateVolume(name string) (*DockerVolume, error) {
+	if !isValidDockerName(name) {
+		return nil, fmt.Errorf("invalid volume name")
+	}
+	body := map[string]any{"Name": name, "Driver": "local"}
+	var vol DockerVolume
+	if err := dc.doJSON("volume create", http.MethodPost, dc.apiURL("/volumes/create"), body, []int{http.StatusCreated, http.StatusOK}, &vol); err != nil {
+		return nil, err
+	}
+	return &vol, nil
+}
+
+func (dc *DockerClient) RemoveVolume(name string) error {
+	if !isValidDockerName(name) {
+		return fmt.Errorf("invalid volume name")
+	}
+	return dc.doJSON("volume rm", http.MethodDelete, dc.apiURL("/volumes/"+name), nil, []int{http.StatusNoContent, http.StatusOK}, nil)
+}
+
+type DockerNetwork struct {
+	Id     string `json:"Id"`
+	Name   string `json:"Name"`
+	Driver string `json:"Driver"`
+	Scope  string `json:"Scope"`
+}
+
+func (dc *DockerClient) ListNetworks() ([]DockerNetwork, error) {
+	var nets []DockerNetwork
+	if err := dc.doJSON("networks", http.MethodGet, dc.apiURL("/networks"), nil, []int{http.StatusOK}, &nets); err != nil {
+		return nil, err
+	}
+	return nets, nil
+}
+
+func (dc *DockerClient) CreateNetwork(name, driver string) (string, error) {
+	if !isValidDockerName(name) {
+		return "", fmt.Errorf("invalid network name")
+	}
+	if _, ok := builtinNetworks[name]; ok {
+		return "", fmt.Errorf("invalid network name")
+	}
+	if _, ok := networkDrivers[driver]; !ok {
+		return "", fmt.Errorf("network driver not allowed")
+	}
+	body := map[string]any{"Name": name, "Driver": driver, "CheckDuplicate": true}
+	var created struct {
+		Id string `json:"Id"`
+	}
+	if err := dc.doJSON("network create", http.MethodPost, dc.apiURL("/networks/create"), body, []int{http.StatusCreated, http.StatusOK}, &created); err != nil {
+		return "", err
+	}
+	if !isValidContainerID(created.Id) {
+		return "", fmt.Errorf("invalid network id")
+	}
+	return created.Id, nil
+}
+
+func (dc *DockerClient) RemoveNetwork(idOrName string) error {
+	if !isValidDockerName(idOrName) {
+		return fmt.Errorf("invalid network name")
+	}
+	if _, ok := builtinNetworks[idOrName]; ok {
+		return fmt.Errorf("invalid network name")
+	}
+	return dc.doJSON("network rm", http.MethodDelete, dc.apiURL("/networks/"+idOrName), nil, []int{http.StatusNoContent, http.StatusOK}, nil)
 }

@@ -30,6 +30,10 @@ const CATALOG = {
         endpoints: [
             'POST /api/v1/fleet/:hostId/execute - Run a Sysscript on one host',
             'POST /api/v1/fleet/execute - Run a Sysscript on up to 50 hosts',
+            'POST /api/v1/fleet/:hostId/jobs - Submit an async Sysscript job',
+            'GET /api/v1/jobs/:jobId - Job status (output for the submitter or a tenant admin)',
+            'GET /api/v1/jobs - List jobs of tenants where exec:run is held',
+            'POST /api/v1/jobs/:jobId/cancel - Cancel a job',
             'GET /api/v1/playbooks - List playbooks',
             'POST /api/v1/playbooks/:id/run - Run a playbook',
             'GET /api/v1/schedules - List schedules',

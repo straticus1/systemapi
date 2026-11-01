@@ -15,6 +15,7 @@ package main
 // closed, never a silent success.
 
 import (
+	"context"
 	"regexp"
 	"runtime"
 	"sync"
@@ -55,10 +56,14 @@ type ServiceManager interface {
 	// Available reports whether this backend can run on the host now.
 	Available() bool
 	// Action runs one mutating verb (start/stop/restart/enable/disable) and
-	// returns the combined command output. An unknown verb is rejected.
-	Action(verb, service string) (output string, err error)
+	// returns the combined command output. An unknown verb is rejected. The
+	// command is stopped when ctx (the script's context) ends.
+	Action(ctx context.Context, verb, service string) (output string, err error)
 	// Status returns a structured status for one service.
-	Status(service string) (ServiceStatus, error)
+	Status(ctx context.Context, service string) (ServiceStatus, error)
+	// IsEnabled reports whether the service is enabled to start at boot. It
+	// is read-only. A state the backend cannot classify is an error.
+	IsEnabled(ctx context.Context, service string) (bool, error)
 }
 
 // PackageManager builds fixed argv for a package manager and reports whether
@@ -70,6 +75,7 @@ type PackageManager interface {
 	RemoveArgv(name string) ([]string, error)
 	UpgradeArgv(name string) ([]string, error)
 	QueryArgv(name string) ([]string, error)
+	ListArgv() ([]string, error)
 }
 
 // ConfigStore owns config file writes and the reload/validate hooks around
@@ -79,8 +85,8 @@ type ConfigStore interface {
 	Name() string
 	Available() bool
 	AtomicWrite(path, content string) error
-	Validate(service, path string) (output string, err error)
-	Reload(service string) (output string, err error)
+	Validate(ctx context.Context, service, path string) (output string, err error)
+	Reload(ctx context.Context, service string) (output string, err error)
 }
 
 // Tweaks covers kernel and service-limit knobs: sysctl get/set, resource

@@ -3,7 +3,8 @@ import { BellRing } from 'lucide-react';
 import { FleetAPI } from '../api';
 
 // Lists alert events from GET /api/v1/alerts. The control plane raises them from
-// its z-score check on CPU and memory telemetry and posts them to tenant webhooks.
+// its z-score check on CPU and memory telemetry (posted to tenant webhooks) and
+// from sys.alerts.push in a script (rule_name 'sysscript', with severity and message).
 // There is no rule editor yet, so this view is read-only.
 const AlertsView = () => {
   const [alerts, setAlerts] = useState([]);
@@ -26,7 +27,7 @@ const AlertsView = () => {
           <BellRing color="var(--accent-red)" /> Alerts
         </h1>
         <p style={{ color: 'var(--text-muted)' }}>
-          Anomalies the control plane detected in CPU and memory telemetry. Custom alert rules are not available in the dashboard yet.
+          Anomalies the control plane detected in CPU and memory telemetry, and alerts scripts raised with sys.alerts.push. Custom alert rules are not available in the dashboard yet.
         </p>
       </div>
 
@@ -43,8 +44,12 @@ const AlertsView = () => {
           {alerts.map(a => (
             <div key={a.id} className="glass-panel" style={{ padding: '20px' }}>
               <h3 style={{ fontSize: '1.05rem', marginBottom: '8px' }}>{a.rule_name}</h3>
+              {a.message ? (
+                <p className="font-mono" style={{ fontSize: '0.9rem', marginBottom: '8px', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{a.message}</p>
+              ) : null}
               <div style={{ fontSize: '0.9rem', color: 'var(--text-muted)', display: 'flex', gap: '12px', flexWrap: 'wrap' }}>
-                <span className="font-mono">{a.metric} = {a.value}</span>
+                {a.metric ? <span className="font-mono">{a.metric} = {a.value}</span> : null}
+                {a.severity ? <span>{a.severity}</span> : null}
                 <span>{a.host_id}</span>
                 <span>{a.status}</span>
                 <span>{new Date(a.created_at).toLocaleString()}</span>

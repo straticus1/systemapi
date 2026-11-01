@@ -56,7 +56,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"syscall"
 	"time"
 )
 
@@ -132,8 +131,8 @@ func trustedNode(info os.FileInfo) error {
 	if info.Mode().Perm()&0o022 != 0 {
 		return errors.New("group or other writable")
 	}
-	st, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || st.Uid != helperTrustOwnerUID {
+	uid, _, ok := fileOwnerIDs(info)
+	if !ok || uid < 0 || uint32(uid) != helperTrustOwnerUID {
 		return errors.New("wrong owner")
 	}
 	return nil
@@ -158,7 +157,7 @@ func loadHelperTrust() (ed25519.PublicKey, string, error) {
 	if err := trustedNode(dirInfo); err != nil {
 		return nil, "", fmt.Errorf("trust dir: %w", err)
 	}
-	f, err := os.OpenFile(helperTrustPath, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	f, err := os.OpenFile(helperTrustPath, os.O_RDONLY|openNoFollow, 0)
 	if err != nil {
 		return nil, "", err
 	}
@@ -219,7 +218,7 @@ func consumeHelperNonce(nonce string, expiresUnix int64, now time.Time) error {
 	if err := trustedNode(dirInfo); err != nil {
 		return fmt.Errorf("replay dir: %w", err)
 	}
-	lock, err := os.OpenFile(filepath.Join(helperReplayDir, helperReplayLockName), os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, 0o600)
+	lock, err := os.OpenFile(filepath.Join(helperReplayDir, helperReplayLockName), os.O_RDWR|os.O_CREATE|openNoFollow, 0o600)
 	if err != nil {
 		return fmt.Errorf("replay lock: %w", err)
 	}
@@ -227,7 +226,7 @@ func consumeHelperNonce(nonce string, expiresUnix int64, now time.Time) error {
 	if info, err := lock.Stat(); err != nil || !info.Mode().IsRegular() {
 		return errors.New("replay lock is not a regular file")
 	}
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+	if err := lockFileExclusive(lock); err != nil {
 		return fmt.Errorf("replay lock: %w", err)
 	}
 	// Released by the deferred Close.
@@ -264,7 +263,7 @@ func consumeHelperNonce(nonce string, expiresUnix int64, now time.Time) error {
 		return errors.New("replay store full")
 	}
 	helperReplayHook("record")
-	f, err := os.OpenFile(filepath.Join(helperReplayDir, nonce), os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	f, err := os.OpenFile(filepath.Join(helperReplayDir, nonce), os.O_WRONLY|os.O_CREATE|os.O_EXCL|openNoFollow, 0o600)
 	if err != nil {
 		if os.IsExist(err) {
 			return errReplay

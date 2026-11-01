@@ -14,8 +14,9 @@ package main
 // platform's reload returns an error, never a silent success.
 
 import (
+	"context"
 	"fmt"
-	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -41,37 +42,52 @@ func (c *configStore) AtomicWrite(path, content string) error {
 // Validate runs the config checker for a service, if one is known. An unknown
 // service is not an error: it returns a clear "no validator" note so a script
 // never mistakes a missing checker for a passing check.
-func (c *configStore) Validate(service, path string) (string, error) {
-	var cmd *exec.Cmd
-	switch strings.ToLower(service) {
-	case "postfix":
-		cmd = exec.Command("postfix", "check")
-	case "bind", "named":
-		cmd = exec.Command("named", "-checkconf", path)
-	case "nsd":
-		cmd = exec.Command("nsd-checkconf", path)
-	case "unbound":
-		cmd = exec.Command("unbound-checkconf", path)
-	default:
+func (c *configStore) Validate(ctx context.Context, service, path string) (string, error) {
+	argv, err := configCheckArgv(service, path)
+	if err != nil {
+		return "", err
+	}
+	if argv == nil {
 		return "no validator for service", nil
 	}
-	out, err := cmd.CombinedOutput()
+	out, err := jobCommand(ctx, argv[0], argv[1:]...).CombinedOutput()
 	return string(out), err
 }
 
+// configCheckArgv is the checker argv for service, nil when there is none.
+// path must be absolute, so it can never read as an option; the getopt
+// checkers also get "--" before it.
+func configCheckArgv(service, path string) ([]string, error) {
+	if !filepath.IsAbs(path) || strings.ContainsRune(path, 0) {
+		return nil, fmt.Errorf("config path must be absolute")
+	}
+	switch strings.ToLower(service) {
+	case "postfix":
+		return []string{"postfix", "check"}, nil
+	case "bind", "named":
+		return []string{"named-checkconf", "--", path}, nil
+	case "nsd":
+		return []string{"nsd-checkconf", "--", path}, nil
+	case "unbound":
+		return []string{"unbound-checkconf", "--", path}, nil
+	default:
+		return nil, nil
+	}
+}
+
 // Reload reloads a service through the family's init system.
-func (c *configStore) Reload(service string) (string, error) {
+func (c *configStore) Reload(ctx context.Context, service string) (string, error) {
 	if !serviceNameRE.MatchString(service) {
 		return "", fmt.Errorf("service not allowed")
 	}
-	var cmd *exec.Cmd
+	var cmd *jobCmd
 	switch c.fam {
 	case familyDarwin:
-		cmd = exec.Command("launchctl", "kickstart", "-k", "system/"+service)
+		cmd = jobCommand(ctx, "launchctl", "kickstart", "-k", "system/"+service)
 	case familyWindows:
 		return "", fmt.Errorf("service reload not supported on windows")
 	default:
-		cmd = exec.Command("systemctl", "reload", service)
+		cmd = jobCommand(ctx, "systemctl", "reload", service)
 	}
 	out, err := cmd.CombinedOutput()
 	return string(out), err

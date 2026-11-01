@@ -37,22 +37,38 @@ or imperatively - without SSH keys, VPNs, or Ansible control nodes.
 
 <!-- Milestone v2.0: Next-Gen Systems Management -->
 
-- [ ] Declarative state management (Ansible replacement - convergence mode)
-- [ ] Imperative execution mode (push-and-verify, both modes supported)
-- [ ] sys.security: YARA scanning, memory scanning, real-time CVE alerting
-- [ ] sys.packages: cross-platform package management (dnf, apt, brew, winget)
-- [ ] sys.containers: Docker/OCI full lifecycle (run, stop, list, exec, logs, pull)
-- [ ] sys.events: real-time system event streaming (inotify, kqueue, ETW)
-- [ ] sys.alerts: push alerts back to FleetManager (implemented, not stubbed)
-- [ ] sys.fs extended: stat, glob, mkdir, rm, chmod, chown, diff
-- [ ] sys.process: list, kill, signal, resource usage per process
-- [ ] sys.services: systemd / launchd / SCM service management
-- [ ] sys.network: interface info, connections, firewall rules, DNS
-- [ ] Docker/OCI interface: images, volumes, networks, registries, compose
-- [ ] Platform support: RHEL/Rocky (dnf, SELinux), Debian/Ubuntu (apt, AppArmor),
-      macOS (launchd, Homebrew), Windows Server (PowerShell, WMI, winget)
-- [ ] Sysscript state store: track last-applied state per host, detect drift
-- [ ] Frontend: state convergence UI, security scan results, package inventory
+- [ ] Declarative state management (Ansible replacement - convergence mode) - not started
+- [ ] Imperative execution mode (push-and-verify, both modes supported) - imperative mode
+      shipped (sysscripts run ad-hoc, async jobs ack results); declarative mode still missing
+      so "both modes" isn't true yet
+- [ ] sys.security: YARA scanning, memory scanning, real-time CVE alerting - stubbed
+      (yara_scan/scan_memory return not-implemented; agent/sys_advanced.go)
+- [x] sys.packages: cross-platform package management (dnf/yum, apt-get/dpkg, zypper, brew) -
+      shipped; pacman (Arch) is parsed but not wired as an install target; winget/Windows deferred
+- [x] sys.containers: Docker/OCI full lifecycle (run, stop, list, exec, logs, pull) - shipped,
+      plus images/volumes/networks/compose with an allowlist preflight
+- [ ] sys.events: real-time system event streaming (inotify, kqueue, ETW) - stubbed
+      (eventsListen returns not-implemented; agent/sys_advanced.go)
+- [x] sys.alerts: push alerts back to FleetManager (implemented, not stubbed) - shipped
+- [x] sys.fs extended: stat, glob, mkdir, rm, chmod, chown, diff - shipped, with a hardened
+      grant-path policy
+- [x] sys.process: list, kill (with signal), resource usage per process - shipped
+- [x] sys.services: systemd / launchd / openrc service management - shipped; Windows SCM
+      deferred with the rest of Windows support
+- [~] sys.network: interface info, connections, DNS reads/writes (set_address/set_route/set_dns)
+      - shipped; firewall rules are explicitly out of scope per Decision 2, not pending work
+- [x] Docker/OCI interface: images, volumes, networks, compose - shipped; registries beyond
+      pull-by-ref not built out further
+- [~] Platform support: RHEL/Rocky (dnf, SELinux), Debian/Ubuntu (apt, AppArmor), SUSE (zypper),
+      Arch (detection only), macOS (launchd, Homebrew) all shipped; Windows Server deferred
+- [x] Async sysscript jobs: /jobs API, CLI wait/kill, agent --sysscript-jobs flag (Linux/macOS),
+      Studio job flow in the frontend - shipped (plan: .omc/plans/async-sysscript-jobs.md,
+      docs/sah-sysscript-jobs.md); Windows job kill and a browser check of the Studio flow
+      are still open
+- [ ] Sysscript state store: track last-applied state per host, detect drift - not started
+      (depends on declarative convergence)
+- [ ] Frontend: state convergence UI, security scan results, package inventory views - not
+      started
 
 ### Out of Scope
 
@@ -130,4 +146,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-28 - Milestone v2.0 started*
+*Last updated: 2026-10-29 - v2.0 Active checklist reconciled against code/git history*

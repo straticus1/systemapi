@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -25,6 +26,8 @@ type CommandMessage struct {
 	Script       string        `json:"script"`
 	Entitlements *Entitlements `json:"entitlements"`
 	RequestID    string        `json:"request_id"`
+	JobID        string        `json:"job_id,omitempty"`
+	TimeoutS     int           `json:"timeout_s,omitempty"`
 	Data         string        `json:"data,omitempty"`
 	DataB64      string        `json:"data_b64,omitempty"`
 	SessionID    string        `json:"session_id,omitempty"`
@@ -38,6 +41,11 @@ type CommandMessage struct {
 	Mode         string        `json:"mode,omitempty"`
 	Reason       string        `json:"reason,omitempty"`
 	Override     bool          `json:"override,omitempty"`
+	// A sysscript_job frame with kind "converge" carries the bundle and,
+	// in Mode, check or apply; ExpectPlan is "-" for check.
+	Kind       string `json:"kind,omitempty"`
+	BundleJSON string `json:"bundle_json,omitempty"`
+	ExpectPlan string `json:"expect_plan_sha256,omitempty"`
 }
 
 // ResponseMessage is an outgoing WebSocket message.
@@ -46,6 +54,7 @@ type ResponseMessage struct {
 	Payload   interface{} `json:"payload"`
 	RequestID string      `json:"request_id,omitempty"`
 	SessionID string      `json:"session_id,omitempty"`
+	JobID     string      `json:"job_id,omitempty"`
 }
 
 func main() {
@@ -101,7 +110,27 @@ func main() {
 	xferAdvertiseFlag := flag.String("xfer-udp-advertise", "", "IP reported to the server in place of the bound one (a published port behind NAT or Docker)")
 	xferAllowDarwinFlag := flag.Bool("xfer-allow-darwin", false, "advertise xfer on macOS (development only: no openat2, no Pdeathsig)")
 	ptyRecordMinFreeFlag := flag.Uint64("pty-record-min-free", recordMinFreeDefault, "refuse a terminal session when the recording filesystem has less free space (bytes)")
+	sysscriptWorkersFlag := flag.Int("sysscript-workers", jobWorkersDefault, fmt.Sprintf("sysscripts run at once (1..%d); %d more may wait, then agent_busy", jobWorkersMax, jobPendingMax))
+	sysscriptLegacyFlag := flag.Int("sysscript-legacy-seconds", jobLegacyDefaultSec, fmt.Sprintf("whole-script deadline of a legacy sysscript frame (1..%d, at most --sysscript-max-seconds)", jobMaxSecondsMax))
+	sysscriptJobsFlag := flag.Bool("sysscript-jobs", true, "advertise async sysscript jobs (sysscript_jobs, Linux and macOS only); =false makes the server send this host's scripts the legacy way")
+	convergeFlag := flag.Bool("converge", false, "advertise desired-state converge jobs (converge, Linux and macOS only, needs --sysscript-jobs); enable only after every server replica runs the converge wiring")
+	sysscriptMaxFlag := flag.Int("sysscript-max-seconds", jobMaxSecondsMax, fmt.Sprintf("ceiling for any sysscript deadline (1..%d)", jobMaxSecondsMax))
+	stateBackupDirFlag := flag.String("state-backup-dir", stateBackupDir, "directory for desired-state file backups (absolute, root-only; must not overlap any write grant, or file changes that need a backup fail)")
 	flag.Parse()
+	backupDirSet := false
+	flag.Visit(func(f *flag.Flag) { backupDirSet = backupDirSet || f.Name == "state-backup-dir" })
+	if err := configureStateBackupDir(*stateBackupDirFlag, backupDirSet, runtime.GOOS); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: --state-backup-dir: %v\n", err)
+		os.Exit(2)
+	}
+	sysscriptJobsOn = *sysscriptJobsFlag
+	convergeOn = *convergeFlag
+	jc, err := parseJobFlags(*sysscriptWorkersFlag, *sysscriptLegacyFlag, *sysscriptMaxFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(2)
+	}
+	jobCfg = jc
 	if *ptyRecordMaxFlag <= 0 || *ptyRecordMinFreeFlag == 0 {
 		fmt.Fprintln(os.Stderr, "Error: --pty-record-max-bytes and --pty-record-min-free must be positive")
 		os.Exit(2)
@@ -259,6 +288,9 @@ func main() {
 	// Graceful shutdown: each xfer child gets cancel and deletes its temp
 	// file; results not sent stay in their records for the next start.
 	xferMgr().stopAll("stopped", xferStopTimeout)
+	// Scripts still running end as agent_stopped (a no-op when the
+	// connection's stop already did it).
+	jobMgr().stopAll(jobKillGrace + jobStopMargin)
 	if err != nil {
 		log.Printf("fatal: %v", err)
 		os.Exit(1)
@@ -274,23 +306,34 @@ func processIncomingMessage(out ptyOut, hostID, stateDir string, message []byte)
 
 	switch cmd.Type {
 	case "sysscript":
+		if len(cmd.RequestID) > requestIDMaxBytes {
+			log.Printf("sysscript refused: request_id too long")
+			writeCommandResult(out, "", "bad_request", "", false)
+			return
+		}
 		if len(cmd.Script) > scriptMaxBytes {
-			writeCommandResult(out, cmd.RequestID, "script_too_large", "")
+			writeCommandResult(out, cmd.RequestID, "script_too_large", "", false)
 			return
 		}
 		if err := authorizeCommand(hostID, "sysscript", cmd.Script, cmd.Lease, time.Now()); err != nil {
 			log.Printf("sysscript refused: %s", err.Error())
-			writeCommandResult(out, cmd.RequestID, err.Error(), "")
+			writeCommandResult(out, cmd.RequestID, err.Error(), "", false)
 			return
 		}
 		log.Printf("sysscript %s", cmd.RequestID)
-		engine := NewSysscriptEngine(cmd.Entitlements)
-		output, err := engine.Execute(cmd.Script)
-		errText := ""
-		if err != nil {
-			errText = err.Error()
-		}
-		writeCommandResult(out, cmd.RequestID, errText, output)
+		// Off the read loop: a worker runs it and writes command_result.
+		jobMgr().submitLegacy(out, cmd.RequestID, cmd.Script, cmd.Entitlements, jobCfg.Legacy)
+
+	case "sysscript_job":
+		// Checked here (id, size, entitlements, lease, nonce, duplicate,
+		// deadline) and queued; a worker runs it.
+		jobMgr().startJob(hostID, &cmd, time.Now())
+
+	case "sysscript_job_cancel":
+		jobMgr().cancelJob(cmd.JobID, cmd.Reason)
+
+	case "sysscript_job_ack":
+		jobMgr().ackJob(cmd.JobID)
 
 	case "pty_start":
 		log.Printf("pty_start %s action=%s", cmd.SessionID, cmd.Action)
@@ -353,12 +396,33 @@ func processIncomingMessage(out ptyOut, hostID, stateDir string, message []byte)
 	}
 }
 
-func writeCommandResult(out ptyOut, requestID, errText, output string) {
-	_ = out.WriteJSON(ResponseMessage{
-		Type:      "command_result",
-		RequestID: requestID,
-		Payload:   map[string]string{"error": errText, "output": output},
-	})
+// requestIDMaxBytes caps the request_id echoed back in command_result and
+// alert frames.
+const requestIDMaxBytes = 256
+
+// writeCommandResult sends the legacy command_result frame, its encoded size
+// capped at jobFrameMax (encodeOutputFrame).
+func writeCommandResult(out ptyOut, requestID, errText, output string, truncated bool) {
+	b, err := commandResultFrame(requestID, errText, output, truncated)
+	if err != nil {
+		log.Printf("command_result %s not encoded: %v", requestID, err)
+		return
+	}
+	if err := out.WriteText(b); err != nil {
+		log.Printf("command_result %s not sent: %v", requestID, err)
+	}
+}
+
+// commandResultFrame encodes the legacy command_result frame.
+func commandResultFrame(requestID, errText, output string, truncated bool) ([]byte, error) {
+	errText, _ = frameText(errText, frameErrMax)
+	return encodeOutputFrame(func(o string, tr bool) interface{} {
+		return ResponseMessage{
+			Type:      "command_result",
+			RequestID: requestID,
+			Payload:   commandResultPayload{Error: errText, Output: o, OutputTruncated: tr},
+		}
+	}, output, truncated)
 }
 
 // resolveAPIKey takes the key from --api-key-file, then SYSTEMAPI_API_KEY,

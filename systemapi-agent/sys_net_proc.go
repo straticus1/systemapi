@@ -27,7 +27,7 @@ func (engine *SysscriptEngine) netDNSLookup(thread *starlark.Thread, b *starlark
 
 	switch strings.ToUpper(rrType) {
 	case "A", "AAAA":
-		addrs, err := net.LookupHost(host)
+		addrs, err := net.DefaultResolver.LookupHost(engine.ctx, host)
 		if err != nil {
 			return starlark.None, fmt.Errorf("dns_lookup: %w", err)
 		}
@@ -43,7 +43,7 @@ func (engine *SysscriptEngine) netDNSLookup(thread *starlark.Thread, b *starlark
 			}
 		}
 	case "MX":
-		records, err := net.LookupMX(host)
+		records, err := net.DefaultResolver.LookupMX(engine.ctx, host)
 		if err != nil {
 			return starlark.None, fmt.Errorf("dns_lookup: %w", err)
 		}
@@ -51,7 +51,7 @@ func (engine *SysscriptEngine) netDNSLookup(thread *starlark.Thread, b *starlark
 			results = append(results, starlark.String(fmt.Sprintf("%d %s", r.Pref, r.Host)))
 		}
 	case "NS":
-		records, err := net.LookupNS(host)
+		records, err := net.DefaultResolver.LookupNS(engine.ctx, host)
 		if err != nil {
 			return starlark.None, fmt.Errorf("dns_lookup: %w", err)
 		}
@@ -59,7 +59,7 @@ func (engine *SysscriptEngine) netDNSLookup(thread *starlark.Thread, b *starlark
 			results = append(results, starlark.String(r.Host))
 		}
 	case "TXT":
-		records, err := net.LookupTXT(host)
+		records, err := net.DefaultResolver.LookupTXT(engine.ctx, host)
 		if err != nil {
 			return starlark.None, fmt.Errorf("dns_lookup: %w", err)
 		}
@@ -67,7 +67,7 @@ func (engine *SysscriptEngine) netDNSLookup(thread *starlark.Thread, b *starlark
 			results = append(results, starlark.String(r))
 		}
 	case "CNAME":
-		cname, err := net.LookupCNAME(host)
+		cname, err := net.DefaultResolver.LookupCNAME(engine.ctx, host)
 		if err != nil {
 			return starlark.None, fmt.Errorf("dns_lookup: %w", err)
 		}
@@ -86,7 +86,7 @@ func (engine *SysscriptEngine) netReverseDNS(thread *starlark.Thread, b *starlar
 	if err := starlark.UnpackArgs("reverse_dns", args, kwargs, "ip", &ip); err != nil {
 		return starlark.None, err
 	}
-	names, err := net.LookupAddr(ip)
+	names, err := net.DefaultResolver.LookupAddr(engine.ctx, ip)
 	if err != nil {
 		return starlark.None, fmt.Errorf("reverse_dns: %w", err)
 	}
@@ -111,7 +111,8 @@ func (engine *SysscriptEngine) netPortCheck(thread *starlark.Thread, b *starlark
 
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
 	start := time.Now()
-	conn, err := net.DialTimeout("tcp", addr, time.Duration(timeoutMs)*time.Millisecond)
+	dialer := &net.Dialer{Timeout: time.Duration(timeoutMs) * time.Millisecond}
+	conn, err := dialer.DialContext(engine.ctx, "tcp", addr)
 	latency := int(time.Since(start).Milliseconds())
 
 	result := starlark.NewDict(3)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
@@ -26,8 +27,10 @@ func (f *fakeConfigStore) AtomicWrite(path, content string) error {
 	f.writes = append(f.writes, [2]string{path, content})
 	return f.writeErr
 }
-func (f *fakeConfigStore) Validate(service, path string) (string, error) { return "", nil }
-func (f *fakeConfigStore) Reload(service string) (string, error) {
+func (f *fakeConfigStore) Validate(_ context.Context, service, path string) (string, error) {
+	return "", nil
+}
+func (f *fakeConfigStore) Reload(_ context.Context, service string) (string, error) {
 	f.reloads = append(f.reloads, service)
 	return f.reloadOut, f.reloadErr
 }

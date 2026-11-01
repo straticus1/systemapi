@@ -10,6 +10,12 @@
 // after After Dark SSO), then "approved" and that path.
 // retire needs an admin key: it posts the --reason (required) to
 // /api/v1/hosts/<id>/retire and sends force only when --force is given.
+// jobs submit/status/wait/cancel/list drive /api/v1/fleet/<id>/jobs and
+// /api/v1/jobs. A wait polls GET /api/v1/jobs/<id> every 2 s (retrying
+// network errors, 429 and 5xx until the wait ends); exit 0 is
+// succeeded, 1 any other end (or an error), 3 still running (the job id is
+// printed). Output the server hides from this key is never fetched another
+// way; the CLI says so on stderr.
 'use strict';
 
 const fs = require('node:fs');
@@ -18,6 +24,18 @@ const path = require('node:path');
 const SCRIPT_MAX = 64 * 1024;
 const BODY_MAX = 1024 * 1024;
 const HOST_RE = /^[A-Za-z0-9._:-]{1,256}$/;
+const JOB_ID_RE = /^sjb_[A-Za-z0-9_-]{22}$/;
+const JOB_STATUSES = new Set(['submitted', 'accepted', 'running', 'succeeded', 'failed', 'cancelled', 'timed_out']);
+const JOB_TERMINAL = new Set(['succeeded', 'failed', 'cancelled', 'timed_out']);
+// The server's wait_s ceiling is 25; 20 keeps the first POST well inside it.
+const JOB_FIRST_WAIT_MAX_S = 20;
+const JOB_POLL_MS = 2000;
+// GET /api/v1/jobs/<id> ends a lost job at its deadline + 60 s, swept every
+// 30 s: a wait with no --wait gives up after deadline + 90 s.
+const JOB_DEADLINE_SLACK_S = 90;
+// The server's largest timeout_s (SYSTEMAPI_SYSSCRIPT_JOB_MAX_S cap).
+const JOB_TIMEOUT_MAX_S = 3600;
+const SECONDS_MAX = 86400;
 
 class Exit extends Error {
   constructor(code, message) {
@@ -36,6 +54,11 @@ function usage() {
     '  breakglass-ticket --host <id>',
     '  host-json --host <id>',
     '  retire --host <id> --reason <text> [--force]',
+    '  jobs submit <host> <script-file> [--timeout <s>] [--wait <s>]',
+    '  jobs status <job-id>',
+    '  jobs wait <job-id> [--wait <s>]',
+    '  jobs cancel <job-id>',
+    '  jobs list [--host <id>] [--status <status>]',
     '  login <username>'
   ].join('\n');
 }
@@ -129,17 +152,19 @@ async function readLimited(res) {
   return Buffer.concat(chunks).toString('utf8');
 }
 
-async function request(cfg, method, pathname, body) {
+// With transient, a network failure or timeout comes back as status 0 and
+// a non-JSON 5xx/429 body as parsed null, for the caller to retry.
+async function request(cfg, method, pathname, body, { timeoutMs, query, transient = false } = {}) {
   const url = new URL(cfg.url.href);
   const prefix = url.pathname === '/' ? '' : url.pathname;
   url.pathname = prefix + pathname;
-  url.search = '';
+  url.search = query ? new URLSearchParams(query).toString() : '';
   url.hash = '';
   const headers = {
     Accept: 'application/json',
     'X-API-Key': cfg.key
   };
-  const timeout = method === 'POST' && pathname.endsWith('/execute') ? 45000 : 20000;
+  const timeout = timeoutMs || (method === 'POST' && pathname.endsWith('/execute') ? 45000 : 20000);
   const init = {
     method,
     headers,
@@ -154,21 +179,28 @@ async function request(cfg, method, pathname, body) {
     init.body = JSON.stringify(body);
   }
   let res;
+  let text;
   try {
     res = await fetch(url, init);
-  } catch {
+    text = await readLimited(res);
+  } catch (err) {
+    if (err instanceof Exit) throw err;
+    if (transient) return { status: 0, parsed: null, date: null };
     fail(1, 'request_failed');
   }
-  const text = await readLimited(res);
   let parsed = null;
   if (text.trim()) {
     try {
       parsed = JSON.parse(text);
     } catch {
-      fail(1, 'bad_response');
+      if (!(transient && retryable(res.status))) fail(1, 'bad_response');
     }
   }
-  return { status: res.status, parsed };
+  return { status: res.status, parsed, date: res.headers.get('date') };
+}
+
+function retryable(status) {
+  return status === 0 || status === 429 || status >= 500;
 }
 
 async function requestPublic(base, method, pathname, body) {
@@ -344,13 +376,223 @@ async function emit(text, key) {
   await write(process.stdout, text);
 }
 
+async function note(text, key) {
+  await write(process.stderr, visible(text, key) + '\n');
+}
+
+// {positional, flags} where flags holds the integer or string value of each
+// allowed --flag; anything else is a usage error.
+function parseJobArgs(argv, allowed) {
+  const positional = [];
+  const flags = {};
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (!arg.startsWith('--')) {
+      positional.push(arg);
+      continue;
+    }
+    const name = arg.slice(2);
+    if (!allowed.includes(name) || Object.prototype.hasOwnProperty.call(flags, name)) fail(2, usage());
+    const value = argv[i + 1];
+    if (!value || value.startsWith('--')) fail(2, 'missing value for ' + arg);
+    i += 1;
+    if (name === 'timeout' || name === 'wait') {
+      const n = /^[0-9]{1,6}$/.test(value) ? Number(value) : NaN;
+      if (!(n >= (name === 'timeout' ? 1 : 0) && n <= SECONDS_MAX)) fail(2, 'invalid ' + arg);
+      flags[name] = n;
+    } else {
+      flags[name] = value;
+    }
+  }
+  return { positional, flags };
+}
+
+function requireJobId(id) {
+  if (typeof id !== 'string' || !JOB_ID_RE.test(id)) fail(2, 'invalid job id');
+  return id;
+}
+
+function jobFrom(parsed) {
+  const job = parsed && parsed.job;
+  if (!job || typeof job !== 'object' || typeof job.job_id !== 'string' || !JOB_STATUSES.has(job.status)) {
+    fail(1, 'bad_response');
+  }
+  return job;
+}
+
+function jobPath(id) {
+  return '/api/v1/jobs/' + encodeURIComponent(id);
+}
+
+// {job, date}: date is the server's Date header, or null.
+async function getJob(cfg, id) {
+  const { status, parsed, date } = await request(cfg, 'GET', jobPath(id));
+  if (status >= 400) fail(1, errorText(parsed, cfg.key));
+  return { job: jobFrom(parsed), date };
+}
+
+// Polls until the job ends or untilMs passes; returns {job, lastError}:
+// the last view, and the last transient failure if the latest poll failed.
+// A network failure, timeout, 429 or 5xx is retried until untilMs, except
+// 501 and 503 jobs_disabled, which will not get better. Each GET waits at
+// most the time left (at least 1 s, at most 20 s).
+async function pollJob(cfg, job, untilMs) {
+  let latest = job;
+  let lastError = '';
+  while (!JOB_TERMINAL.has(latest.status)) {
+    const left = untilMs - Date.now();
+    if (left <= 0) break;
+    await sleep(Math.min(JOB_POLL_MS, left));
+    const timeoutMs = Math.min(20000, Math.max(1000, untilMs - Date.now()));
+    const { status, parsed } = await request(cfg, 'GET', jobPath(latest.job_id), undefined, { timeoutMs, transient: true });
+    const code = parsed && typeof parsed.error === 'string' ? parsed.error : '';
+    if (status === 501 || (status === 503 && code === 'jobs_disabled')) fail(1, errorText(parsed, cfg.key));
+    if (retryable(status)) {
+      lastError = status === 0 ? 'request_failed' : (code ? visible(code, cfg.key) : 'http_' + status);
+      continue;
+    }
+    if (status >= 400) fail(1, errorText(parsed, cfg.key));
+    latest = jobFrom(parsed);
+    lastError = '';
+  }
+  return { job: latest, lastError };
+}
+
+// Default end of a wait with no --wait: the job's deadline + 90 s, counted
+// on the server's clock (its Date header) so client skew does not matter;
+// with no usable Date, timeout_s + 90 s from now. Never more than the
+// longest job (3600 s) + 90 s from now.
+function defaultWaitUntil(job, date, startedMs) {
+  const maxMs = startedMs + (JOB_TIMEOUT_MAX_S + JOB_DEADLINE_SLACK_S) * 1000;
+  const serverNowS = date ? Date.parse(date) / 1000 : NaN;
+  if (typeof job.deadline_unix === 'number' && Number.isFinite(serverNowS)) {
+    return Math.min(maxMs, startedMs + (job.deadline_unix - serverNowS + JOB_DEADLINE_SLACK_S) * 1000);
+  }
+  const timeoutS = typeof job.timeout_s === 'number' && job.timeout_s > 0 ? job.timeout_s : 0;
+  return Math.min(maxMs, startedMs + (timeoutS + JOB_DEADLINE_SLACK_S) * 1000);
+}
+
+function jobExitCode(job) {
+  if (!JOB_TERMINAL.has(job.status)) return 3;
+  return job.status === 'succeeded' ? 0 : 1;
+}
+
+// A finished job prints its output on stdout and, when it did not succeed,
+// "<status> <error>" on stderr. A running one prints its id, and the last
+// transient error when the last poll failed.
+async function reportJob({ job, lastError }, key) {
+  if (!JOB_TERMINAL.has(job.status)) {
+    await emit(job.job_id + '\n', key);
+    await note(lastError ? 'still running (last poll: ' + lastError + ')' : 'still running', key);
+    process.exitCode = 3;
+    return;
+  }
+  if (job.output_visible === false) {
+    await note('output hidden: only the submitter or a tenant admin can read it', key);
+  } else if (job.output_expired === true) {
+    await note('output expired', key);
+  } else if (typeof job.output === 'string') {
+    await emit(job.output, key);
+    if (job.output_truncated === true) await note('output truncated', key);
+  }
+  if (job.status !== 'succeeded') {
+    const error = typeof job.error === 'string' && job.error ? ' ' + job.error : '';
+    await note(job.status + error, key);
+  }
+  process.exitCode = jobExitCode(job);
+}
+
+async function jobs(argv) {
+  const sub = argv[0];
+  const rest = argv.slice(1);
+  if (sub === 'submit') {
+    const { positional, flags } = parseJobArgs(rest, ['timeout', 'wait']);
+    if (positional.length !== 2) fail(2, usage());
+    const host = requireHost(positional[0]);
+    const cfg = loadConfig();
+    const script = readScript(positional[1]);
+    const waitS = flags.wait || 0;
+    const firstWait = Math.min(waitS, JOB_FIRST_WAIT_MAX_S);
+    const started = Date.now();
+    const body = { script, entitlements: { allow_exec: true }, wait_s: firstWait };
+    if (flags.timeout !== undefined) body.timeout_s = flags.timeout;
+    const { status, parsed } = await request(cfg, 'POST', '/api/v1/fleet/' + encodeURIComponent(host) + '/jobs', body,
+      { timeoutMs: firstWait > 0 ? (firstWait + 10) * 1000 : 20000 });
+    if (status >= 400) fail(1, errorText(parsed, cfg.key));
+    let job;
+    if (status === 200) {
+      job = jobFrom(parsed);
+    } else {
+      const id = parsed && parsed.job_id;
+      if (typeof id !== 'string' || !JOB_ID_RE.test(id) || !JOB_STATUSES.has(parsed.status)) fail(1, 'bad_response');
+      job = { job_id: id, status: parsed.status };
+    }
+    if (waitS === 0) {
+      await emit(job.job_id + '\n', cfg.key);
+      return;
+    }
+    // The job exists from here on: say which one before waiting on it.
+    if (status === 202) await note('job ' + job.job_id, cfg.key);
+    await reportJob(await pollJob(cfg, job, started + waitS * 1000), cfg.key);
+    return;
+  }
+  if (sub === 'status' || sub === 'wait' || sub === 'cancel') {
+    const { positional, flags } = parseJobArgs(rest, sub === 'wait' ? ['wait'] : []);
+    if (positional.length !== 1) fail(2, usage());
+    const id = requireJobId(positional[0]);
+    const cfg = loadConfig();
+    if (sub === 'cancel') {
+      const { status, parsed } = await request(cfg, 'POST', jobPath(id) + '/cancel');
+      if (status >= 400) fail(1, errorText(parsed, cfg.key));
+      const job = jobFrom(parsed);
+      await emit([job.job_id, job.status].map(cell).join('\t') + '\n', cfg.key);
+      return;
+    }
+    const started = Date.now();
+    const { job, date } = await getJob(cfg, id);
+    if (sub === 'status') {
+      await emit(JSON.stringify(job) + '\n', cfg.key);
+      process.exitCode = jobExitCode(job);
+      return;
+    }
+    const untilMs = flags.wait === undefined ? defaultWaitUntil(job, date, started) : started + flags.wait * 1000;
+    await reportJob(await pollJob(cfg, job, untilMs), cfg.key);
+    return;
+  }
+  if (sub === 'list') {
+    const { positional, flags } = parseJobArgs(rest, ['host', 'status']);
+    if (positional.length !== 0) fail(2, usage());
+    const query = {};
+    if (flags.host !== undefined) query.host_id = requireHost(flags.host);
+    if (flags.status !== undefined) {
+      if (!JOB_STATUSES.has(flags.status)) fail(2, 'invalid --status');
+      query.status = flags.status;
+    }
+    const cfg = loadConfig();
+    const { status, parsed } = await request(cfg, 'GET', '/api/v1/jobs', undefined, { query });
+    if (status >= 400) fail(1, errorText(parsed, cfg.key));
+    if (!parsed || !Array.isArray(parsed.jobs)) fail(1, 'bad_response');
+    const lines = parsed.jobs.map((job) => {
+      if (!job || typeof job !== 'object') fail(1, 'bad_response');
+      return [job.job_id, job.host_id, job.status, job.source, job.created_at, job.duration_ms].map(cell).join('\t');
+    });
+    await emit(lines.length ? lines.join('\n') + '\n' : '', cfg.key);
+    return;
+  }
+  fail(2, usage());
+}
+
 async function main() {
   const argv = process.argv.slice(2);
   const cmd = argv[0];
-  const known = new Set(['hosts', 'exec', 'metrics', 'audit', 'breakglass-ticket', 'host-json', 'login', 'retire']);
+  const known = new Set(['hosts', 'exec', 'metrics', 'audit', 'breakglass-ticket', 'host-json', 'login', 'retire', 'jobs']);
   if (!cmd || !known.has(cmd)) fail(2, usage());
   if (cmd === 'login') {
     await login(argv.slice(1));
+    return;
+  }
+  if (cmd === 'jobs') {
+    await jobs(argv.slice(1));
     return;
   }
   const opts = parseArgs(argv.slice(1));
@@ -447,15 +689,20 @@ async function main() {
   await emit(JSON.stringify(out) + '\n', cfg.key);
 }
 
-main().catch(async (err) => {
-  const code = err instanceof Exit ? err.exitCode : 1;
-  const message = err instanceof Exit ? err.message : 'request_failed';
-  const text = message.endsWith('\n') ? message : message + '\n';
-  try {
-    await write(process.stderr, text);
-  } catch {
+if (require.main === module) {
+  main().catch(async (err) => {
+    const code = err instanceof Exit ? err.exitCode : 1;
+    const message = err instanceof Exit ? err.message : 'request_failed';
+    const text = message.endsWith('\n') ? message : message + '\n';
+    try {
+      await write(process.stderr, text);
+    } catch {
+      process.exitCode = code;
+      return;
+    }
     process.exitCode = code;
-    return;
-  }
-  process.exitCode = code;
-});
+  });
+}
+
+// For tests.
+module.exports = { defaultWaitUntil };

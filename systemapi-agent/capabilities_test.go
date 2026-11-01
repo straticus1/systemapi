@@ -9,8 +9,9 @@ import (
 
 // expectedCaps builds the capability set this host should advertise from the
 // same probes the implementation uses: tcp and config are always on, pty off
-// only on windows, file only on Linux with openat2, and service/package/tweak
-// follow their platform probes.
+// only on windows, sysscript_jobs only on Linux and macOS (unless
+// --sysscript-jobs=false), file only on Linux with openat2, and
+// service/package/tweak follow their platform probes.
 func expectedCaps() string {
 	present := map[string]bool{
 		"tcp":    true, // tcp.go
@@ -18,6 +19,9 @@ func expectedCaps() string {
 	}
 	if runtime.GOOS != "windows" {
 		present["pty"] = true
+	}
+	if runtime.GOOS == "linux" || runtime.GOOS == "darwin" {
+		present["sysscript_jobs"] = true // the process-group kill exists here
 	}
 	if runtime.GOOS == "linux" && openat2Available() {
 		present["file"] = true
@@ -67,5 +71,50 @@ func TestCapabilitiesAdvertiseOnlyWhatIsReal(t *testing.T) {
 		if c == "zz_test_off" {
 			t.Fatal("a capability whose probe fails was advertised")
 		}
+	}
+}
+
+func hasCap(name string) bool {
+	return strings.Contains(","+capabilitiesHeaderValue()+",", ","+name+",")
+}
+
+// sysscript_jobs: on by default on Linux and macOS only, and
+// --sysscript-jobs=false (sysscriptJobsOn) turns it off on any OS, so the
+// server sends that host's scripts the legacy way.
+func TestSysscriptJobsCapabilitySwitch(t *testing.T) {
+	defer func(prev bool) { sysscriptJobsOn = prev }(sysscriptJobsOn)
+	sysscriptJobsOn = true
+	groupKill := runtime.GOOS == "linux" || runtime.GOOS == "darwin"
+	if got := hasCap("sysscript_jobs"); got != groupKill {
+		t.Fatalf("GOOS=%s: sysscript_jobs advertised=%v, want %v", runtime.GOOS, got, groupKill)
+	}
+	sysscriptJobsOn = false
+	if hasCap("sysscript_jobs") {
+		t.Fatal("--sysscript-jobs=false still advertises sysscript_jobs")
+	}
+	if !hasCap("tcp") || !hasCap("config") {
+		t.Fatal("--sysscript-jobs=false must not touch other capabilities")
+	}
+}
+
+// converge: off by default; --converge (convergeOn) advertises it only on
+// Linux and macOS, and only while async jobs are advertised.
+func TestConvergeCapabilitySwitch(t *testing.T) {
+	defer func(prevJobs, prevConv bool) { sysscriptJobsOn, convergeOn = prevJobs, prevConv }(sysscriptJobsOn, convergeOn)
+	if convergeOn {
+		t.Fatal("--converge must default to off")
+	}
+	sysscriptJobsOn = true
+	if hasCap("converge") {
+		t.Fatal("converge advertised without --converge")
+	}
+	convergeOn = true
+	groupKill := runtime.GOOS == "linux" || runtime.GOOS == "darwin"
+	if got := hasCap("converge"); got != groupKill {
+		t.Fatalf("GOOS=%s: converge advertised=%v, want %v", runtime.GOOS, got, groupKill)
+	}
+	sysscriptJobsOn = false
+	if hasCap("converge") {
+		t.Fatal("--sysscript-jobs=false still advertises converge")
 	}
 }

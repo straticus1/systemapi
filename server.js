@@ -120,6 +120,26 @@ const executionsTotal = new promClient.Counter({
     registers: [register]
 });
 
+const sysscriptJobsTotal = new promClient.Counter({
+    name: 'systemapi_sysscript_jobs_total',
+    help: 'Async sysscript jobs ended on this instance, by status and source',
+    labelNames: ['status', 'source'],
+    registers: [register]
+});
+
+const jobFrameRejectedTotal = new promClient.Counter({
+    name: 'systemapi_job_frame_rejected_total',
+    help: 'Agent job frames dropped, by reason',
+    labelNames: ['reason'],
+    registers: [register]
+});
+
+const jobNotifyFallbackTotal = new promClient.Counter({
+    name: 'systemapi_job_notify_fallback_total',
+    help: 'Job dispatches or cancels delivered by the fallback scan instead of a notification',
+    registers: [register]
+});
+
 const terminalAuditFailures = new promClient.Counter({
     name: 'systemapi_terminal_audit_failures_total',
     help: 'Terminal end audit rows that could not be written after retries',
@@ -452,6 +472,9 @@ const prometheusMetrics = {
     diskUsageGauge,
     alertsActiveGauge,
     executionsTotal,
+    sysscriptJobsTotal,
+    jobFrameRejectedTotal,
+    jobNotifyFallbackTotal,
     terminalAuditFailures,
     hostTotalGauge,
     hostOnlineGauge,

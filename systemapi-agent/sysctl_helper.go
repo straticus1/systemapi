@@ -256,7 +256,7 @@ func doSysctlHelper(reqPath string) sysctlHelperRes {
 // writeHandoffFile writes data to a fresh 0600 file. O_EXCL means the unique id
 // must not already exist; O_NOFOLLOW means a planted symlink is refused.
 func writeHandoffFile(path string, data []byte) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|openNoFollow, 0o600)
 	if err != nil {
 		return err
 	}
@@ -273,7 +273,7 @@ func writeHandoffFile(path string, data []byte) error {
 // (sysctl, config, systemd-override); each passes its own cap because a config
 // or unit-override request carries far more bytes than a sysctl one.
 func readHandoffFile(path string, max int64) ([]byte, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	f, err := os.OpenFile(path, os.O_RDONLY|openNoFollow, 0)
 	if err != nil {
 		return nil, err
 	}

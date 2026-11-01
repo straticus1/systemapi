@@ -1,6 +1,6 @@
 package main
 
-// Negative tests for the Sysscript path-grant gate (pathGrantAllows), used by
+// Negative tests for the Sysscript path-grant gate (fsGrantPath, via configWriteAllowed), used by
 // AllowConfigWrite, AllowFSRead and AllowFSWrite. Threats: a sibling path that
 // shares a string prefix with a grant (/etc/example vs /etc/example-evil), a
 // ".." traversal, a relative path, and a symlink inside a granted directory
@@ -17,7 +17,7 @@ import (
 func TestPathGrantAllowsBoundary(t *testing.T) {
 	grants := []string{"/etc/example", "/etc/nginx/"}
 	for _, p := range []string{"/etc/example", "/etc/example/a.conf", "/etc/nginx/nginx.conf", "/etc/nginx"} {
-		if !pathGrantAllows(p, grants) {
+		if !configWriteAllowed(p, grants) {
 			t.Fatalf("%q should be allowed", p)
 		}
 	}
@@ -26,21 +26,21 @@ func TestPathGrantAllowsBoundary(t *testing.T) {
 		"/etc/example/../shadow", "/etc/example/./a", "/etc/example//a", "/etc/example/",
 		"etc/example/a", "", "/etc/example/a\nb",
 	} {
-		if pathGrantAllows(p, grants) {
+		if configWriteAllowed(p, grants) {
 			t.Fatalf("%q must be denied", p)
 		}
 	}
-	if pathGrantAllows("/etc/passwd", nil) {
+	if configWriteAllowed("/etc/passwd", nil) {
 		t.Fatal("empty grant list is not allow-all")
 	}
-	if !pathGrantAllows("/anything", []string{"*"}) {
+	if !configWriteAllowed("/anything", []string{"*"}) {
 		t.Fatal("* should allow an absolute path")
 	}
-	if pathGrantAllows("relative", []string{"*"}) || pathGrantAllows("/a/../b", []string{"*"}) {
+	if configWriteAllowed("relative", []string{"*"}) || configWriteAllowed("/a/../b", []string{"*"}) {
 		t.Fatal("* must not admit a malformed path")
 	}
 	// A malformed grant grants nothing.
-	if pathGrantAllows("/etc/x", []string{"/etc/../etc"}) || pathGrantAllows("/etc/x", []string{"etc"}) {
+	if configWriteAllowed("/etc/x", []string{"/etc/../etc"}) || configWriteAllowed("/etc/x", []string{"etc"}) {
 		t.Fatal("a malformed grant must not match")
 	}
 }
@@ -61,7 +61,7 @@ func TestPathGrantAllowsRefusesSymlinkEscape(t *testing.T) {
 		t.Fatal(err)
 	}
 	grants := []string{granted}
-	if !pathGrantAllows(filepath.Join(granted, "new.conf"), grants) {
+	if !configWriteAllowed(filepath.Join(granted, "new.conf"), grants) {
 		t.Fatal("a plain path under the grant should be allowed")
 	}
 	for _, p := range []string{
@@ -69,7 +69,7 @@ func TestPathGrantAllowsRefusesSymlinkEscape(t *testing.T) {
 		filepath.Join(granted, "link"),
 		filepath.Join(granted, "flink"), // dangling file symlink pointing out
 	} {
-		if pathGrantAllows(p, grants) {
+		if configWriteAllowed(p, grants) {
 			t.Fatalf("%q escapes the grant through a symlink and must be denied", p)
 		}
 	}
@@ -101,8 +101,8 @@ func TestPathGrantAllowsSymlinkLoopDenied(t *testing.T) {
 	done := make(chan [2]bool, 1)
 	go func() {
 		done <- [2]bool{
-			pathGrantAllows(filepath.Join(loop, "x"), []string{dir}),
-			pathGrantAllows(loop, []string{"*"}),
+			configWriteAllowed(filepath.Join(loop, "x"), []string{dir}),
+			configWriteAllowed(loop, []string{"*"}),
 		}
 	}()
 	select {
@@ -111,6 +111,6 @@ func TestPathGrantAllowsSymlinkLoopDenied(t *testing.T) {
 			t.Fatalf("a path through a symlink loop must be denied, got %v", got)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("pathGrantAllows did not return on a symlink loop")
+		t.Fatal("configWriteAllowed did not return on a symlink loop")
 	}
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -62,10 +63,10 @@ func TestNoneServiceManagerFailsClosed(t *testing.T) {
 	if n.Available() {
 		t.Fatal("windows service manager must not be available")
 	}
-	if _, err := n.Action("start", "nginx"); err == nil {
+	if _, err := n.Action(context.Background(), "start", "nginx"); err == nil {
 		t.Fatal("none manager Action must return an error, not a silent success")
 	}
-	if _, err := n.Status("nginx"); err == nil {
+	if _, err := n.Status(context.Background(), "nginx"); err == nil {
 		t.Fatal("none manager Status must return an error")
 	}
 }
@@ -77,7 +78,7 @@ func TestPackageArgvAllManagers(t *testing.T) {
 		{"apt-get", "install", "apt-get install -y --no-install-recommends -- nginx"},
 		{"apt-get", "remove", "apt-get remove -y -- nginx"},
 		{"apt-get", "upgrade", "apt-get install -y --only-upgrade -- nginx"},
-		{"apt-get", "query", "dpkg-query -W -- nginx"},
+		{"apt-get", "query", "dpkg-query -W -f ${Package}\t${Version}\t${db:Status-Abbrev}\n -- nginx"},
 		{"dnf", "install", "dnf install -y -- nginx"},
 		{"dnf", "remove", "dnf remove -y -- nginx"},
 		{"dnf", "upgrade", "dnf upgrade -y -- nginx"},
@@ -147,16 +148,16 @@ func TestPackageManagerOrderPrefersFamily(t *testing.T) {
 
 func TestConfigStoreValidateAndReload(t *testing.T) {
 	cs := newConfigStore(familyDebian)
-	out, err := cs.Validate("mystery-service", "/etc/mystery.conf")
+	out, err := cs.Validate(context.Background(), "mystery-service", "/etc/mystery.conf")
 	if err != nil || out != "no validator for service" {
 		t.Fatalf("unknown validator should be a clean no-op, got out=%q err=%v", out, err)
 	}
 	// reload rejects an unsafe service name before any exec
-	if _, err := cs.Reload("a;b"); err == nil {
+	if _, err := cs.Reload(context.Background(), "a;b"); err == nil {
 		t.Fatal("reload must reject an unsafe service name")
 	}
 	// windows config reload is unsupported, not a silent success
-	if _, err := newConfigStore(familyWindows).Reload("nginx"); err == nil {
+	if _, err := newConfigStore(familyWindows).Reload(context.Background(), "nginx"); err == nil {
 		t.Fatal("windows reload must fail closed")
 	}
 	if !cs.Available() {
@@ -165,16 +166,16 @@ func TestConfigStoreValidateAndReload(t *testing.T) {
 }
 
 func TestConfigWriteAllowed(t *testing.T) {
-	if !pathGrantAllows("/etc/nginx/nginx.conf", []string{"/etc/nginx/"}) {
+	if !configWriteAllowed("/etc/nginx/nginx.conf", []string{"/etc/nginx/"}) {
 		t.Fatal("prefix match should be allowed")
 	}
-	if !pathGrantAllows("/anything", []string{"*"}) {
+	if !configWriteAllowed("/anything", []string{"*"}) {
 		t.Fatal("* should allow")
 	}
-	if pathGrantAllows("/etc/passwd", []string{"/etc/nginx/"}) {
+	if configWriteAllowed("/etc/passwd", []string{"/etc/nginx/"}) {
 		t.Fatal("out-of-prefix path must be denied")
 	}
-	if pathGrantAllows("/etc/passwd", nil) {
+	if configWriteAllowed("/etc/passwd", nil) {
 		t.Fatal("empty allow list is not allow-all")
 	}
 }

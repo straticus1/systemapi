@@ -28,7 +28,7 @@ func TestInstallPackageDeniesStarAndEmpty(t *testing.T) {
 		return nil
 	}
 	for _, allow := range [][]string{{"*"}, nil, {}} {
-		err := installPackage("nginx", allow)
+		err := installPackage(context.Background(), "nginx", allow)
 		if err == nil || !strings.Contains(err.Error(), "package not allowed") {
 			t.Fatalf("%v: %v", allow, err)
 		}
@@ -51,7 +51,7 @@ func TestInstallPackageHostGate(t *testing.T) {
 		got = append([]string(nil), argv...)
 		return nil
 	}
-	err := installPackage("nginx", []string{"nginx"})
+	err := installPackage(context.Background(), "nginx", []string{"nginx"})
 	if hostLinux() {
 		if err != nil {
 			t.Fatal(err)

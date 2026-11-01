@@ -71,10 +71,16 @@ var (
 type ptyOut interface {
 	WriteJSON(v interface{}) error
 	WriteBinary(b []byte) error
+	// WriteText sends an already encoded JSON text frame (encodeFrame).
+	WriteText(b []byte) error
 }
 
+// wsWriteTimeout bounds one write. A write that misses it breaks the
+// connection (gorilla write errors are sticky) and the agent reconnects.
+const wsWriteTimeout = 15 * time.Second
+
 // wsWriter serializes writes to one gorilla connection, which allows only
-// one concurrent writer.
+// one concurrent writer, and gives each write a deadline.
 type wsWriter struct {
 	mu sync.Mutex
 	c  *websocket.Conn
@@ -83,18 +89,36 @@ type wsWriter struct {
 func (w *wsWriter) WriteJSON(v interface{}) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if err := w.c.SetWriteDeadline(time.Now().Add(wsWriteTimeout)); err != nil {
+		return err
+	}
 	return w.c.WriteJSON(v)
 }
 
 func (w *wsWriter) WriteBinary(b []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if err := w.c.SetWriteDeadline(time.Now().Add(wsWriteTimeout)); err != nil {
+		return err
+	}
 	return w.c.WriteMessage(websocket.BinaryMessage, b)
+}
+
+func (w *wsWriter) WriteText(b []byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.c.SetWriteDeadline(time.Now().Add(wsWriteTimeout)); err != nil {
+		return err
+	}
+	return w.c.WriteMessage(websocket.TextMessage, b)
 }
 
 func (w *wsWriter) WriteClose() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if err := w.c.SetWriteDeadline(time.Now().Add(wsWriteTimeout)); err != nil {
+		return err
+	}
 	return w.c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 }
 

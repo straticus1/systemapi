@@ -2,10 +2,10 @@ package main
 
 import (
 	"fmt"
+	"sort"
 	"time"
 
 	"go.starlark.net/starlark"
-	"gopkg.in/yaml.v3"
 )
 
 // --- sys.config.write(path, content) ---
@@ -16,15 +16,15 @@ func (engine *SysscriptEngine) configWrite(thread *starlark.Thread, b *starlark.
 		return starlark.None, err
 	}
 
-	allowed := pathGrantAllows(path, engine.Entitlements.AllowConfigWrite)
-	if !allowed {
+	resolved, err := fsGrantPath(engine.Entitlements.AllowConfigWrite, path, "config write", true)
+	if err != nil {
 		result := starlark.NewDict(2)
 		result.SetKey(starlark.String("success"), starlark.False)
 		result.SetKey(starlark.String("error"), starlark.String(fmt.Sprintf("security exception: config write to %s not granted", path)))
 		return result, nil
 	}
 
-	err := currentPlatform().Config.AtomicWrite(path, content)
+	err = currentPlatform().Config.AtomicWrite(resolved, content)
 	result := starlark.NewDict(2)
 	if err != nil {
 		result.SetKey(starlark.String("success"), starlark.False)
@@ -77,7 +77,19 @@ func (engine *SysscriptEngine) configValidate(thread *starlark.Thread, b *starla
 		return starlark.None, err
 	}
 
-	out, err := currentPlatform().Config.Validate(service, path)
+	// The checkers run as root and echo the file back in their errors, so the
+	// path needs the same grant as sys.config.write (AllowConfigWrite), and
+	// only the resolved absolute path reaches argv.
+	resolved, err := fsGrantPath(engine.Entitlements.AllowConfigWrite, path, "config validate", true)
+	if err != nil {
+		result := starlark.NewDict(3)
+		result.SetKey(starlark.String("success"), starlark.False)
+		result.SetKey(starlark.String("output"), starlark.String(""))
+		result.SetKey(starlark.String("error"), starlark.String(err.Error()))
+		return result, nil
+	}
+
+	out, err := currentPlatform().Config.Validate(engine.ctx, service, resolved)
 	result := starlark.NewDict(3)
 	if err != nil {
 		result.SetKey(starlark.String("success"), starlark.False)
@@ -114,7 +126,7 @@ func (engine *SysscriptEngine) configReload(thread *starlark.Thread, b *starlark
 		return result, nil
 	}
 
-	out, err := currentPlatform().Config.Reload(service)
+	out, err := currentPlatform().Config.Reload(engine.ctx, service)
 	result := starlark.NewDict(3)
 	if err != nil {
 		result.SetKey(starlark.String("success"), starlark.False)
@@ -136,8 +148,8 @@ func (engine *SysscriptEngine) configBackup(thread *starlark.Thread, b *starlark
 		return starlark.None, err
 	}
 
-	allowed := pathGrantAllows(path, engine.Entitlements.AllowFSRead)
-	if !allowed {
+	resolved, err := fsGrantPath(engine.Entitlements.AllowFSRead, path, "read", true)
+	if err != nil {
 		result := starlark.NewDict(3)
 		result.SetKey(starlark.String("success"), starlark.False)
 		result.SetKey(starlark.String("backup_path"), starlark.String(""))
@@ -145,7 +157,7 @@ func (engine *SysscriptEngine) configBackup(thread *starlark.Thread, b *starlark
 		return result, nil
 	}
 
-	backupPath, err := engine.cm.BackupConfig(path)
+	backupPath, err := engine.cm.BackupConfig(resolved)
 	result := starlark.NewDict(3)
 	if err != nil {
 		result.SetKey(starlark.String("success"), starlark.False)
@@ -168,18 +180,18 @@ func (engine *SysscriptEngine) configRestore(thread *starlark.Thread, b *starlar
 	}
 
 	// Check AllowFSWrite or AllowConfigWrite
-	allowed := pathGrantAllows(path, engine.Entitlements.AllowFSWrite)
-	if !allowed {
-		allowed = pathGrantAllows(path, engine.Entitlements.AllowConfigWrite)
+	resolved, err := fsGrantPath(engine.Entitlements.AllowFSWrite, path, "write", true)
+	if err != nil {
+		resolved, err = fsGrantPath(engine.Entitlements.AllowConfigWrite, path, "write", true)
 	}
-	if !allowed {
+	if err != nil {
 		result := starlark.NewDict(2)
 		result.SetKey(starlark.String("success"), starlark.False)
 		result.SetKey(starlark.String("error"), starlark.String(fmt.Sprintf("security exception: write to %s not granted", path)))
 		return result, nil
 	}
 
-	err := engine.cm.RestoreConfig(path)
+	err = engine.cm.RestoreConfig(resolved)
 	result := starlark.NewDict(2)
 	if err != nil {
 		result.SetKey(starlark.String("success"), starlark.False)
@@ -189,37 +201,6 @@ func (engine *SysscriptEngine) configRestore(thread *starlark.Thread, b *starlar
 		result.SetKey(starlark.String("error"), starlark.String(""))
 	}
 	return result, nil
-}
-
-// --- sys.yaml.parse(content) ---
-
-func (engine *SysscriptEngine) yamlParse(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	var content string
-	if err := starlark.UnpackArgs("parse", args, kwargs, "content", &content); err != nil {
-		return starlark.None, err
-	}
-
-	var raw interface{}
-	if err := yaml.Unmarshal([]byte(content), &raw); err != nil {
-		return starlark.None, fmt.Errorf("yaml parse error: %w", err)
-	}
-	return goToStarlark(raw), nil
-}
-
-// --- sys.yaml.encode(value) ---
-
-func (engine *SysscriptEngine) yamlEncode(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	var val starlark.Value
-	if err := starlark.UnpackArgs("encode", args, kwargs, "value", &val); err != nil {
-		return starlark.None, err
-	}
-
-	goVal := starlarkToGo(val)
-	out, err := yaml.Marshal(goVal)
-	if err != nil {
-		return starlark.None, fmt.Errorf("yaml encode error: %w", err)
-	}
-	return starlark.String(string(out)), nil
 }
 
 // --- Conversion helpers ---
@@ -261,43 +242,65 @@ func starlarkToGo(v starlark.Value) interface{} {
 	}
 }
 
-// goToStarlark converts a native Go value (as produced by yaml.v3 Unmarshal) to a Starlark value.
-func goToStarlark(v interface{}) starlark.Value {
+// goToStarlark converts a native Go value (as produced by yaml.v3 or
+// encoding/json Unmarshal) to a Starlark value. Dict keys are in sorted
+// order, so a dict iterates the same way every run (the converge
+// declaration depends on it). Non-string map keys are formatted with %v; two
+// keys that format alike (1 and "1") are an error rather than one silently
+// replacing the other.
+func goToStarlark(v interface{}) (starlark.Value, error) {
 	if v == nil {
-		return starlark.None
+		return starlark.None, nil
 	}
 	switch val := v.(type) {
 	case bool:
-		return starlark.Bool(val)
+		return starlark.Bool(val), nil
 	case int:
-		return starlark.MakeInt(val)
+		return starlark.MakeInt(val), nil
 	case int64:
-		return starlark.MakeInt64(val)
+		return starlark.MakeInt64(val), nil
 	case float64:
-		return starlark.Float(val)
+		return starlark.Float(val), nil
 	case string:
-		return starlark.String(val)
+		return starlark.String(val), nil
 	case []interface{}:
 		elems := make([]starlark.Value, len(val))
 		for i, item := range val {
-			elems[i] = goToStarlark(item)
+			e, err := goToStarlark(item)
+			if err != nil {
+				return nil, err
+			}
+			elems[i] = e
 		}
-		return starlark.NewList(elems)
+		return starlark.NewList(elems), nil
 	case map[string]interface{}:
-		d := starlark.NewDict(len(val))
-		for k, item := range val {
-			d.SetKey(starlark.String(k), goToStarlark(item))
+		keys := make([]string, 0, len(val))
+		for k := range val {
+			keys = append(keys, k)
 		}
-		return d
+		sort.Strings(keys)
+		d := starlark.NewDict(len(val))
+		for _, k := range keys {
+			e, err := goToStarlark(val[k])
+			if err != nil {
+				return nil, err
+			}
+			if err := d.SetKey(starlark.String(k), e); err != nil {
+				return nil, err
+			}
+		}
+		return d, nil
 	case map[interface{}]interface{}:
-		// yaml.v3 can produce this for non-string-keyed maps
-		d := starlark.NewDict(len(val))
+		byKey := make(map[string]interface{}, len(val))
 		for k, item := range val {
-			keyStr := fmt.Sprintf("%v", k)
-			d.SetKey(starlark.String(keyStr), goToStarlark(item))
+			ks := fmt.Sprintf("%v", k)
+			if _, dup := byKey[ks]; dup {
+				return nil, fmt.Errorf("map keys collide as %q", ks)
+			}
+			byKey[ks] = item
 		}
-		return d
+		return goToStarlark(byKey)
 	default:
-		return starlark.String(fmt.Sprintf("%v", val))
+		return starlark.String(fmt.Sprintf("%v", val)), nil
 	}
 }

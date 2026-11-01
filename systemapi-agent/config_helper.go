@@ -156,18 +156,8 @@ type configHelperRes struct {
 // "." or ".." component, no trailing slash, and not "/" itself. Rejecting ".."
 // here is what stops a request file from escaping an /etc prefix by traversal.
 func configTargetShapeOK(p string) bool {
-	if p == "" || len(p) > 4096 || p == "/" || !strings.HasPrefix(p, "/") || !noControl(p) {
-		return false
-	}
-	if strings.HasSuffix(p, "/") {
-		return false
-	}
-	for _, c := range strings.Split(p[1:], "/") {
-		if c == "" || c == "." || c == ".." {
-			return false
-		}
-	}
-	return true
+	// The same shape rule as every Sysscript path grant (sys_fs.go).
+	return fsPathShapeOK(p)
 }
 
 // configTargetDenied reports whether target is, or sits beneath, a self-root

@@ -23,6 +23,7 @@ import (
 // K3sClient communicates with the Kubernetes API using TLS from kubeconfig.
 // k3s and k8s share this type. The script never receives the kubeconfig.
 type K3sClient struct {
+	ctx       context.Context // parent of every call; nil refuses all calls
 	client    *http.Client
 	serverURL string
 	tlsConfig *tls.Config
@@ -86,18 +87,30 @@ type K8sPod struct {
 	} `json:"status"`
 }
 
-// NewK3sClient reads only /etc/rancher/k3s/k3s.yaml. It does not fall back to KUBECONFIG.
-func NewK3sClient() (*K3sClient, error) {
-	return newKubeClient(k3sKubeconfigPath)
+// NewK3sClient reads only /etc/rancher/k3s/k3s.yaml. It does not fall back to
+// KUBECONFIG. Every call is bounded by ctx (the script's context) and by
+// kubeCallTimeout.
+func NewK3sClient(ctx context.Context) (*K3sClient, error) {
+	kc, err := newKubeClient(k3sKubeconfigPath)
+	if err != nil {
+		return nil, err
+	}
+	kc.ctx = ctx
+	return kc, nil
 }
 
-// NewK8sClient reads KUBECONFIG and nothing else.
-func NewK8sClient() (*K3sClient, error) {
+// NewK8sClient reads KUBECONFIG and nothing else. See NewK3sClient for ctx.
+func NewK8sClient(ctx context.Context) (*K3sClient, error) {
 	path := os.Getenv("KUBECONFIG")
 	if path == "" {
 		return nil, fmt.Errorf("KUBECONFIG not set")
 	}
-	return newKubeClient(path)
+	kc, err := newKubeClient(path)
+	if err != nil {
+		return nil, err
+	}
+	kc.ctx = ctx
+	return kc, nil
 }
 
 // Threats: TLS minimum is 1.3 and certificate verification stays on.
@@ -189,7 +202,7 @@ func resourcePath(apiVersion, kind, namespace string) (string, error) {
 // ListNodes returns all nodes from the Kubernetes API.
 // On error, returns nil slice and the error.
 func (kc *K3sClient) ListNodes() ([]K8sNode, error) {
-	resp, err := kc.client.Get(kc.serverURL + "/api/v1/nodes")
+	resp, err := kc.send(http.MethodGet, kc.serverURL+"/api/v1/nodes", "", nil)
 	if err != nil {
 		return nil, fmt.Errorf("k3s list nodes: %w", err)
 	}
@@ -225,7 +238,7 @@ func (kc *K3sClient) ListPods(namespace string) ([]K8sPod, error) {
 		path = kc.serverURL + "/api/v1/namespaces/" + namespace + "/pods"
 	}
 
-	resp, err := kc.client.Get(path)
+	resp, err := kc.send(http.MethodGet, path, "", nil)
 	if err != nil {
 		return nil, fmt.Errorf("k3s list pods: %w", err)
 	}
@@ -296,7 +309,7 @@ func (kc *K3sClient) Apply(yamlStr string) error {
 	fullURL := kc.serverURL + path
 
 	// POST to create
-	resp, err := kc.client.Post(fullURL, "application/json", bytes.NewReader(jsonBytes))
+	resp, err := kc.send(http.MethodPost, fullURL, "application/json", bytes.NewReader(jsonBytes))
 	if err != nil {
 		return fmt.Errorf("k3s apply POST: %w", err)
 	}
@@ -325,11 +338,22 @@ func (kc *K3sClient) Apply(yamlStr string) error {
 
 // doPatch sends a strategic-merge-patch request to the given URL.
 func (kc *K3sClient) doPatch(url string, body []byte) (*http.Response, error) {
-	req, err := http.NewRequest(http.MethodPatch, url, bytes.NewReader(body))
+	return kc.send(http.MethodPatch, url, "application/strategic-merge-patch+json", bytes.NewReader(body))
+}
+
+// send makes one request bound to the client's context (the script's
+// deadline and cancel) and to the client's kubeCallTimeout.
+func (kc *K3sClient) send(method, url, contentType string, body io.Reader) (*http.Response, error) {
+	if err := kc.requireClient(); err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(kc.ctx, method, url, body)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/strategic-merge-patch+json")
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
 	return kc.client.Do(req)
 }
 
@@ -378,7 +402,7 @@ type kubeObjectList struct {
 }
 
 func (kc *K3sClient) requireClient() error {
-	if kc == nil || kc.client == nil {
+	if kc == nil || kc.client == nil || kc.ctx == nil {
 		return fmt.Errorf("kube client not initialized")
 	}
 	return nil
@@ -412,7 +436,7 @@ func (kc *K3sClient) kubeDo(method, path string, max int) ([]byte, int, error) {
 	if err := kc.requireClient(); err != nil {
 		return nil, 0, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), kubeCallTimeout)
+	ctx, cancel := context.WithTimeout(kc.ctx, kubeCallTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, method, kc.serverURL+path, nil)
 	if err != nil {
@@ -586,7 +610,7 @@ func (kc *K3sClient) PodExec(namespace, name string, cmd []string) (string, erro
 		HandshakeTimeout: kubeCallTimeout,
 		Subprotocols:     []string{"v4.channel.k8s.io"},
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), kubeCallTimeout)
+	ctx, cancel := context.WithTimeout(kc.ctx, kubeCallTimeout)
 	defer cancel()
 	conn, resp, err := dialer.DialContext(ctx, base.String(), nil)
 	if resp != nil && resp.Body != nil {
@@ -609,6 +633,10 @@ func (kc *K3sClient) PodExec(namespace, name string, cmd []string) (string, erro
 		return "", fmt.Errorf("kube exec: %w", err)
 	}
 	defer conn.Close()
+	// The read loop also ends when the script's deadline or cancel closes
+	// the stream.
+	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopClose()
 	if err := conn.SetReadDeadline(time.Now().Add(kubeCallTimeout)); err != nil {
 		return "", err
 	}

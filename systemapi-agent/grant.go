@@ -14,7 +14,8 @@ import (
 
 // Threats: a lease that names "*", a JSON boolean, or a hard-denied sysctl
 // must not become a grant. Path checks reject prefix tricks (/mnt vs
-// /mnt-evil), symlink escape, and a symlink loop (bounded, denied). Manifest checks reject privileged pods,
+// /mnt-evil) and symlink escape (the path grant itself is fsGrantPath in
+// sys_fs.go). Manifest checks reject privileged pods,
 // host namespaces, and hostPath. This file does not open a socket, mount,
 // or write sysctl. An empty list is not allow-all.
 
@@ -287,89 +288,6 @@ func pathWithin(root, candidate string) bool {
 		return false
 	}
 	return !filepath.IsAbs(rel)
-}
-
-// pathGrantAllows is the Sysscript path-grant gate (AllowConfigWrite,
-// AllowFSRead, AllowFSWrite). path must have the server's rootShapeOk shape
-// (absolute, no control byte, no empty, "." or ".." component, no trailing
-// slash). A grant matches the path itself or anything beneath it on a
-// component boundary, so "/etc/example" does not admit "/etc/example-evil".
-// The match must also hold after resolving symlinks in the existing part of
-// both paths, so a symlink inside a granted directory cannot point the access
-// outside it. "*" admits any well-formed path. A malformed grant matches
-// nothing. The check is not atomic with the later file operation (a symlink
-// swapped in afterwards is not caught here).
-func pathGrantAllows(path string, grants []string) bool {
-	if path == "/" || !xferRootOK(path) {
-		return false
-	}
-	resolved, ok := resolveExisting(path)
-	if !ok {
-		return false
-	}
-	for _, g := range grants {
-		if g == "*" {
-			return true
-		}
-		if len(g) > 1 {
-			g = strings.TrimSuffix(g, "/")
-		}
-		if !xferRootOK(g) {
-			continue
-		}
-		if !pathWithin(g, path) {
-			continue
-		}
-		if rg, ok := resolveExisting(g); ok && pathWithin(rg, resolved) {
-			return true
-		}
-	}
-	return false
-}
-
-// resolveDepthMax bounds the dangling-symlink hops resolveExisting follows,
-// matching the kernel's MAXSYMLINKS (40).
-const resolveDepthMax = 40
-
-// resolveExisting resolves symlinks in the longest existing prefix of the
-// absolute path p and re-appends the part that does not exist yet. It reports
-// false when resolution does not terminate within resolveDepthMax hops (a
-// symlink loop such as a -> a/b); callers must then deny.
-func resolveExisting(p string) (string, bool) {
-	return resolveExistingDepth(p, 0)
-}
-
-func resolveExistingDepth(p string, depth int) (string, bool) {
-	if depth > resolveDepthMax {
-		return "", false
-	}
-	cur, rest := p, ""
-	for {
-		if r, err := filepath.EvalSymlinks(cur); err == nil {
-			return filepath.Join(r, rest), true
-		}
-		if info, err := os.Lstat(cur); err == nil && info.Mode()&os.ModeSymlink != 0 {
-			// A dangling (or looping) symlink: resolve its target lexically.
-			target, err := os.Readlink(cur)
-			if err != nil {
-				return "", false
-			}
-			if !filepath.IsAbs(target) {
-				target = filepath.Join(filepath.Dir(cur), target)
-			}
-			dir, ok := resolveExistingDepth(filepath.Dir(target), depth+1)
-			if !ok {
-				return "", false
-			}
-			return filepath.Join(dir, filepath.Base(target), rest), true
-		}
-		parent := filepath.Dir(cur)
-		if parent == cur {
-			return p, true
-		}
-		rest = filepath.Join(filepath.Base(cur), rest)
-		cur = parent
-	}
 }
 
 func mountHardDenied(cleaned string) bool {

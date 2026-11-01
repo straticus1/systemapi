@@ -29,22 +29,36 @@
 // <deadline_unix>\nwatch\n<watch_id>\n<ro|rw>\n<true|false>\n<reason>", so
 // only the lease signer can claim an override and a start or renew lease
 // cannot be replayed as a watch (or the reverse).
+// An async sysscript job (action sysscript_job) signs "sysscript_job\n
+// <job_id>\n<deadline_unix>\n<timeout_s>\n<sha256_hex(script)>\n
+// <sha256_hex(canonical entitlements v1)>" (controlplane/entitlements.js),
+// so the agent runs only the signed script under the signed entitlements and
+// time limits, and a sysscript lease cannot start a job (or the reverse).
+// A converge job (action converge_job, .omc/plans/convergence-drift.md §7.1)
+// signs "converge_job\n<job_id>\n<deadline_unix>\n<timeout_s>\n
+// <sha256_hex(bundle_json)>\n<sha256_hex(canonical entitlements v1)>\n
+// <check|apply>\n<expect_plan_sha256|->": the mode and the approved plan hash
+// are bound, check always signs "-" and apply always a plan hash, and a
+// sysscript_job lease cannot start a converge job (or the reverse). Shared
+// vectors: controlplane/testdata/converge-job-lease-vectors.json.
 'use strict';
 
 const crypto = require('node:crypto');
 const { validateFileRoot, sysctlDenied, SYSCTL_KEY_RE } = require('./channels');
 const { randomBytes, timingSafeEqual } = crypto;
 
-const ACTIONS = new Set(['sysscript', 'pty', 'pty_root', 'breakglass', 'tcp', 'file', 'file_root', 'xfer', 'xfer_root', 'sys_service', 'sys_package', 'sys_config', 'sys_tweak']);
+const ACTIONS = new Set(['sysscript', 'sysscript_job', 'converge_job', 'pty', 'pty_root', 'breakglass', 'tcp', 'file', 'file_root', 'xfer', 'xfer_root', 'sys_service', 'sys_package', 'sys_config', 'sys_tweak']);
 const TERMINAL_ACTIONS = new Set(['pty', 'pty_root', 'breakglass']);
 const CHANNEL_ACTIONS = new Set(['tcp', 'file', 'file_root']);
 const XFER_ACTIONS = new Set(['xfer', 'xfer_root']);
 // SAH OS-management channel actions (docs/sah-os-management-design.md).
 const SYS_ACTIONS = new Set(['sys_service', 'sys_package', 'sys_config', 'sys_tweak']);
 // Actions whose hash covers "<action>\n<payload>".
-const SESSION_ACTIONS = new Set([...TERMINAL_ACTIONS, ...CHANNEL_ACTIONS, ...XFER_ACTIONS, ...SYS_ACTIONS]);
+const SESSION_ACTIONS = new Set([...TERMINAL_ACTIONS, ...CHANNEL_ACTIONS, ...XFER_ACTIONS, ...SYS_ACTIONS, 'sysscript_job', 'converge_job']);
 // Service/unit name guard; mirrors systemapi-agent/platform.go serviceNameRE.
 const SERVICE_UNIT_RE = /^[a-zA-Z0-9][a-zA-Z0-9@._:-]{0,127}$/;
+const SYSSCRIPT_JOB_RE = /^sjb_[A-Za-z0-9_-]{22}$/;
+const SYSSCRIPT_JOB_TIMEOUT_MAX = 3600;
 const TCP_SESSION_RE = /^tcs_[A-Za-z0-9_-]{16,64}$/;
 const FILE_SESSION_RE = /^fls_[A-Za-z0-9_-]{16,64}$/;
 const XFER_GRANT_RE = /^xfr_[A-Za-z0-9_-]{8,64}$/;
@@ -340,8 +354,38 @@ function xferPayload({
   ].join('\n');
 }
 
+// The sysscript_job payload (five lines, no trailing newline). The hashes
+// are 64 lowercase hex: sha256 of the script's UTF-8 bytes and
+// entitlementsSha256 of the entitlements sent in the frame.
+function sysscriptJobPayload({ jobId, deadlineUnix, timeoutS, scriptSha256, entitlementsSha256 } = {}) {
+  if (typeof jobId !== 'string' || !SYSSCRIPT_JOB_RE.test(jobId)) throw badPayload();
+  if (!intIn(deadlineUnix, 1, Number.MAX_SAFE_INTEGER)) throw badPayload();
+  if (!intIn(timeoutS, 1, SYSSCRIPT_JOB_TIMEOUT_MAX)) throw badPayload();
+  if (typeof scriptSha256 !== 'string' || !SHA256_HEX_RE.test(scriptSha256)) throw badPayload();
+  if (typeof entitlementsSha256 !== 'string' || !SHA256_HEX_RE.test(entitlementsSha256)) throw badPayload();
+  return `${jobId}\n${deadlineUnix}\n${timeoutS}\n${scriptSha256}\n${entitlementsSha256}`;
+}
+
+// The converge_job payload (seven lines, no trailing newline): the
+// sysscript_job fields with bundleSha256 (sha256 of the bundle_json string's
+// UTF-8 bytes) in the script hash's place, then the mode and the plan hash.
+// mode check takes expectPlanSha256 "-" and mode apply a 64 lowercase hex
+// plan hash; anything else is bad_payload.
+function convergeJobPayload({ jobId, deadlineUnix, timeoutS, bundleSha256, entitlementsSha256, mode, expectPlanSha256 } = {}) {
+  const base = sysscriptJobPayload({ jobId, deadlineUnix, timeoutS, scriptSha256: bundleSha256, entitlementsSha256 });
+  const ok = (mode === 'check' && expectPlanSha256 === '-')
+    || (mode === 'apply' && typeof expectPlanSha256 === 'string' && SHA256_HEX_RE.test(expectPlanSha256));
+  if (!ok) throw badPayload();
+  return `${base}\n${mode}\n${expectPlanSha256}`;
+}
+
 module.exports = {
   TERMINAL_ACTIONS,
+  convergeJobPayload,
+  SYSSCRIPT_JOB_RE,
+  SYSSCRIPT_JOB_TIMEOUT_MAX,
+  sysscriptJobPayload,
+  sha256Hex,
   CHANNEL_ACTIONS,
   SYS_ACTIONS,
   TCP_SESSION_RE,

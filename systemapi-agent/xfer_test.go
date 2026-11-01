@@ -22,7 +22,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -49,8 +48,7 @@ func runFakeRecv(args []string) int {
 	// from the agent (a pipe, a socket, a state or key file).
 	var extra []string
 	for fd := 5; fd < 64; fd++ {
-		var st syscall.Stat_t
-		if syscall.Fstat(fd, &st) != nil {
+		if !fdOpen(fd) {
 			continue
 		}
 		target, _ := os.Readlink("/proc/self/fd/" + strconv.Itoa(fd))
@@ -1610,7 +1608,7 @@ func TestXferHeldFd4StillReaped(t *testing.T) {
 	for _, l := range strings.Split(readFakeLog(root, ".fake-ctl.log"), "\n") {
 		if pid, ok := strings.CutPrefix(l, "holder "); ok {
 			if n, err := strconv.Atoi(pid); err == nil {
-				_ = syscall.Kill(n, syscall.SIGKILL)
+				killPid(n)
 			}
 		}
 	}
@@ -1686,7 +1684,7 @@ func TestXferDroppedIdentityExecsByFd(t *testing.T) {
 		t.Fatal(err)
 	}
 	u, _ := user.Lookup("nobody")
-	if st, ok := fi.Sys().(*syscall.Stat_t); !ok || strconv.FormatUint(uint64(st.Uid), 10) != u.Uid {
+	if uid, ok := fileUID(fi); !ok || strconv.FormatUint(uint64(uid), 10) != u.Uid {
 		t.Fatalf("target not written as nobody: %v", fi.Sys())
 	}
 }

@@ -30,6 +30,7 @@ func (f *fakePkgMgr) UpgradeArgv(n string) ([]string, error) {
 	return []string{"pkg", "upgrade", n}, f.err
 }
 func (f *fakePkgMgr) QueryArgv(n string) ([]string, error) { return []string{"pkg", "query", n}, f.err }
+func (f *fakePkgMgr) ListArgv() ([]string, error)          { return []string{"pkg", "list"}, f.err }
 
 type sysPkgHarness struct {
 	priv   ed25519.PrivateKey
