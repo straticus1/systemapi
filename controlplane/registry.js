@@ -24,6 +24,7 @@ const { fingerprint } = require('./token');
 const { assertPolicyShape } = require('./channels');
 const { demoKeyAllowed } = require('./httpauth');
 const { sshKeyMaterial } = require('./sshkey');
+const { alertAuditEntry, ALERT_RULE_RE } = require('./capalerts');
 const {
   AUTO_ACTOR, CONVERGE_SOURCES, HOST_STATE_STATUSES, RUN_KINDS, applyRunRetentionDays, assignmentInput, assignmentPatch, convergeOutcome,
   convergeReport, driftRule, effectiveAssignments, firstCheckOffsetS, hostStateDiff, isConvergeSource, newId,
@@ -756,6 +757,17 @@ function reportAuditEntry(run, job, sha, rep, prevStatus, status) {
   });
 }
 
+// A capability or host:offline alert rule name, or a 500 (fail closed).
+function alertRule(rule) {
+  if (typeof rule !== 'string' || !ALERT_RULE_RE.test(rule)) throw http(500, 'bad_alert_rule');
+  return rule;
+}
+
+function hostHealthValue(health) {
+  if (health !== 'ok' && health !== 'degraded' && health !== 'unknown') throw http(500, 'bad_health');
+  return health;
+}
+
 function driftAlertEntry(run, rep) {
   return {
     tenant_id: run.tenant_id,
@@ -1453,6 +1465,68 @@ class MemoryRegistry {
     const byName = this.hostCapabilities.get(hostId);
     if (!byName) return [];
     return [...byName.values()].map((r) => ({ ...r })).sort((a, b) => (a.name < b.name ? -1 : 1));
+  }
+
+  // See PgRegistry.openHostAlert.
+  async openHostAlert(entry) {
+    const rule = alertRule(entry.rule_name);
+    const host = this.hosts.get(entry.host_id);
+    if (!host || host.retired_at) return null;
+    if (this.alerts.some((a) => a.host_id === entry.host_id && a.rule_name === rule && (a.status === 'open' || a.status === 'ack'))) return null;
+    const row = {
+      id: this.alertSeq++,
+      tenant_id: host.tenant_id,
+      host_id: entry.host_id,
+      rule_name: rule,
+      metric: null,
+      value: null,
+      severity: entry.severity || null,
+      message: entry.message || null,
+      status: 'open',
+      created_at: new Date().toISOString()
+    };
+    await this.appendAudit(alertAuditEntry(row, entry.audit, entry.actor, true));
+    this.alerts.push(row);
+    return { ...row };
+  }
+
+  // See PgRegistry.resolveHostAlerts.
+  async resolveHostAlerts(hostId, list, actor) {
+    const rules = list.map((a) => alertRule(a.rule));
+    const out = [];
+    for (const row of this.alerts) {
+      if (row.host_id !== hostId || !rules.includes(row.rule_name) || (row.status !== 'open' && row.status !== 'ack')) continue;
+      await this.appendAudit(alertAuditEntry(row, list.find((a) => a.rule === row.rule_name), actor, false));
+      row.status = 'resolved';
+      out.push({ ...row });
+    }
+    return out;
+  }
+
+  async setHostHealth(hostId, health) {
+    const row = this.hosts.get(hostId);
+    if (row) row.capability_health = hostHealthValue(health);
+  }
+
+  // See PgRegistry.countHostHealth.
+  async countHostHealth() {
+    const out = { ok: 0, degraded: 0, unknown: 0, offline: 0 };
+    for (const h of this.hosts.values()) {
+      if (h.retired_at) continue;
+      out[h.status !== 'online' ? 'offline' : (h.capability_health || 'unknown')] += 1;
+    }
+    return out;
+  }
+
+  // See PgRegistry.listCapabilityStates.
+  async listCapabilityStates() {
+    const out = [];
+    for (const [hostId, byName] of this.hostCapabilities) {
+      const h = this.hosts.get(hostId);
+      if (!h || h.retired_at) continue;
+      for (const r of byName.values()) out.push({ host_id: hostId, name: r.name, state: r.state });
+    }
+    return out;
   }
 
   async listSoftware(hostId) {
@@ -3096,6 +3170,99 @@ class PgRegistry {
     const res = await this.pool.query(
       'SELECT name, state, reason, since, last_report_at FROM cp_host_capabilities WHERE host_id = $1 ORDER BY name',
       [hostId]
+    );
+    return res.rows;
+  }
+
+  // Opens a capability or host:offline alert for a live (not retired) host,
+  // its tenant read from cp_hosts, and appends the capability_alert_open
+  // audit row in the same transaction. The insert goes through
+  // cp_alert_events_active_capability_idx (ON CONFLICT DO NOTHING), so an
+  // active alert for the same host and rule, from any replica, makes this
+  // return null and write nothing.
+  async openHostAlert(entry) {
+    const rule = alertRule(entry.rule_name);
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const ins = await client.query(
+        `INSERT INTO cp_alert_events (tenant_id, host_id, rule_name, severity, message, status)
+         SELECT h.tenant_id, h.host_id, $2, $3, $4, 'open' FROM cp_hosts h
+          WHERE h.host_id = $1 AND h.retired_at IS NULL
+         ON CONFLICT (host_id, rule_name)
+           WHERE status IN ('open', 'ack') AND (rule_name LIKE 'capability:%' OR rule_name = 'host:offline') DO NOTHING
+         RETURNING id, tenant_id, host_id, rule_name, metric, value, severity, message, status, created_at`,
+        [entry.host_id, rule, entry.severity || null, entry.message || null]
+      );
+      const row = ins.rows[0] || null;
+      if (row) await auditInsert(client, alertAuditEntry(row, entry.audit, entry.actor, true));
+      await client.query('COMMIT');
+      return row;
+    } catch (err) {
+      try { await client.query('ROLLBACK'); } catch { /* connection already failed */ }
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  // Resolves hostId's active alerts for the rules in list ([{rule,
+  // capability, state, reason}]) with one capability_alert_resolve audit row
+  // each, in one transaction. Returns the resolved rows (none when nothing
+  // was active).
+  async resolveHostAlerts(hostId, list, actor) {
+    const rules = list.map((a) => alertRule(a.rule));
+    if (rules.length === 0) return [];
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const res = await client.query(
+        `UPDATE cp_alert_events SET status = 'resolved'
+          WHERE host_id = $1 AND rule_name = ANY($2::text[]) AND status IN ('open', 'ack')
+         RETURNING id, tenant_id, host_id, rule_name, metric, value, severity, message, status, created_at`,
+        [hostId, rules]
+      );
+      for (const row of res.rows) {
+        await auditInsert(client, alertAuditEntry(row, list.find((a) => a.rule === row.rule_name), actor, false));
+      }
+      await client.query('COMMIT');
+      return res.rows;
+    } catch (err) {
+      try { await client.query('ROLLBACK'); } catch { /* connection already failed */ }
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  // The capability health the instance holding the socket last computed
+  // (ok, degraded or unknown), for the cross-replica gauge.
+  async setHostHealth(hostId, health) {
+    await this.pool.query(
+      'UPDATE cp_hosts SET capability_health = $2 WHERE host_id = $1 AND capability_health IS DISTINCT FROM $2',
+      [hostId, hostHealthValue(health)]
+    );
+  }
+
+  // Live hosts by health: offline unless status is online, else the stored
+  // capability health (unknown when none was written).
+  async countHostHealth() {
+    const res = await this.pool.query(
+      `SELECT CASE WHEN status <> 'online' THEN 'offline' ELSE COALESCE(capability_health, 'unknown') END AS health,
+              count(*)::int AS n
+         FROM cp_hosts WHERE retired_at IS NULL GROUP BY 1`
+    );
+    const out = { ok: 0, degraded: 0, unknown: 0, offline: 0 };
+    for (const r of res.rows) if (r.health in out) out[r.health] = r.n;
+    return out;
+  }
+
+  // Every capability row of a live host.
+  async listCapabilityStates() {
+    const res = await this.pool.query(
+      `SELECT c.host_id, c.name, c.state FROM cp_host_capabilities c
+         JOIN cp_hosts h ON h.host_id = c.host_id
+        WHERE h.retired_at IS NULL`
     );
     return res.rows;
   }

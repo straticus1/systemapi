@@ -938,6 +938,8 @@ function mount(app, fleet) {
     });
     // Also closes an agent that connected after the check above.
     const agentClosed = typeof fleet.retireAgent === 'function' ? fleet.retireAgent(host.host_id) : false;
+    // Its alert state and capability gauge series go with it.
+    if (typeof fleet.onHostRetired === 'function') fleet.onHostRetired(host.host_id);
     res.json({
       host_id: row.host_id,
       hostname: row.hostname,

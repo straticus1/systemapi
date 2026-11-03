@@ -140,6 +140,36 @@ const jobNotifyFallbackTotal = new promClient.Counter({
     registers: [register]
 });
 
+// Capability health (plan P1b). The gauges are set from the database in
+// controlplane/index.js refreshGauges; the counters count on this instance.
+const capabilityStateGauge = new promClient.Gauge({
+    name: 'systemapi_capability_state',
+    help: 'Last reported state of each agent capability per host (1 for the current state)',
+    labelNames: ['host_id', 'capability', 'state'],
+    registers: [register]
+});
+
+const hostsHealthGauge = new promClient.Gauge({
+    name: 'systemapi_hosts_health',
+    help: 'Live hosts by capability health: ok, degraded, unknown, offline',
+    labelNames: ['state'],
+    registers: [register]
+});
+
+const agentUnsupportedTotal = new promClient.Counter({
+    name: 'systemapi_agent_unsupported_total',
+    help: 'Requests refused agent_unsupported because the capability is not routable, by capability',
+    labelNames: ['capability'],
+    registers: [register]
+});
+
+const capabilityReportDroppedTotal = new promClient.Counter({
+    name: 'systemapi_capability_report_dropped_total',
+    help: 'capability_report frames refused or dropped, by reason',
+    labelNames: ['reason'],
+    registers: [register]
+});
+
 const terminalAuditFailures = new promClient.Counter({
     name: 'systemapi_terminal_audit_failures_total',
     help: 'Terminal end audit rows that could not be written after retries',
@@ -476,6 +506,10 @@ const prometheusMetrics = {
     jobFrameRejectedTotal,
     jobNotifyFallbackTotal,
     terminalAuditFailures,
+    capabilityStateGauge,
+    hostsHealthGauge,
+    agentUnsupportedTotal,
+    capabilityReportDroppedTotal,
     hostTotalGauge,
     hostOnlineGauge,
     hostOfflineGauge

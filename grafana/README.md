@@ -18,6 +18,24 @@ SystemAPI.io now exports Prometheus metrics that can be visualized in Grafana.
 - `systemapi_alerts_active` - Number of active alerts
 - `systemapi_executions_total{status}` - Total executions (labeled by success/failure)
 
+### Capability Health Metrics
+Set every 30 s from the database (correct across replicas); a retired host's
+series disappear. See `api_docs.md` "Prometheus series".
+- `systemapi_capability_state{host_id, capability, state}` - 1 for each host's stored capability state (`ok`, `degraded`, `absent`)
+- `systemapi_hosts_health{state}` - live hosts by health: `ok`, `degraded`, `unknown` (connected, no report yet), `offline`
+- `systemapi_agent_unsupported_total{capability}` - requests refused `agent_unsupported` (capability not routable), per instance
+- `systemapi_capability_report_dropped_total{reason}` - capability reports refused or dropped, by reason code, per instance
+
+Examples:
+```promql
+# Hosts with a degraded or absent capability
+count by (host_id) (systemapi_capability_state{state!="ok"} == 1)
+# Degraded hosts
+systemapi_hosts_health{state="degraded"}
+# Refusals for a withdrawn capability, last hour
+sum by (capability) (increase(systemapi_agent_unsupported_total[1h]))
+```
+
 ### Node.js Process Metrics (Auto-collected)
 - `process_cpu_user_seconds_total` - CPU time in user mode
 - `process_cpu_system_seconds_total` - CPU time in system mode

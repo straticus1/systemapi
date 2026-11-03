@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { useAppStore } from '../store';
 import { Server, Cpu, TerminalSquare, ShieldAlert, X } from 'lucide-react';
 import { FleetAPI } from '../api';
-import { cpuLabel, scriptOutcome } from '../format';
+import { cpuLabel, scriptOutcome, healthBadge, healthTitle, degradedCapabilities } from '../format';
 
 const FleetDashboard = () => {
   const { hosts, fetchHosts, isLoadingHosts } = useAppStore();
@@ -102,7 +102,24 @@ const HostCard = ({ host, onConnect, onDiagnostic }) => {
      });
      return () => { ignore = true; };
   }, [expanded, host.host_id]);
-  
+
+  // Capability detail for the badge's hover (degraded hosts) and the info
+  // panel; fetched again only when the health or the panel changes.
+  const [capDetail, setCapDetail] = useState(null);
+  const [capError, setCapError] = useState('');
+  useEffect(() => {
+     if (!expanded && host.health !== 'degraded') return;
+     let ignore = false;
+     FleetAPI.getCapabilities(host.host_id).then((detail) => {
+        if (ignore) return;
+        setCapDetail(detail);
+        setCapError('');
+     }).catch((e) => {
+        if (!ignore) setCapError(e?.response?.data?.error || 'unavailable');
+     });
+     return () => { ignore = true; };
+  }, [expanded, host.host_id, host.health]);
+
   const lastSeenDate = new Date(host.last_seen_at);
   const [secondsAgo, setSecondsAgo] = useState(null);
   useEffect(() => {
@@ -177,6 +194,7 @@ const HostCard = ({ host, onConnect, onDiagnostic }) => {
             <h3 style={{ fontSize: '1.1rem', marginBottom: '4px', display: 'flex', alignItems: 'center', gap: '8px' }}>
               {host.hostname}
               <span className={`status-indicator ${isOnline ? 'status-online' : 'status-offline'}`}></span>
+              <HealthBadge health={host.health} detail={capDetail} />
             </h3>
             <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
               {host.os} / {host.platform}
@@ -249,6 +267,7 @@ const HostCard = ({ host, onConnect, onDiagnostic }) => {
       
       {expanded && (
         <div style={{ padding: '20px', borderTop: '1px solid var(--border-light)', background: 'rgba(0,0,0,0.3)', maxHeight: '300px', overflowY: 'auto' }}>
+            <CapabilityPanel detail={capDetail} error={capError} />
             <h4 style={{ color: 'var(--accent)', marginBottom: '12px' }}>Software & CVE Inventory</h4>
             {isLoadingExtras ? (
                 <div style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>Loading inventory...</div>
@@ -306,6 +325,54 @@ const Sparkline = ({ values }) => {
         <svg width="100%" height={height} viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" aria-hidden="true">
             <polyline fill="none" stroke="var(--accent)" strokeWidth="1.5" vectorEffect="non-scaling-stroke" points={points} />
         </svg>
+    );
+};
+
+// ok / degraded / unknown / offline; the hover names the degraded
+// capabilities and their reason codes.
+const HealthBadge = ({ health, detail }) => {
+    const badge = healthBadge(health);
+    return (
+        <span title={healthTitle(health, detail)} aria-label={`Health: ${badge.label}`} style={{
+            fontSize: '0.7rem', fontWeight: 500, padding: '1px 8px', borderRadius: '12px',
+            color: badge.color, background: badge.background, border: `1px solid ${badge.color}`, cursor: 'default'
+        }}>{badge.label}</span>
+    );
+};
+
+const CapabilityPanel = ({ detail, error }) => {
+    if (error) return <div style={{ color: 'var(--text-muted)', fontSize: '0.8rem', marginBottom: '16px' }}>Capabilities: {error}</div>;
+    if (!detail) return <div style={{ color: 'var(--text-muted)', fontSize: '0.85rem', marginBottom: '16px' }}>Loading capabilities...</div>;
+    const degraded = new Map(degradedCapabilities(detail).map((c) => [c.name, c]));
+    const expected = new Set(detail.expected || []);
+    const caps = Array.isArray(detail.caps) ? detail.caps : [];
+    return (
+        <div style={{ marginBottom: '20px' }}>
+            <h4 style={{ color: 'var(--accent)', marginBottom: '12px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                Capabilities <HealthBadge health={detail.health} detail={detail} />
+            </h4>
+            {degraded.size > 0 && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginBottom: '10px' }}>
+                    {[...degraded.values()].map((c) => (
+                        <div key={c.name} style={{ fontSize: '0.8rem', background: 'var(--accent-amber-soft)', padding: '8px', borderRadius: '4px', borderLeft: '3px solid var(--accent-amber)' }}>
+                            <strong>{c.name}</strong> {c.state}{c.reason ? <span className="font-mono" style={{ color: 'var(--text-muted)' }}> {c.reason}</span> : null}
+                        </div>
+                    ))}
+                </div>
+            )}
+            {caps.length > 0 ? (
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px' }}>
+                    {caps.map((c) => (
+                        <div key={c.name} style={{ fontSize: '0.75rem', padding: '6px', background: 'rgba(255,255,255,0.05)', borderRadius: '4px' }}>
+                            <div><strong>{c.name}</strong>{expected.has(c.name) ? <span style={{ color: 'var(--text-muted)' }}> expected</span> : null}</div>
+                            <div style={{ color: c.state === 'ok' ? 'var(--accent-green)' : 'var(--accent-amber)' }}>
+                                {c.state}{c.reason ? ` (${c.reason})` : ''}
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            ) : <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>No capability report stored yet.</div>}
+        </div>
     );
 };
 

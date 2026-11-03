@@ -449,3 +449,16 @@ CREATE TABLE IF NOT EXISTS cp_host_capabilities (
   last_report_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (host_id, name)
 );
+
+-- Capability and host-offline alerts (plan P1b, controlplane/capalerts.js):
+-- at most one active (open or ack) alert per host and rule, across replicas;
+-- openHostAlert inserts with ON CONFLICT ... DO NOTHING on this index. The
+-- drift index above is separate and unchanged.
+CREATE UNIQUE INDEX IF NOT EXISTS cp_alert_events_active_capability_idx ON cp_alert_events (host_id, rule_name)
+  WHERE status IN ('open', 'ack') AND (rule_name LIKE 'capability:%' OR rule_name = 'host:offline');
+
+-- The capability health the instance holding the host's socket last computed
+-- (NULL until then, counted as unknown); offline comes from status. Read by
+-- the systemapi_hosts_health gauge so every replica reports the same counts.
+ALTER TABLE cp_hosts ADD COLUMN IF NOT EXISTS capability_health TEXT
+  CHECK (capability_health IN ('ok', 'degraded', 'unknown'));
