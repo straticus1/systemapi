@@ -120,9 +120,12 @@ type capEnv struct {
 	tweakRead func() error
 	// ptmx stats /dev/ptmx.
 	ptmx func() error
-	// managerUp checks the service manager answers (systemctl show -p
-	// Version on Linux).
-	managerUp func() error
+	// serviceBackend names the platform's service backend when it is
+	// available (platform_service.go: systemd, openrc, launchd), else "".
+	serviceBackend func() string
+	// managerUp checks that backend answers, read-only: systemctl show -p
+	// Version, rc-service --version, or the launchd backend's own check.
+	managerUp func(backend string) error
 	// unitLoaded reports whether a unit's LoadState is "loaded"; an error
 	// means the manager did not answer.
 	unitLoaded func(unit string) (bool, error)
@@ -272,9 +275,10 @@ func probeHelperWrite(e *capEnv, name, unit string) capResult {
 	return helperReady(e, name, unit)
 }
 
+// probeTweak: a sysctl get needs only /proc/sys, not systemd.
 func probeTweak(e *capEnv, _ capResult) capResult {
-	if r, ok := linuxSystemd(e, "tweak"); !ok {
-		return r
+	if e.goos != "linux" {
+		return capAbsent("tweak", "unsupported_os")
 	}
 	if e.tweakRead() != nil {
 		return capDegraded("tweak", "probe_error")
@@ -282,17 +286,17 @@ func probeTweak(e *capEnv, _ capResult) capResult {
 	return capOK("tweak")
 }
 
+// probeService: supported wherever the platform's own service backend is
+// (systemd, OpenRC, launchd), as before; the probe checks it answers.
 func probeService(e *capEnv, _ capResult) capResult {
-	switch e.goos {
-	case "linux":
-		if !e.systemd() {
+	b := e.serviceBackend()
+	if b == "" {
+		if e.goos == "linux" {
 			return capAbsent("service", "no_systemd")
 		}
-	case "darwin":
-	default:
 		return capAbsent("service", "unsupported_os")
 	}
-	if e.managerUp() != nil {
+	if e.managerUp(b) != nil {
 		return capDegraded("service", "manager_unreachable")
 	}
 	return capOK("service")
@@ -439,11 +443,15 @@ type capReportFrame struct {
 
 // capManager holds the last probe results (for transitions and the
 // keep-last-known rule) and the time of the last report, process-wide, so the
-// report gap holds across reconnects too.
+// report gap holds across reconnects too. mu guards only these fields and is
+// never held while a probe runs or a frame is written, so a dial never waits
+// behind a running probe.
 type capManager struct {
 	mu       sync.Mutex
 	env      *capEnv
 	last     map[string]capResult
+	lastRes  []capResult // the last complete probe, sorted
+	inFlight int         // probes running now
 	lastSent time.Time
 	sentAny  bool
 }
@@ -462,28 +470,47 @@ func newCapManager(e *capEnv) *capManager {
 	return &capManager{env: e, last: map[string]capResult{}}
 }
 
-// probe runs every probe now, records the results and logs transitions
-// (name, state and reason code only).
+// probe runs every probe now, outside the lock, against a snapshot of the
+// last results, then swaps the new results in under the lock and logs
+// transitions (name, state and reason code only).
 func (m *capManager) probe() []capResult {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.probeLocked()
-}
+	prev := make(map[string]capResult, len(m.last))
+	for k, v := range m.last {
+		prev[k] = v
+	}
+	m.inFlight++
+	m.mu.Unlock()
 
-func (m *capManager) probeLocked() []capResult {
-	res := probeCapabilities(m.env, m.last)
+	res := probeCapabilities(m.env, prev)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.inFlight--
 	for _, r := range res {
 		if p, ok := m.last[r.Name]; !ok || p != r {
 			log.Printf("capability %s: %s %s", r.Name, r.State, r.Reason)
 		}
 		m.last[r.Name] = r
 	}
+	m.lastRes = res
 	return res
 }
 
-// dialHeaders probes and returns both header values for a new dial.
+// dialHeaders returns both header values for a new dial. It runs a fresh
+// probe of its own, unless another probe is already running and a complete
+// earlier result exists: then it uses that result rather than wait.
 func (m *capManager) dialHeaders() (supported, degraded string) {
-	supported, degraded = capHeaderValues(m.probe())
+	m.mu.Lock()
+	var res []capResult
+	if m.inFlight > 0 && m.lastRes != nil {
+		res = m.lastRes
+	}
+	m.mu.Unlock()
+	if res == nil {
+		res = m.probe()
+	}
+	supported, degraded = capHeaderValues(res)
 	log.Printf("advertised capabilities=%q degraded=%q", supported, degraded)
 	return supported, degraded
 }
@@ -502,21 +529,28 @@ func (m *capManager) untilAllowed(now time.Time) time.Duration {
 // not passed (then it reports false with no error).
 func (m *capManager) sendReport(out ptyOut) (bool, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	now := time.Now()
 	if m.sentAny && now.Sub(m.lastSent) < capReportMinGap {
+		m.mu.Unlock()
 		return false, nil
 	}
-	res := m.probeLocked()
+	// Reserve the slot before probing, so a concurrent sender backs off.
+	m.lastSent, m.sentAny = now, true
+	m.mu.Unlock()
+
+	res := m.probe()
 	frame := capReportFrame{
 		Type:     "capability_report",
 		V:        1,
 		ProbedAt: now.UTC().Format(time.RFC3339),
 		Caps:     res,
 	}
+	err := out.WriteJSON(frame)
 	// The gap runs from the write, not from the probe before it.
-	m.lastSent, m.sentAny = time.Now(), true
-	return true, out.WriteJSON(frame)
+	m.mu.Lock()
+	m.lastSent = time.Now()
+	m.mu.Unlock()
+	return true, err
 }
 
 // serve sends capability reports on one enrolled connection until quit
@@ -657,22 +691,14 @@ func realCapEnv() *capEnv {
 			_, err := os.Stat("/dev/ptmx")
 			return err
 		},
-		managerUp: func() error {
-			if runtime.GOOS != "linux" {
-				if !currentPlatform().Services.Available() {
-					return errCapMissing
-				}
-				return nil
+		serviceBackend: func() string {
+			s := currentPlatform().Services
+			if s.Name() == "none" || !s.Available() {
+				return ""
 			}
-			v, err := capSystemctl("show", "-p", "Version", "--value")
-			if err != nil {
-				return err
-			}
-			if v == "" {
-				return errors.New("no version")
-			}
-			return nil
+			return s.Name()
 		},
+		managerUp: capManagerUp,
 		unitLoaded: func(unit string) (bool, error) {
 			v, err := capSystemctl("show", "-p", "LoadState", "--value", unit)
 			if err != nil {
@@ -713,7 +739,13 @@ func statDir(dir string) error {
 // capSystemctl runs a read-only systemctl query (fixed argv, absolute path,
 // no shell, bounded) and returns its trimmed stdout.
 func capSystemctl(args ...string) (string, error) {
-	path, ok := findExecutable("systemctl", execDirs)
+	return capRun("systemctl", args...)
+}
+
+// capRun runs a read-only probe command found in execDirs (never $PATH),
+// fixed argv, no shell, capProbeTimeout, and returns its trimmed stdout.
+func capRun(bin string, args ...string) (string, error) {
+	path, ok := findExecutable(bin, execDirs)
 	if !ok {
 		return "", errCapMissing
 	}
@@ -726,21 +758,39 @@ func capSystemctl(args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// checkHelperTrustFile is the helpers' own loader (loadHelperTrust: root
-// owned file and directory, regular, no symlink, parses) plus the mode the
-// install step sets, exactly 0644.
+// capManagerUp checks a service backend answers, read-only and bounded:
+// systemd `systemctl show -p Version --value` (non-empty), OpenRC
+// `rc-service --version`, launchd the backend's own presence check.
+func capManagerUp(backend string) error {
+	switch backend {
+	case "systemd":
+		v, err := capSystemctl("show", "-p", "Version", "--value")
+		if err != nil {
+			return err
+		}
+		if v == "" {
+			return errors.New("no version")
+		}
+		return nil
+	case "openrc":
+		_, err := capRun("rc-service", "--version")
+		return err
+	case "launchd":
+		if !currentPlatform().Services.Available() {
+			return errCapMissing
+		}
+		return nil
+	}
+	return errCapMissing
+}
+
+// checkHelperTrustFile is the helpers' own loader, loadHelperTrust: the
+// file and its directory root-owned and without a group or other write bit
+// (so 0644, 0640 and 0600 all pass), a regular file opened without
+// following a symlink, and a body that parses.
 func checkHelperTrustFile() error {
-	if _, _, err := loadHelperTrust(); err != nil {
-		return err
-	}
-	fi, err := os.Lstat(helperTrustPath)
-	if err != nil {
-		return err
-	}
-	if fi.Mode().Perm() != 0o644 {
-		return errors.New("trust file mode is not 0644")
-	}
-	return nil
+	_, _, err := loadHelperTrust()
+	return err
 }
 
 // capPackageBackend is the selected package backend, or the family's native

@@ -57,16 +57,20 @@ The tokens: `tcp`, `pty`, `file`, `xfer`, `config`, `config_write`, `tweak`,
 `converge`. `config_write`, `sysctl_write` and `override_write` are supported
 on Linux with systemd; their probes need the matching
 `sah-*-helper@.service` template loaded and
-`/etc/systemapi-agent/helper-trust.json` root-owned, mode 0644 and parsing.
-Without `/run/systemd/system`, `service`, `config_write`, `sysctl_write`,
-`override_write` and `tweak` are not supported (`no_systemd`); `pty`, `file`,
-`tcp` and `sysscript_jobs` keep working.
+`/etc/systemapi-agent/helper-trust.json` to be a root-owned regular file
+(no symlink) with no group or other write bit (0644, 0640 and 0600 all
+pass) that parses. Without `/run/systemd/system`, only `config_write`,
+`sysctl_write` and `override_write` are not supported (`no_systemd`).
+`tweak` works wherever `/proc/sys` is readable, and `service` wherever the
+platform's own service backend works (systemd, OpenRC, launchd); `pty`,
+`file`, `tcp` and `sysscript_jobs` keep working.
 
 The probes are read-only and cheap. They never start a unit, never take a
 package-manager lock and never write. `file`/`xfer`: openat2 of `/` (`xfer`
 also re-checks `--xfer-bin`). `config`: a read-only openat2 open of
 `/etc/hostname`. `tweak`: read `/proc/sys/kernel/hostname`. `service`:
-`systemctl show -p Version --value`. `package`: `dpkg-query --version` or
+`systemctl show -p Version --value` (systemd) or `rc-service --version`
+(OpenRC), 5 s timeout. `package`: `dpkg-query --version` or
 `rpm --version`. `pty`: `/dev/ptmx` exists. `sysscript_jobs`, `converge`:
 the flag is on and the state directory exists; a stat error that is not
 "missing" keeps the last known state.

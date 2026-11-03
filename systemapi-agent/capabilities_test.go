@@ -31,7 +31,8 @@ func fakeCapEnv() *capEnv {
 		configOpen:     func() error { return nil },
 		tweakRead:      func() error { return nil },
 		ptmx:           func() error { return nil },
-		managerUp:      func() error { return nil },
+		serviceBackend: func() string { return "systemd" },
+		managerUp:      func(string) error { return nil },
 		unitLoaded:     func(string) (bool, error) { return true, nil },
 		trust:          func() error { return nil },
 		xferConfigured: func() bool { return true },
@@ -124,7 +125,7 @@ func TestCapProbesOkAndDegraded(t *testing.T) {
 		{"override_write manager", "override_write", func(e *capEnv) {
 			e.unitLoaded = func(string) (bool, error) { return false, leakyErr }
 		}, "manager_unreachable"},
-		{"service manager", "service", func(e *capEnv) { e.managerUp = func() error { return leakyErr } }, "manager_unreachable"},
+		{"service manager", "service", func(e *capEnv) { e.managerUp = func(string) error { return leakyErr } }, "manager_unreachable"},
 		{"package missing", "package", func(e *capEnv) { e.pkgVersion = func(string) error { return errCapMissing } }, "binary_missing"},
 		{"package error", "package", func(e *capEnv) { e.pkgVersion = func(string) error { return leakyErr } }, "probe_error"},
 		{"sysscript_jobs dir gone", "sysscript_jobs", func(e *capEnv) { e.stateDir = func() error { return errCapMissing } }, "probe_error"},
@@ -164,7 +165,7 @@ func TestCapProbesAbsent(t *testing.T) {
 		{"darwin file", "file", func(e *capEnv) { e.goos = "darwin" }, "unsupported_os"},
 		{"darwin config_write", "config_write", func(e *capEnv) { e.goos = "darwin" }, "unsupported_os"},
 		{"darwin tweak", "tweak", func(e *capEnv) { e.goos = "darwin" }, "unsupported_os"},
-		{"windows service", "service", func(e *capEnv) { e.goos = "windows" }, "unsupported_os"},
+		{"windows service", "service", func(e *capEnv) { e.goos = "windows"; e.serviceBackend = func() string { return "" } }, "unsupported_os"},
 	}
 	for _, c := range cases {
 		e := fakeCapEnv()
@@ -176,30 +177,79 @@ func TestCapProbesAbsent(t *testing.T) {
 	}
 }
 
-// No /run/systemd/system: the systemd-backed capabilities are absent
-// no_systemd; pty, file, tcp and sysscript_jobs keep working.
+// No /run/systemd/system and no service backend at all (a plain container):
+// only the helper-backed writes are absent no_systemd, and service is absent
+// because there is no backend; tweak, pty, file, tcp and sysscript_jobs keep
+// working.
 func TestCapNoSystemdDegradesNeverBreaks(t *testing.T) {
 	e := fakeCapEnv()
 	e.systemd = func() bool { return false }
+	e.serviceBackend = func() string { return "" }
 	// A host without systemd must not even be asked about units.
 	e.unitLoaded = func(string) (bool, error) { panic("unit probe without systemd") }
-	e.managerUp = func() error { panic("manager probe without systemd") }
+	e.managerUp = func(string) error { panic("manager probe without a backend") }
 	got := capsByName(probeCapabilities(e, nil))
-	for _, name := range []string{"service", "config_write", "sysctl_write", "override_write", "tweak"} {
+	for _, name := range []string{"service", "config_write", "sysctl_write", "override_write"} {
 		if r := got[name]; r.State != capStateAbsent || r.Reason != "no_systemd" {
 			t.Errorf("%s: %+v, want absent no_systemd", name, r)
 		}
 	}
-	for _, name := range []string{"pty", "file", "tcp", "sysscript_jobs", "config"} {
+	for _, name := range []string{"pty", "file", "tcp", "sysscript_jobs", "config", "tweak"} {
 		if r := got[name]; r.State != capStateOK {
 			t.Errorf("%s: %+v, want ok", name, r)
 		}
 	}
 	sup, _ := capHeaderValues(probeCapabilities(e, nil))
-	for _, name := range []string{"service", "config_write", "tweak"} {
+	for _, name := range []string{"service", "config_write", "sysctl_write", "override_write"} {
 		if strings.Contains(","+sup+",", ","+name+",") {
 			t.Errorf("%s advertised without systemd: %q", name, sup)
 		}
+	}
+	if !strings.Contains(","+sup+",", ",tweak,") {
+		t.Errorf("tweak withdrawn without systemd: %q", sup)
+	}
+}
+
+// An OpenRC host (no /run/systemd/system, rc-service present): service and
+// tweak keep working as before; only the helper-backed writes are absent.
+func TestCapOpenRCHost(t *testing.T) {
+	e := fakeCapEnv()
+	e.systemd = func() bool { return false }
+	e.serviceBackend = func() string { return "openrc" }
+	var asked []string
+	e.managerUp = func(b string) error { asked = append(asked, b); return nil }
+	e.unitLoaded = func(string) (bool, error) { panic("unit probe on openrc") }
+	got := capsByName(probeCapabilities(e, nil))
+	if r := got["service"]; r.State != capStateOK {
+		t.Fatalf("service on openrc: %+v", r)
+	}
+	if len(asked) != 1 || asked[0] != "openrc" {
+		t.Fatalf("manager probe asked %v, want the openrc backend", asked)
+	}
+	if r := got["tweak"]; r.State != capStateOK {
+		t.Fatalf("tweak on openrc: %+v", r)
+	}
+	for _, name := range []string{"config_write", "sysctl_write", "override_write"} {
+		if r := got[name]; r.State != capStateAbsent || r.Reason != "no_systemd" {
+			t.Errorf("%s: %+v, want absent no_systemd", name, r)
+		}
+	}
+	// rc-service not answering: degraded, still supported.
+	e.managerUp = func(string) error { return leakyErr }
+	if r := probeOne(t, e, "service"); r.State != capStateDegraded || r.Reason != "manager_unreachable" {
+		t.Fatalf("dead openrc: %+v", r)
+	}
+	sup, deg := capHeaderValues(probeCapabilities(e, nil))
+	if !strings.Contains(","+sup+",", ",service,") || deg != "service" {
+		t.Fatalf("supported %q degraded %q", sup, deg)
+	}
+}
+
+// capManagerUp asks each backend its own read-only question; an unknown
+// backend fails closed.
+func TestCapManagerUpUnknownBackend(t *testing.T) {
+	if capManagerUp("") == nil || capManagerUp("runit") == nil {
+		t.Fatal("unknown backend reported up")
 	}
 }
 
@@ -243,7 +293,8 @@ func TestCapJobsKeepLastKnownOnTransientError(t *testing.T) {
 func TestCapReportBoundedAndClean(t *testing.T) {
 	e := fakeCapEnv()
 	fail := func() error { return leakyErr }
-	e.openat2Root, e.configOpen, e.tweakRead, e.ptmx, e.managerUp, e.trust, e.xferBin, e.stateDir = fail, fail, fail, fail, fail, fail, fail, fail
+	e.openat2Root, e.configOpen, e.tweakRead, e.ptmx, e.trust, e.xferBin, e.stateDir = fail, fail, fail, fail, fail, fail, fail
+	e.managerUp = func(string) error { return leakyErr }
 	e.unitLoaded = func(string) (bool, error) { return false, leakyErr }
 	e.pkgVersion = func(string) error { return leakyErr }
 	m := newCapManager(e)
@@ -362,6 +413,58 @@ func TestCapStartFailedProbeInDegradedHeader(t *testing.T) {
 	}
 }
 
+// A dial during a slow probe does not wait for it: it uses the last
+// complete results. The slow probe's results are swapped in when it ends.
+func TestCapDialDoesNotWaitBehindSlowProbe(t *testing.T) {
+	e := fakeCapEnv()
+	var block atomic.Bool
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	e.tweakRead = func() error {
+		if block.Load() {
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
+			<-release
+			return leakyErr
+		}
+		return nil
+	}
+	m := newCapManager(e)
+	m.probe() // the last complete results: all ok
+	block.Store(true)
+	slowDone := make(chan struct{})
+	go func() { m.probe(); close(slowDone) }()
+	<-entered
+
+	dialed := make(chan [2]string, 1)
+	go func() { s, d := m.dialHeaders(); dialed <- [2]string{s, d} }()
+	select {
+	case h := <-dialed:
+		if !strings.Contains(","+h[0]+",", ",tweak,") || h[1] != "" {
+			t.Fatalf("dial headers %q", h)
+		}
+	case <-time.After(2 * time.Second):
+		close(release)
+		t.Fatal("dial waited behind the running probe")
+	}
+	// A report's gap check and the frame write do not hold the lock either:
+	// untilAllowed answers at once.
+	waitDone := make(chan struct{})
+	go func() { m.untilAllowed(time.Now()); close(waitDone) }()
+	select {
+	case <-waitDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("untilAllowed blocked behind a probe")
+	}
+	close(release)
+	<-slowDone
+	if r := capsByName(m.lastRes)["tweak"]; r.State != capStateDegraded {
+		t.Fatalf("slow probe result not swapped in: %+v", r)
+	}
+}
+
 func TestCapIntervalAndJitter(t *testing.T) {
 	for _, d := range []time.Duration{0, 59 * time.Second, 61 * time.Minute} {
 		if parseCapabilityInterval(d) == nil {
@@ -389,13 +492,53 @@ func TestCheckHelperTrustFile(t *testing.T) {
 	if err := checkHelperTrustFile(); err != nil {
 		t.Fatalf("good trust file: %v", err)
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
+	// Any mode without a group or other write bit is fine.
+	for _, mode := range []os.FileMode{0o600, 0o640, 0o644, 0o400} {
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := checkHelperTrustFile(); err != nil {
+			t.Fatalf("mode %o refused: %v", mode, err)
+		}
+	}
+	// Group or world writable is refused.
+	for _, mode := range []os.FileMode{0o664, 0o646, 0o666, 0o620} {
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+		if checkHelperTrustFile() == nil {
+			t.Fatalf("mode %o accepted", mode)
+		}
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Not owned by the trusted owner (root in production): refused.
+	prevUID := helperTrustOwnerUID
+	helperTrustOwnerUID = prevUID + 1
+	if checkHelperTrustFile() == nil {
+		t.Fatal("foreign-owned trust file accepted")
+	}
+	helperTrustOwnerUID = prevUID
+	// A symlink to a good file: refused.
+	good, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	real := path + ".real"
+	if err := os.WriteFile(real, good, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, path); err != nil {
 		t.Fatal(err)
 	}
 	if checkHelperTrustFile() == nil {
-		t.Fatal("mode 0600 accepted")
+		t.Fatal("symlinked trust file accepted")
 	}
-	if err := os.Chmod(path, 0o644); err != nil {
+	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(path, []byte("{not json"), 0o644); err != nil {
