@@ -17,7 +17,7 @@
 const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const path = require('node:path');
-const { GENESIS, canonicalJSON, rowHash, verifyRows } = require('./chain');
+const { GENESIS, canonicalJSON, rowHash, verifyRows, legacyMaxSeq } = require('./chain');
 const { scopesForKeyRows } = require('./authz');
 const { escapeLike, efficiency: efficiencyOf } = require('./stats');
 const { fingerprint } = require('./token');
@@ -193,6 +193,18 @@ function channelPolicyAuditEntry(tenantId, hostId, actor, action, reason, tcpPol
       previous_config_policy: prevConfig ?? null,
       previous_tweak_policy: prevTweak ?? null
     }
+  };
+}
+
+// The audit row for a key scope change: the key id (its public part), the
+// tenant the admin acted through, the new and the previous scope sets.
+function keyScopesAuditEntry(tenantId, actor, keyId, scopes, previous, tenants = [tenantId]) {
+  return {
+    tenant_id: tenantId,
+    host_id: null,
+    actor,
+    action: 'key_scopes_set',
+    payload: { key_id: keyId, scopes: [...scopes].sort(), previous_scopes: [...previous].sort(), tenants: [...tenants].sort() }
   };
 }
 
@@ -1228,7 +1240,7 @@ class MemoryRegistry {
   }
 
   async verifyAudit() {
-    return verifyRows(this.audit);
+    return verifyRows(this.audit, undefined, { legacyMaxSeq: legacyMaxSeq(this.env) });
   }
 
   async listAudit(tenantIds, limit = 100) {
@@ -1263,6 +1275,13 @@ class MemoryRegistry {
   }
 
   async setScopes(keyId, scopes) {
+    this.scopes.set(keyId, [...scopes]);
+  }
+
+  // The audit row first: if it fails, the scopes stay as they were.
+  async setScopesAudited({ keyId, scopes, tenantId, tenants, actor }) {
+    const previous = this.scopes.get(keyId) || [];
+    await this.appendAudit(keyScopesAuditEntry(tenantId, actor, keyId, scopes, previous, tenants));
     this.scopes.set(keyId, [...scopes]);
   }
 
@@ -2756,7 +2775,7 @@ class PgRegistry {
     const res = await this.pool.query(
       'SELECT seq, prev_hash, row_hash, tenant_id, host_id, actor, action, payload FROM cp_audit ORDER BY seq ASC'
     );
-    return verifyRows(res.rows.map((row) => ({ ...row, seq: Number(row.seq) })));
+    return verifyRows(res.rows.map((row) => ({ ...row, seq: Number(row.seq) })), undefined, { legacyMaxSeq: legacyMaxSeq(this.env) });
   }
 
   async listAudit(tenantIds, limit = 100) {
@@ -2811,6 +2830,27 @@ class PgRegistry {
       [keyId]
     );
     return res.rows.length > 0;
+  }
+
+  // One transaction: lock the key's scope rows, replace them, append the
+  // audit row (the chain lock last). Any failure rolls all of it back.
+  async setScopesAudited({ keyId, scopes, tenantId, tenants, actor }) {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const cur = await client.query('SELECT scope FROM cp_api_scopes WHERE key_id = $1 ORDER BY scope FOR UPDATE', [keyId]);
+      await client.query('DELETE FROM cp_api_scopes WHERE key_id = $1', [keyId]);
+      for (const scope of scopes) {
+        await client.query('INSERT INTO cp_api_scopes (key_id, scope) VALUES ($1, $2)', [keyId, scope]);
+      }
+      await auditInsert(client, keyScopesAuditEntry(tenantId, actor, keyId, scopes, cur.rows.map((r) => r.scope), tenants));
+      await client.query('COMMIT');
+    } catch (err) {
+      try { await client.query('ROLLBACK'); } catch { /* connection already failed */ }
+      throw err;
+    } finally {
+      client.release();
+    }
   }
 
   async setScopes(keyId, scopes) {
@@ -4365,15 +4405,39 @@ async function applySchemaOnce(pool, timeoutMs) {
   }
 }
 
-async function applySchema(pool, env) {
+// Errors that mean the database is not reachable or not accepting
+// connections yet (a host boot races PostgreSQL's start). They are retried
+// with backoff for up to SYSTEMAPI_BOOT_DB_WAIT_MS (default 120 s), then
+// thrown. Anything else (a bad password, a missing database, an unknown host,
+// a schema error) is thrown at once.
+const BOOT_DB_WAIT_CODES = new Set(['ECONNREFUSED', 'ECONNRESET', 'EAI_AGAIN', 'ETIMEDOUT', '57P03']);
+
+function bootDbWaitMs(env) {
+  const raw = env && env.SYSTEMAPI_BOOT_DB_WAIT_MS;
+  const n = raw === undefined || raw === '' ? NaN : Number(raw);
+  return Number.isInteger(n) && n >= 0 && n <= 600000 ? n : 120000;
+}
+
+async function applySchema(pool, env, logger = console) {
   const timeoutMs = bootLockTimeoutMs(env);
-  for (let attempt = 1; ; attempt += 1) {
+  const deadline = Date.now() + bootDbWaitMs(env);
+  let lockAttempts = 0;
+  let delay = 250;
+  for (;;) {
     try {
       await applySchemaOnce(pool, timeoutMs);
       return;
     } catch (err) {
-      if (err.code !== '55P03' || attempt >= BOOT_ATTEMPTS) throw err;
-      await new Promise((resolve) => setTimeout(resolve, Math.min(timeoutMs, 1000)));
+      if (err.code === '55P03') {
+        lockAttempts += 1;
+        if (lockAttempts >= BOOT_ATTEMPTS) throw err;
+        await new Promise((resolve) => setTimeout(resolve, Math.min(timeoutMs, 1000)));
+        continue;
+      }
+      if (!BOOT_DB_WAIT_CODES.has(err.code) || Date.now() + delay > deadline) throw err;
+      (logger.warn || logger.log).call(logger, `[control] database not ready (${err.code}); retrying in ${delay} ms`);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      delay = Math.min(delay * 2, 5000);
     }
   }
 }
@@ -4384,7 +4448,7 @@ async function createRegistry({ pool, env, logger = console }) {
   }
   if (pool) {
     try {
-      await applySchema(pool, env);
+      await applySchema(pool, env, logger);
       logger.log('[control] cp schema ready');
       return new PgRegistry(pool, env);
     } catch (err) {

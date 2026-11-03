@@ -4,7 +4,9 @@
 // Genesis prev_hash is 64 zero hex chars. Rows written since 2026-10-14 hash
 // every column (tenant_id, host_id, actor, action, payload), so rewriting the
 // actor or host breaks verification. Older rows hashed only the payload; they
-// still verify, and their other columns stay unprotected.
+// verify only up to legacyMaxSeq (SYSTEMAPI_AUDIT_LEGACY_MAX_SEQ, unset = no
+// row), so a v2-era row cannot be downgraded to the weaker hash, and the
+// legacy rows' other columns stay unprotected.
 // KNOWN_FORKS: a fork already in a production chain (two rows that chained
 // from the same parent before the chain-wide append lock, d8c8342). Each pin
 // fixes the parent (prev_hash), the sibling row that became a dead branch
@@ -69,8 +71,9 @@ function rowHash(prevHash, row) {
 }
 
 // verifyRows walks rows in seq order. forks defaults to KNOWN_FORKS (tests
-// pass their own).
-function verifyRows(rows, forks = KNOWN_FORKS) {
+// pass their own); legacyMaxSeq is the last seq allowed the payload-only hash
+// (0: none).
+function verifyRows(rows, forks = KNOWN_FORKS, { legacyMaxSeq = 0 } = {}) {
   let prev = GENESIS;
   let last = null;
   const used = new Set();
@@ -90,7 +93,8 @@ function verifyRows(rows, forks = KNOWN_FORKS) {
       return { ok: false, broken_at: row.seq };
     }
     const v2 = rowHash(row.prev_hash, row) === row.row_hash;
-    if (!v2 && (pin || pinnedSibling || chainHash(row.prev_hash, row.payload) !== row.row_hash)) {
+    const legacyOk = row.seq <= legacyMaxSeq && chainHash(row.prev_hash, row.payload) === row.row_hash;
+    if (!v2 && (pin || pinnedSibling || !legacyOk)) {
       return { ok: false, broken_at: row.seq };
     }
     prev = row.row_hash;
@@ -99,4 +103,10 @@ function verifyRows(rows, forks = KNOWN_FORKS) {
   return accepted.length > 0 ? { ok: true, head: prev, known_forks: accepted } : { ok: true, head: prev };
 }
 
-module.exports = { GENESIS, KNOWN_FORKS, canonicalJSON, chainHash, rowHash, verifyRows };
+// SYSTEMAPI_AUDIT_LEGACY_MAX_SEQ: a non-negative integer, else 0.
+function legacyMaxSeq(env) {
+  const n = Number(env && env.SYSTEMAPI_AUDIT_LEGACY_MAX_SEQ);
+  return Number.isSafeInteger(n) && n >= 0 ? n : 0;
+}
+
+module.exports = { GENESIS, KNOWN_FORKS, canonicalJSON, chainHash, rowHash, verifyRows, legacyMaxSeq };

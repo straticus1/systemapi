@@ -1,4 +1,6 @@
-# Sample unit for the SystemAPI agent. Copy to /etc/systemd/system/, edit
+# Sample unit for the SystemAPI agent. Install the binary as
+# /usr/local/lib/systemapi-agent/systemapi-agent (root-owned, the path the
+# deploy kit and the sah-*-helper@ units use). Copy to /etc/systemd/system/, edit
 # the tenant, server URL and pty user, put the API key in
 # /etc/systemapi-agent/api-key (mode 0600, owned by root), then:
 #   systemctl daemon-reload && systemctl enable --now systemapi-agent
@@ -15,7 +17,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/systemapi-agent \
+ExecStart=/usr/local/lib/systemapi-agent/systemapi-agent \
   --server wss://api.systemapi.io/api/v1/systems/stream \
   --tenant CHANGE_ME_TENANT \
   --api-key-file /etc/systemapi-agent/api-key \

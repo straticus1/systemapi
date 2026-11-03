@@ -658,6 +658,15 @@ function mount(app, fleet) {
     }
   };
 
+  // Readiness, unlike /health (liveness): 503 until boot has applied the
+  // schema and set the registry. Deploys wait on it before declaring a
+  // release healthy. No auth and no detail beyond the flag.
+  app.get('/ready', (req, res) => {
+    noStore(res);
+    if (fleet.registry) res.json({ ready: true });
+    else res.status(503).json({ ready: false });
+  });
+
   app.post('/oauth/device', parseForm, wrap(async (req, res) => {
     noStore(res);
     const out = await oauth.startDevice(fleet.registry, bodyString(req.body, 'username'), fleet.env || {}, {
@@ -1354,19 +1363,26 @@ function mount(app, fleet) {
   app.put('/api/v1/tenants/:tenant/members/:user/sso', ssoBind(false));
   app.delete('/api/v1/tenants/:tenant/members/:user/sso', ssoBind(true));
 
+  // A key's scopes apply in every tenant its owner belongs to, so only an
+  // admin of every one of those tenants may set them (an admin of one tenant
+  // cannot widen what the key does in another). The change and its audit row
+  // are one transaction; the row names the first of those tenants and lists
+  // them all.
   app.post('/api/v1/keys/:keyId/scopes', wrap(async (req, res) => {
     const principal = await authenticate(req, fleet);
-    const adminTenant = principal.memberships.find((m) => hasScope(scopesFor(principal, m.tenant_id), 'admin'));
-    if (!adminTenant) throw http(403, 'scope_denied');
+    const admins = adminTenantIds(principal);
+    if (admins.length === 0) throw http(403, 'scope_denied');
     const owner = await lookupKeyOwner(fleet, req.params.keyId);
     if (!owner) throw http(404, 'not_found');
     const ownerMemberships = await fleet.registry.membershipsForUser(owner.user_id);
-    const shared = ownerMemberships.some((m) => tenantIds(principal).includes(m.tenant_id));
-    if (!shared && owner.user_id !== principal.userId) throw http(404, 'not_found');
+    const ownerTenants = [...new Set(ownerMemberships.map((m) => m.tenant_id))].sort();
+    if (ownerTenants.length === 0 || !ownerTenants.every((t) => admins.includes(t))) throw http(404, 'not_found');
+    const via = ownerTenants[0];
     const requested = Array.isArray(req.body && req.body.scopes) ? req.body.scopes : null;
-    if (!requested || requested.some((s) => !ALL.includes(s))) throw http(400, 'bad_scope');
-    await fleet.registry.setScopes(req.params.keyId, requested);
-    res.json({ key_id: req.params.keyId, scopes: requested });
+    if (!requested || requested.some((s) => typeof s !== 'string' || !ALL.includes(s))) throw http(400, 'bad_scope');
+    const scopes = [...new Set(requested)];
+    await fleet.registry.setScopesAudited({ keyId: req.params.keyId, scopes, tenantId: via, tenants: ownerTenants, actor: String(principal.userId) });
+    res.json({ key_id: req.params.keyId, scopes });
   }));
 
   app.post('/api/v1/oauth/links', wrap(async (req, res) => {

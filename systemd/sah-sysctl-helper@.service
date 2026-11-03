@@ -68,7 +68,7 @@ Documentation=file:///usr/share/doc/systemapi/sah-os-management-design.md
 [Service]
 Type=oneshot
 # Only the request id is passed. The confinement is this unit, never an argument.
-ExecStart=/usr/local/bin/systemapi-agent __sysctl-helper %i
+ExecStart=/usr/local/lib/systemapi-agent/systemapi-agent __sysctl-helper %i
 
 # Root, because writing /proc/sys is privileged. The capability bounding set
 # below is the real limiter.

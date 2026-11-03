@@ -44,7 +44,7 @@ Every row with no SAH answer is the real roadmap. The last two are the hard ones
 
 ## Current surface (grounded)
 
-The agent exposes OS operations as Starlark Sysscript builtins, each gated by per-run entitlements and run under a signed lease with an audit-chain row: `sys.config.write`/`template` (atomic write via `config_manager.go`, `AllowConfigWrite` prefix list), `sys.packages.*` (install only, fixed argv, no shell, name regex plus exact grant), `sys.host`, `sys.net_proc`, `sys.containers`, `sys.k3s`, software inventory, `service`/`systemctl`. Capabilities `file`, `tcp`, `xfer` are probed and advertised; `service`/`config`/`package`/`tweak` are not yet capabilities.
+The agent exposes OS operations as Starlark Sysscript builtins, each gated by per-run entitlements and run under a signed lease with an audit-chain row: `sys.config.write`/`template` (atomic write via `config_manager.go`, `AllowConfigWrite` prefix list), `sys.packages.*` (install only, fixed argv, no shell, name regex plus exact grant), `sys.host`, `sys.net_proc`, `sys.containers`, `sys.k3s`, software inventory, `service`/`systemctl`. Capabilities `pty`, `file`, `tcp`, `xfer`, `service`, `config`, `package`, `tweak`, `sysscript_jobs` and `converge` are registered (`systemapi-agent/capabilities.go`, `platform.go`); most probes check presence, not function (planned: `.omc/plans/sah-fleet-readiness.md` P1).
 
 Gaps: package support is `apt-get` and `dnf` only (no `yum`, `zypper`, `brew`); services assume systemd; deep paths are Linux (`file_helper_linux.go`, `host_linux.go`); macOS is PTY plus inventory; Windows is PTY only. OS management is reachable only by running a Sysscript, not as first-class API endpoints.
 

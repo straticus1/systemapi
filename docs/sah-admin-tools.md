@@ -58,11 +58,11 @@ allowlist (deny by default); a disallowed binding answers a `*_denied` error.
 
 ## Wired state (read before trusting the above as GA)
 
-The sys channel is **partially wired**, like sahxfer. The client (`sah_sys.mjs`)
-and the policy grants (`sahpolicy.py`) are on `main`. The control-plane sys
-routes (`sys:service`, `sys:package`, `sys:config`, `sys:tweak`) and the agent's
-privilege-separated mutation helpers (`sysctl_helper.go`, `config_helper.go`,
-`systemd_override_helper.go`) are on `worktree-agent` branches, built and
-deployed to miniapps1 (agents `d251b3f` sysctl, `f34146a` mutation helpers), but
-not merged to `main` and not in the suite Wired join. Open decision: merge these
-to `main` and promote the sys channel in `sah-suite.md`, or keep it partial.
+The sys channel is **partially wired**. The client (`sah_sys.mjs`), the policy
+grants (`sahpolicy.py`), the control-plane sys routes (`sys:service`,
+`sys:package`, `sys:config`, `sys:tweak`) and the agent's privilege-separated
+mutation helpers (`sysctl_helper.go`, `config_helper.go`,
+`systemd_override_helper.go`) are all on `main` (3f9b952, 5c86dbc); production
+runs agent 5c86dbc. Reads work. Writes need the `sah-*-helper@` units and the
+helper trust file, which the deploy kit does not install yet (planned:
+`.omc/plans/sah-fleet-readiness.md` P3b), so writes fail on production.

@@ -1393,3 +1393,32 @@ test('upsertSoftwareBatch writes a whole inventory in one statement and returns 
   assert.deepEqual(await registry.upsertSoftwareBatch(host, more), [{ name: 'pkg0', version: '2.0' }]);
   assert.deepEqual(await registry.upsertSoftwareBatch(host, []), []);
 });
+
+test('setScopesAudited replaces a key\'s scopes and writes the audit row in one transaction', async () => {
+  const key = `kscope${crypto.randomBytes(3).toString('hex')}`;
+  await registry.setScopes(key, ['hosts:read']);
+  await registry.setScopesAudited({ keyId: key, scopes: ['exec:run', 'hosts:read'], tenantId: 'acme', actor: 'user-1' });
+  const rows = (await pool.query('SELECT scope FROM cp_api_scopes WHERE key_id = $1 ORDER BY scope', [key])).rows.map((r) => r.scope);
+  assert.deepEqual(rows, ['exec:run', 'hosts:read']);
+  const audit = (await pool.query("SELECT payload FROM cp_audit WHERE action = 'key_scopes_set' AND payload->>'key_id' = $1", [key])).rows;
+  assert.equal(audit.length, 1);
+  assert.deepEqual(audit[0].payload.previous_scopes, ['hosts:read']);
+  // The audit insert fails after the scope rows changed: both roll back.
+  const failing = new PgRegistry({
+    async connect() {
+      const client = await pool.connect();
+      return {
+        query(sql, params) {
+          if (typeof sql === 'string' && sql.startsWith('INSERT INTO cp_audit')) return Promise.reject(new Error('audit down'));
+          return client.query(sql, params);
+        },
+        release(err) { client.release(err); }
+      };
+    },
+    query: (sql, params) => pool.query(sql, params)
+  }, { NODE_ENV: 'production' });
+  await assert.rejects(failing.setScopesAudited({ keyId: key, scopes: ['admin'], tenantId: 'acme', actor: 'user-1' }), /audit down/);
+  const after = (await pool.query('SELECT scope FROM cp_api_scopes WHERE key_id = $1 ORDER BY scope', [key])).rows.map((r) => r.scope);
+  assert.deepEqual(after, ['exec:run', 'hosts:read']);
+  assert.equal((await registry.verifyAudit()).ok, true);
+});

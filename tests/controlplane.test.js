@@ -2116,7 +2116,7 @@ test('sys:tweak is an operator scope; sysctl gated by keys, overrides by units, 
   }
 });
 
-test('the audit chain covers actor, host, tenant and action; legacy rows still verify', async () => {
+test('the audit chain covers actor, host, tenant and action; legacy rows verify only up to the configured seq', async () => {
   const { GENESIS, chainHash } = require('../controlplane/chain');
   const reg = new MemoryRegistry({ NODE_ENV: 'test' });
   await reg.appendAudit({ tenant_id: 'acme', host_id: HOST_A, actor: 'user-1', action: 'terminal_start', payload: { session_id: 's1' } });
@@ -2132,13 +2132,24 @@ test('the audit chain covers actor, host, tenant and action; legacy rows still v
   }
   assert.equal((await reg.verifyAudit()).ok, true);
 
-  // A row written before every column was hashed (payload only) still verifies.
-  const legacy = new MemoryRegistry({ NODE_ENV: 'test' });
+  // A row written before every column was hashed (payload only) verifies only
+  // when SYSTEMAPI_AUDIT_LEGACY_MAX_SEQ covers it; by default none does.
   const payload = { n: 1 };
-  legacy.audit.push({ seq: 1, prev_hash: GENESIS, row_hash: chainHash(GENESIS, payload), tenant_id: 'acme', host_id: null, actor: 'old', action: 'sysscript', payload });
-  legacy.auditSeq = 2;
-  await legacy.appendAudit({ tenant_id: 'acme', actor: 'new', action: 'sysscript', payload: { n: 2 } });
-  assert.equal((await legacy.verifyAudit()).ok, true);
+  const legacyChain = async (env) => {
+    const r = new MemoryRegistry({ NODE_ENV: 'test', ...env });
+    r.audit.push({ seq: 1, prev_hash: GENESIS, row_hash: chainHash(GENESIS, payload), tenant_id: 'acme', host_id: null, actor: 'old', action: 'sysscript', payload });
+    r.auditSeq = 2;
+    await r.appendAudit({ tenant_id: 'acme', actor: 'new', action: 'sysscript', payload: { n: 2 } });
+    return r;
+  };
+  assert.deepEqual(await (await legacyChain({})).verifyAudit(), { ok: false, broken_at: 1 }, 'off by default');
+  assert.equal((await (await legacyChain({ SYSTEMAPI_AUDIT_LEGACY_MAX_SEQ: '1' })).verifyAudit()).ok, true);
+  assert.equal((await (await legacyChain({ SYSTEMAPI_AUDIT_LEGACY_MAX_SEQ: 'x' })).verifyAudit()).ok, false, 'a bad value means none');
+  // A v2-era row re-hashed the legacy way fails even with legacy allowed below it.
+  const r = await legacyChain({ SYSTEMAPI_AUDIT_LEGACY_MAX_SEQ: '1' });
+  await r.appendAudit({ tenant_id: 'acme', actor: 'new', action: 'sysscript', payload: { n: 3 } });
+  r.audit[2] = { ...r.audit[2], actor: 'forged', row_hash: chainHash(r.audit[2].prev_hash, r.audit[2].payload) };
+  assert.deepEqual(await r.verifyAudit(), { ok: false, broken_at: 3 });
 });
 
 test('ws-ticket is rate limited per actor and host, with a separate privileged budget', async () => {
