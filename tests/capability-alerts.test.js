@@ -733,3 +733,24 @@ test('a sysscript_jobs refusal counts systemapi_agent_unsupported_total like the
     assert.deepEqual((await series(r.metrics, 'systemapi_agent_unsupported_total')).map((v) => v.value), [1]);
   } finally { await r.close(); }
 });
+
+test('host:offline is never held back by the hourly cap, and health is re-asserted after another writer cleared it', async () => {
+  const r = await rig();
+  try {
+    const agent = await connectAgent(r);
+    await sendReport(r, agent, [{ name: 'pty', state: 'ok' }]);
+    await waitUntil('health ok', () => r.fm.registry.hosts.get(HOST_A).capability_health === 'ok');
+    // Another writer clears it (a late offline from another replica); the next evaluation repairs it.
+    r.fm.registry.hosts.get(HOST_A).capability_health = null;
+    await r.fm.capAlerts.tick();
+    assert.equal(r.fm.registry.hosts.get(HOST_A).capability_health, 'ok', 're-asserted');
+    // The cap is full, then the host goes offline: the critical alert still opens.
+    agent.ws.close();
+    await waitUntil('offline', () => !r.fm.connectedAgents.has(HOST_A));
+    const now = r.fm.capAlerts.now();
+    r.fm.capAlerts.opens.set(HOST_A, Array.from({ length: 6 }, () => now - 1000));
+    r.advance(OFFLINE_AFTER_MS);
+    await r.fm.capAlerts.tick();
+    assert.deepEqual(alertsOf(r, 'host:offline').map((a) => a.status), ['open']);
+  } finally { await r.close(); }
+});

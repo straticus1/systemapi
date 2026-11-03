@@ -3341,7 +3341,8 @@ class PgRegistry {
     if (!nonEmpty(instance)) return false;
     const res = await this.pool.query(
       `UPDATE cp_hosts SET capability_health = $2
-        WHERE host_id = $1 AND agent_instance = $3 AND retired_at IS NULL`,
+        WHERE host_id = $1 AND agent_instance = $3 AND retired_at IS NULL
+          AND capability_health IS DISTINCT FROM $2`,
       [hostId, value, instance]
     );
     return res.rowCount > 0;

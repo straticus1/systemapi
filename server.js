@@ -482,13 +482,19 @@ if (process.env.DB_PASSWORD && process.env.DB_PASSWORD !== '') {
         user: process.env.DB_USER || 'playground_user',
         password: process.env.DB_PASSWORD,
         database: process.env.DB_NAME || 'systemapi_playground',
-        ssl: dbSsl(process.env)
+        ssl: dbSsl(process.env),
+        // A hung statement (lock wait, half-open connection) fails instead
+        // of holding a pool slot and every per-host chain behind it forever.
+        statement_timeout: 15000,
+        query_timeout: 20000
     });
 } else {
     // Local fallback for development & verification
     console.warn('Using local postgres DB settings (DB_PASSWORD not set).');
     dbPool = new Pool({
-        connectionString: process.env.DATABASE_URL || 'postgres://localhost/postgres'
+        connectionString: process.env.DATABASE_URL || 'postgres://localhost/postgres',
+        statement_timeout: 15000,
+        query_timeout: 20000
     });
 }
 

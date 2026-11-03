@@ -277,8 +277,10 @@ class CapabilityAlerts {
 
   // The health row is written only while this instance holds the host's
   // presence row; a refused write is tried again at the next evaluation.
+  // Re-asserted on every evaluation (the UPDATE is a no-op when the row
+  // already holds it), so a NULL written behind the holder's back (a late
+  // offline from another replica) is repaired at the next tick.
   async setHealth(hostId, st, health) {
-    if (st.health === health) return;
     const reg = this.fleet.registry;
     if (!reg || typeof reg.setHostHealth !== 'function') return;
     const instance = typeof this.fleet.instanceId === 'function' ? this.fleet.instanceId() : null;
@@ -301,7 +303,9 @@ class CapabilityAlerts {
     const key = alertKey(hostId, a.rule);
     const now = this.now();
     const times = (this.opens.get(hostId) || []).filter((t) => now - t < OPEN_WINDOW_MS);
-    if (times.length >= this.opensPerHourMax) {
+    // host:offline is never held back: capability warnings must not delay
+    // the critical alert.
+    if (a.rule !== 'host:offline' && times.length >= this.opensPerHourMax) {
       if (!this.capped.has(key)) {
         this.capped.add(key);
         this.cappedTotal += 1;
