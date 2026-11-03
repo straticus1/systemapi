@@ -459,7 +459,9 @@ func TestFileCapabilityFollowsTheProbe(t *testing.T) {
 			has = true
 		}
 	}
-	if has != (runtime.GOOS == "linux" && openat2Available()) {
+	// Supported on Linux; a failed openat2 probe is reported degraded
+	// (capabilities.go), not withdrawn from the supported header.
+	if has != (runtime.GOOS == "linux") {
 		t.Fatalf("file capability %v on %s", has, runtime.GOOS)
 	}
 	if runtime.GOOS == "linux" {

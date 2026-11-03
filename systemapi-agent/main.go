@@ -116,7 +116,13 @@ func main() {
 	convergeFlag := flag.Bool("converge", false, "advertise desired-state converge jobs (converge, Linux and macOS only, needs --sysscript-jobs); enable only after every server replica runs the converge wiring")
 	sysscriptMaxFlag := flag.Int("sysscript-max-seconds", jobMaxSecondsMax, fmt.Sprintf("ceiling for any sysscript deadline (1..%d)", jobMaxSecondsMax))
 	stateBackupDirFlag := flag.String("state-backup-dir", stateBackupDir, "directory for desired-state file backups (absolute, root-only; must not overlap any write grant, or file changes that need a backup fail)")
+	capReportsFlag := flag.Bool("capability-reports", true, "send capability_report frames after enroll and on capability_probe; =false sends none (the dial headers, degraded one included, are still sent)")
+	capIntervalFlag := flag.Duration("capability-interval", capIntervalDefault, "how often capabilities are re-probed and reported (1m..60m, +/-10% jitter)")
 	flag.Parse()
+	if err := parseCapabilityInterval(*capIntervalFlag); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(2)
+	}
 	backupDirSet := false
 	flag.Visit(func(f *flag.Flag) { backupDirSet = backupDirSet || f.Name == "state-backup-dir" })
 	if err := configureStateBackupDir(*stateBackupDirFlag, backupDirSet, runtime.GOOS); err != nil {
@@ -253,10 +259,13 @@ func main() {
 	header.Set("X-SystemAPI-Host-ID", st.HostID)
 	header.Set("X-SystemAPI-Hostname", hostname)
 	header.Set("X-SystemAPI-SSH-PubKey", pubLine)
-	caps := capabilitiesHeaderValue()
-	log.Printf("advertised capabilities=%q", caps)
-	if caps != "" {
-		header.Set(capabilitiesHeader, caps)
+	// The capability headers are recomputed on every dial (agentConn.dialHeader).
+	capStateDir = filepath.Dir(statePath)
+	var reporter *capManager
+	if *capReportsFlag {
+		reporter = capMgr()
+	} else {
+		log.Printf("capability reports are off (--capability-reports=false)")
 	}
 
 	dialer := *websocket.DefaultDialer
@@ -283,6 +292,9 @@ func main() {
 		minBackoff:     time.Second,
 		maxBackoff:     60 * time.Second,
 		telemetry:      gatherTelemetry,
+		capHeaders:     capMgr().dialHeaders,
+		caps:           reporter,
+		capInterval:    *capIntervalFlag,
 	}
 	err = conn.run(stop)
 	// Graceful shutdown: each xfer child gets cancel and deletes its temp

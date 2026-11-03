@@ -58,6 +58,35 @@ type agentConn struct {
 	maxBackoff     time.Duration
 	// telemetry is gatherTelemetry outside tests.
 	telemetry func(hostname string) (TelemetryPayload, error)
+	// capHeaders returns the supported and degraded capability header values;
+	// it is called on every dial (capManager.dialHeaders outside tests). Nil
+	// sends neither header.
+	capHeaders func() (supported, degraded string)
+	// caps sends capability_report frames after enroll (--capability-reports);
+	// nil sends none and ignores capability_probe.
+	caps        *capManager
+	capInterval time.Duration
+}
+
+// dialHeader is the dial header with freshly computed capability headers.
+func (a *agentConn) dialHeader() http.Header {
+	h := a.header.Clone()
+	if h == nil {
+		h = http.Header{}
+	}
+	if a.capHeaders == nil {
+		return h
+	}
+	h.Del(capabilitiesHeader)
+	h.Del(capabilitiesDegradedHeader)
+	sup, deg := a.capHeaders()
+	if sup != "" {
+		h.Set(capabilitiesHeader, sup)
+	}
+	if deg != "" {
+		h.Set(capabilitiesDegradedHeader, deg)
+	}
+	return h
 }
 
 // jittered returns a delay in [d/2, d].
@@ -108,7 +137,7 @@ func (a *agentConn) run(stop <-chan struct{}) error {
 // connection enrolled.
 func (a *agentConn) runOnce(stop <-chan struct{}) (bool, error) {
 	log.Printf("dialing control plane host_id=%s", a.st.HostID)
-	c, resp, err := a.dialer.Dial(a.url, a.header)
+	c, resp, err := a.dialer.Dial(a.url, a.dialHeader())
 	if err != nil {
 		if resp != nil && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
 			return false, fatalError{fmt.Errorf("control plane rejected the API key (HTTP %d)", resp.StatusCode)}
@@ -133,6 +162,11 @@ func (a *agentConn) runOnce(stop <-chan struct{}) (bool, error) {
 	}
 	done := make(chan struct{})
 	stateDir := filepath.Dir(a.statePath)
+	// capProbe carries server capability_probe requests to the reporter; one
+	// pending request is enough (more collapse into it).
+	capProbe := make(chan struct{}, 1)
+	capQuit := make(chan struct{})
+	defer close(capQuit)
 
 	go func() {
 		defer close(done)
@@ -183,6 +217,15 @@ func (a *agentConn) runOnce(stop <-chan struct{}) (bool, error) {
 				}
 				signalEnroll(err)
 				return
+			case "capability_probe":
+				// Answered by the reporter, within its report gap; ignored
+				// when reports are off.
+				if a.caps != nil {
+					select {
+					case capProbe <- struct{}{}:
+					default:
+					}
+				}
 			default:
 				handled, err := ch.handle(peek.Type, message)
 				if err != nil {
@@ -213,6 +256,13 @@ func (a *agentConn) runOnce(stop <-chan struct{}) (bool, error) {
 			log.Printf("enrolled host_id=%s", a.st.HostID)
 			// Queued xfer results go out on an enrolled socket only.
 			xferMgr().attach(out)
+			if a.caps != nil {
+				interval := a.capInterval
+				if interval <= 0 {
+					interval = capIntervalDefault
+				}
+				go a.caps.serve(out, capProbe, capQuit, interval)
+			}
 		case <-enrollTimer.C:
 			if !enrolledOK {
 				return false, errors.New("enrollment timed out")

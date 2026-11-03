@@ -35,7 +35,7 @@ import (
 	"os"
 	"sort"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"unicode/utf8"
 
 	"golang.org/x/sys/unix"
@@ -47,32 +47,55 @@ const (
 	fileListNameCap = 1_000_000
 )
 
-var (
-	openat2Once sync.Once
-	openat2OK   bool
-)
+// openat2State caches the last openat2 probe for the request-time gates
+// (file_open, openBeneathRoot, xfer): 0 not probed yet, 1 ok, 2 failed. The
+// capability probe (capabilities.go) re-runs probeOpenat2Root every cycle,
+// so a kernel or seccomp change is picked up without a restart.
+var openat2State atomic.Int32
 
-func init() {
-	registerCapability("file", openat2Available)
-}
-
-// openat2Available probes the kernel once: without openat2 (Linux < 5.6, or
-// a seccomp filter that refuses it) the file capability is not advertised
+// openat2Available reports the last probe: without openat2 (Linux < 5.6, or
+// a seccomp filter that refuses it) the file channel is reported degraded
 // and file_open answers agent_unsupported (§5.4, no fallback).
 func openat2Available() bool {
-	openat2Once.Do(func() {
-		fd, err := unix.Openat2(unix.AT_FDCWD, "/", &unix.OpenHow{
-			Flags:   unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC,
-			Resolve: unix.RESOLVE_NO_SYMLINKS,
-		})
-		if err == nil {
-			_ = unix.Close(fd)
-			openat2OK = true
-		} else {
-			log.Printf("file capability: openat2 probe failed, file channel not advertised: %v", err)
-		}
+	switch openat2State.Load() {
+	case 1:
+		return true
+	case 2:
+		return false
+	}
+	return probeOpenat2Root() == nil
+}
+
+// probeOpenat2Root opens "/" with openat2(O_PATH|O_DIRECTORY) and records
+// the result. The error is logged locally, on a change only; it never leaves
+// the host (the report carries a reason code).
+func probeOpenat2Root() error {
+	fd, err := unix.Openat2(unix.AT_FDCWD, "/", &unix.OpenHow{
+		Flags:   unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC,
+		Resolve: unix.RESOLVE_NO_SYMLINKS,
 	})
-	return openat2OK
+	if err == nil {
+		_ = unix.Close(fd)
+		openat2State.Store(1)
+		return nil
+	}
+	if openat2State.Swap(2) != 2 {
+		log.Printf("file capability: openat2 probe failed: %v", err)
+	}
+	return err
+}
+
+// probeConfigOpen is the config read path's check: a read-only openat2 open
+// of /etc/hostname that follows no symlink, closed at once.
+func probeConfigOpen() error {
+	fd, err := unix.Openat2(unix.AT_FDCWD, "/etc/hostname", &unix.OpenHow{
+		Flags:   unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NOFOLLOW | unix.O_NONBLOCK,
+		Resolve: unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS,
+	})
+	if err != nil {
+		return err
+	}
+	return unix.Close(fd)
 }
 
 // openat2 retries EAGAIN (a concurrent rename or mount under

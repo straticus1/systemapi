@@ -8,6 +8,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 )
 
@@ -25,3 +26,20 @@ func removeUploadTemp(root, path, uploadID string) error {
 }
 
 func openat2Available() bool { return false }
+
+// probeOpenat2Root: no openat2 off Linux.
+func probeOpenat2Root() error { return errFileUnsupported }
+
+// probeConfigOpen off Linux only checks that /etc is a directory: config
+// stays advertised as before, and its read refuses here anyway
+// (sys_config_read_other.go).
+func probeConfigOpen() error {
+	fi, err := os.Stat("/etc")
+	if err != nil {
+		return err
+	}
+	if !fi.IsDir() {
+		return errCapMissing
+	}
+	return nil
+}

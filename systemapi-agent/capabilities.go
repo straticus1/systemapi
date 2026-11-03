@@ -1,31 +1,610 @@
-// Capability advertisement. The agent tells the server which channel
-// handlers it really has (X-SystemAPI-Capabilities on the WebSocket dial),
-// so the server can answer agent_unsupported for an old or partial agent
-// instead of sending frames nobody handles. A handler registers itself with
-// registerCapability (normally from an init function in its own file) and a
-// probe that reports whether it can run on this host, e.g. the file channel
-// only where openat2 exists (docs/sah-file-protocol.md §5.4).
-// Threats: none on its own. The header is advisory for the server's error
-// reporting; it never grants anything. Leases, scopes and the agent's own
-// allowlists still decide every request.
+// Capability advertisement and health (.omc/plans/sah-fleet-readiness.md
+// P1a). On every dial the agent sends X-SystemAPI-Capabilities, the
+// capabilities this binary SUPPORTS on this OS with these flags, and
+// X-SystemAPI-Capabilities-Degraded, the supported ones whose probe failed
+// right then. After enroll it sends a capability_report frame every cycle
+// (--capability-interval, jittered), and on a server capability_probe frame,
+// never more than one per capReportMinGap. Each capability has one probe
+// here; every probe is read-only and cheap: it never starts a privileged unit,
+// never takes a package-manager lock and never writes.
+//
+// Threats: a capability that silently stopped working (openat2 refused by a
+// seccomp filter, a helper unit or trust file not installed, a dead service
+// manager) being routed to as if healthy; and a report leaking host detail.
+// Every probe result is reduced to a name from capRegistry, a state from a
+// closed set and a reason from capReasons, so a report or header never
+// carries a path, an error text or anything read from the host; the token
+// grammar and the 16-token / 256-byte header bound are enforced on the way
+// out. Health is self-reported: it detects breakage, NOT compromise (a
+// compromised agent can report everything ok). The headers and reports are
+// advisory routing input for the server; they never grant anything. Leases,
+// scopes and the agent's own allowlists still decide every request.
 package main
 
 import (
+	"context"
+	"crypto/rand"
+	"errors"
+	"io"
+	"io/fs"
+	"log"
+	"math/big"
+	"os"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 )
 
-const capabilitiesHeader = "X-SystemAPI-Capabilities"
+const (
+	capabilitiesHeader         = "X-SystemAPI-Capabilities"
+	capabilitiesDegradedHeader = "X-SystemAPI-Capabilities-Degraded"
+
+	capStateOK       = "ok"
+	capStateDegraded = "degraded"
+	capStateAbsent   = "absent"
+
+	// capTokensMax and capHeaderMax are the server's parseCapabilities
+	// bounds (controlplane/channels.js).
+	capTokensMax = 16
+	capHeaderMax = 256
+
+	// capProbeTimeout bounds each command a probe runs.
+	capProbeTimeout = 5 * time.Second
+
+	capIntervalDefault = 10 * time.Minute
+	capIntervalMin     = time.Minute
+	capIntervalMax     = 60 * time.Minute
+)
+
+// capReportMinGap is the least time between two capability_report frames.
+// A var only so tests can shorten it.
+var capReportMinGap = 60 * time.Second
+
+var capNameRE = regexp.MustCompile(`^[a-z][a-z0-9_]{0,15}$`)
+
+// capReasons is the closed reason set of the capability_report frame.
+var capReasons = map[string]bool{
+	"enosys_openat2":       true,
+	"binary_missing":       true,
+	"helper_unit_missing":  true,
+	"helper_trust_missing": true,
+	"manager_unreachable":  true,
+	"flag_off":             true,
+	"unsupported_os":       true,
+	"no_systemd":           true,
+	"probe_error":          true,
+}
+
+// The privileged helper templates the write-side capabilities depend on.
+const (
+	configHelperTemplate   = configHelperUnitPrefix + ".service"
+	sysctlHelperTemplate   = sysctlHelperUnitPrefix + ".service"
+	overrideHelperTemplate = overrideHelperUnitPrefix + ".service"
+)
+
+// errCapMissing marks a probe target that does not exist (a binary or a
+// directory), as opposed to one that could not be checked.
+var errCapMissing = errors.New("missing")
+
+// capResult is one capability's probe outcome, as reported.
+type capResult struct {
+	Name   string `json:"name"`
+	State  string `json:"state"`
+	Reason string `json:"reason"`
+}
+
+func capOK(name string) capResult { return capResult{Name: name, State: capStateOK} }
+func capDegraded(name, reason string) capResult {
+	return capResult{Name: name, State: capStateDegraded, Reason: reason}
+}
+func capAbsent(name, reason string) capResult {
+	return capResult{Name: name, State: capStateAbsent, Reason: reason}
+}
+
+// capEnv is every host check a probe makes. Each answers only a bool or an
+// error, which the probe maps to a fixed reason code. Tests replace it.
+type capEnv struct {
+	goos string
+	// systemd reports whether /run/systemd/system is a directory.
+	systemd func() bool
+	// openat2Root opens "/" with openat2(O_PATH|O_DIRECTORY).
+	openat2Root func() error
+	// configOpen is the config read path's check: a read-only openat2 open
+	// of /etc/hostname on Linux.
+	configOpen func() error
+	// tweakRead reads /proc/sys/kernel/hostname.
+	tweakRead func() error
+	// ptmx stats /dev/ptmx.
+	ptmx func() error
+	// managerUp checks the service manager answers (systemctl show -p
+	// Version on Linux).
+	managerUp func() error
+	// unitLoaded reports whether a unit's LoadState is "loaded"; an error
+	// means the manager did not answer.
+	unitLoaded func(unit string) (bool, error)
+	// trust checks the helpers' trust file.
+	trust func() error
+	// xferConfigured reports whether --xfer-bin (and on macOS
+	// --xfer-allow-darwin) is set.
+	xferConfigured func() bool
+	// xferBin re-checks --xfer-bin with checkXferBin.
+	xferBin func() error
+	// pkgBackend names this host's package backend ("" for none).
+	pkgBackend func() string
+	// pkgVersion runs the backend's version query; errCapMissing when its
+	// binary is not installed.
+	pkgVersion func(backend string) error
+	jobsOn     func() bool
+	convergeOn func() bool
+	// stateDir stats the agent's state directory; errCapMissing when it is
+	// gone or not a directory.
+	stateDir func() error
+}
+
+// capRegistry is every capability this agent knows, with its probe. prev is
+// the last result of that capability ("" state when none), used where a
+// transient probe error must not flip the state.
+var capRegistry = map[string]func(e *capEnv, prev capResult) capResult{
+	"tcp":          func(e *capEnv, _ capResult) capResult { return capOK("tcp") },
+	"pty":          probePTY,
+	"file":         probeFile,
+	"xfer":         probeXfer,
+	"config":       probeConfig,
+	"config_write": probeConfigWrite,
+	"tweak":        probeTweak,
+	"sysctl_write": func(e *capEnv, _ capResult) capResult {
+		return probeHelperWrite(e, "sysctl_write", sysctlHelperTemplate)
+	},
+	"override_write": func(e *capEnv, _ capResult) capResult {
+		return probeHelperWrite(e, "override_write", overrideHelperTemplate)
+	},
+	"service":        probeService,
+	"package":        probePackage,
+	"sysscript_jobs": probeSysscriptJobs,
+	"converge":       probeConverge,
+}
+
+// openat2Reason maps an openat2 failure: ENOSYS (an old kernel) and EPERM (a
+// seccomp filter; opening "/" O_PATH cannot otherwise be refused) are
+// enosys_openat2, anything else probe_error.
+func openat2Reason(err error) string {
+	if errors.Is(err, syscall.ENOSYS) || errors.Is(err, syscall.EPERM) {
+		return "enosys_openat2"
+	}
+	return "probe_error"
+}
+
+func probePTY(e *capEnv, _ capResult) capResult {
+	if e.goos == "windows" {
+		return capAbsent("pty", "unsupported_os")
+	}
+	if e.ptmx() != nil {
+		return capDegraded("pty", "probe_error")
+	}
+	return capOK("pty")
+}
+
+func probeFile(e *capEnv, _ capResult) capResult {
+	if e.goos != "linux" {
+		return capAbsent("file", "unsupported_os")
+	}
+	if err := e.openat2Root(); err != nil {
+		return capDegraded("file", openat2Reason(err))
+	}
+	return capOK("file")
+}
+
+func probeXfer(e *capEnv, _ capResult) capResult {
+	if e.goos != "linux" && e.goos != "darwin" {
+		return capAbsent("xfer", "unsupported_os")
+	}
+	if !e.xferConfigured() {
+		return capAbsent("xfer", "flag_off")
+	}
+	if e.goos == "linux" {
+		if err := e.openat2Root(); err != nil {
+			return capDegraded("xfer", openat2Reason(err))
+		}
+	}
+	if e.xferBin() != nil {
+		return capDegraded("xfer", "binary_missing")
+	}
+	return capOK("xfer")
+}
+
+// probeConfig: config (read, reload) is supported everywhere, as before;
+// the probe is the read path's own open.
+func probeConfig(e *capEnv, _ capResult) capResult {
+	if err := e.configOpen(); err != nil {
+		if e.goos == "linux" {
+			return capDegraded("config", openat2Reason(err))
+		}
+		return capDegraded("config", "probe_error")
+	}
+	return capOK("config")
+}
+
+// linuxSystemd answers the absent cases shared by every systemd-backed
+// capability: not Linux, or no live systemd.
+func linuxSystemd(e *capEnv, name string) (capResult, bool) {
+	if e.goos != "linux" {
+		return capAbsent(name, "unsupported_os"), false
+	}
+	if !e.systemd() {
+		return capAbsent(name, "no_systemd"), false
+	}
+	return capResult{}, true
+}
+
+// helperReady checks a helper template is loaded and the trust file usable.
+func helperReady(e *capEnv, name, unit string) capResult {
+	loaded, err := e.unitLoaded(unit)
+	if err != nil {
+		return capDegraded(name, "manager_unreachable")
+	}
+	if !loaded {
+		return capDegraded(name, "helper_unit_missing")
+	}
+	if e.trust() != nil {
+		return capDegraded(name, "helper_trust_missing")
+	}
+	return capOK(name)
+}
+
+func probeConfigWrite(e *capEnv, _ capResult) capResult {
+	if r, ok := linuxSystemd(e, "config_write"); !ok {
+		return r
+	}
+	if c := probeConfig(e, capResult{}); c.State != capStateOK {
+		return capDegraded("config_write", c.Reason)
+	}
+	return helperReady(e, "config_write", configHelperTemplate)
+}
+
+func probeHelperWrite(e *capEnv, name, unit string) capResult {
+	if r, ok := linuxSystemd(e, name); !ok {
+		return r
+	}
+	return helperReady(e, name, unit)
+}
+
+func probeTweak(e *capEnv, _ capResult) capResult {
+	if r, ok := linuxSystemd(e, "tweak"); !ok {
+		return r
+	}
+	if e.tweakRead() != nil {
+		return capDegraded("tweak", "probe_error")
+	}
+	return capOK("tweak")
+}
+
+func probeService(e *capEnv, _ capResult) capResult {
+	switch e.goos {
+	case "linux":
+		if !e.systemd() {
+			return capAbsent("service", "no_systemd")
+		}
+	case "darwin":
+	default:
+		return capAbsent("service", "unsupported_os")
+	}
+	if e.managerUp() != nil {
+		return capDegraded("service", "manager_unreachable")
+	}
+	return capOK("service")
+}
+
+func probePackage(e *capEnv, _ capResult) capResult {
+	b := e.pkgBackend()
+	if b == "" {
+		return capAbsent("package", "unsupported_os")
+	}
+	if err := e.pkgVersion(b); err != nil {
+		if errors.Is(err, errCapMissing) {
+			return capDegraded("package", "binary_missing")
+		}
+		return capDegraded("package", "probe_error")
+	}
+	return capOK("package")
+}
+
+// jobsState is the shared rule of sysscript_jobs and converge: the state dir
+// must exist, and a stat error other than "missing" keeps the last known
+// state (ok when there is none), so a transient error never withdraws them.
+func jobsState(e *capEnv, name string, prev capResult) capResult {
+	err := e.stateDir()
+	switch {
+	case err == nil:
+		return capOK(name)
+	case errors.Is(err, errCapMissing):
+		return capDegraded(name, "probe_error")
+	case prev.State == capStateOK || prev.State == capStateDegraded:
+		return capResult{Name: name, State: prev.State, Reason: prev.Reason}
+	}
+	return capOK(name)
+}
+
+func probeSysscriptJobs(e *capEnv, prev capResult) capResult {
+	if e.goos != "linux" && e.goos != "darwin" {
+		return capAbsent("sysscript_jobs", "unsupported_os")
+	}
+	if !e.jobsOn() {
+		return capAbsent("sysscript_jobs", "flag_off")
+	}
+	return jobsState(e, "sysscript_jobs", prev)
+}
+
+func probeConverge(e *capEnv, prev capResult) capResult {
+	if e.goos != "linux" && e.goos != "darwin" {
+		return capAbsent("converge", "unsupported_os")
+	}
+	if !e.convergeOn() || !e.jobsOn() {
+		return capAbsent("converge", "flag_off")
+	}
+	return jobsState(e, "converge", prev)
+}
+
+// probeCapabilities runs every registered probe and returns the results
+// sorted by name, bounded by boundCapResults.
+func probeCapabilities(e *capEnv, prev map[string]capResult) []capResult {
+	out := make([]capResult, 0, len(capRegistry))
+	for name, probe := range capRegistry {
+		r := probe(e, prev[name])
+		r.Name = name
+		out = append(out, r)
+	}
+	return boundCapResults(out)
+}
+
+// boundCapResults is the last gate before anything leaves the agent: names
+// from capRegistry matching the token grammar, a known state, a reason from
+// capReasons (empty exactly when ok; an unknown one becomes probe_error),
+// sorted, at most capTokensMax entries.
+func boundCapResults(in []capResult) []capResult {
+	out := make([]capResult, 0, len(in))
+	for _, r := range in {
+		if _, ok := capRegistry[r.Name]; !ok || !capNameRE.MatchString(r.Name) {
+			continue
+		}
+		switch r.State {
+		case capStateOK:
+			r.Reason = ""
+		case capStateDegraded, capStateAbsent:
+			if !capReasons[r.Reason] {
+				r.Reason = "probe_error"
+			}
+		default:
+			r = capDegraded(r.Name, "probe_error")
+		}
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	if len(out) > capTokensMax {
+		out = out[:capTokensMax]
+	}
+	return out
+}
+
+// capHeaderValues builds the two dial headers from probe results: every
+// supported (not absent) name, and the degraded ones. Each list holds at
+// most capTokensMax tokens and capHeaderMax bytes.
+func capHeaderValues(results []capResult) (supported, degraded string) {
+	var sup, deg []string
+	for _, r := range boundCapResults(results) {
+		if r.State == capStateAbsent {
+			continue
+		}
+		sup = append(sup, r.Name)
+		if r.State == capStateDegraded {
+			deg = append(deg, r.Name)
+		}
+	}
+	return joinCapTokens(sup), joinCapTokens(deg)
+}
+
+func joinCapTokens(tokens []string) string {
+	var b strings.Builder
+	n := 0
+	for _, t := range tokens {
+		if n == capTokensMax || !capNameRE.MatchString(t) {
+			continue
+		}
+		add := len(t)
+		if n > 0 {
+			add++
+		}
+		if b.Len()+add > capHeaderMax {
+			break
+		}
+		if n > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(t)
+		n++
+	}
+	return b.String()
+}
+
+// capReportFrame is the agent -> server capability_report frame.
+type capReportFrame struct {
+	Type     string      `json:"type"`
+	V        int         `json:"v"`
+	ProbedAt string      `json:"probed_at"`
+	Caps     []capResult `json:"caps"`
+}
+
+// capManager holds the last probe results (for transitions and the
+// keep-last-known rule) and the time of the last report, process-wide, so the
+// report gap holds across reconnects too.
+type capManager struct {
+	mu       sync.Mutex
+	env      *capEnv
+	last     map[string]capResult
+	lastSent time.Time
+	sentAny  bool
+}
 
 var (
-	capMu     sync.Mutex
-	capProbes = map[string]func() bool{
-		"pty":            func() bool { return runtime.GOOS != "windows" },
-		"sysscript_jobs": sysscriptJobsCapable,
-		"converge":       convergeCapable,
+	capMgrOnce sync.Once
+	capMgrInst *capManager
+)
+
+func capMgr() *capManager {
+	capMgrOnce.Do(func() { capMgrInst = newCapManager(realCapEnv()) })
+	return capMgrInst
+}
+
+func newCapManager(e *capEnv) *capManager {
+	return &capManager{env: e, last: map[string]capResult{}}
+}
+
+// probe runs every probe now, records the results and logs transitions
+// (name, state and reason code only).
+func (m *capManager) probe() []capResult {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.probeLocked()
+}
+
+func (m *capManager) probeLocked() []capResult {
+	res := probeCapabilities(m.env, m.last)
+	for _, r := range res {
+		if p, ok := m.last[r.Name]; !ok || p != r {
+			log.Printf("capability %s: %s %s", r.Name, r.State, r.Reason)
+		}
+		m.last[r.Name] = r
 	}
+	return res
+}
+
+// dialHeaders probes and returns both header values for a new dial.
+func (m *capManager) dialHeaders() (supported, degraded string) {
+	supported, degraded = capHeaderValues(m.probe())
+	log.Printf("advertised capabilities=%q degraded=%q", supported, degraded)
+	return supported, degraded
+}
+
+// untilAllowed is how long until the next report may go out.
+func (m *capManager) untilAllowed(now time.Time) time.Duration {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.sentAny {
+		return 0
+	}
+	return m.lastSent.Add(capReportMinGap).Sub(now)
+}
+
+// sendReport probes and writes one capability_report, unless the gap has
+// not passed (then it reports false with no error).
+func (m *capManager) sendReport(out ptyOut) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	if m.sentAny && now.Sub(m.lastSent) < capReportMinGap {
+		return false, nil
+	}
+	res := m.probeLocked()
+	frame := capReportFrame{
+		Type:     "capability_report",
+		V:        1,
+		ProbedAt: now.UTC().Format(time.RFC3339),
+		Caps:     res,
+	}
+	// The gap runs from the write, not from the probe before it.
+	m.lastSent, m.sentAny = time.Now(), true
+	return true, out.WriteJSON(frame)
+}
+
+// serve sends capability reports on one enrolled connection until quit
+// closes: one at once, one every jittered interval, one per request on
+// probe; never two within capReportMinGap (a request inside the gap is
+// answered when it ends). It returns when a write fails.
+func (m *capManager) serve(out ptyOut, probe <-chan struct{}, quit <-chan struct{}, interval time.Duration) {
+	want := true
+	cycle := time.NewTimer(capJitter(interval))
+	defer cycle.Stop()
+	var gate *time.Timer
+	var gateC <-chan time.Time
+	defer func() {
+		if gate != nil {
+			gate.Stop()
+		}
+	}()
+	for {
+		if want && gateC == nil {
+			if wait := m.untilAllowed(time.Now()); wait > 0 {
+				gate = time.NewTimer(wait)
+				gateC = gate.C
+			} else {
+				sent, err := m.sendReport(out)
+				if err != nil {
+					log.Printf("capability_report not sent; reports stop on this connection")
+					return
+				}
+				want = !sent
+				if want {
+					// Lost a race with another sender: wait for the gap.
+					gate = time.NewTimer(capReportMinGap)
+					gateC = gate.C
+				}
+			}
+		}
+		select {
+		case <-quit:
+			return
+		case <-cycle.C:
+			want = true
+			cycle.Reset(capJitter(interval))
+		case <-probe:
+			want = true
+		case <-gateC:
+			gateC = nil
+		}
+	}
+}
+
+// capJitter returns d +/- 10%, from crypto/rand (d itself if it fails).
+func capJitter(d time.Duration) time.Duration {
+	span := int64(d / 5)
+	if span <= 0 {
+		return d
+	}
+	n, err := rand.Int(rand.Reader, big.NewInt(span+1))
+	if err != nil {
+		return d
+	}
+	return d - time.Duration(span/2) + time.Duration(n.Int64())
+}
+
+// parseCapabilityInterval checks --capability-interval.
+func parseCapabilityInterval(d time.Duration) error {
+	if d < capIntervalMin || d > capIntervalMax {
+		return errors.New("--capability-interval must be between 1m and 60m")
+	}
+	return nil
+}
+
+// Compatibility helpers: the supported list and header from a fresh probe.
+func agentCapabilities() []string {
+	s, _ := capHeaderValues(capMgr().probe())
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, ",")
+}
+
+func capabilitiesHeaderValue() string {
+	s, _ := capHeaderValues(capMgr().probe())
+	return s
+}
+
+// --- the real host checks ---
+
+var (
 	// sysscriptJobsOn is --sysscript-jobs (default true). Off, the agent
 	// stops advertising sysscript_jobs and the server sends its scripts
 	// the legacy way: a per-host off switch.
@@ -35,9 +614,12 @@ var (
 	// §7.6). Off, the agent does not advertise converge and refuses
 	// converge_job frames as converge_unsupported.
 	convergeOn = false
+	// capStateDir is the agent's state directory (the --state file's
+	// directory), set from main.
+	capStateDir string
 )
 
-// sysscriptJobsCapable reports whether to advertise async sysscript jobs
+// sysscriptJobsCapable reports whether async sysscript jobs run here
 // (sysscript_jobs.go: sysscript_job frames with acked results and a sync on
 // every connection). Only Linux and macOS, where jobCommand kills the whole
 // process group (proc_group_unix.go); elsewhere the kill reaches only the
@@ -46,36 +628,161 @@ func sysscriptJobsCapable() bool {
 	return sysscriptJobsOn && (runtime.GOOS == "linux" || runtime.GOOS == "darwin")
 }
 
-// convergeCapable reports whether to advertise converge jobs (kind
-// "converge" sysscript_job frames under a converge_job lease): only with
-// --converge, and only where async jobs are advertised (Linux and macOS).
+// convergeCapable reports whether converge jobs (kind "converge"
+// sysscript_job frames under a converge_job lease) run here: only with
+// --converge, and only where async jobs run (Linux and macOS).
 func convergeCapable() bool {
 	return convergeOn && sysscriptJobsCapable()
 }
 
-// registerCapability adds a capability and its probe. A later registration
-// of the same name replaces the probe.
-func registerCapability(name string, probe func() bool) {
-	capMu.Lock()
-	capProbes[name] = probe
-	capMu.Unlock()
-}
-
-// agentCapabilities lists, sorted, every capability whose probe passes now.
-func agentCapabilities() []string {
-	capMu.Lock()
-	defer capMu.Unlock()
-	out := make([]string, 0, len(capProbes))
-	for name, probe := range capProbes {
-		if probe != nil && probe() {
-			out = append(out, name)
-		}
+func realCapEnv() *capEnv {
+	return &capEnv{
+		goos: runtime.GOOS,
+		systemd: func() bool {
+			fi, err := os.Stat("/run/systemd/system")
+			return err == nil && fi.IsDir()
+		},
+		openat2Root: probeOpenat2Root,
+		configOpen:  probeConfigOpen,
+		tweakRead: func() error {
+			f, err := os.Open("/proc/sys/kernel/hostname")
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+			_, err = io.Copy(io.Discard, io.LimitReader(f, 256))
+			return err
+		},
+		ptmx: func() error {
+			_, err := os.Stat("/dev/ptmx")
+			return err
+		},
+		managerUp: func() error {
+			if runtime.GOOS != "linux" {
+				if !currentPlatform().Services.Available() {
+					return errCapMissing
+				}
+				return nil
+			}
+			v, err := capSystemctl("show", "-p", "Version", "--value")
+			if err != nil {
+				return err
+			}
+			if v == "" {
+				return errors.New("no version")
+			}
+			return nil
+		},
+		unitLoaded: func(unit string) (bool, error) {
+			v, err := capSystemctl("show", "-p", "LoadState", "--value", unit)
+			if err != nil {
+				return false, err
+			}
+			return v == "loaded", nil
+		},
+		trust:          checkHelperTrustFile,
+		xferConfigured: func() bool { return xferCfg.bin != "" && (runtime.GOOS == "linux" || xferCfg.allowDarwin) },
+		xferBin:        func() error { return checkXferBin(xferCfg.bin, os.Geteuid()) },
+		pkgBackend:     capPackageBackend,
+		pkgVersion:     capPackageVersion,
+		jobsOn:         func() bool { return sysscriptJobsOn },
+		convergeOn:     func() bool { return convergeOn },
+		stateDir:       func() error { return statDir(capStateDir) },
 	}
-	sort.Strings(out)
-	return out
 }
 
-// capabilitiesHeaderValue is the comma list sent on dial.
-func capabilitiesHeaderValue() string {
-	return strings.Join(agentCapabilities(), ",")
+// statDir is the state-dir check: errCapMissing when it is unset, gone or
+// not a directory; any other stat error as is.
+func statDir(dir string) error {
+	if dir == "" {
+		return errCapMissing
+	}
+	fi, err := os.Stat(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return errCapMissing
+	}
+	if err != nil {
+		return err
+	}
+	if !fi.IsDir() {
+		return errCapMissing
+	}
+	return nil
+}
+
+// capSystemctl runs a read-only systemctl query (fixed argv, absolute path,
+// no shell, bounded) and returns its trimmed stdout.
+func capSystemctl(args ...string) (string, error) {
+	path, ok := findExecutable("systemctl", execDirs)
+	if !ok {
+		return "", errCapMissing
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), capProbeTimeout)
+	defer cancel()
+	out, err := jobCommand(ctx, path, args...).Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// checkHelperTrustFile is the helpers' own loader (loadHelperTrust: root
+// owned file and directory, regular, no symlink, parses) plus the mode the
+// install step sets, exactly 0644.
+func checkHelperTrustFile() error {
+	if _, _, err := loadHelperTrust(); err != nil {
+		return err
+	}
+	fi, err := os.Lstat(helperTrustPath)
+	if err != nil {
+		return err
+	}
+	if fi.Mode().Perm() != 0o644 {
+		return errors.New("trust file mode is not 0644")
+	}
+	return nil
+}
+
+// capPackageBackend is the selected package backend, or the family's native
+// one when its binary is missing (reported binary_missing), "" when the
+// family has none.
+func capPackageBackend() string {
+	if p := currentPlatform().Packages; p.Name() != "none" {
+		return p.Name()
+	}
+	switch currentFamily() {
+	case familyDebian:
+		return "apt-get"
+	case familyRHEL:
+		return "dnf"
+	case familySUSE:
+		return "zypper"
+	case familyDarwin:
+		return "brew"
+	}
+	return ""
+}
+
+// capPackageVersion runs the backend's version query: dpkg-query for apt,
+// rpm for the rpm family, brew for brew. None takes a lock.
+func capPackageVersion(backend string) error {
+	var bin string
+	switch backend {
+	case "apt-get":
+		bin = "dpkg-query"
+	case "dnf", "yum", "zypper":
+		bin = "rpm"
+	case "brew":
+		bin = "brew"
+	default:
+		return errCapMissing
+	}
+	path, ok := findExecutable(bin, execDirs)
+	if !ok {
+		return errCapMissing
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), capProbeTimeout)
+	defer cancel()
+	_, err := jobCommand(ctx, path, "--version").Output()
+	return err
 }
