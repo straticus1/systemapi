@@ -1377,3 +1377,19 @@ test('boot: a table lock held by a long transaction fails the boot after bounded
     await admin.end();
   }
 });
+
+test('upsertSoftwareBatch writes a whole inventory in one statement and returns only the new rows', async () => {
+  const { normalizeSoftwareInventory } = require('../controlplane/software');
+  const host = '33333333-3333-4333-8333-333333333333';
+  const { items } = normalizeSoftwareInventory(Array.from({ length: 1500 }, (_, i) => ({ name: `pkg${i}`, version: '1.0', architecture: 'amd64' })));
+  const added = await registry.upsertSoftwareBatch(host, items);
+  assert.equal(added.length, 1500);
+  const before = await pool.query('SELECT max(last_detected_at) AS t FROM cp_software WHERE host_id = $1', [host]);
+  assert.deepEqual(await registry.upsertSoftwareBatch(host, items), [], 'a resent list adds nothing');
+  const after = await pool.query('SELECT count(*)::int AS n, max(last_detected_at) AS t FROM cp_software WHERE host_id = $1', [host]);
+  assert.equal(after.rows[0].n, 1500);
+  assert.ok(after.rows[0].t >= before.rows[0].t, 'the resend refreshes last_detected_at');
+  const more = normalizeSoftwareInventory([...items, { name: 'pkg0', version: '2.0', architecture: 'amd64' }]).items;
+  assert.deepEqual(await registry.upsertSoftwareBatch(host, more), [{ name: 'pkg0', version: '2.0' }]);
+  assert.deepEqual(await registry.upsertSoftwareBatch(host, []), []);
+});

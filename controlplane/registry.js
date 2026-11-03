@@ -1395,6 +1395,14 @@ class MemoryRegistry {
     return { inserted: true };
   }
 
+  async upsertSoftwareBatch(hostId, items) {
+    const added = [];
+    for (const sw of items) {
+      if ((await this.upsertSoftware(hostId, sw)).inserted) added.push({ name: sw.name, version: sw.version });
+    }
+    return added;
+  }
+
   async listSoftware(hostId) {
     return this.software.filter((s) => s.host_id === hostId);
   }
@@ -2962,6 +2970,23 @@ class PgRegistry {
       [hostId, sw.name || 'unknown', sw.version || 'unknown', sw.architecture || '']
     );
     return { inserted: Boolean(res.rows[0] && res.rows[0].inserted) };
+  }
+
+  // A whole normalized inventory (controlplane/software.js: unique on
+  // (name, version), which ON CONFLICT needs) in one statement and one commit;
+  // a row per commit made one host's report outlast the agent's 5 s tick.
+  // Returns the rows that are new.
+  async upsertSoftwareBatch(hostId, items) {
+    if (items.length === 0) return [];
+    const res = await this.pool.query(
+      `INSERT INTO cp_software (host_id, name, version, architecture)
+       SELECT $1, t.name, t.version, t.architecture
+         FROM unnest($2::text[], $3::text[], $4::text[]) AS t(name, version, architecture)
+       ON CONFLICT (host_id, name, version) DO UPDATE SET last_detected_at = now()
+       RETURNING name, version, (xmax = 0) AS inserted`,
+      [hostId, items.map((i) => i.name), items.map((i) => i.version), items.map((i) => i.architecture)]
+    );
+    return res.rows.filter((r) => r.inserted).map((r) => ({ name: r.name, version: r.version }));
   }
 
   async listSoftware(hostId) {

@@ -55,6 +55,9 @@ const { fingerprint, randomToken } = require('../controlplane/token');
 const { zscore } = require('../controlplane/stats');
 const { readPlaybook } = require('../controlplane/playbooks');
 const { parseCapabilities } = require('../controlplane/channels');
+const {
+    normalizeSoftwareInventory, SOFTWARE_REFRESH_MS, SOFTWARE_MIN_WRITE_GAP_MS, SOFTWARE_RETRY_MS, SOFTWARE_MAX_CONCURRENT
+} = require('../controlplane/software');
 const { CreditLedger } = require('../controlplane/credit');
 const { deliverWebhooks, COOLDOWN_MS } = require('../controlplane/router');
 const { TcpChannels } = require('./tcp');
@@ -194,6 +197,10 @@ class FleetManager {
         this.pendingExecutions = new Map();
         // Hosts whose live agent is being ping-probed for a newcomer.
         this.agentProbes = new Set();
+        // Software inventory per host: the digest and time of the last list
+        // written, and the hosts with a write running (one at a time each).
+        this.softwareSeen = new Map();
+        this.softwareInFlight = new Set();
         this.signer = null;
         this.tickets = null;
         this.registry = null;
@@ -1410,13 +1417,42 @@ class FleetManager {
         await this.darkStorage.send(command);
     }
 
+    // The agent resends its whole list every telemetry tick. Write it only
+    // when it changed or about SOFTWARE_REFRESH_MS has passed, in one
+    // statement, never twice at once for a host and at most
+    // SOFTWARE_MAX_CONCURRENT at once overall, and at most once per
+    // SOFTWARE_MIN_WRITE_GAP_MS for a host: unawaited per-row writes piled
+    // up and held the pool. A report that cannot run now is dropped; the next
+    // tick carries the same list. A failed write or a refused list makes the
+    // host wait SOFTWARE_RETRY_MS, so a list that always fails is not retried
+    // every tick.
     async processSoftwareInventory(hostId, softwareList) {
-        if (!this.registry) return;
-        for (const sw of softwareList) {
-            if (!sw || typeof sw !== 'object') continue;
-            const saved = await this.registry.upsertSoftware(hostId, sw);
-            if (saved.inserted) await this.checkDarkAPIForCVEs(hostId, sw.name || 'unknown', sw.version || 'unknown');
+        if (!this.registry || this.softwareInFlight.has(hostId)) return;
+        if (this.softwareInFlight.size >= SOFTWARE_MAX_CONCURRENT) return;
+        const now = Date.now();
+        const last = this.softwareSeen.get(hostId);
+        if (last && last.retryAt && now < last.retryAt) return;
+        if (last && last.writtenAt && now - last.writtenAt < SOFTWARE_MIN_WRITE_GAP_MS) return;
+        let added;
+        this.softwareInFlight.add(hostId);
+        try {
+            const { items, digest, skipped } = normalizeSoftwareInventory(softwareList);
+            if (last && !last.retryAt && last.digest === digest && now < last.refreshAt) return;
+            if (skipped > 0 && (!last || last.digest !== digest)) {
+                console.warn(`[Software Inventory] host ${hostId}: skipped ${skipped} item(s) with a field over the length limit`);
+            }
+            added = await this.registry.upsertSoftwareBatch(hostId, items);
+            // Spread the hourly refresh so hosts that connected together do
+            // not all rewrite in the same tick.
+            const jitter = crypto.randomInt(0, Math.floor(SOFTWARE_REFRESH_MS / 4));
+            this.softwareSeen.set(hostId, { digest, writtenAt: now, refreshAt: now + SOFTWARE_REFRESH_MS - jitter });
+        } catch (err) {
+            this.softwareSeen.set(hostId, { retryAt: now + SOFTWARE_RETRY_MS });
+            throw new Error(`host ${hostId}: ${err.message}`, { cause: err });
+        } finally {
+            this.softwareInFlight.delete(hostId);
         }
+        for (const sw of added) await this.checkDarkAPIForCVEs(hostId, sw.name, sw.version);
     }
 
     async checkDarkAPIForCVEs(hostId, name, version) {
