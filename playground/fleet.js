@@ -41,6 +41,13 @@
  * A retired host (POST /api/v1/hosts/:host_id/retire with force) loses its
  * live agent the same way: close 4403 "host_retired" (retireAgent), and the
  * registry refuses that host_id's re-enroll as host_retired.
+ * Capability health (controlplane/capabilities.js, with its own Threats
+ * note): capability_report frames count only after enroll, one at a time per
+ * host and at least 60 s apart; refused or dropped ones are counted, and 10
+ * within 10 min close the socket 1008. Routing uses the dial header minus the
+ * degraded header minus what reports on this connection withdraw; a report
+ * never adds a capability. Health is self-reported: it detects breakage, NOT
+ * compromise.
  */
 
 const WebSocket = require('ws');
@@ -54,7 +61,10 @@ const { issueLease, terminalPayload } = require('../controlplane/lease');
 const { fingerprint, randomToken } = require('../controlplane/token');
 const { zscore } = require('../controlplane/stats');
 const { readPlaybook } = require('../controlplane/playbooks');
-const { parseCapabilities } = require('../controlplane/channels');
+const { parseCapabilities, effectivePolicies } = require('../controlplane/channels');
+const {
+    validateCapabilityReport, ConnectionCapabilities, expectedCapabilities, hostHealth
+} = require('../controlplane/capabilities');
 const {
     normalizeSoftwareInventory, SOFTWARE_REFRESH_MS, SOFTWARE_MIN_WRITE_GAP_MS, SOFTWARE_RETRY_MS, SOFTWARE_MAX_CONCURRENT
 } = require('../controlplane/software');
@@ -96,6 +106,13 @@ const AGENT_PROBE_MS_DEFAULT = 5000;
 const AGENT_PING_MS = 30_000;
 const AGENT_REVOKED_CLOSE = 4403;
 const AGENT_CLOSE_GRACE_MS = 2000;
+// capability_report frames (controlplane/capabilities.js): per host, one in
+// flight and at least CAP_REPORT_GAP_MS apart; CAP_VIOLATION_MAX refused or
+// dropped frames within CAP_VIOLATION_WINDOW_MS close the socket 1008.
+const CAP_REPORT_GAP_MS = 60_000;
+const CAP_VIOLATION_WINDOW_MS = 10 * 60_000;
+const CAP_VIOLATION_MAX = 10;
+const AGENT_POLICY_CLOSE = 1008;
 // sys.alerts.push frames (sysscript_alert). The agent enforces the same
 // limits; these hold against an agent that does not.
 const ALERT_SEVERITIES = new Set(['info', 'warning', 'critical']);
@@ -181,6 +198,19 @@ class FleetManager {
         this.agentLedgers = new WeakMap();
         // The API key id each accepted agent socket enrolled with.
         this.agentKeys = new WeakMap();
+        // Per live agent socket: its capability routing and report state
+        // (ConnectionCapabilities). agentCaps stays the dial header, which
+        // job routing, the converge gate and the presence row read.
+        this.agentCapState = new WeakMap();
+        // Per host: the capability_report rate state, and the capability
+        // rows last written (so a report writes only what changed).
+        this.capReportLimits = new Map();
+        this.capStored = new Map();
+        // Refused or dropped capability_report frames by reason code.
+        this.capReportDrops = new Map();
+        this.capReportGapMs = CAP_REPORT_GAP_MS;
+        this.capViolationWindowMs = CAP_VIOLATION_WINDOW_MS;
+        this.capViolationMax = CAP_VIOLATION_MAX;
         this.agentPingMs = AGENT_PING_MS;
         this.terminalSessions = new Map();
         this.terminalWss = new WebSocket.Server({ noServer: true, maxPayload: PTY_FRAME_MAX });
@@ -307,6 +337,7 @@ class FleetManager {
         request.systemapiEnroll = enroll;
         request.systemapiKey = keyData;
         request.systemapiCapabilities = parseCapabilities(request.headers['x-systemapi-capabilities']);
+        request.systemapiCapabilitiesDegraded = parseCapabilities(request.headers['x-systemapi-capabilities-degraded']);
         this.wss.handleUpgrade(request, socket, head, (ws) => {
             this.wss.emit('connection', ws, request, keyData);
         });
@@ -893,6 +924,9 @@ class FleetManager {
                 } else if (msg.type === 'sys_result' || msg.type === 'sys_status') {
                     const id = hostId;
                     if (id) inOrder(() => this.sys.onAgentFrame(ws, id, msg));
+                } else if (msg.type === 'capability_report') {
+                    if (hostId) await this.onCapabilityReport(ws, hostId, keyId, msg, messageBuffer.length);
+                    else this.noteCapabilityDrop('pre_enroll');
                 }
             } catch (err) {
                 console.error('[Fleet] message error:', err.message);
@@ -993,6 +1027,10 @@ class FleetManager {
             hostId = host.host_id;
             this.hostTenants.set(hostId, host.tenant_id);
             this.agentCaps.set(ws, request.systemapiCapabilities || new Set());
+            this.agentCapState.set(ws, new ConnectionCapabilities(
+                request.systemapiCapabilities || new Set(),
+                request.systemapiCapabilitiesDegraded || new Set()
+            ));
             this.agentKeys.set(ws, keyId);
             this.connectedAgents.set(hostId, ws);
             this.jobs.onEnroll(ws, hostId);
@@ -1096,14 +1134,185 @@ class FleetManager {
         return true;
     }
 
-    // True when the live agent for hostId advertised capability on dial.
-    // Channel handlers answer agent_unsupported when this is false (an old
-    // agent advertises nothing).
+    // True when capability is in the live agent's effective set: advertised
+    // on dial, minus the degraded header, minus what the latest report on
+    // this connection marks degraded or absent (sysscript_jobs and converge
+    // follow the header only). Channel handlers answer agent_unsupported
+    // when this is false (an old agent advertises nothing).
     agentSupports(hostId, capability) {
         const ws = this.connectedAgents.get(hostId);
         if (!ws) return false;
+        const state = this.agentCapState.get(ws);
+        if (state) return state.supports(capability);
         const caps = this.agentCaps.get(ws);
         return !!caps && caps.has(capability);
+    }
+
+    // The dial header of hostId's live agent (what the binary supports).
+    agentSupportedCaps(hostId) {
+        const ws = this.connectedAgents.get(hostId);
+        return (ws && this.agentCaps.get(ws)) || new Set();
+    }
+
+    // The reason code an agent_unsupported for capability carries, or null.
+    agentUnsupportedReason(hostId, capability) {
+        const ws = this.connectedAgents.get(hostId);
+        const state = ws && this.agentCapState.get(ws);
+        return state ? state.unsupportedReason(capability) : null;
+    }
+
+    noteCapabilityDrop(reason) {
+        this.capReportDrops.set(reason, (this.capReportDrops.get(reason) || 0) + 1);
+    }
+
+    capReportLimit(hostId) {
+        let limit = this.capReportLimits.get(hostId);
+        if (!limit) {
+            limit = { inFlight: false, lastAt: 0, probeCredit: false, violations: [], closing: null };
+            this.capReportLimits.set(hostId, limit);
+        }
+        return limit;
+    }
+
+    // A refused or dropped capability_report: counted; capViolationMax of
+    // them within the window close the socket 1008 (the credit-ledger
+    // pattern: a security event, then the socket ends).
+    capabilityViolation(ws, hostId, keyId, limit, reason, nowMs) {
+        this.noteCapabilityDrop(reason);
+        if (limit.closing === ws) return;
+        limit.violations = limit.violations.filter((t) => nowMs - t < this.capViolationWindowMs);
+        limit.violations.push(nowMs);
+        if (limit.violations.length < this.capViolationMax) return;
+        limit.closing = ws;
+        console.error(`[Fleet] agent capability_report flood host=${hostId} (${reason}); disconnecting the agent`);
+        this.noteSecurity('agent_capability_flood', fingerprint(keyId), { host_id: hostId, reason })
+            .catch((err) => console.error('[Fleet] security event failed:', err.message));
+        if (ws.readyState === WebSocket.OPEN) ws.close(AGENT_POLICY_CLOSE, 'capability_report_flood');
+        unref(setTimeout(() => {
+            if (ws.readyState !== WebSocket.CLOSED) ws.terminate();
+        }, AGENT_CLOSE_GRACE_MS));
+    }
+
+    // A capability_report from hostId's enrolled agent: rate-checked and
+    // validated before any DB work, applied to this connection's routing at
+    // once, then the changed rows written in one statement.
+    async onCapabilityReport(ws, hostId, keyId, msg, bytes) {
+        const now = Date.now();
+        const state = this.agentCapState.get(ws);
+        if (!state || this.connectedAgents.get(hostId) !== ws) {
+            this.noteCapabilityDrop('stale_socket');
+            return;
+        }
+        const limit = this.capReportLimit(hostId);
+        if (limit.inFlight) {
+            this.capabilityViolation(ws, hostId, keyId, limit, 'in_flight', now);
+            return;
+        }
+        // The first report on a connection and the answer to a server probe
+        // are not held to the gap.
+        if (state.reportCount > 0 && !limit.probeCredit && now - limit.lastAt < this.capReportGapMs) {
+            this.capabilityViolation(ws, hostId, keyId, limit, 'too_soon', now);
+            return;
+        }
+        const checked = validateCapabilityReport(msg, bytes);
+        if (!checked.ok) {
+            this.capabilityViolation(ws, hostId, keyId, limit, checked.error, now);
+            return;
+        }
+        if (checked.dropped > 0) this.noteCapabilityDrop('unknown_name');
+        limit.lastAt = now;
+        limit.probeCredit = false;
+        state.applyReport(checked.report, now);
+        limit.inFlight = true;
+        try {
+            await this.storeCapabilities(hostId, checked.report.caps);
+        } finally {
+            limit.inFlight = false;
+        }
+    }
+
+    // Writes the report's rows that differ from what was last written for
+    // hostId (all of them when nothing is cached), in one statement. A failed
+    // write is logged and forgets the cache, so the next report writes every
+    // row again; routing already took the report.
+    async storeCapabilities(hostId, caps) {
+        if (!this.registry || typeof this.registry.setHostCapabilities !== 'function') return;
+        const stored = this.capStored.get(hostId);
+        const rows = stored
+            ? caps.filter((c) => {
+                const prev = stored.get(c.name);
+                return !prev || prev.state !== c.state || prev.reason !== c.reason;
+            })
+            : caps;
+        if (rows.length === 0) return;
+        let changed;
+        try {
+            changed = await this.registry.setHostCapabilities(hostId, rows);
+        } catch (err) {
+            this.capStored.delete(hostId);
+            console.error(`[Fleet] capability write failed host=${hostId} error=${errorCode(err)}`);
+            return;
+        }
+        const next = stored || new Map();
+        for (const c of rows) next.set(c.name, { state: c.state, reason: c.reason });
+        this.capStored.set(hostId, next);
+        const changes = changed.filter((c) => c.previous_state !== c.state);
+        if (changes.length > 0) this.onCapabilityChange(hostId, changes);
+    }
+
+    // The single hook for capability state changes (alerts, webhooks and
+    // metrics arrive with a later phase). changes is [{name, state, reason,
+    // since, last_report_at, previous_state}] for the rows whose state
+    // changed; previous_state is null on a name's first row.
+    onCapabilityChange(hostId, changes) {
+        const summary = changes.map((c) => `${c.name}:${c.previous_state || 'none'}->${c.state}`).join(',');
+        console.log(`[Fleet] capability change host=${hostId} ${summary}`);
+    }
+
+    // Sends capability_probe to hostId's live agent (old agents ignore it);
+    // its answer is not held to the report gap. False when no agent is
+    // connected here.
+    requestCapabilityProbe(hostId) {
+        const ws = this.connectedAgents.get(hostId);
+        if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+        this.capReportLimit(hostId).probeCredit = true;
+        sendJSON(ws, { type: 'capability_probe' });
+        return true;
+    }
+
+    // The expected capabilities of hostId under its effective channel policy.
+    async expectedCapabilities(hostId) {
+        return expectedCapabilities(await effectivePolicies(this.registry, hostId));
+    }
+
+    liveCapState(hostId) {
+        const ws = this.connectedAgents.get(hostId);
+        const connected = !!ws && ws.readyState === WebSocket.OPEN;
+        return { connected, conn: connected ? this.agentCapState.get(ws) || null : null };
+    }
+
+    // hostId's health as seen from this instance (offline when its socket is
+    // not held here). Reads the policy only for a host that has reported.
+    async hostHealth(hostId) {
+        const { connected, conn } = this.liveCapState(hostId);
+        if (!conn || conn.reportCount === 0) return hostHealth({ connected, conn, expected: [] });
+        return hostHealth({ connected, conn, expected: await this.expectedCapabilities(hostId) });
+    }
+
+    // The GET /api/v1/hosts/:id/capabilities body for an authorized host.
+    async hostCapabilities(hostId) {
+        const { connected, conn } = this.liveCapState(hostId);
+        const expected = await this.expectedCapabilities(hostId);
+        const caps = this.registry && typeof this.registry.listHostCapabilities === 'function'
+            ? await this.registry.listHostCapabilities(hostId) : [];
+        return {
+            host_id: hostId,
+            health: hostHealth({ connected, conn, expected }),
+            supported: conn ? [...conn.supported].sort() : [],
+            effective: conn ? conn.effective() : [],
+            expected,
+            caps
+        };
     }
 
     // The credit ledger of one agent socket (controlplane/credit.js). An

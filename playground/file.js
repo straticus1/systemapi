@@ -274,8 +274,8 @@ class FileChannels {
         });
     }
 
-    failSocket(ws, code) {
-        sendJSON(ws, { type: 'file_status', payload: { error: code } });
+    failSocket(ws, code, reason = null) {
+        sendJSON(ws, { type: 'file_status', payload: reason ? { error: code, reason } : { error: code } });
         if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close(1011);
     }
 
@@ -346,7 +346,7 @@ class FileChannels {
             return;
         }
         if (!fm.agentSupports(hostId, 'file')) {
-            this.failSocket(ws, 'agent_unsupported');
+            this.failSocket(ws, 'agent_unsupported', fm.agentUnsupportedReason(hostId, 'file'));
             return;
         }
         const actor = row.actor || null;

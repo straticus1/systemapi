@@ -432,3 +432,20 @@ DO $$ BEGIN
     ALTER TABLE cp_sysscript_jobs VALIDATE CONSTRAINT cp_sysscript_jobs_source_check_v2;
   END IF;
 END $$;
+
+-- Agent capability health (plan sah-fleet-readiness P1b): the last reported
+-- state of each known capability per host, kept for every known name in a
+-- report (in the dial header or not). Written only when a name's state or
+-- reason changes, in one statement per report; since is when the state last
+-- changed, last_report_at the report that last wrote the row. Names, states
+-- and reasons come from fixed server-side sets (controlplane/capabilities.js).
+-- clearAgentPresence leaves these rows alone: health outlives the socket.
+CREATE TABLE IF NOT EXISTS cp_host_capabilities (
+  host_id TEXT NOT NULL,
+  name TEXT NOT NULL CHECK (name ~ '^[a-z][a-z0-9_]{0,15}$'),
+  state TEXT NOT NULL CHECK (state IN ('ok', 'degraded', 'absent')),
+  reason TEXT NOT NULL DEFAULT '' CHECK (char_length(reason) <= 32),
+  since TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_report_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (host_id, name)
+);

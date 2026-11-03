@@ -1782,7 +1782,7 @@ test('hosts/resolve matches exactly, case-insensitively, inside the caller tenan
   try {
     const exact = await resolve('a.example');
     assert.equal(exact.status, 200);
-    assert.deepEqual(exact.body, { host_id: HOST_A, hostname: 'a.example', tenant: 'acme', status: 'online' });
+    assert.deepEqual(exact.body, { host_id: HOST_A, hostname: 'a.example', tenant: 'acme', status: 'online', health: 'unknown' });
 
     const upper = await resolve('A.EXAMPLE');
     assert.equal(upper.status, 200);

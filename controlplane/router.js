@@ -84,6 +84,8 @@ function sendError(res, err) {
   const body = { error: status >= 500 && !deliberate ? 'internal' : code };
   // A legacy /execute that went as a job and timed out names the job.
   if (deliberate && typeof err.jobId === 'string') body.job_id = err.jobId;
+  // A capability withdrawn for degradation names its fixed reason code.
+  if (deliberate && typeof err.reason === 'string' && /^[a-z0-9_]{1,32}$/.test(err.reason)) body.reason = err.reason;
   res.status(status).json(body);
 }
 
@@ -233,6 +235,14 @@ async function requireHost(fleet, principal, hostId) {
     throw http(404, 'not_found');
   }
   return host;
+}
+
+// A host's capability health as this instance sees it (offline when its
+// agent socket is not held here; a fleet without capability support, such
+// as a test stub, says offline unless connected, then unknown).
+async function hostHealthOf(fleet, hostId) {
+  if (typeof fleet.hostHealth === 'function') return fleet.hostHealth(hostId);
+  return fleet.connectedAgents && fleet.connectedAgents.has(hostId) ? 'unknown' : 'offline';
 }
 
 function requireScope(fleet, principal, tenantId, scope) {
@@ -889,7 +899,13 @@ function mount(app, fleet) {
       res.status(409).json({ error: 'ambiguous', matches: matches.length });
       return;
     }
-    res.json({ host_id: host.host_id, hostname: host.hostname, tenant: host.tenant_id, status: isOnline(host) ? 'online' : 'offline' });
+    res.json({
+      host_id: host.host_id,
+      hostname: host.hostname,
+      tenant: host.tenant_id,
+      status: isOnline(host) ? 'online' : 'offline',
+      health: await hostHealthOf(fleet, host.host_id)
+    });
   }));
 
   // Retire a host record (a re-enrolled agent left the old row behind). The
@@ -930,6 +946,31 @@ function mount(app, fleet) {
       forced: online,
       agent_closed: agentClosed
     });
+  }));
+
+  // Capability health (plan P1b), self-reported by the agent: it detects
+  // breakage, not compromise. Tenant-filtered like retire.
+  app.get('/api/v1/hosts/:hostId/capabilities', wrap(async (req, res) => {
+    noStore(res);
+    const principal = await authenticate(req, fleet);
+    requireScopeAnywhere(fleet, principal, ['hosts:read']);
+    const host = await requireHost(fleet, principal, req.params.hostId);
+    requireScope(fleet, principal, host.tenant_id, 'hosts:read');
+    if (typeof fleet.hostCapabilities !== 'function') throw http(501, 'agent_unsupported');
+    res.json(await fleet.hostCapabilities(host.host_id));
+  }));
+
+  // Asks the host's live agent to re-run its probes now (capability_probe);
+  // the agent answers with a capability_report. Admin only.
+  app.post('/api/v1/hosts/:hostId/capabilities/probe', wrap(async (req, res) => {
+    noStore(res);
+    const principal = await authenticate(req, fleet);
+    requireScopeAnywhere(fleet, principal, ['admin']);
+    const host = await requireHost(fleet, principal, req.params.hostId);
+    requireScope(fleet, principal, host.tenant_id, 'admin');
+    const sent = typeof fleet.requestCapabilityProbe === 'function' && fleet.requestCapabilityProbe(host.host_id);
+    if (!sent) throw http(409, 'host_offline');
+    res.status(202).json({ host_id: host.host_id, probe: 'sent' });
   }));
 
   app.get('/api/v1/fleet/export', wrap(async (req, res) => {
@@ -980,7 +1021,8 @@ function mount(app, fleet) {
     const ids = tenantIds(principal);
     for (const id of ids) requireScope(fleet, principal, id, 'hosts:read');
     const includeRetired = req.query.include_retired === '1' || req.query.include_retired === 'true';
-    const hosts = await fleet.registry.listHosts(ids, typeof req.query.q === 'string' ? req.query.q : null, { includeRetired });
+    const listed = await fleet.registry.listHosts(ids, typeof req.query.q === 'string' ? req.query.q : null, { includeRetired });
+    const hosts = await Promise.all(listed.map(async (h) => ({ ...h, health: await hostHealthOf(fleet, h.host_id) })));
     res.json({ hosts, user: principal.kind === 'session' ? { id: principal.userId, email: principal.email } : null });
   }));
 
