@@ -5,11 +5,34 @@
 // every column (tenant_id, host_id, actor, action, payload), so rewriting the
 // actor or host breaks verification. Older rows hashed only the payload; they
 // still verify, and their other columns stay unprotected.
+// KNOWN_FORKS: a fork already in a production chain (two rows that chained
+// from the same parent before the chain-wide append lock, d8c8342). Each pin
+// fixes the parent (prev_hash), the sibling row that became a dead branch
+// (sibling_seq, sibling_row_hash) and the forked row (seq, row_hash). A fork
+// is accepted once, only when the row directly before it is the pinned
+// sibling and both share the pinned parent; pinned rows must carry the v2
+// (every-column) hash. Editing or deleting either pinned row, inserting rows
+// between them, or replaying a pin fails. Does NOT protect: a full rewrite of
+// later rows (compare the recorded head), truncation of the tail, or the
+// columns legacy (pre-2026-10-14) rows did not hash.
 'use strict';
 
 const crypto = require('node:crypto');
 
 const GENESIS = '0'.repeat(64);
+
+// miniapps1 (api.systemapi.io), 2026-10-22T13:08:18Z: tcp_end (seq 24) and
+// ticket_issued (seq 25) both chained from seq 23. Checked 2026-11-03: the
+// only break in the 48-row chain; every row hash-valid.
+const KNOWN_FORKS = Object.freeze([
+  Object.freeze({
+    seq: 25,
+    prev_hash: 'b4b783cf3a1e647a7807739751e9697864908ef98d61267b4ad0b470f57f4810',
+    row_hash: 'c5768d715c4f2f24c3692e88cce6086757aa27f618808658c0402e233af2c8ed',
+    sibling_seq: 24,
+    sibling_row_hash: '66707aeb841345707d7924b70f602f45c35a25f19078652ecbfa7b343c800c2a'
+  })
+]);
 
 function stable(value) {
   if (Array.isArray(value)) return value.map(stable);
@@ -45,18 +68,35 @@ function rowHash(prevHash, row) {
   return chainHash(prevHash, rowFields(row));
 }
 
-function verifyRows(rows) {
+// verifyRows walks rows in seq order. forks defaults to KNOWN_FORKS (tests
+// pass their own).
+function verifyRows(rows, forks = KNOWN_FORKS) {
   let prev = GENESIS;
+  let last = null;
+  const used = new Set();
+  const accepted = [];
   for (const row of rows) {
+    const pin = forks.find((f) => f.row_hash === row.row_hash);
+    const pinnedSibling = forks.some((f) => f.sibling_row_hash === row.row_hash);
     if (row.prev_hash !== prev) {
+      const ok = pin && !used.has(pin) && pin.seq === row.seq && pin.prev_hash === row.prev_hash &&
+        last && last.seq === pin.sibling_seq && last.row_hash === pin.sibling_row_hash &&
+        last.prev_hash === row.prev_hash;
+      if (!ok) return { ok: false, broken_at: row.seq };
+      used.add(pin);
+      accepted.push(row.seq);
+    } else if (pin) {
+      // The pinned row links in line: its sibling is gone.
       return { ok: false, broken_at: row.seq };
     }
-    if (rowHash(prev, row) !== row.row_hash && chainHash(prev, row.payload) !== row.row_hash) {
+    const v2 = rowHash(row.prev_hash, row) === row.row_hash;
+    if (!v2 && (pin || pinnedSibling || chainHash(row.prev_hash, row.payload) !== row.row_hash)) {
       return { ok: false, broken_at: row.seq };
     }
     prev = row.row_hash;
+    last = row;
   }
-  return { ok: true, head: prev };
+  return accepted.length > 0 ? { ok: true, head: prev, known_forks: accepted } : { ok: true, head: prev };
 }
 
-module.exports = { GENESIS, canonicalJSON, chainHash, rowHash, verifyRows };
+module.exports = { GENESIS, KNOWN_FORKS, canonicalJSON, chainHash, rowHash, verifyRows };

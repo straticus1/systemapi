@@ -101,7 +101,13 @@ the router.
   enrollment headers described in `cli_docs.md`.
 
 `GET /api/v1/audit/verify` returns 403 `scope_denied` to a caller who belongs
-to no tenant.
+to no tenant. It returns `{"ok": true, "head": "<hash>"}`, or
+`{"ok": false, "broken_at": <seq>}` at the first bad link or row hash. A fork
+pinned in `KNOWN_FORKS` (`controlplane/chain.js`: the parent, the dead-branch
+sibling row and the forked row, by hash) still verifies once, only in that
+exact shape, and is listed: `{"ok": true, "head": ..., "known_forks": [25]}`.
+`/api/v1/compliance/export` carries the same `known_forks`.
+Production has one, seq 25 (2026-10-22, before the append lock in d8c8342).
 
 Every route checks a scope (`hosts:read`, `metrics:read`, `exec:run`,
 `alerts:write`, `audit:read`, `admin`, ...). An API key with no scope rows has

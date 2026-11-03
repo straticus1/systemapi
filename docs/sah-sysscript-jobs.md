@@ -19,8 +19,9 @@ switch off).
 ## Rollout
 
 1. **Before you start**, run `GET /api/v1/audit/verify`. `cp_audit` may
-   contain forks written before d8c8342. Record the result so a later
-   failure can be told apart from an old one.
+   contain forks written before d8c8342; production's one fork (seq 25) is
+   pinned in `KNOWN_FORKS` and reported as `known_forks`. Record the result
+   so a later failure can be told apart from an old one.
 2. **Server first.** Deploy the control plane on every instance, with
    `SYSTEMAPI_SYSSCRIPT_JOBS` unset or `1`. The schema additions are applied
    on start. Agents that do not advertise the capability are unaffected.
