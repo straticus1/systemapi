@@ -76,8 +76,22 @@ func probeOpenat2Root() error {
 	})
 	if err == nil {
 		_ = unix.Close(fd)
+	}
+	return recordOpenat2(err)
+}
+
+// recordOpenat2 stores one probe outcome. Only a refusal of openat2 itself
+// (ENOSYS or EPERM, openat2Reason "enosys_openat2") stores the failed state;
+// any other error (EMFILE, ENOMEM, EINTR...) is returned and leaves the
+// stored state as it was, so a transient error never turns the file
+// channel's request-time gate off.
+func recordOpenat2(err error) error {
+	if err == nil {
 		openat2State.Store(1)
 		return nil
+	}
+	if openat2Reason(err) != "enosys_openat2" {
+		return err
 	}
 	if openat2State.Swap(2) != 2 {
 		log.Printf("file capability: openat2 probe failed: %v", err)
