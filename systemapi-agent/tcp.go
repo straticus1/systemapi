@@ -54,10 +54,6 @@ var (
 	}
 )
 
-func init() {
-	registerCapability("tcp", func() bool { return true })
-}
-
 // channelConn is the channel state of one control-plane connection: the
 // credit mux and the live TCP streams. It ends with the connection.
 type channelConn struct {

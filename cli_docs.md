@@ -31,6 +31,8 @@ SYSTEMAPI_API_KEY=<key> ./systemapi-agent \
 | `--sysscript-workers` | 4 | Scripts that run at once (1 to 16), jobs and legacy scripts together. 8 more may wait for a worker; beyond that a script is refused `agent_busy`. |
 | `--sysscript-legacy-seconds` | 300 | Whole-script deadline of a legacy (non-job) script, 1 to 3600, cut to `--sysscript-max-seconds`. |
 | `--sysscript-max-seconds` | 3600 | Ceiling for any script deadline (1 to 3600). A job deadline beyond it is cut to it. |
+| `--capability-reports` | `true` | Send `capability_report` frames (see Capabilities below). `false` sends none and ignores `capability_probe`; both dial headers, the degraded one included, are still sent. |
+| `--capability-interval` | `10m` | How often the capability probes re-run and a report goes out, with +/-10% jitter. 1m to 60m; anything else stops the agent from starting. |
 
 `terminal:root` sessions use their own lease action (`pty_root`), run as root,
 and need an agent running as root. The agent keeps 4 of its 32 session slots
@@ -38,6 +40,57 @@ for `terminal:root` and break-glass. Ending a session (stop, lease expiry,
 deadline, or the shell exiting) sends SIGHUP and then SIGKILL to its process
 group and, on Linux, to every process in its session. On SIGINT, SIGTERM or a
 lost connection the agent ends every session first.
+
+### Capabilities
+
+On every dial the agent sends two headers. Both are comma lists of tokens
+(`^[a-z][a-z0-9_]{0,15}$`, at most 16 tokens and 256 bytes), recomputed on
+each dial:
+
+- `X-SystemAPI-Capabilities`: what this binary supports on this OS with
+  these flags.
+- `X-SystemAPI-Capabilities-Degraded`: the supported ones whose probe failed
+  at dial time. Left out when none failed.
+
+The tokens: `tcp`, `pty`, `file`, `xfer`, `config`, `config_write`, `tweak`,
+`sysctl_write`, `override_write`, `service`, `package`, `sysscript_jobs`,
+`converge`. `config_write`, `sysctl_write` and `override_write` are supported
+on Linux with systemd; their probes need the matching
+`sah-*-helper@.service` template loaded and
+`/etc/systemapi-agent/helper-trust.json` to be a root-owned regular file
+(no symlink) with no group or other write bit (0644, 0640 and 0600 all
+pass) that parses. Without `/run/systemd/system`, only `config_write`,
+`sysctl_write` and `override_write` are not supported (`no_systemd`).
+`tweak` works wherever `/proc/sys` is readable, and `service` wherever the
+platform's own service backend works (systemd, OpenRC, launchd); `pty`,
+`file`, `tcp` and `sysscript_jobs` keep working.
+
+The probes are read-only and cheap. They never start a unit, never take a
+package-manager lock and never write. `file`/`xfer`: openat2 of `/` (`xfer`
+also re-checks `--xfer-bin`). `config`: a read-only openat2 open of
+`/etc/hostname`. `tweak`: read `/proc/sys/kernel/hostname`. `service`:
+`systemctl show -p Version --value` (systemd) or `rc-service --version`
+(OpenRC), 5 s timeout. `package`: `dpkg-query --version` or
+`rpm --version`. `pty`: `/dev/ptmx` exists. `sysscript_jobs`, `converge`:
+the flag is on and the state directory exists; a stat error that is not
+"missing" keeps the last known state.
+
+After enroll, then every cycle, and on a server `{"type":"capability_probe"}`
+frame, the agent sends:
+
+```json
+{"type":"capability_report","v":1,"probed_at":"2026-11-03T10:00:00Z",
+ "caps":[{"name":"file","state":"degraded","reason":"enosys_openat2"}]}
+```
+
+At most one report goes out per 60 s, across reconnects too; a probe request
+inside that window is answered when it ends. `caps` has at most 16 entries,
+names from the agent's own list. `state` is `ok`, `degraded` or `absent`.
+`reason` is empty for `ok`, otherwise one of `enosys_openat2`,
+`binary_missing`, `helper_unit_missing`, `helper_trust_missing`,
+`manager_unreachable`, `flag_off`, `unsupported_os`, `no_systemd`,
+`probe_error`. A report never carries a path or an error text. Health is
+self-reported: it shows breakage, not compromise.
 
 ### Verify a recording
 

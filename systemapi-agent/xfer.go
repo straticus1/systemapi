@@ -92,10 +92,8 @@ type xferConfig struct {
 // xferCfg is set once from the flags before the agent connects.
 var xferCfg xferConfig
 
-func init() {
-	registerCapability("xfer", xferAvailable)
-}
-
+// xferAvailable is the request-time gate; the xfer capability probe is in
+// capabilities.go.
 func xferAvailable() bool {
 	return xferSupported(runtime.GOOS, xferCfg.bin != "", xferCfg.allowDarwin, openat2Available)
 }

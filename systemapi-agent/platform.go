@@ -202,16 +202,5 @@ func currentPlatform() *Platform {
 	return platformInst
 }
 
-// Capability probes. Each is advertised like file/tcp/xfer, true only when the
-// platform really supports it (docs/sah-file-protocol.md §5.4 pattern).
-func serviceCapable() bool { return currentPlatform().Services.Available() }
-func packageCapable() bool { return currentPlatform().Packages.Available() }
-func configCapable() bool  { return currentPlatform().Config.Available() }
-func tweakCapable() bool   { return currentPlatform().Tweaks.Available() }
-
-func init() {
-	registerCapability("service", serviceCapable)
-	registerCapability("package", packageCapable)
-	registerCapability("config", configCapable)
-	registerCapability("tweak", tweakCapable)
-}
+// The service, package, config and tweak capability probes live in
+// capabilities.go.

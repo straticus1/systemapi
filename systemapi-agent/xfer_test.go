@@ -1570,8 +1570,10 @@ func TestXferCapabilityRules(t *testing.T) {
 		}
 		return false
 	}
-	if has() != xferAvailable() {
-		t.Fatal("capability does not follow the probe")
+	// Supported = the flags and the OS allow it; a failed openat2 probe is
+	// reported degraded, not withdrawn (capabilities.go).
+	if has() != (runtime.GOOS == "linux" || runtime.GOOS == "darwin") {
+		t.Fatal("capability does not follow the flags")
 	}
 	xferCfg.bin = ""
 	if has() {
