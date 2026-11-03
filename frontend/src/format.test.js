@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cpuLabel, scriptOutcome, terminalSocketURL, resizeFrameFor, jobActive, jobOutcome, jobClock, parseTimeout, jobErrorText, pollFailure } from './format.js';
+import { cpuLabel, scriptOutcome, terminalSocketURL, resizeFrameFor, jobActive, jobOutcome, jobClock, parseTimeout, jobErrorText, pollFailure, healthBadge, degradedCapabilities, healthTitle } from './format.js';
 
 test('cpuLabel shows a real sample', () => {
   assert.equal(cpuLabel({ status: 'online', cpu_percent: 42.345 }), '42.3%');
@@ -89,4 +89,35 @@ test('jobErrorText explains bad_timeout and passes other codes through', () => {
 test('pollFailure stops on 401/403/404/503 and retries the rest', () => {
   for (const s of [401, 403, 404, 503]) assert.equal(pollFailure(s), 'stop');
   for (const s of [undefined, 429, 500, 502, 504]) assert.equal(pollFailure(s), 'retry');
+});
+
+test('healthBadge maps the four states and shows anything else as unknown', () => {
+  for (const s of ['ok', 'degraded', 'unknown', 'offline']) assert.equal(healthBadge(s).state, s);
+  for (const s of [undefined, null, 'great', '__proto__', 'constructor', 'toString']) assert.equal(healthBadge(s).state, 'unknown');
+});
+
+test('degradedCapabilities lists expected capabilities that are not routable, with reason codes', () => {
+  const detail = {
+    supported: ['file', 'pty', 'xfer'],
+    effective: ['pty'],
+    expected: ['file', 'xfer', 'tcp'],
+    caps: [{ name: 'file', state: 'degraded', reason: 'enosys_openat2' }, { name: 'pty', state: 'ok', reason: '' }]
+  };
+  assert.deepEqual(degradedCapabilities(detail), [
+    { name: 'file', state: 'degraded', reason: 'enosys_openat2' },
+    { name: 'xfer', state: 'degraded', reason: '' },
+    { name: 'tcp', state: 'absent', reason: 'not_supported' }
+  ]);
+  assert.deepEqual(degradedCapabilities(null), []);
+  assert.deepEqual(degradedCapabilities({ expected: 'file' }), []);
+});
+
+test('healthTitle names degraded capabilities and reasons on hover', () => {
+  const detail = { supported: ['file'], effective: [], expected: ['file'], caps: [{ name: 'file', state: 'degraded', reason: 'enosys_openat2' }] };
+  assert.equal(healthTitle('degraded', detail), 'Degraded: file (enosys_openat2)');
+  assert.equal(healthTitle('degraded', null), 'Degraded.');
+  assert.match(healthTitle('unknown'), /not sent a capability report/);
+  assert.match(healthTitle(undefined), /unknown/);
+  assert.match(healthTitle('offline'), /Offline/);
+  assert.equal(healthTitle('ok'), 'All expected capabilities ok.');
 });

@@ -94,3 +94,44 @@ export function pollFailure(status) {
   if (status === 401 || status === 403 || status === 404 || status === 503) return 'stop';
   return 'retry';
 }
+
+// Host capability health from /api/v1/fleet (plan P1b): ok, degraded,
+// unknown (connected, no capability report yet) or offline. Anything else
+// shows as unknown.
+const HEALTH = {
+  ok: { label: 'ok', color: 'var(--accent-green)', background: 'var(--accent-green-soft)' },
+  degraded: { label: 'degraded', color: 'var(--accent-amber)', background: 'var(--accent-amber-soft)' },
+  unknown: { label: 'unknown', color: 'var(--text-muted)', background: 'rgba(255, 255, 255, 0.05)' },
+  offline: { label: 'offline', color: 'var(--text-muted)', background: 'rgba(255, 255, 255, 0.05)' }
+};
+
+export function healthBadge(health) {
+  const key = Object.prototype.hasOwnProperty.call(HEALTH, health) ? health : 'unknown';
+  return { state: key, ...HEALTH[key] };
+}
+
+// The expected capabilities that are not routable, with their reason codes,
+// from GET /api/v1/hosts/:id/capabilities. One the agent never advertised
+// shows as absent, not_supported.
+export function degradedCapabilities(detail) {
+  if (!detail || !Array.isArray(detail.expected)) return [];
+  const effective = new Set(Array.isArray(detail.effective) ? detail.effective : []);
+  const supported = new Set(Array.isArray(detail.supported) ? detail.supported : []);
+  const caps = Array.isArray(detail.caps) ? detail.caps : [];
+  return detail.expected.filter((name) => !effective.has(name)).map((name) => {
+    const row = caps.find((c) => c && c.name === name);
+    if (row && row.state !== 'ok') return { name, state: row.state, reason: row.reason || '' };
+    return supported.has(name) ? { name, state: 'degraded', reason: '' } : { name, state: 'absent', reason: 'not_supported' };
+  });
+}
+
+// The badge's hover text.
+export function healthTitle(health, detail) {
+  const { state } = healthBadge(health);
+  if (state === 'unknown') return 'Health unknown: the agent has not sent a capability report on this connection.';
+  if (state === 'offline') return 'Offline: no agent connection.';
+  if (state === 'ok') return 'All expected capabilities ok.';
+  const list = degradedCapabilities(detail);
+  if (list.length === 0) return 'Degraded.';
+  return `Degraded: ${list.map((c) => (c.reason ? `${c.name} (${c.reason})` : c.name)).join(', ')}`;
+}

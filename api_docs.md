@@ -203,6 +203,8 @@ capability ok).
   carried (in the header or not) and across reconnects. A row is written
   only when its state or reason changes; `since` is when the state last
   changed and `last_report_at` the report that last wrote the row.
+- Alerts, webhooks and metrics: [Capability and offline alerts](#capability-and-offline-alerts)
+  and [Prometheus series](#prometheus-series).
 
 ## Metrics and alerts
 
@@ -217,6 +219,64 @@ capability ok).
 
 Alert events are raised by the control plane's z-score check on CPU and memory
 telemetry and posted to the tenant's webhooks. There is no API for alert rules.
+
+### Capability and offline alerts
+
+Built-in rules (plan P1b, `controlplane/capalerts.js`), evaluated by the
+instance holding the host's agent socket in the 30 s control tick and after
+each accepted capability report. N is the agent report cadence,
+`SYSTEMAPI_CAPABILITY_INTERVAL_S` (integer 60..86400, default 600).
+
+| `rule_name` | Opens | Resolves |
+| --- | --- | --- |
+| `capability:<name>` | an **expected** capability (see Capability health) has been out of the connection's effective set for 2 x N continuously | after 2 consecutive reports with it routable, or at the next report once it is no longer expected |
+| `capability:reports` | a connection that sent at least one report sends none for 3 x N | after 2 reports |
+| `host:offline` | 5 minutes after the host's last agent socket closed (a reconnect inside that window opens nothing) | on reconnect |
+
+- A connection that never sent a report (health `unknown`: old agents,
+  reports switched off) never opens a capability alert.
+- At most one active (`open` or `ack`) alert per host and rule, across
+  replicas: the partial unique index
+  `cp_alert_events_active_capability_idx` and `ON CONFLICT DO NOTHING`. A
+  retired host gets none. `severity` is `warning` for `capability:*` and
+  `critical` for `host:offline`; `message` is the capability, state and
+  reason code (no paths).
+- Each open and resolve appends an audit row in the same transaction,
+  actor `system:capability`, action `capability_alert_open` or
+  `capability_alert_resolve`, payload `{"alert_id","rule","capability",
+  "state","reason"}`.
+- Webhook body, signed like every webhook (`X-SystemAPI-Signature:
+  sha256=<HMAC-SHA256 of the raw body with the webhook secret>`):
+
+  ```json
+  {"type":"capability_alert","status":"open","alert_id":42,"host_id":"c5bf94a5-...",
+   "capability":"file","state":"degraded","reason":"enosys_openat2"}
+  ```
+
+  `type` is `capability_alert` (`capability:*`; `capability` is `null` for
+  `capability:reports`, with `state` `unknown`, `reason` `report_missing`)
+  or `host_offline` (`capability` `null`; `state` `offline`, `reason`
+  `no_socket` on open; `online`, `reconnected` on resolve). `status` is
+  `open` or `resolved`; a resolve carries `state` `ok` (or `not_expected`)
+  and `reason` `""`. Opens keep the anomaly cooldown: at most one open
+  webhook per host and rule per 5 minutes (the alert row and its audit row
+  are always written); resolves are always sent.
+- Limits: `host:offline` cannot fire while the control plane is down, nor
+  for a host that went offline before the control plane process started;
+  use an external check of `/ready`.
+
+### Prometheus series
+
+`GET /metrics` (prom-client). The capability gauges are set in the 30 s
+refresh from the database, so every replica reports the same values; a
+retired host's series are removed at retire and left out of every refresh.
+
+| Series | Type | Meaning |
+| --- | --- | --- |
+| `systemapi_capability_state{host_id,capability,state}` | gauge | 1 for the stored state row of each capability per live host (`cp_host_capabilities`) |
+| `systemapi_hosts_health{state}` | gauge | live hosts by health: `ok`, `degraded`, `unknown`, `offline` (`offline` unless the host row is online; otherwise the health last written by the instance holding its socket, `unknown` before any) |
+| `systemapi_agent_unsupported_total{capability}` | counter | requests this instance refused `agent_unsupported` because the capability is not routable |
+| `systemapi_capability_report_dropped_total{reason}` | counter | capability reports this instance refused or dropped: `pre_enroll`, `stale_socket`, `in_flight`, `too_soon`, `unknown_name`, or a validator code (`too_large`, `bad_frame`, `bad_version`, `bad_probed_at`, `bad_caps`, `too_many`, `bad_entry`, `duplicate`, `bad_state`, `bad_reason`) |
 
 ## Execution
 

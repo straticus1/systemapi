@@ -47,6 +47,11 @@ export const FleetAPI = {
     const res = await api.post(`/api/v1/jobs/${encodeURIComponent(jobId)}/cancel`);
     return res.data;
   },
+  // Capability health detail: health, supported, effective, expected, caps.
+  getCapabilities: async (hostId) => {
+    const res = await api.get(`/api/v1/hosts/${encodeURIComponent(hostId)}/capabilities`);
+    return res.data;
+  },
   getAlerts: async () => {
     const res = await api.get('/api/v1/alerts');
     return res.data;

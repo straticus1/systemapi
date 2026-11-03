@@ -19,6 +19,7 @@
   --accent-green: #3fa877;
   --accent-green-soft: rgba(63, 168, 119, 0.12);
   --accent-amber: #c99a3e;
+  --accent-amber-soft: rgba(201, 154, 62, 0.12);
 }
 
 * {

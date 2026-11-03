@@ -1471,3 +1471,95 @@ test('setHostCapabilities writes only changed rows in one statement, keeps since
   await registry.clearAgentPresence(host, 'conn-x');
   assert.equal((await registry.listHostCapabilities(host)).length, 3);
 });
+
+test('capability alerts: one active alert per host and rule across registries (the partial index), audit in the same transaction, retired hosts skipped', async () => {
+  const H = '77777777-7777-4777-8777-777777777777';
+  const R = '88888888-8888-4888-8888-888888888888';
+  const base = { tenantId: 'acme', userId: 'user-1', keyId: 'k1', os: '', platform: '' };
+  await registry.enroll({ ...base, hostId: H, hostname: 'cap.example', sshPubkey: opensshEd25519(8) });
+  await registry.enroll({ ...base, hostId: R, hostname: 'gone.example', sshPubkey: opensshEd25519(9) });
+  const other = new PgRegistry(pool, { NODE_ENV: 'production' });
+  const audit = { rule: 'capability:file', capability: 'file', state: 'degraded', reason: 'enosys_openat2' };
+  const entry = { host_id: H, rule_name: 'capability:file', severity: 'warning', message: 'file degraded (enosys_openat2)', actor: 'system:capability', audit };
+  const auditCount = async (action) => (await pool.query('SELECT count(*)::int AS n FROM cp_audit WHERE action = $1 AND host_id = $2', [action, H])).rows[0].n;
+
+  // Eight concurrent opens from two registries: one row, one audit row.
+  const outs = await Promise.all(Array.from({ length: 8 }, (_, i) => (i % 2 ? other : registry).openHostAlert(entry)));
+  const made = outs.filter(Boolean);
+  assert.equal(made.length, 1);
+  assert.equal(made[0].tenant_id, 'acme', 'tenant read from cp_hosts');
+  const active = async (rule) => (await pool.query(
+    "SELECT id, status FROM cp_alert_events WHERE host_id = $1 AND rule_name = $2 AND status IN ('open', 'ack')", [H, rule])).rows;
+  assert.equal((await active('capability:file')).length, 1);
+  assert.equal(await auditCount('capability_alert_open'), 1);
+  // ack still counts as active.
+  await registry.setAlertStatus(['acme'], made[0].id, 'ack');
+  assert.equal(await registry.openHostAlert(entry), null);
+  // A plain INSERT of a second active row is refused by the index itself.
+  await assert.rejects(pool.query(
+    "INSERT INTO cp_alert_events (tenant_id, host_id, rule_name, status) VALUES ('acme', $1, 'capability:file', 'open')", [H]), /cp_alert_events_active_capability_idx/);
+  // host:offline is covered too; other rules (anomaly, sysscript) are not.
+  const offline = { ...entry, rule_name: 'host:offline', audit: { ...audit, rule: 'host:offline', capability: null } };
+  assert.ok(await registry.openHostAlert(offline));
+  assert.equal(await other.openHostAlert(offline), null);
+  await pool.query("INSERT INTO cp_alert_events (tenant_id, host_id, rule_name, status) VALUES ('acme', $1, 'zscore:cpu', 'open'), ('acme', $1, 'zscore:cpu', 'open')", [H]);
+
+  // Resolve: both rules in one transaction with one audit row each; again is a no-op.
+  const resolved = await other.resolveHostAlerts(H, [
+    { rule: 'capability:file', capability: 'file', state: 'ok', reason: '' },
+    { rule: 'host:offline', capability: null, state: 'online', reason: 'reconnected' }
+  ], 'system:capability');
+  assert.deepEqual(resolved.map((x) => x.rule_name).sort(), ['capability:file', 'host:offline']);
+  assert.equal(await auditCount('capability_alert_resolve'), 2);
+  assert.deepEqual(await registry.resolveHostAlerts(H, [{ rule: 'capability:file' }], 'system:capability'), []);
+  const payload = (await pool.query(
+    "SELECT payload FROM cp_audit WHERE action = 'capability_alert_resolve' AND host_id = $1 AND payload->>'rule' = 'capability:file'", [H])).rows[0].payload;
+  assert.deepEqual(payload, { alert_id: Number(made[0].id), rule: 'capability:file', capability: 'file', state: 'ok', reason: '' });
+  // After a resolve, a new episode opens a new row.
+  assert.ok(await registry.openHostAlert(entry));
+
+  // A failing audit insert rolls the alert back (fail closed).
+  await pool.query(`CREATE FUNCTION test_refuse_cap_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN RAISE EXCEPTION 'audit refused by test'; END $$`);
+  await pool.query('CREATE TRIGGER test_refuse_cap_audit BEFORE INSERT ON cp_audit FOR EACH ROW EXECUTE FUNCTION test_refuse_cap_audit()');
+  try {
+    await assert.rejects(registry.openHostAlert({ ...entry, rule_name: 'capability:tcp', audit: { ...audit, rule: 'capability:tcp' } }), /audit refused/);
+    assert.equal((await active('capability:tcp')).length, 0);
+    await assert.rejects(registry.resolveHostAlerts(H, [{ rule: 'capability:file', capability: 'file', state: 'ok', reason: '' }], 'a'), /audit refused/);
+    assert.equal((await active('capability:file')).length, 1, 'resolve rolled back');
+  } finally {
+    await pool.query('DROP TRIGGER test_refuse_cap_audit ON cp_audit');
+    await pool.query('DROP FUNCTION test_refuse_cap_audit()');
+  }
+
+  // A retired host gets no alert; a bad rule never reaches SQL.
+  await registry.retireHost({ tenantId: 'acme', hostId: R, actor: 'u', reason: 'gone' });
+  assert.equal(await registry.openHostAlert({ ...entry, host_id: R }), null);
+  await assert.rejects(registry.openHostAlert({ ...entry, rule_name: "capability:x'; DROP TABLE cp_audit; --" }), (e) => e.code === 'bad_alert_rule');
+  // The drift index is untouched.
+  const idx = (await pool.query("SELECT indexdef FROM pg_indexes WHERE indexname = 'cp_alert_events_active_drift_idx'")).rows[0].indexdef;
+  assert.match(idx, /rule_name ~~ 'drift:%'/);
+  assert.equal((await registry.verifyAudit()).ok, true);
+});
+
+test('capability gauges from the database: health counts and state rows, retired hosts left out', async () => {
+  const H = '99999999-9999-4999-8999-999999999999';
+  const base = { tenantId: 'gauge', userId: 'user-g', keyId: 'kg', os: '', platform: '' };
+  const empty = await registry.countHostHealth();
+  await registry.enroll({ ...base, hostId: H, hostname: 'g.example', sshPubkey: opensshEd25519(10) });
+  const before = await registry.countHostHealth();
+  assert.equal(before.unknown, empty.unknown + 1, 'an enrolled host without a written health counts as unknown');
+  await registry.setHostHealth(H, 'degraded');
+  await registry.setHostCapabilities(H, [{ name: 'file', state: 'degraded', reason: 'enosys_openat2' }]);
+  const during = await registry.countHostHealth();
+  assert.equal(during.degraded, before.degraded + 1);
+  assert.equal(during.unknown, before.unknown - 1);
+  assert.ok((await registry.listCapabilityStates()).some((r) => r.host_id === H && r.name === 'file' && r.state === 'degraded'));
+  await assert.rejects(registry.setHostHealth(H, 'offline'), (e) => e.code === 'bad_health');
+  await assert.rejects(pool.query("UPDATE cp_hosts SET capability_health = 'great' WHERE host_id = $1", [H]));
+  await registry.setHostStatus(H, 'offline');
+  assert.equal((await registry.countHostHealth()).offline, before.offline + 1);
+  await registry.retireHost({ tenantId: 'gauge', hostId: H, actor: 'u', reason: 'gone' });
+  assert.deepEqual(await registry.countHostHealth(), empty, 'a retired host is not counted');
+  assert.equal((await registry.listCapabilityStates()).some((r) => r.host_id === H), false);
+});

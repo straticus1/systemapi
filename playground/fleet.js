@@ -63,8 +63,9 @@ const { zscore } = require('../controlplane/stats');
 const { readPlaybook } = require('../controlplane/playbooks');
 const { parseCapabilities, effectivePolicies } = require('../controlplane/channels');
 const {
-    validateCapabilityReport, ConnectionCapabilities, expectedCapabilities, hostHealth
+    validateCapabilityReport, ConnectionCapabilities, expectedCapabilities, hostHealth, KNOWN_CAPABILITIES, CAPABILITY_STATES
 } = require('../controlplane/capabilities');
+const { CapabilityAlerts } = require('../controlplane/capalerts');
 const {
     normalizeSoftwareInventory, SOFTWARE_REFRESH_MS, SOFTWARE_MIN_WRITE_GAP_MS, SOFTWARE_RETRY_MS, SOFTWARE_MAX_CONCURRENT
 } = require('../controlplane/software');
@@ -113,6 +114,7 @@ const CAP_REPORT_GAP_MS = 60_000;
 const CAP_VIOLATION_WINDOW_MS = 10 * 60_000;
 const CAP_VIOLATION_MAX = 10;
 const AGENT_POLICY_CLOSE = 1008;
+const KNOWN_CAPABILITY_SET = new Set(KNOWN_CAPABILITIES);
 // sys.alerts.push frames (sysscript_alert). The agent enforces the same
 // limits; these hold against an agent that does not.
 const ALERT_SEVERITIES = new Set(['info', 'warning', 'critical']);
@@ -211,6 +213,9 @@ class FleetManager {
         this.capReportGapMs = CAP_REPORT_GAP_MS;
         this.capViolationWindowMs = CAP_VIOLATION_WINDOW_MS;
         this.capViolationMax = CAP_VIOLATION_MAX;
+        // capability:<name>, capability:reports and host:offline alerts
+        // (controlplane/capalerts.js), evaluated in the control tick.
+        this.capAlerts = new CapabilityAlerts(this);
         this.agentPingMs = AGENT_PING_MS;
         this.terminalSessions = new Map();
         this.terminalWss = new WebSocket.Server({ noServer: true, maxPayload: PTY_FRAME_MAX });
@@ -953,6 +958,7 @@ class FleetManager {
             if (this.connectedAgents.get(hostId) !== ws) return;
             this.connectedAgents.delete(hostId);
             this.jobs.onClose(ws, hostId);
+            this.capAlerts.onDisconnect(hostId);
             if (this.registry) {
                 try { await this.registry.setHostStatus(hostId, 'offline'); } catch (err) {
                     console.error('[Fleet] status update failed:', err.message);
@@ -1034,6 +1040,10 @@ class FleetManager {
             this.agentKeys.set(ws, keyId);
             this.connectedAgents.set(hostId, ws);
             this.jobs.onEnroll(ws, hostId);
+            const enrolledId = hostId;
+            this.capAlerts.onConnect(enrolledId).catch((err) => {
+                console.error(`[Fleet] capability alerts on connect failed host=${enrolledId} error=${errorCode(err)}`);
+            });
             ws.send(JSON.stringify({
                 type: 'enrolled',
                 host_id: hostId,
@@ -1155,14 +1165,22 @@ class FleetManager {
     }
 
     // The reason code an agent_unsupported for capability carries, or null.
+    // Called only where routing answers agent_unsupported, so it also counts
+    // systemapi_agent_unsupported_total{capability}.
     agentUnsupportedReason(hostId, capability) {
+        if (this.metrics && this.metrics.agentUnsupportedTotal) {
+            this.metrics.agentUnsupportedTotal.inc({ capability: KNOWN_CAPABILITY_SET.has(capability) ? capability : 'other' });
+        }
         const ws = this.connectedAgents.get(hostId);
         const state = ws && this.agentCapState.get(ws);
         return state ? state.unsupportedReason(capability) : null;
     }
 
+    // reason is a fixed code (the validator's errors and the rate-limit
+    // ones), so the counter's label set is bounded.
     noteCapabilityDrop(reason) {
         this.capReportDrops.set(reason, (this.capReportDrops.get(reason) || 0) + 1);
+        if (this.metrics && this.metrics.capabilityReportDroppedTotal) this.metrics.capabilityReportDroppedTotal.inc({ reason });
     }
 
     capReportLimit(hostId) {
@@ -1223,18 +1241,63 @@ class FleetManager {
         limit.lastAt = now;
         limit.probeCredit = false;
         state.applyReport(checked.report, now);
+        this.capAlerts.noteReport(hostId, state);
         limit.inFlight = true;
+        let changed = false;
         try {
-            await this.storeCapabilities(hostId, checked.report.caps);
+            changed = await this.storeCapabilities(hostId, checked.report.caps);
         } finally {
             limit.inFlight = false;
+        }
+        // A change already evaluated the alerts (onCapabilityChange).
+        if (!changed) await this.evaluateCapabilityAlerts(hostId);
+    }
+
+    async evaluateCapabilityAlerts(hostId) {
+        try {
+            await this.capAlerts.evaluate(hostId, { refresh: true });
+        } catch (err) {
+            console.error(`[Fleet] capability alert evaluation failed host=${hostId} error=${errorCode(err)}`);
+        }
+    }
+
+    // The control tick's alert pass (controlplane/index.js).
+    tickCapabilityAlerts() {
+        return this.capAlerts.tick();
+    }
+
+    // A capability or host-offline alert webhook (signed by deliverWebhooks).
+    // Opens keep the anomaly cooldown: at most one open webhook per host and
+    // rule per COOLDOWN_MS; resolves are always sent. The alert row and its
+    // audit row are never suppressed.
+    async deliverAlertWebhook(tenantId, rule, hostId, body, isOpen) {
+        if (!tenantId) return;
+        if (isOpen && this.cooled(hostId, rule)) return;
+        await deliverWebhooks(this, tenantId, body);
+    }
+
+    // A retired host leaves the alert state, the cooldowns and its
+    // capability gauge series at once (refreshGauges also leaves it out).
+    onHostRetired(hostId) {
+        this.capAlerts.dropHost(hostId);
+        this.capStored.delete(hostId);
+        this.capReportLimits.delete(hostId);
+        for (const key of [...this.alertCooldown.keys()]) {
+            if (key.endsWith(`:${hostId}`)) this.alertCooldown.delete(key);
+        }
+        const gauge = this.metrics && this.metrics.capabilityStateGauge;
+        if (gauge) {
+            for (const capability of KNOWN_CAPABILITIES) {
+                for (const state of CAPABILITY_STATES) gauge.remove({ host_id: hostId, capability, state });
+            }
         }
     }
 
     // Writes the report's rows that differ from what was last written for
     // hostId (all of them when nothing is cached), in one statement. A failed
     // write is logged and forgets the cache, so the next report writes every
-    // row again; routing already took the report.
+    // row again; routing already took the report. True when a state changed
+    // (onCapabilityChange ran).
     async storeCapabilities(hostId, caps) {
         if (!this.registry || typeof this.registry.setHostCapabilities !== 'function') return;
         const stored = this.capStored.get(hostId);
@@ -1244,29 +1307,32 @@ class FleetManager {
                 return !prev || prev.state !== c.state || prev.reason !== c.reason;
             })
             : caps;
-        if (rows.length === 0) return;
+        if (rows.length === 0) return false;
         let changed;
         try {
             changed = await this.registry.setHostCapabilities(hostId, rows);
         } catch (err) {
             this.capStored.delete(hostId);
             console.error(`[Fleet] capability write failed host=${hostId} error=${errorCode(err)}`);
-            return;
+            return false;
         }
         const next = stored || new Map();
         for (const c of rows) next.set(c.name, { state: c.state, reason: c.reason });
         this.capStored.set(hostId, next);
         const changes = changed.filter((c) => c.previous_state !== c.state);
-        if (changes.length > 0) this.onCapabilityChange(hostId, changes);
+        if (changes.length === 0) return false;
+        await this.onCapabilityChange(hostId, changes);
+        return true;
     }
 
-    // The single hook for capability state changes (alerts, webhooks and
-    // metrics arrive with a later phase). changes is [{name, state, reason,
-    // since, last_report_at, previous_state}] for the rows whose state
-    // changed; previous_state is null on a name's first row.
-    onCapabilityChange(hostId, changes) {
+    // The single hook for capability state changes: logs them and evaluates
+    // the host's alerts. changes is [{name, state, reason, since,
+    // last_report_at, previous_state}] for the rows whose state changed;
+    // previous_state is null on a name's first row.
+    async onCapabilityChange(hostId, changes) {
         const summary = changes.map((c) => `${c.name}:${c.previous_state || 'none'}->${c.state}`).join(',');
         console.log(`[Fleet] capability change host=${hostId} ${summary}`);
+        await this.evaluateCapabilityAlerts(hostId);
     }
 
     // Sends capability_probe to hostId's live agent (old agents ignore it);

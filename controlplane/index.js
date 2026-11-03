@@ -38,6 +38,9 @@ async function boot(fleet, env = process.env, logger = console) {
     tickSchedules(fleet, logger).catch((err) => logger.error('[control] schedule tick failed:', err.message));
     refreshGauges(fleet).catch((err) => logger.error('[control] gauge refresh failed:', err.message));
     if (fleet.jobs) fleet.jobs.tick().catch((err) => logger.error('[control] job tick failed:', err.message));
+    if (typeof fleet.tickCapabilityAlerts === 'function') {
+      fleet.tickCapabilityAlerts().catch((err) => logger.error('[control] capability alert tick failed:', err.message));
+    }
   }, 30000);
   if (typeof timer.unref === 'function') timer.unref();
   fleet.scheduleTimer = timer;
@@ -106,6 +109,19 @@ async function refreshGauges(fleet) {
   if (fleet.metrics.alertsActiveGauge && typeof fleet.registry.countOpenAlerts === 'function') {
     // Process-wide count of status=open. Not a per-tenant view.
     fleet.metrics.alertsActiveGauge.set(await fleet.registry.countOpenAlerts());
+  }
+  // Capability health from the database (cp_host_capabilities and
+  // cp_hosts.capability_health), so every replica reports the same series;
+  // a retired host's series disappear at the next refresh. reset() and the
+  // sets run without an await between them, so a scrape never sees a gap.
+  if (fleet.metrics.capabilityStateGauge && typeof fleet.registry.listCapabilityStates === 'function') {
+    const rows = await fleet.registry.listCapabilityStates();
+    fleet.metrics.capabilityStateGauge.reset();
+    for (const r of rows) fleet.metrics.capabilityStateGauge.set({ host_id: r.host_id, capability: r.name, state: r.state }, 1);
+  }
+  if (fleet.metrics.hostsHealthGauge && typeof fleet.registry.countHostHealth === 'function') {
+    const counts = await fleet.registry.countHostHealth();
+    for (const state of ['ok', 'degraded', 'unknown', 'offline']) fleet.metrics.hostsHealthGauge.set({ state }, counts[state] || 0);
   }
 }
 
