@@ -16,8 +16,28 @@ function attach(app, fleet, env = process.env, logger = console) {
   return fleet;
 }
 
+// SYSTEMAPI_INSTANCE_ID: a stable id for this process on presence rows
+// (cp_hosts.agent_instance), 1..64 of [A-Za-z0-9_.-]; null when unset or
+// malformed (the presence id then stays random per process). It must be
+// unique per running process: boot marks every host that names it offline.
+const INSTANCE_ID_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+function stableInstanceId(env) {
+  const raw = env && env.SYSTEMAPI_INSTANCE_ID;
+  return typeof raw === 'string' && INSTANCE_ID_RE.test(raw) ? raw : null;
+}
+
 async function boot(fleet, env = process.env, logger = console) {
-  fleet.registry = await createRegistry({ pool: fleet.db, env, logger });
+  const instance = stableInstanceId(env);
+  if (instance && fleet.jobs) fleet.jobs.instanceId = instance;
+  const registry = await createRegistry({ pool: fleet.db, env, logger });
+  // Before any agent can enroll here (enroll needs fleet.registry): the
+  // hosts this process held before a restart are offline with no capability
+  // health, so no stale ok or degraded outlives the process that wrote it.
+  if (fleet.jobs && typeof registry.releaseInstanceHosts === 'function') {
+    const released = await registry.releaseInstanceHosts(fleet.jobs.instanceId);
+    if (released > 0) logger.log(`[control] ${released} host(s) held by this instance before its restart marked offline`);
+  }
+  fleet.registry = registry;
   fleet.env = env;
   if (env.REDIS_URL) {
     try {
@@ -130,5 +150,6 @@ module.exports = {
   boot,
   refreshGauges,
   tickSchedules,
-  deliverWebhooks
+  deliverWebhooks,
+  stableInstanceId
 };

@@ -160,8 +160,12 @@ capability ok).
   supports; `X-SystemAPI-Capabilities-Degraded` (same grammar: at most 16
   tokens of `[a-z][a-z0-9_]{0,15}`, 256 bytes) names the supported ones whose
   probe failed at dial. The agent then sends `{"type":"capability_report",
-  "v":1,"probed_at":"<RFC3339>","caps":[{"name","state","reason"}]}` after
-  enroll, about every 10 minutes and on change. `state` is `ok`, `degraded`
+  "v":1,"probed_at":"<RFC3339>","caps":[{"name","state","reason"}],
+  "interval_s":<int>}` after enroll, every `--capability-interval` (default
+  10 minutes), on each dial and on a `capability_probe`. `interval_s` is the
+  agent's report interval in seconds: optional (older agents omit it), and
+  when present an integer from 60 to 3600, else the frame is refused
+  `bad_interval`. It is kept per connection, from the latest report. `state` is `ok`, `degraded`
   or `absent`; `reason` is empty when ok, else one of `enosys_openat2`,
   `binary_missing`, `helper_unit_missing`, `helper_trust_missing`,
   `manager_unreachable`, `flag_off`, `unsupported_os`, `no_systemd`,
@@ -170,8 +174,9 @@ capability ok).
   from the known list (`pty`, `file`, `tcp`, `xfer`, `service`, `config`,
   `package`, `tweak`, `sysscript_jobs`, `converge`, `config_write`,
   `sysctl_write`, `override_write`; others are dropped); anything else in it
-  refuses the whole frame. Per host one report is processed at a time and
-  reports are at least 60 s apart (the first on a connection and the answer
+  refuses the whole frame. Per agent socket one report is written at a time
+  (writes for one host run in order, never overlapping, across reconnects)
+  and reports are at least 60 s apart (the first on a connection and the answer
   to a probe excepted); extras are dropped. 10 refused or dropped reports
   within 10 minutes close the agent socket with 1008 and an
   `agent_capability_flood` security event.
@@ -180,8 +185,9 @@ capability ok).
   `degraded` or `absent` and restores the ones it marks `ok`; a name missing
   from a report keeps its state, and a report never adds a name the header
   lacks. `sysscript_jobs` and `converge` follow the header only. A withdrawn
-  capability answers `agent_unsupported` with its `reason` (`probe_error`
-  when only the degraded header named it): `{"error":"agent_unsupported",
+  capability answers `agent_unsupported` with its `reason` (when only the
+  degraded header named it: `helper_unit_missing` for a `*_write` token,
+  `probe_error` otherwise): `{"error":"agent_unsupported",
   "reason":"enosys_openat2"}` in the channel status frame, or the 501 body
   of an xfer grant.
 - **sys writes.** `config write` needs `config_write`, `tweak sysctl-set`
@@ -195,10 +201,18 @@ capability ok).
   `config_write`, service units `service`, tweak sysctls `tweak` and
   `sysctl_write`, tweak units `tweak` and `override_write`, package names
   `package`, a tcp allow list `tcp`.
-- **`health`**: `offline` (no agent socket on this control plane), `unknown`
-  (connected, no report on this connection yet: old agents, reports off),
-  `degraded` (an expected capability is not in the effective set), else
-  `ok`.
+- **`health`**: `offline` (no agent socket), `unknown` (connected, no
+  report on this connection yet: old agents, reports off), `degraded` (an
+  expected capability is not in the effective set), else `ok`. The instance
+  holding the socket computes it and writes it to `cp_hosts.capability_health`
+  (only while the host's presence row names that instance); every other
+  replica shows that row (`offline` unless the row is online). Disconnect,
+  retire and a restart of the holding instance clear it. A restart finds its
+  own rows only with a stable `SYSTEMAPI_INSTANCE_ID` (1..64 of
+  `[A-Za-z0-9_.-]`, unique per running process; boot marks every host whose
+  presence names it offline before taking sockets). Unset, the presence id
+  is random per process and a crashed instance's hosts stay until their
+  status is next written.
 - **`caps`** are the stored rows, kept for every known name a report
   carried (in the header or not) and across reconnects. A row is written
   only when its state or reason changes; `since` is when the state last
@@ -224,14 +238,15 @@ telemetry and posted to the tenant's webhooks. There is no API for alert rules.
 
 Built-in rules (plan P1b, `controlplane/capalerts.js`), evaluated by the
 instance holding the host's agent socket in the 30 s control tick and after
-each accepted capability report. N is the agent report cadence,
-`SYSTEMAPI_CAPABILITY_INTERVAL_S` (integer 60..86400, default 600).
+each accepted capability report. N is the report cadence: the larger of
+`SYSTEMAPI_CAPABILITY_INTERVAL_S` (integer 60..3600, default 600; anything
+else is the default) and the `interval_s` of the connection's latest report.
 
 | `rule_name` | Opens | Resolves |
 | --- | --- | --- |
 | `capability:<name>` | an **expected** capability (see Capability health) has been out of the connection's effective set for 2 x N continuously | after 2 consecutive reports with it routable, or at the next report once it is no longer expected |
 | `capability:reports` | a connection that sent at least one report sends none for 3 x N | after 2 reports |
-| `host:offline` | 5 minutes after the host's last agent socket closed (a reconnect inside that window opens nothing) | on reconnect |
+| `host:offline` | 5 minutes after the host's last agent socket closed (a reconnect inside that window opens nothing, on any replica: the insert re-checks that the row is not online and has no presence written in the last 90 s) | on reconnect |
 
 - A connection that never sent a report (health `unknown`: old agents,
   reports switched off) never opens a capability alert.
@@ -241,6 +256,16 @@ each accepted capability report. N is the agent report cadence,
   retired host gets none. `severity` is `warning` for `capability:*` and
   `critical` for `host:offline`; `message` is the capability, state and
   reason code (no paths).
+- At most 6 opens per host per rolling hour (all rules together), per
+  instance: a flapping agent cannot flood alerts or webhooks. A held-back
+  open is counted once in `systemapi_capability_alert_capped_total{rule}`
+  and opens once the hour allows, if its condition still holds.
+- A failed database write leaves the rule's state as it was; the next tick
+  tries again.
+- Retiring a host resolves its active `capability:*` and `host:offline`
+  alerts in the retire transaction, each with a `capability_alert_resolve`
+  audit row (actor the retiring user, `state` and `reason` `retired`); no
+  webhook is sent for them.
 - Each open and resolve appends an audit row in the same transaction,
   actor `system:capability`, action `capability_alert_open` or
   `capability_alert_resolve`, payload `{"alert_id","rule","capability",
@@ -249,8 +274,9 @@ each accepted capability report. N is the agent report cadence,
   sha256=<HMAC-SHA256 of the raw body with the webhook secret>`):
 
   ```json
-  {"type":"capability_alert","status":"open","alert_id":42,"host_id":"c5bf94a5-...",
-   "capability":"file","state":"degraded","reason":"enosys_openat2"}
+  {"type":"capability_alert","status":"open","rule":"capability:file","alert_id":42,
+   "host_id":"c5bf94a5-...","capability":"file","state":"degraded","reason":"enosys_openat2",
+   "ts":"2026-11-03T12:20:00.000Z"}
   ```
 
   `type` is `capability_alert` (`capability:*`; `capability` is `null` for
@@ -260,7 +286,10 @@ each accepted capability report. N is the agent report cadence,
   `open` or `resolved`; a resolve carries `state` `ok` (or `not_expected`)
   and `reason` `""`. Opens keep the anomaly cooldown: at most one open
   webhook per host and rule per 5 minutes (the alert row and its audit row
-  are always written); resolves are always sent.
+  are always written). A resolve is sent unless its open's webhook was
+  suppressed by that cooldown (then neither goes out). `rule` is the alert's
+  `rule_name`; `ts` (ISO 8601, inside the signed body) is when the control
+  plane evaluated it, so a receiver can drop replays.
 - Limits: `host:offline` cannot fire while the control plane is down, nor
   for a host that went offline before the control plane process started;
   use an external check of `/ready`.
@@ -276,7 +305,8 @@ retired host's series are removed at retire and left out of every refresh.
 | `systemapi_capability_state{host_id,capability,state}` | gauge | 1 for the stored state row of each capability per live host (`cp_host_capabilities`) |
 | `systemapi_hosts_health{state}` | gauge | live hosts by health: `ok`, `degraded`, `unknown`, `offline` (`offline` unless the host row is online; otherwise the health last written by the instance holding its socket, `unknown` before any) |
 | `systemapi_agent_unsupported_total{capability}` | counter | requests this instance refused `agent_unsupported` because the capability is not routable |
-| `systemapi_capability_report_dropped_total{reason}` | counter | capability reports this instance refused or dropped: `pre_enroll`, `stale_socket`, `in_flight`, `too_soon`, `unknown_name`, or a validator code (`too_large`, `bad_frame`, `bad_version`, `bad_probed_at`, `bad_caps`, `too_many`, `bad_entry`, `duplicate`, `bad_state`, `bad_reason`) |
+| `systemapi_capability_report_dropped_total{reason}` | counter | capability reports this instance refused or dropped: `pre_enroll`, `stale_socket`, `in_flight` (this socket's previous write still running: never a violation), `too_soon`, `unknown_name`, or a validator code (`too_large`, `bad_frame`, `bad_version`, `bad_probed_at`, `bad_interval`, `bad_caps`, `too_many`, `bad_entry`, `duplicate`, `bad_state`, `bad_reason`) |
+| `systemapi_capability_alert_capped_total{rule}` | counter | alert opens this instance held back by the 6-per-host-per-hour cap |
 
 ## Execution
 

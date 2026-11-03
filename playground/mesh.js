@@ -150,6 +150,7 @@ class MeshChannels {
             return;
         }
         if (!fm.agentSupports(hostId, 'tcp')) {
+            if (typeof fm.noteUnsupported === 'function') fm.noteUnsupported('tcp');
             this.failSocket(ws, 'agent_unsupported', fm.agentUnsupportedReason(hostId, 'tcp'));
             return;
         }

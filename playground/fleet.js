@@ -42,8 +42,11 @@
  * live agent the same way: close 4403 "host_retired" (retireAgent), and the
  * registry refuses that host_id's re-enroll as host_retired.
  * Capability health (controlplane/capabilities.js, with its own Threats
- * note): capability_report frames count only after enroll, one at a time per
- * host and at least 60 s apart; refused or dropped ones are counted, and 10
+ * note): capability_report frames count only after enroll, one write at a
+ * time per socket (writes for one host queue behind each other, across
+ * sockets) and at least 60 s apart; refused or dropped ones are counted (a
+ * report dropped because our own write is still running is never a
+ * violation), and 10
  * within 10 min close the socket 1008. Routing uses the dial header minus the
  * degraded header minus what reports on this connection withdraw; a report
  * never adds a capability. Health is self-reported: it detects breakage, NOT
@@ -115,9 +118,6 @@ const CAP_REPORT_GAP_MS = 60_000;
 // the agent measures from its own last write, so a report delayed in
 // transit can arrive a little early.
 const CAP_REPORT_GAP_SLACK_MS = 5_000;
-// A capability write slower than this is given up (the next report writes
-// every row again), so a slow database never holds a host's slot.
-const CAP_WRITE_TIMEOUT_MS = 5_000;
 const CAP_VIOLATION_WINDOW_MS = 10 * 60_000;
 const CAP_VIOLATION_MAX = 10;
 const AGENT_POLICY_CLOSE = 1008;
@@ -211,14 +211,18 @@ class FleetManager {
         // (ConnectionCapabilities). agentCaps stays the dial header, which
         // job routing, the converge gate and the presence row read.
         this.agentCapState = new WeakMap();
-        // Per host: the capability_report rate state, and the capability
-        // rows last written (so a report writes only what changed).
+        // Per host: the capability_report rate state. Per live agent socket:
+        // its write slot (one capability write in flight) and the rows it
+        // last wrote (so a report writes only what changed); keyed by socket,
+        // so an old socket's late write never touches the new one's state.
+        // Per host: the tail of its capability writes, so writes for one
+        // host never overlap, across sockets too.
         this.capReportLimits = new Map();
-        this.capStored = new Map();
+        this.capWrites = new WeakMap();
+        this.capWriteChains = new Map();
         // Refused or dropped capability_report frames by reason code.
         this.capReportDrops = new Map();
         this.capReportGapMs = CAP_REPORT_GAP_MS;
-        this.capWriteTimeoutMs = CAP_WRITE_TIMEOUT_MS;
         this.capViolationWindowMs = CAP_VIOLATION_WINDOW_MS;
         this.capViolationMax = CAP_VIOLATION_MAX;
         // capability:<name>, capability:reports and host:offline alerts
@@ -1043,8 +1047,8 @@ class FleetManager {
             this.agentCaps.set(ws, request.systemapiCapabilities || new Set());
             // A fresh connection starts from what it reports, not from what
             // this instance last wrote (another instance may have written
-            // since), and holds no probe credit from an earlier socket.
-            this.capStored.delete(hostId);
+            // since: the write cache is per socket), and holds no probe
+            // credit from an earlier socket.
             if (this.capReportLimits.has(hostId)) this.capReportLimits.get(hostId).probeCredit = false;
             this.agentCapState.set(ws, new ConnectionCapabilities(
                 request.systemapiCapabilities || new Set(),
@@ -1177,13 +1181,16 @@ class FleetManager {
         return (ws && this.agentCaps.get(ws)) || new Set();
     }
 
-    // The reason code an agent_unsupported for capability carries, or null.
-    // Called only where routing answers agent_unsupported, so it also counts
-    // systemapi_agent_unsupported_total{capability}.
-    agentUnsupportedReason(hostId, capability) {
+    // Counts systemapi_agent_unsupported_total{capability}: called wherever
+    // routing answers agent_unsupported (the channels and the job routes).
+    noteUnsupported(capability) {
         if (this.metrics && this.metrics.agentUnsupportedTotal) {
             this.metrics.agentUnsupportedTotal.inc({ capability: KNOWN_CAPABILITY_SET.has(capability) ? capability : 'other' });
         }
+    }
+
+    // The reason code an agent_unsupported for capability carries, or null.
+    agentUnsupportedReason(hostId, capability) {
         const ws = this.connectedAgents.get(hostId);
         const state = ws && this.agentCapState.get(ws);
         return state ? state.unsupportedReason(capability) : null;
@@ -1235,9 +1242,10 @@ class FleetManager {
             return;
         }
         const limit = this.capReportLimit(hostId);
-        // A write still running is our side being slow, not the agent
-        // misbehaving: drop and count it, never a violation.
-        if (limit.inFlight) {
+        const slot = this.capWriteState(ws);
+        // This socket's write still running is our side being slow, not the
+        // agent misbehaving: drop and count it, never a violation.
+        if (slot.inFlight) {
             this.noteCapabilityDrop('in_flight');
             return;
         }
@@ -1257,15 +1265,28 @@ class FleetManager {
         limit.probeCredit = false;
         state.applyReport(checked.report, now);
         this.capAlerts.noteReport(hostId, state);
-        limit.inFlight = true;
+        // The slot is held until the write itself settles (no timeout frees
+        // it early), so this socket never has two writes running.
+        slot.inFlight = true;
         let changed = false;
         try {
-            changed = await this.storeCapabilities(hostId, checked.report.caps);
+            changed = await this.storeCapabilities(ws, hostId, checked.report.caps);
         } finally {
-            limit.inFlight = false;
+            slot.inFlight = false;
         }
-        // A change already evaluated the alerts (onCapabilityChange).
-        if (!changed) await this.evaluateCapabilityAlerts(hostId);
+        // A change already evaluated the alerts (onCapabilityChange); an old
+        // socket's late write evaluates nothing.
+        if (!changed && this.connectedAgents.get(hostId) === ws) await this.evaluateCapabilityAlerts(hostId);
+    }
+
+    // The capability write state of one agent socket.
+    capWriteState(ws) {
+        let slot = this.capWrites.get(ws);
+        if (!slot) {
+            slot = { inFlight: false, stored: null };
+            this.capWrites.set(ws, slot);
+        }
+        return slot;
     }
 
     async evaluateCapabilityAlerts(hostId) {
@@ -1285,17 +1306,29 @@ class FleetManager {
     // Opens keep the anomaly cooldown: at most one open webhook per host and
     // rule per COOLDOWN_MS; resolves are always sent. The alert row and its
     // audit row are never suppressed.
+    // False when the cooldown suppressed it.
     async deliverAlertWebhook(tenantId, rule, hostId, body, isOpen) {
-        if (!tenantId) return;
-        if (isOpen && this.cooled(hostId, rule)) return;
+        if (!tenantId) return true;
+        if (isOpen && this.cooled(hostId, rule)) return false;
         await deliverWebhooks(this, tenantId, body);
+        return true;
+    }
+
+    // An alert open held back by the hourly per-host cap (capalerts.js).
+    noteAlertCapped(rule) {
+        const m = this.metrics && this.metrics.capabilityAlertCappedTotal;
+        if (m) m.inc({ rule: /^(capability:[a-z_]{1,16}|host:offline)$/.test(rule) ? rule : 'other' });
+    }
+
+    // This process's id on presence rows (cp_hosts.agent_instance).
+    instanceId() {
+        return this.jobs ? this.jobs.instanceId : null;
     }
 
     // A retired host leaves the alert state, the cooldowns and its
     // capability gauge series at once (refreshGauges also leaves it out).
     onHostRetired(hostId) {
         this.capAlerts.dropHost(hostId);
-        this.capStored.delete(hostId);
         this.capReportLimits.delete(hostId);
         for (const key of [...this.alertCooldown.keys()]) {
             if (key.endsWith(`:${hostId}`)) this.alertCooldown.delete(key);
@@ -1308,14 +1341,30 @@ class FleetManager {
         }
     }
 
-    // Writes the report's rows that differ from what was last written for
-    // hostId (all of them when nothing is cached), in one statement. A failed
-    // write is logged and forgets the cache, so the next report writes every
-    // row again; routing already took the report. True when a state changed
-    // (onCapabilityChange ran).
-    async storeCapabilities(hostId, caps) {
-        if (!this.registry || typeof this.registry.setHostCapabilities !== 'function') return;
-        const stored = this.capStored.get(hostId);
+    // Queues ws's report rows behind any capability write still running for
+    // hostId (from this or an older socket), so writes for one host never
+    // overlap and land in order. Resolves as writeCapabilities does.
+    storeCapabilities(ws, hostId, caps) {
+        const prior = this.capWriteChains.get(hostId) || Promise.resolve();
+        const run = prior.then(() => this.writeCapabilities(ws, hostId, caps));
+        const tail = run.then(() => {}, () => {});
+        this.capWriteChains.set(hostId, tail);
+        tail.then(() => {
+            if (this.capWriteChains.get(hostId) === tail) this.capWriteChains.delete(hostId);
+        });
+        return run;
+    }
+
+    // Writes the report's rows that differ from what ws last wrote (all of
+    // them when nothing is cached), in one statement. A failed write is
+    // logged and forgets ws's cache, so its next report writes every row
+    // again; routing already took the report. A write that completes after
+    // ws stopped being hostId's socket updates no cache and evaluates
+    // nothing. True when a state changed (onCapabilityChange ran).
+    async writeCapabilities(ws, hostId, caps) {
+        if (!this.registry || typeof this.registry.setHostCapabilities !== 'function') return false;
+        const slot = this.capWriteState(ws);
+        const stored = slot.stored;
         const rows = stored
             ? caps.filter((c) => {
                 const prev = stored.get(c.name);
@@ -1325,23 +1374,16 @@ class FleetManager {
         if (rows.length === 0) return false;
         let changed;
         try {
-            let timer;
-            const timeout = new Promise((_, reject) => {
-                timer = setTimeout(() => reject(Object.assign(new Error('capability write timed out'), { code: 'write_timeout' })), this.capWriteTimeoutMs);
-            });
-            try {
-                changed = await Promise.race([this.registry.setHostCapabilities(hostId, rows), timeout]);
-            } finally {
-                clearTimeout(timer);
-            }
+            changed = await this.registry.setHostCapabilities(hostId, rows);
         } catch (err) {
-            this.capStored.delete(hostId);
+            slot.stored = null;
             console.error(`[Fleet] capability write failed host=${hostId} error=${errorCode(err)}`);
             return false;
         }
+        if (this.connectedAgents.get(hostId) !== ws) return false;
         const next = stored || new Map();
         for (const c of rows) next.set(c.name, { state: c.state, reason: c.reason });
-        this.capStored.set(hostId, next);
+        slot.stored = next;
         const changes = changed.filter((c) => c.previous_state !== c.state);
         if (changes.length === 0) return false;
         await this.onCapabilityChange(hostId, changes);
@@ -1380,12 +1422,19 @@ class FleetManager {
         return { connected, conn: connected ? this.agentCapState.get(ws) || null : null };
     }
 
-    // hostId's health as seen from this instance (offline when its socket is
-    // not held here). Reads the policy only for a host that has reported.
-    async hostHealth(hostId) {
+    // hostId's health. Its socket held here: computed from this connection,
+    // with the expected set the alert pass last read (the policy is read
+    // only when none is cached). Not held here: from row (a cp_hosts row,
+    // written by the instance that holds it), offline without one.
+    async hostHealth(hostId, row = null) {
         const { connected, conn } = this.liveCapState(hostId);
+        if (!connected) {
+            if (!row) return 'offline';
+            return row.status === 'online' ? (row.capability_health || 'unknown') : 'offline';
+        }
         if (!conn || conn.reportCount === 0) return hostHealth({ connected, conn, expected: [] });
-        return hostHealth({ connected, conn, expected: await this.expectedCapabilities(hostId) });
+        const expected = this.capAlerts.cachedExpected(hostId) || await this.expectedCapabilities(hostId);
+        return hostHealth({ connected, conn, expected });
     }
 
     // The GET /api/v1/hosts/:id/capabilities body for an authorized host.

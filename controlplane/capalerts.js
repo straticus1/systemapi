@@ -6,8 +6,10 @@
 // partial unique index cp_alert_events_active_capability_idx keeps at most one
 // active alert per host and rule across replicas.
 //
-// Rules, N = the agent report cadence (SYSTEMAPI_CAPABILITY_INTERVAL_S,
-// default 600):
+// Rules, N = the report cadence: the larger of SYSTEMAPI_CAPABILITY_INTERVAL_S
+// (default 600, at most 3600) and the interval_s the agent's latest report on
+// this connection carried (its --capability-interval, 60..3600), so an agent
+// set to report hourly never alerts on a 10 min control plane default:
 //   capability:<name>  an expected capability (expectedCapabilities over the
 //                      effective policy) out of the effective routing set for
 //                      2 x N on this connection; a connection with no report
@@ -18,15 +20,26 @@
 //   (for capability:reports, any 2 reports); a capability no longer
 //   expected resolves at the next evaluation with a report.
 //   host:offline       5 min after the host's last socket closed (a reconnect
-//                      inside that window opens nothing); resolved on
-//                      reconnect.
+//                      inside that window opens nothing, also to another
+//                      replica: the open re-checks status and presence in
+//                      SQL); resolved on reconnect.
+//   A host opens at most OPENS_PER_HOUR_MAX alerts per rolling hour (a
+//   flapping agent cannot flood alerts or webhooks); the held-back opens are
+//   counted (cappedTotal, systemapi_capability_alert_capped_total) and tried
+//   again once the hour allows. A resolve whose open webhook the cooldown
+//   suppressed sends no webhook either. Retiring a host resolves its alerts
+//   in the retire transaction (registry.retireHost).
 //
 // Threats: unbounded memory or timers from many hosts or flapping agents,
 // duplicate alerts from replicas or retries, and paths or raw agent text in
 // alerts, audits or webhooks. There is no per-host timer: one tick walks the
 // hosts, single-flight. Memory holds one entry per connected host plus hosts
-// closed less than 5 min ago; a host is dropped when its offline alert is
-// tried, on retire, and an offline entry never outlives the window. Every
+// closed less than 5 min ago (longer only while their offline alert keeps
+// failing to write or is held back by the hourly cap); a host is dropped once
+// its offline alert is written, and on retire. The retired, hourly-open and
+// suppressed-webhook sets are per host and rule and pruned in the tick. State
+// flags move only after the database call succeeded, so a failed write is
+// tried again on the next tick. Every
 // alert field is a fixed rule name, a name from KNOWN_CAPABILITIES, a fixed
 // state, or a reason code from the validator's fixed set. Inserts go through
 // the partial unique index (ON CONFLICT DO NOTHING), resolves are idempotent
@@ -39,7 +52,12 @@
 const { KNOWN_CAPABILITIES, HEADER_ONLY, hostHealth } = require('./capabilities');
 
 const DEFAULT_INTERVAL_S = 600;
+const MIN_INTERVAL_S = 60;
+const MAX_INTERVAL_S = 3600;
 const OFFLINE_AFTER_MS = 5 * 60_000;
+// Alert opens per host per rolling hour.
+const OPENS_PER_HOUR_MAX = 6;
+const OPEN_WINDOW_MS = 60 * 60_000;
 // How long a host's expected set is reused before the policy is read again.
 const EXPECTED_TTL_MS = 5 * 60_000;
 const REPORTS_RULE = 'capability:reports';
@@ -47,15 +65,16 @@ const OFFLINE_RULE = 'host:offline';
 const ACTOR = 'system:capability';
 const TRACKED = KNOWN_CAPABILITIES.filter((name) => !HEADER_ONLY.has(name));
 
-// SYSTEMAPI_CAPABILITY_INTERVAL_S: an integer from 60 to 86400, else the
-// default.
+// SYSTEMAPI_CAPABILITY_INTERVAL_S: an integer from 60 to 3600 (the agent's
+// own --capability-interval range), else the default.
 function capabilityIntervalMs(env) {
   const raw = env && env.SYSTEMAPI_CAPABILITY_INTERVAL_S;
   const n = raw === undefined || raw === '' ? NaN : Number(raw);
-  return (Number.isInteger(n) && n >= 60 && n <= 86400 ? n : DEFAULT_INTERVAL_S) * 1000;
+  return (Number.isInteger(n) && n >= MIN_INTERVAL_S && n <= MAX_INTERVAL_S ? n : DEFAULT_INTERVAL_S) * 1000;
 }
 
 const capabilityRule = (name) => `capability:${name}`;
+const alertKey = (hostId, rule) => `${hostId}\n${rule}`;
 
 function freshCaps() {
   const caps = new Map();
@@ -65,19 +84,40 @@ function freshCaps() {
 
 class CapabilityAlerts {
   // fleet: liveCapState(hostId), expectedCapabilities(hostId), registry,
-  // deliverAlertWebhook(tenantId, rule, body).
+  // deliverAlertWebhook(tenantId, rule, hostId, body, isOpen) (false when
+  // the cooldown suppressed it), instanceId(), noteAlertCapped(rule).
   constructor(fleet) {
     this.fleet = fleet;
     this.hosts = new Map();
+    // hostId -> retire time: a close that lands after the retire is ignored.
+    this.retired = new Map();
+    // hostId -> open times in the last hour.
+    this.opens = new Map();
+    // alertKey of an active alert whose open webhook the cooldown suppressed.
+    this.suppressedWebhooks = new Set();
+    // alertKey of an open held back by the hourly cap (counted once).
+    this.capped = new Set();
+    this.cappedTotal = 0;
     // Overridable for tests.
     this.now = () => Date.now();
     this.intervalMs = null;
     this.offlineAfterMs = OFFLINE_AFTER_MS;
+    this.opensPerHourMax = OPENS_PER_HOUR_MAX;
     this.ticking = false;
   }
 
-  nMs() {
-    return this.intervalMs || capabilityIntervalMs(this.fleet.env || process.env);
+  // N for one connection: the larger of the control plane's setting and the
+  // interval_s the agent's latest report carried.
+  nMs(conn) {
+    const base = this.intervalMs || capabilityIntervalMs(this.fleet.env || process.env);
+    const agent = conn && Number.isInteger(conn.intervalS) ? conn.intervalS * 1000 : 0;
+    return Math.max(base, agent);
+  }
+
+  // The expected set the last evaluation read for a connected host, or null.
+  cachedExpected(hostId) {
+    const st = this.hosts.get(hostId);
+    return st && st.caps && st.expected ? [...st.expected] : null;
   }
 
   // A new connection for hostId: fresh per-connection state, and any open
@@ -95,18 +135,28 @@ class CapabilityAlerts {
       expectedAt: 0,
       health: null
     });
+    this.retired.delete(hostId);
     await this.resolve(hostId, [{ rule: OFFLINE_RULE, capability: null, state: 'online', reason: 'reconnected' }], 'host_offline');
     await this.evaluate(hostId);
   }
 
-  // hostId's last socket closed (a replaced one does not call this).
+  // hostId's last socket closed (a replaced one does not call this). A host
+  // retired in the last window is ignored: its socket closes after the
+  // retire dropped it.
   onDisconnect(hostId) {
-    const prev = this.hosts.get(hostId);
-    this.hosts.set(hostId, { disconnectedAt: this.now(), health: prev ? prev.health : null });
+    if (this.retired.has(hostId)) return;
+    this.hosts.set(hostId, { disconnectedAt: this.now() });
   }
 
+  // A retired host leaves every alert structure.
   dropHost(hostId) {
     this.hosts.delete(hostId);
+    this.retired.set(hostId, this.now());
+    this.opens.delete(hostId);
+    const prefix = alertKey(hostId, '');
+    for (const set of [this.suppressedWebhooks, this.capped]) {
+      for (const key of [...set]) if (key.startsWith(prefix)) set.delete(key);
+    }
   }
 
   // An accepted report on hostId's live connection: the streaks move.
@@ -137,10 +187,12 @@ class CapabilityAlerts {
     const now = this.now();
     if (!st.caps) {
       if (now - st.disconnectedAt < this.offlineAfterMs) return;
-      // One try: whatever its outcome the host leaves memory (a reconnect
-      // resolves through the database, not this entry).
-      this.hosts.delete(hostId);
-      await this.open(hostId, { rule: OFFLINE_RULE, capability: null, state: 'offline', reason: 'no_socket' }, 'host_offline', 'critical');
+      // The host leaves memory once the open is written (the registry may
+      // still find it online elsewhere and open nothing); a failed or capped
+      // open is tried again next tick. A reconnect resolves through the
+      // database, not this entry.
+      const done = await this.open(hostId, { rule: OFFLINE_RULE, capability: null, state: 'offline', reason: 'no_socket' }, 'host_offline', 'critical');
+      if (done && this.hosts.get(hostId) === st) this.hosts.delete(hostId);
       return;
     }
     const { connected, conn } = this.fleet.liveCapState(hostId);
@@ -151,40 +203,45 @@ class CapabilityAlerts {
     }
     const expected = await this.expected(hostId, st, refresh);
     if (this.hosts.get(hostId) !== st) return;
-    const n = this.nMs();
+    const n = this.nMs(conn);
+    // Resolves are written together; their flags move only once written.
     const resolves = [];
+    const resolved = [];
     for (const [name, c] of st.caps) {
       const routable = conn.supports(name);
       if (expected.has(name) && !routable) {
         c.resolveDone = false;
         if (c.since === null) c.since = now;
         if (!c.opened && now - c.since >= 2 * n) {
-          c.opened = true;
           const r = conn.reported.get(name);
           const state = r && r.state !== 'ok' ? r.state : 'degraded';
           const reason = conn.unsupportedReason(name) || (r && r.reason) || 'probe_error';
-          await this.open(hostId, { rule: capabilityRule(name), capability: name, state, reason }, 'capability_alert', 'warning');
+          if (await this.open(hostId, { rule: capabilityRule(name), capability: name, state, reason }, 'capability_alert', 'warning')) {
+            c.opened = true;
+          }
         }
         continue;
       }
       c.since = null;
       if (!c.resolveDone && (c.okStreak >= 2 || !expected.has(name))) {
-        c.resolveDone = true;
-        c.opened = false;
         resolves.push({ rule: capabilityRule(name), capability: name, state: routable ? 'ok' : 'not_expected', reason: '' });
+        resolved.push(() => { c.resolveDone = true; c.opened = false; });
       }
     }
     if (!st.reportsOpened && now - st.lastReportAt >= 3 * n) {
-      st.reportsOpened = true;
-      st.reportsBase = st.reports;
-      st.reportsResolveDone = false;
-      await this.open(hostId, { rule: REPORTS_RULE, capability: null, state: 'unknown', reason: 'report_missing' }, 'capability_alert', 'warning');
+      if (await this.open(hostId, { rule: REPORTS_RULE, capability: null, state: 'unknown', reason: 'report_missing' }, 'capability_alert', 'warning')) {
+        st.reportsOpened = true;
+        st.reportsBase = st.reports;
+        st.reportsResolveDone = false;
+      }
     } else if (!st.reportsResolveDone && st.reports - st.reportsBase >= 2) {
-      st.reportsResolveDone = true;
-      st.reportsOpened = false;
       resolves.push({ rule: REPORTS_RULE, capability: null, state: 'ok', reason: '' });
+      resolved.push(() => { st.reportsResolveDone = true; st.reportsOpened = false; });
     }
-    if (resolves.length > 0) await this.resolve(hostId, resolves, 'capability_alert');
+    if (resolves.length > 0) {
+      await this.resolve(hostId, resolves, 'capability_alert');
+      for (const done of resolved) done();
+    }
     await this.setHealth(hostId, st, hostHealth({ connected, conn, expected: [...expected] }));
   }
 
@@ -194,6 +251,7 @@ class CapabilityAlerts {
     if (this.ticking) return;
     this.ticking = true;
     try {
+      this.prune();
       for (const hostId of [...this.hosts.keys()]) {
         try {
           await this.evaluate(hostId);
@@ -206,23 +264,62 @@ class CapabilityAlerts {
     }
   }
 
+  // Old retire marks and open times leave memory.
+  prune() {
+    const now = this.now();
+    for (const [hostId, at] of this.retired) if (now - at >= 2 * this.offlineAfterMs) this.retired.delete(hostId);
+    for (const [hostId, times] of this.opens) {
+      const live = times.filter((t) => now - t < OPEN_WINDOW_MS);
+      if (live.length === 0) this.opens.delete(hostId);
+      else this.opens.set(hostId, live);
+    }
+  }
+
+  // The health row is written only while this instance holds the host's
+  // presence row; a refused write is tried again at the next evaluation.
   async setHealth(hostId, st, health) {
     if (st.health === health) return;
     const reg = this.fleet.registry;
     if (!reg || typeof reg.setHostHealth !== 'function') return;
-    await reg.setHostHealth(hostId, health);
-    st.health = health;
+    const instance = typeof this.fleet.instanceId === 'function' ? this.fleet.instanceId() : null;
+    if (await reg.setHostHealth(hostId, health, instance)) st.health = health;
   }
 
+  webhookBody(type, status, row, hostId, a) {
+    return {
+      type, status, rule: a.rule, alert_id: row.id, host_id: hostId,
+      capability: a.capability, state: a.state, reason: a.reason, ts: new Date(this.now()).toISOString()
+    };
+  }
+
+  // True once the open is settled in the database (a row written, or one
+  // already active for this host and rule, or the host gone); false when
+  // the hourly cap held it back. Throws when the write failed.
   async open(hostId, a, type, severity) {
     const reg = this.fleet.registry;
-    if (!reg || typeof reg.openHostAlert !== 'function') return;
+    if (!reg || typeof reg.openHostAlert !== 'function') return true;
+    const key = alertKey(hostId, a.rule);
+    const now = this.now();
+    const times = (this.opens.get(hostId) || []).filter((t) => now - t < OPEN_WINDOW_MS);
+    if (times.length >= this.opensPerHourMax) {
+      if (!this.capped.has(key)) {
+        this.capped.add(key);
+        this.cappedTotal += 1;
+        if (typeof this.fleet.noteAlertCapped === 'function') this.fleet.noteAlertCapped(a.rule);
+        console.warn(`[alerts] capability alert held back host=${hostId} rule=${a.rule} (over ${this.opensPerHourMax} per hour)`);
+      }
+      return false;
+    }
     const message = a.capability ? `${a.capability} ${a.state}${a.reason ? ` (${a.reason})` : ''}` : `${a.rule} ${a.reason}`;
     const row = await reg.openHostAlert({ host_id: hostId, rule_name: a.rule, severity, message, actor: ACTOR, audit: a });
-    if (!row) return;
-    await this.fleet.deliverAlertWebhook(row.tenant_id, a.rule, hostId, {
-      type, status: 'open', alert_id: row.id, host_id: hostId, capability: a.capability, state: a.state, reason: a.reason
-    }, true);
+    this.capped.delete(key);
+    if (!row) return true;
+    times.push(now);
+    this.opens.set(hostId, times);
+    const sent = await this.fleet.deliverAlertWebhook(row.tenant_id, a.rule, hostId, this.webhookBody(type, 'open', row, hostId, a), true);
+    if (sent === false) this.suppressedWebhooks.add(key);
+    else this.suppressedWebhooks.delete(key);
+    return true;
   }
 
   async resolve(hostId, list, type) {
@@ -231,9 +328,11 @@ class CapabilityAlerts {
     const rows = await reg.resolveHostAlerts(hostId, list, ACTOR);
     for (const row of rows) {
       const a = list.find((x) => x.rule === row.rule_name);
-      await this.fleet.deliverAlertWebhook(row.tenant_id, a.rule, hostId, {
-        type, status: 'resolved', alert_id: row.id, host_id: hostId, capability: a.capability, state: a.state, reason: a.reason
-      }, false);
+      const key = alertKey(hostId, a.rule);
+      this.capped.delete(key);
+      // Its open went out without a webhook (cooldown): so does the resolve.
+      if (this.suppressedWebhooks.delete(key)) continue;
+      await this.fleet.deliverAlertWebhook(row.tenant_id, a.rule, hostId, this.webhookBody(type, 'resolved', row, hostId, a), false);
     }
   }
 }
@@ -266,5 +365,8 @@ module.exports = {
   REPORTS_RULE,
   OFFLINE_RULE,
   OFFLINE_AFTER_MS,
-  DEFAULT_INTERVAL_S
+  OPENS_PER_HOUR_MAX,
+  DEFAULT_INTERVAL_S,
+  MIN_INTERVAL_S,
+  MAX_INTERVAL_S
 };

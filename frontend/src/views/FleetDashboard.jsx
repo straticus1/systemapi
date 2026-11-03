@@ -83,6 +83,7 @@ const FleetDashboard = () => {
 const HostCard = ({ host, onConnect, onDiagnostic }) => {
   const isOnline = host.status === 'online';
   const [expanded, setExpanded] = useState(false);
+  const fetchedAt = useAppStore((s) => s.hostsFetchedAt);
   const [software, setSoftware] = useState([]);
   const [cves, setCves] = useState([]);
   const [isLoadingExtras, setIsLoadingExtras] = useState(false);
@@ -103,12 +104,12 @@ const HostCard = ({ host, onConnect, onDiagnostic }) => {
      return () => { ignore = true; };
   }, [expanded, host.host_id]);
 
-  // Capability detail for the badge's hover (degraded hosts) and the info
-  // panel; fetched again only when the health or the panel changes.
+  // Capability detail for the info panel: fetched only while the card is
+  // expanded, and again each time the fleet list refreshes.
   const [capDetail, setCapDetail] = useState(null);
   const [capError, setCapError] = useState('');
   useEffect(() => {
-     if (!expanded && host.health !== 'degraded') return;
+     if (!expanded) return;
      let ignore = false;
      FleetAPI.getCapabilities(host.host_id).then((detail) => {
         if (ignore) return;
@@ -118,7 +119,9 @@ const HostCard = ({ host, onConnect, onDiagnostic }) => {
         if (!ignore) setCapError(e?.response?.data?.error || 'unavailable');
      });
      return () => { ignore = true; };
-  }, [expanded, host.host_id, host.health]);
+  }, [expanded, host.host_id, fetchedAt]);
+  const toggleExpanded = () => { if (!expanded) setIsLoadingExtras(true); setExpanded(!expanded); };
+  const panelId = `host-info-${host.host_id}`;
 
   const lastSeenDate = new Date(host.last_seen_at);
   const [secondsAgo, setSecondsAgo] = useState(null);
@@ -194,7 +197,7 @@ const HostCard = ({ host, onConnect, onDiagnostic }) => {
             <h3 style={{ fontSize: '1.1rem', marginBottom: '4px', display: 'flex', alignItems: 'center', gap: '8px' }}>
               {host.hostname}
               <span className={`status-indicator ${isOnline ? 'status-online' : 'status-offline'}`}></span>
-              <HealthBadge health={host.health} detail={capDetail} />
+              <HealthBadge health={host.health} detail={capDetail} expanded={expanded} onToggle={toggleExpanded} controls={panelId} />
             </h3>
             <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
               {host.os} / {host.platform}
@@ -223,7 +226,7 @@ const HostCard = ({ host, onConnect, onDiagnostic }) => {
       </div>
       
       <div style={{ padding: '16px 20px', borderTop: '1px solid var(--border-light)', display: 'flex', gap: '8px' }}>
-         <button onClick={() => { if (!expanded) setIsLoadingExtras(true); setExpanded(!expanded); }} className="btn btn-ghost" style={{ flex: 1 }}>
+         <button onClick={toggleExpanded} aria-expanded={expanded} aria-controls={panelId} className="btn btn-ghost" style={{ flex: 1 }}>
             {expanded ? 'Hide Info' : 'Show Info'}
          </button>
          <button onClick={onConnect} disabled={!isOnline} className="btn btn-primary" style={{ flex: 1, opacity: isOnline ? 1 : 0.5 }}>
@@ -266,7 +269,7 @@ const HostCard = ({ host, onConnect, onDiagnostic }) => {
       </div>
       
       {expanded && (
-        <div style={{ padding: '20px', borderTop: '1px solid var(--border-light)', background: 'rgba(0,0,0,0.3)', maxHeight: '300px', overflowY: 'auto' }}>
+        <div id={panelId} style={{ padding: '20px', borderTop: '1px solid var(--border-light)', background: 'rgba(0,0,0,0.3)', maxHeight: '300px', overflowY: 'auto' }}>
             <CapabilityPanel detail={capDetail} error={capError} />
             <h4 style={{ color: 'var(--accent)', marginBottom: '12px' }}>Software & CVE Inventory</h4>
             {isLoadingExtras ? (
@@ -328,16 +331,26 @@ const Sparkline = ({ values }) => {
     );
 };
 
-// ok / degraded / unknown / offline; the hover names the degraded
-// capabilities and their reason codes.
-const HealthBadge = ({ health, detail }) => {
+// ok / degraded / unknown / offline, with "Health:" for screen readers. A
+// degraded badge on a card is a button that opens the info panel, where the
+// degraded capabilities and their reason codes are listed inline (keyboard
+// and touch reach it; the hover title is only a mouse shortcut).
+const HealthBadge = ({ health, detail, expanded, onToggle, controls }) => {
     const badge = healthBadge(health);
-    return (
-        <span title={healthTitle(health, detail)} aria-label={`Health: ${badge.label}`} style={{
-            fontSize: '0.7rem', fontWeight: 500, padding: '1px 8px', borderRadius: '12px',
-            color: badge.color, background: badge.background, border: `1px solid ${badge.color}`, cursor: 'default'
-        }}>{badge.label}</span>
-    );
+    const style = {
+        fontSize: '0.7rem', fontWeight: 500, padding: '1px 8px', borderRadius: '12px', lineHeight: 'inherit',
+        color: badge.color, background: badge.background, border: `1px solid ${badge.color}`, cursor: 'default'
+    };
+    const text = <><span className="visually-hidden">Health: </span>{badge.label}</>;
+    if (badge.state === 'degraded' && onToggle) {
+        return (
+            <button type="button" onClick={onToggle} aria-expanded={!!expanded} aria-controls={controls}
+                title={healthTitle(health, detail)} style={{ ...style, cursor: 'pointer', font: 'inherit', fontSize: '0.7rem' }}>
+                {text}<span className="visually-hidden">{expanded ? ', hide the degraded capabilities' : ', show the degraded capabilities'}</span>
+            </button>
+        );
+    }
+    return <span title={healthTitle(health, detail)} style={style}>{text}</span>;
 };
 
 const CapabilityPanel = ({ detail, error }) => {
@@ -352,18 +365,18 @@ const CapabilityPanel = ({ detail, error }) => {
                 Capabilities <HealthBadge health={detail.health} detail={detail} />
             </h4>
             {degraded.size > 0 && (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginBottom: '10px' }}>
+                <ul aria-label="Degraded capabilities" style={{ listStyle: 'none', display: 'flex', flexDirection: 'column', gap: '6px', marginBottom: '10px' }}>
                     {[...degraded.values()].map((c) => (
-                        <div key={c.name} style={{ fontSize: '0.8rem', background: 'var(--accent-amber-soft)', padding: '8px', borderRadius: '4px', borderLeft: '3px solid var(--accent-amber)' }}>
+                        <li key={c.name} style={{ fontSize: '0.8rem', background: 'var(--accent-amber-soft)', padding: '8px', borderRadius: '4px', borderLeft: '3px solid var(--accent-amber)' }}>
                             <strong>{c.name}</strong> {c.state}{c.reason ? <span className="font-mono" style={{ color: 'var(--text-muted)' }}> {c.reason}</span> : null}
-                        </div>
+                        </li>
                     ))}
-                </div>
+                </ul>
             )}
             {caps.length > 0 ? (
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px' }}>
                     {caps.map((c) => (
-                        <div key={c.name} style={{ fontSize: '0.75rem', padding: '6px', background: 'rgba(255,255,255,0.05)', borderRadius: '4px' }}>
+                        <div key={c.name} style={{ fontSize: '0.75rem', padding: '6px', background: 'var(--neutral-soft)', borderRadius: '4px' }}>
                             <div><strong>{c.name}</strong>{expected.has(c.name) ? <span style={{ color: 'var(--text-muted)' }}> expected</span> : null}</div>
                             <div style={{ color: c.state === 'ok' ? 'var(--accent-green)' : 'var(--accent-amber)' }}>
                                 {c.state}{c.reason ? ` (${c.reason})` : ''}

@@ -101,8 +101,8 @@ export function pollFailure(status) {
 const HEALTH = {
   ok: { label: 'ok', color: 'var(--accent-green)', background: 'var(--accent-green-soft)' },
   degraded: { label: 'degraded', color: 'var(--accent-amber)', background: 'var(--accent-amber-soft)' },
-  unknown: { label: 'unknown', color: 'var(--text-muted)', background: 'rgba(255, 255, 255, 0.05)' },
-  offline: { label: 'offline', color: 'var(--text-muted)', background: 'rgba(255, 255, 255, 0.05)' }
+  unknown: { label: 'unknown', color: 'var(--text-muted)', background: 'var(--neutral-soft)' },
+  offline: { label: 'offline', color: 'var(--text-muted)', background: 'var(--neutral-soft)' }
 };
 
 export function healthBadge(health) {

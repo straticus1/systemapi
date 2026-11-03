@@ -9,6 +9,9 @@ export const useAppStore = create((set, get) => ({
   authMethod: localStorage.getItem('systemapi_key') ? 'api_key' : null,
 
   hosts: [],
+  // When the fleet list last loaded: an expanded host card refreshes its
+  // capability panel with it.
+  hostsFetchedAt: 0,
   isLoadingHosts: false,
   error: null,
 
@@ -72,7 +75,7 @@ export const useAppStore = create((set, get) => ({
     set({ isLoadingHosts: true, error: null });
     try {
       const data = await FleetAPI.getHosts();
-      set({ hosts: data.hosts, isLoadingHosts: false });
+      set({ hosts: data.hosts, isLoadingHosts: false, hostsFetchedAt: Date.now() });
     } catch (err) {
       set({ error: err.message || 'Failed to fetch fleet', isLoadingHosts: false });
     }

@@ -84,8 +84,15 @@ frame, the agent sends:
 
 ```json
 {"type":"capability_report","v":1,"probed_at":"2026-11-03T10:00:00Z",
- "caps":[{"name":"file","state":"degraded","reason":"enosys_openat2"}]}
+ "caps":[{"name":"file","state":"degraded","reason":"enosys_openat2"}],
+ "interval_s":600}
 ```
+
+`interval_s` is `--capability-interval` in whole seconds (60..3600), so the
+control plane times its missing-report and degraded alerts to this agent's
+cadence. A report carries the newest finished probe: when a newer probe
+(a redial's) finished while this report's own probe ran, the newer results
+are sent.
 
 At most one report goes out per 60 s, across reconnects too; a probe request
 inside that window is answered when it ends. `caps` has at most 16 entries,

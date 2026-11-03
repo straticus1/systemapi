@@ -237,12 +237,15 @@ async function requireHost(fleet, principal, hostId) {
   return host;
 }
 
-// A host's capability health as this instance sees it (offline when its
-// agent socket is not held here; a fleet without capability support, such
-// as a test stub, says offline unless connected, then unknown).
-async function hostHealthOf(fleet, hostId) {
-  if (typeof fleet.hostHealth === 'function') return fleet.hostHealth(hostId);
-  return fleet.connectedAgents && fleet.connectedAgents.has(hostId) ? 'unknown' : 'offline';
+// A host's capability health: computed here when this instance holds its
+// agent socket, else from the row (cp_hosts.status and capability_health,
+// written by the instance that holds it), so every replica shows the same
+// badge. A fleet without capability support (a test stub) says unknown
+// while connected, else what the row says.
+const rowHealth = (row) => (row.status === 'online' ? (row.capability_health || 'unknown') : 'offline');
+async function hostHealthOf(fleet, row) {
+  if (typeof fleet.hostHealth === 'function') return fleet.hostHealth(row.host_id, row);
+  return fleet.connectedAgents && fleet.connectedAgents.has(row.host_id) ? 'unknown' : rowHealth(row);
 }
 
 function requireScope(fleet, principal, tenantId, scope) {
@@ -904,7 +907,7 @@ function mount(app, fleet) {
       hostname: host.hostname,
       tenant: host.tenant_id,
       status: isOnline(host) ? 'online' : 'offline',
-      health: await hostHealthOf(fleet, host.host_id)
+      health: await hostHealthOf(fleet, host)
     });
   }));
 
@@ -1024,7 +1027,10 @@ function mount(app, fleet) {
     for (const id of ids) requireScope(fleet, principal, id, 'hosts:read');
     const includeRetired = req.query.include_retired === '1' || req.query.include_retired === 'true';
     const listed = await fleet.registry.listHosts(ids, typeof req.query.q === 'string' ? req.query.q : null, { includeRetired });
-    const hosts = await Promise.all(listed.map(async (h) => ({ ...h, health: await hostHealthOf(fleet, h.host_id) })));
+    // health replaces the raw capability_health column.
+    const hosts = await Promise.all(listed.map(async ({ capability_health: _raw, ...h }) => ({
+      ...h, health: await hostHealthOf(fleet, { ...h, capability_health: _raw })
+    })));
     res.json({ hosts, user: principal.kind === 'session' ? { id: principal.userId, email: principal.email } : null });
   }));
 

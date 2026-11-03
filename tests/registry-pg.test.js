@@ -1500,6 +1500,8 @@ test('capability alerts: one active alert per host and rule across registries (t
     "INSERT INTO cp_alert_events (tenant_id, host_id, rule_name, status) VALUES ('acme', $1, 'capability:file', 'open')", [H]), /cp_alert_events_active_capability_idx/);
   // host:offline is covered too; other rules (anomaly, sysscript) are not.
   const offline = { ...entry, rule_name: 'host:offline', audit: { ...audit, rule: 'host:offline', capability: null } };
+  assert.equal(await registry.openHostAlert(offline), null, 'host:offline never opens for a host that is online');
+  await registry.setHostStatus(H, 'offline');
   assert.ok(await registry.openHostAlert(offline));
   assert.equal(await other.openHostAlert(offline), null);
   await pool.query("INSERT INTO cp_alert_events (tenant_id, host_id, rule_name, status) VALUES ('acme', $1, 'zscore:cpu', 'open'), ('acme', $1, 'zscore:cpu', 'open')", [H]);
@@ -1549,17 +1551,154 @@ test('capability gauges from the database: health counts and state rows, retired
   await registry.enroll({ ...base, hostId: H, hostname: 'g.example', sshPubkey: opensshEd25519(10) });
   const before = await registry.countHostHealth();
   assert.equal(before.unknown, empty.unknown + 1, 'an enrolled host without a written health counts as unknown');
-  await registry.setHostHealth(H, 'degraded');
+  await registry.setAgentPresence(H, { caps: [], instance: 'gauge-i', connId: 'gauge-i:1', enrolledAt: new Date() });
+  assert.equal(await registry.setHostHealth(H, 'degraded', 'gauge-i'), true);
   await registry.setHostCapabilities(H, [{ name: 'file', state: 'degraded', reason: 'enosys_openat2' }]);
   const during = await registry.countHostHealth();
   assert.equal(during.degraded, before.degraded + 1);
   assert.equal(during.unknown, before.unknown - 1);
   assert.ok((await registry.listCapabilityStates()).some((r) => r.host_id === H && r.name === 'file' && r.state === 'degraded'));
-  await assert.rejects(registry.setHostHealth(H, 'offline'), (e) => e.code === 'bad_health');
+  await assert.rejects(registry.setHostHealth(H, 'offline', 'gauge-i'), (e) => e.code === 'bad_health');
   await assert.rejects(pool.query("UPDATE cp_hosts SET capability_health = 'great' WHERE host_id = $1", [H]));
   await registry.setHostStatus(H, 'offline');
   assert.equal((await registry.countHostHealth()).offline, before.offline + 1);
   await registry.retireHost({ tenantId: 'gauge', hostId: H, actor: 'u', reason: 'gone' });
   assert.deepEqual(await registry.countHostHealth(), empty, 'a retired host is not counted');
   assert.equal((await registry.listCapabilityStates()).some((r) => r.host_id === H), false);
+});
+
+test('capability health: written only by the instance on the presence row, cleared with offline and on retire; boot releases its own rows', async () => {
+  const H = 'aaaaaaa1-aaaa-4aaa-8aaa-aaaaaaaaaaa1';
+  const O = 'aaaaaaa2-aaaa-4aaa-8aaa-aaaaaaaaaaa2';
+  const base = { tenantId: 'health', userId: 'user-h', keyId: 'kh', os: '', platform: '' };
+  await registry.enroll({ ...base, hostId: H, hostname: 'h1.example', sshPubkey: opensshEd25519(11) });
+  await registry.enroll({ ...base, hostId: O, hostname: 'h2.example', sshPubkey: opensshEd25519(12) });
+  const row = async (id = H) => (await pool.query(
+    'SELECT status, capability_health, agent_instance, agent_conn_id FROM cp_hosts WHERE host_id = $1', [id])).rows[0];
+  assert.equal(await registry.setHostHealth(H, 'ok', 'cp-a'), false, 'no presence row: no write');
+  await registry.setAgentPresence(H, { caps: [], instance: 'cp-a', connId: 'cp-a:1', enrolledAt: new Date() });
+  assert.equal(await registry.setHostHealth(H, 'ok', 'cp-b'), false, 'another instance cannot write');
+  assert.equal(await registry.setHostHealth(H, 'ok', null), false);
+  assert.equal((await row()).capability_health, null);
+  assert.equal(await registry.setHostHealth(H, 'ok', 'cp-a'), true);
+  assert.equal((await row()).capability_health, 'ok');
+  // The fleet list and resolve carry the column for the badge.
+  assert.equal((await registry.listHosts(['health'])).find((h) => h.host_id === H).capability_health, 'ok');
+  assert.equal((await registry.resolveHosts(['health'], 'h1.example'))[0].capability_health, 'ok');
+  await registry.setHostStatus(H, 'online');
+  assert.equal((await row()).capability_health, 'ok', 'online keeps it');
+  await registry.setHostStatus(H, 'offline');
+  assert.equal((await row()).capability_health, null, 'offline clears it');
+
+  // Boot (controlplane/index.js) with a stable SYSTEMAPI_INSTANCE_ID marks
+  // the rows that instance held offline before it accepts sockets.
+  await registry.setHostStatus(H, 'online');
+  assert.equal(await registry.setHostHealth(H, 'degraded', 'cp-a'), true);
+  await registry.setAgentPresence(O, { caps: [], instance: 'cp-other', connId: 'cp-other:1', enrolledAt: new Date() });
+  await registry.setHostStatus(O, 'online');
+  assert.equal(await registry.setHostHealth(O, 'ok', 'cp-other'), true);
+  const { boot } = require('../controlplane/index');
+  const fleet = { db: pool, jobs: { instanceId: 'random', listen() {} } };
+  const logs = [];
+  await boot(fleet, { NODE_ENV: 'production', SYSTEMAPI_INSTANCE_ID: 'cp-a' }, { log: (m) => logs.push(m), warn() {}, error() {} });
+  clearInterval(fleet.scheduleTimer);
+  assert.equal(fleet.jobs.instanceId, 'cp-a');
+  assert.deepEqual(await row(), { status: 'offline', capability_health: null, agent_instance: null, agent_conn_id: null });
+  assert.deepEqual(await row(O), { status: 'online', capability_health: 'ok', agent_instance: 'cp-other', agent_conn_id: 'cp-other:1' }, 'another instance\'s rows are untouched');
+  assert.ok(logs.some((m) => /1 host\(s\)/.test(m)));
+  assert.equal(await registry.releaseInstanceHosts(''), 0);
+
+  // Retire clears it too, and resolves the host's capability and offline
+  // alerts in the same transaction with a retired resolve audit row each.
+  const entry = (rule, capability) => ({
+    host_id: O, rule_name: rule, severity: 'warning', message: 'm', actor: 'system:capability',
+    audit: { rule, capability, state: 'degraded', reason: 'probe_error' }
+  });
+  assert.ok(await registry.openHostAlert(entry('capability:file', 'file')));
+  assert.ok(await registry.openHostAlert(entry('capability:reports', null)));
+  await pool.query("INSERT INTO cp_alert_events (tenant_id, host_id, rule_name, status) VALUES ('health', $1, 'zscore:cpu', 'open')", [O]);
+  await registry.retireHost({ tenantId: 'health', hostId: O, actor: 'admin-1', reason: 'gone', forced: true });
+  assert.equal((await row(O)).capability_health, null);
+  const alerts = (await pool.query('SELECT rule_name, status FROM cp_alert_events WHERE host_id = $1 ORDER BY rule_name', [O])).rows;
+  assert.deepEqual(alerts.map((a) => [a.rule_name, a.status]), [['capability:file', 'resolved'], ['capability:reports', 'resolved'], ['zscore:cpu', 'open']]);
+  const audits = (await pool.query(
+    "SELECT actor, payload FROM cp_audit WHERE host_id = $1 AND action = 'capability_alert_resolve' ORDER BY payload->>'rule'", [O])).rows;
+  assert.deepEqual(audits.map((a) => [a.actor, a.payload.rule, a.payload.capability, a.payload.state, a.payload.reason]), [
+    ['admin-1', 'capability:file', 'file', 'retired', 'retired'],
+    ['admin-1', 'capability:reports', null, 'retired', 'retired']
+  ]);
+  assert.equal((await registry.verifyAudit()).ok, true);
+
+  // A failing resolve audit rolls the whole retire back (fail closed).
+  const R = 'aaaaaaa3-aaaa-4aaa-8aaa-aaaaaaaaaaa3';
+  await registry.enroll({ ...base, hostId: R, hostname: 'h3.example', sshPubkey: opensshEd25519(13) });
+  await registry.setHostStatus(R, 'offline');
+  assert.ok(await registry.openHostAlert({ ...entry('host:offline', null), host_id: R }));
+  await pool.query(`CREATE FUNCTION test_refuse_resolve_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN IF NEW.action = 'capability_alert_resolve' THEN RAISE EXCEPTION 'resolve audit refused by test'; END IF; RETURN NEW; END $$`);
+  await pool.query('CREATE TRIGGER test_refuse_resolve_audit BEFORE INSERT ON cp_audit FOR EACH ROW EXECUTE FUNCTION test_refuse_resolve_audit()');
+  try {
+    await assert.rejects(registry.retireHost({ tenantId: 'health', hostId: R, actor: 'admin-1', reason: 'gone' }), /resolve audit refused/);
+  } finally {
+    await pool.query('DROP TRIGGER test_refuse_resolve_audit ON cp_audit');
+    await pool.query('DROP FUNCTION test_refuse_resolve_audit()');
+  }
+  const r = (await pool.query('SELECT retired_at FROM cp_hosts WHERE host_id = $1', [R])).rows[0];
+  assert.equal(r.retired_at, null, 'retire rolled back');
+  assert.equal((await pool.query("SELECT status FROM cp_alert_events WHERE host_id = $1 AND rule_name = 'host:offline'", [R])).rows[0].status, 'open');
+});
+
+test('host:offline: two FleetManagers on one database; a disconnect on one and a reconnect on the other inside 5 min opens nothing', async () => {
+  const { rig, connectAgent, waitUntil } = require('./job-agent-rig');
+  const tag = crypto.randomBytes(4).toString('hex');
+  const tenant = `o${tag}`;
+  const hostId = crypto.randomUUID();
+  const keys = { 'pg-agent': { key_id: `ka${tag}`, user_id: `u${tag}` } };
+  const regOne = new PgRegistry(pool, { NODE_ENV: 'production' });
+  const regTwo = new PgRegistry(pool, { NODE_ENV: 'production' });
+  listeners.push(regOne, regTwo);
+  regOne.keyActive = async () => true;
+  regTwo.keyActive = async () => true;
+  const one = await rig({ registry: regOne, keys });
+  const two = await rig({ registry: regTwo, keys });
+  let clock = Date.now();
+  one.fm.capAlerts.now = () => clock;
+  const offlineRows = async () => (await pool.query(
+    "SELECT id FROM cp_alert_events WHERE host_id = $1 AND rule_name = 'host:offline'", [hostId])).rows;
+  const hostRow = async () => (await pool.query('SELECT status, agent_instance FROM cp_hosts WHERE host_id = $1', [hostId])).rows[0];
+  try {
+    const a = await connectAgent(one, hostId, { tenant, key: 'pg-agent' });
+    await waitUntil('presence on one', async () => (await hostRow()).agent_instance === one.fm.jobs.instanceId, 8000);
+    a.ws.terminate();
+    await waitUntil('offline on one', async () => {
+      const h = await hostRow();
+      return !one.fm.connectedAgents.has(hostId) && h.status === 'offline' && h.agent_instance === null;
+    }, 8000);
+    assert.ok(one.fm.capAlerts.hosts.get(hostId), 'one tracks the closed host');
+    clock += 60_000;
+    await connectAgent(two, hostId, { tenant, key: 'pg-agent' });
+    await waitUntil('presence on two', async () => (await hostRow()).agent_instance === two.fm.jobs.instanceId, 8000);
+    clock += 5 * 60_000;
+    await one.fm.capAlerts.tick();
+    assert.deepEqual(await offlineRows(), [], 'online on the other replica: no alert');
+    assert.equal(one.fm.capAlerts.hosts.has(hostId), false);
+    // A late status write from one saying offline is not enough while two's
+    // presence is fresh.
+    await regOne.setHostStatus(hostId, 'offline');
+    one.fm.capAlerts.onDisconnect(hostId);
+    clock += 5 * 60_000;
+    await one.fm.capAlerts.tick();
+    assert.deepEqual(await offlineRows(), []);
+    // With two's presence stale (its instance gone), it opens.
+    await pool.query("UPDATE cp_hosts SET agent_seen_at = now() - interval '5 minutes' WHERE host_id = $1", [hostId]);
+    one.fm.capAlerts.onDisconnect(hostId);
+    clock += 5 * 60_000;
+    await one.fm.capAlerts.tick();
+    assert.equal((await offlineRows()).length, 1);
+  } finally {
+    await one.close();
+    await two.close();
+    // The closed socket's presence clear lands before the pool ends.
+    await waitUntil('presence cleared', async () => (await hostRow()).agent_instance === null, 8000);
+  }
 });
