@@ -84,8 +84,8 @@ class MeshChannels {
     }
 
     // A session-level error: mesh_status without a stream, then 1011.
-    failSocket(ws, code) {
-        sendJSON(ws, { type: 'mesh_status', payload: { error: code } });
+    failSocket(ws, code, reason = null) {
+        sendJSON(ws, { type: 'mesh_status', payload: reason ? { error: code, reason } : { error: code } });
         if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close(1011);
     }
 
@@ -150,7 +150,7 @@ class MeshChannels {
             return;
         }
         if (!fm.agentSupports(hostId, 'tcp')) {
-            this.failSocket(ws, 'agent_unsupported');
+            this.failSocket(ws, 'agent_unsupported', fm.agentUnsupportedReason(hostId, 'tcp'));
             return;
         }
         const actor = row.actor || null;

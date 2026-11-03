@@ -120,6 +120,8 @@ no scopes.
 | GET | `/api/v1/fleet` | Hosts in your tenants. `?q=` filters by hostname. Retired hosts are left out unless `?include_retired=1`; each row carries `retired_at` (null when live). |
 | GET | `/api/v1/hosts/resolve?name=` | Exact `host_id`, or exact case-insensitive hostname, in your tenants; retired hosts never match. With several matches, the single online one wins when every other match is offline and last seen more than `SYSTEMAPI_RESOLVE_STALE_HOURS` (default 24) ago. 200, 404 `not_found`, 409 `ambiguous`, 400 `invalid_name`. See `docs/sahconnect-terminal-protocol.md`. |
 | POST | `/api/v1/hosts/:host_id/retire` | `admin` scope in the host's tenant. Body `{"reason": "<1-256 chars>", "force": false}`. Stamps `retired_at`, appends a `host_retired` audit row (reason, hostname, forced, last_seen_at) in the same transaction, and keeps the row. A retired host never resolves, is left out of the fleet listing and counts, has no channel policy (deny), and its `host_id` cannot re-enroll (`enroll_error host_retired`). A connected host is refused `409 {"error":"host_online","host_id":...}` unless `"force": true`, which also closes the agent socket (4403 `host_retired`) and so ends its terminal, TCP, file and xfer sessions. 200 `{"host_id","hostname","tenant","retired_at","forced","agent_closed"}`; 400 `reason_required`, `bad_reason`, `bad_force`; 403 `scope_denied`; 404 `not_found`; 409 `already_retired`. The API key the agent enrolled with is not revoked: it is the tenant's key and may serve other hosts. |
+| GET | `/api/v1/hosts/:host_id/capabilities` | `hosts:read` in the host's tenant; another tenant's host is `404 not_found` with an `idor` security event. 200 `{"host_id","health","supported","effective","expected","caps":[{"name","state","reason","since","last_report_at"}]}`. See [Capability health](#capability-health). |
+| POST | `/api/v1/hosts/:host_id/capabilities/probe` | `admin` scope in the host's tenant. Sends `capability_probe` to the live agent, which re-runs its probes and reports (old agents ignore it). 202 `{"host_id","probe":"sent"}`; 409 `host_offline` when no agent socket is held by this control plane; 403 `scope_denied`; 404 `not_found`. |
 | GET | `/api/v1/fleet/export` | Same list; `?format=csv` for CSV. |
 | GET | `/api/v1/fleet/efficiency` | Average CPU and memory per host over the last 100 samples. |
 | GET | `/api/v1/fleet/:hostId/software` | Installed software reported by the agent. |
@@ -145,7 +147,62 @@ A host in the list looks like:
 
 `cpu_percent` is the latest `cpu.usage_percent` sample and is `null` when there
 is none. Memory, disk and network figures are stored as telemetry but are not
-part of this object.
+part of this object. `/api/v1/fleet` rows and `/api/v1/hosts/resolve` also
+carry `health` (below).
+
+### Capability health
+
+Self-reported by the agent: it detects breakage (a missing helper, a kernel
+without `openat2`), **not compromise** (a compromised agent can report every
+capability ok).
+
+- The dial header `X-SystemAPI-Capabilities` names what the agent binary
+  supports; `X-SystemAPI-Capabilities-Degraded` (same grammar: at most 16
+  tokens of `[a-z][a-z0-9_]{0,15}`, 256 bytes) names the supported ones whose
+  probe failed at dial. The agent then sends `{"type":"capability_report",
+  "v":1,"probed_at":"<RFC3339>","caps":[{"name","state","reason"}]}` after
+  enroll, about every 10 minutes and on change. `state` is `ok`, `degraded`
+  or `absent`; `reason` is empty when ok, else one of `enosys_openat2`,
+  `binary_missing`, `helper_unit_missing`, `helper_trust_missing`,
+  `manager_unreachable`, `flag_off`, `unsupported_os`, `no_systemd`,
+  `probe_error`.
+- A report is taken only after enroll, at most 8 KiB and 16 entries, names
+  from the known list (`pty`, `file`, `tcp`, `xfer`, `service`, `config`,
+  `package`, `tweak`, `sysscript_jobs`, `converge`, `config_write`,
+  `sysctl_write`, `override_write`; others are dropped); anything else in it
+  refuses the whole frame. Per host one report is processed at a time and
+  reports are at least 60 s apart (the first on a connection and the answer
+  to a probe excepted); extras are dropped. 10 refused or dropped reports
+  within 10 minutes close the agent socket with 1008 and an
+  `agent_capability_flood` security event.
+- **Routing.** A connection's effective set is the supported header minus
+  the degraded header, then each report withdraws the names it marks
+  `degraded` or `absent` and restores the ones it marks `ok`; a name missing
+  from a report keeps its state, and a report never adds a name the header
+  lacks. `sysscript_jobs` and `converge` follow the header only. A withdrawn
+  capability answers `agent_unsupported` with its `reason` (`probe_error`
+  when only the degraded header named it): `{"error":"agent_unsupported",
+  "reason":"enosys_openat2"}` in the channel status frame, or the 501 body
+  of an xfer grant.
+- **sys writes.** `config write` needs `config_write`, `tweak sysctl-set`
+  `sysctl_write`, `unit-override-set` and `resource-limit-set`
+  `override_write`; reads stay on `config`/`tweak`. An agent whose header has
+  none of the three write tokens is an old agent and its writes gate on
+  `config`/`tweak` as before. A new agent without the token answers
+  `agent_unsupported` with `helper_unit_missing` (or the reason it reported).
+- **Expected** capabilities come from the host's effective channel policy:
+  file roots `file` (a write root also `xfer`), config paths `config` and
+  `config_write`, service units `service`, tweak sysctls `tweak` and
+  `sysctl_write`, tweak units `tweak` and `override_write`, package names
+  `package`, a tcp allow list `tcp`.
+- **`health`**: `offline` (no agent socket on this control plane), `unknown`
+  (connected, no report on this connection yet: old agents, reports off),
+  `degraded` (an expected capability is not in the effective set), else
+  `ok`.
+- **`caps`** are the stored rows, kept for every known name a report
+  carried (in the header or not) and across reconnects. A row is written
+  only when its state or reason changes; `since` is when the state last
+  changed and `last_report_at` the report that last wrote the row.
 
 ## Metrics and alerts
 

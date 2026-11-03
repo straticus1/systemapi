@@ -1422,3 +1422,52 @@ test('setScopesAudited replaces a key\'s scopes and writes the audit row in one 
   assert.deepEqual(after, ['exec:run', 'hosts:read']);
   assert.equal((await registry.verifyAudit()).ok, true);
 });
+
+test('setHostCapabilities writes only changed rows in one statement, keeps since on a reason change, and returns the previous state', async () => {
+  const host = '44444444-4444-4444-8444-444444444444';
+  let statements = 0;
+  const counting = new PgRegistry({
+    query: (sql, params) => { statements += 1; return pool.query(sql, params); },
+    connect: () => pool.connect()
+  }, { NODE_ENV: 'production' });
+  const first = await counting.setHostCapabilities(host, [
+    { name: 'pty', state: 'ok', reason: '' },
+    { name: 'file', state: 'degraded', reason: 'enosys_openat2' },
+    { name: 'package', state: 'absent', reason: 'binary_missing' }
+  ]);
+  assert.equal(statements, 1);
+  assert.deepEqual(first.map((r) => [r.name, r.previous_state, r.state]).sort(),
+    [['file', null, 'degraded'], ['package', null, 'absent'], ['pty', null, 'ok']]);
+  const rowsOf = async () => (await pool.query('SELECT name, since, last_report_at FROM cp_host_capabilities WHERE host_id = $1 ORDER BY name', [host])).rows;
+  const sinceOf = (rows, name) => rows.find((r) => r.name === name).since.getTime();
+  const before = await rowsOf();
+  // The same rows again: one statement, nothing written.
+  statements = 0;
+  assert.deepEqual(await counting.setHostCapabilities(host, [
+    { name: 'pty', state: 'ok', reason: '' },
+    { name: 'file', state: 'degraded', reason: 'enosys_openat2' }
+  ]), []);
+  assert.equal(statements, 1);
+  assert.deepEqual(await rowsOf(), before, 'an unchanged row is not rewritten');
+  await new Promise((r) => setTimeout(r, 20));
+  // file: reason only (since kept); pty: state change (since moves).
+  const changed = await counting.setHostCapabilities(host, [
+    { name: 'file', state: 'degraded', reason: 'probe_error' },
+    { name: 'pty', state: 'degraded', reason: 'probe_error' }
+  ]);
+  assert.deepEqual(changed.map((r) => [r.name, r.previous_state, r.state, r.reason]).sort(),
+    [['file', 'degraded', 'degraded', 'probe_error'], ['pty', 'ok', 'degraded', 'probe_error']]);
+  const after = await rowsOf();
+  assert.equal(sinceOf(after, 'file'), sinceOf(before, 'file'));
+  assert.ok(sinceOf(after, 'pty') > sinceOf(before, 'pty'));
+  const listed = await registry.listHostCapabilities(host);
+  assert.deepEqual(listed.map((r) => [r.name, r.state, r.reason]).sort(),
+    [['file', 'degraded', 'probe_error'], ['package', 'absent', 'binary_missing'], ['pty', 'degraded', 'probe_error']]);
+  assert.deepEqual(await counting.setHostCapabilities(host, []), []);
+  // The table refuses what the validator refuses.
+  await assert.rejects(registry.setHostCapabilities(host, [{ name: 'file', state: 'broken', reason: '' }]));
+  await assert.rejects(registry.setHostCapabilities(host, [{ name: 'Bad Name', state: 'ok', reason: '' }]));
+  // clearAgentPresence leaves capability rows alone.
+  await registry.clearAgentPresence(host, 'conn-x');
+  assert.equal((await registry.listHostCapabilities(host)).length, 3);
+});

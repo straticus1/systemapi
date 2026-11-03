@@ -884,6 +884,8 @@ class MemoryRegistry {
     this.assignments = new Map();
     this.hostStates = new Map();
     this.convergeRuns = new Map();
+    // host_id -> Map(name -> cp_host_capabilities row).
+    this.hostCapabilities = new Map();
   }
 
   async enroll({ tenantId, userId, keyId, hostId, hostname, os, platform, sshPubkey }) {
@@ -1420,6 +1422,37 @@ class MemoryRegistry {
       if ((await this.upsertSoftware(hostId, sw)).inserted) added.push({ name: sw.name, version: sw.version });
     }
     return added;
+  }
+
+  // See PgRegistry.setHostCapabilities.
+  async setHostCapabilities(hostId, rows) {
+    let byName = this.hostCapabilities.get(hostId);
+    if (!byName) {
+      byName = new Map();
+      this.hostCapabilities.set(hostId, byName);
+    }
+    const now = new Date().toISOString();
+    const out = [];
+    for (const r of rows) {
+      const prev = byName.get(r.name);
+      if (prev && prev.state === r.state && prev.reason === r.reason) continue;
+      const row = {
+        name: r.name,
+        state: r.state,
+        reason: r.reason,
+        since: prev && prev.state === r.state ? prev.since : now,
+        last_report_at: now
+      };
+      byName.set(r.name, row);
+      out.push({ ...row, previous_state: prev ? prev.state : null });
+    }
+    return out.sort((a, b) => (a.name < b.name ? -1 : 1));
+  }
+
+  async listHostCapabilities(hostId) {
+    const byName = this.hostCapabilities.get(hostId);
+    if (!byName) return [];
+    return [...byName.values()].map((r) => ({ ...r })).sort((a, b) => (a.name < b.name ? -1 : 1));
   }
 
   async listSoftware(hostId) {
@@ -3027,6 +3060,44 @@ class PgRegistry {
       [hostId, items.map((i) => i.name), items.map((i) => i.version), items.map((i) => i.architecture)]
     );
     return res.rows.filter((r) => r.inserted).map((r) => ({ name: r.name, version: r.version }));
+  }
+
+  // A capability report's rows ({name, state, reason}, validated by
+  // controlplane/capabilities.js) in one statement: a row is written only
+  // when its state or reason changed; since moves only when the state did.
+  // Returns the written rows, each with the state it replaced (null for a
+  // new row). Both CTEs read the same snapshot, so prev is the old state.
+  async setHostCapabilities(hostId, rows) {
+    if (rows.length === 0) return [];
+    const res = await this.pool.query(
+      `WITH prev AS (
+         SELECT name, state FROM cp_host_capabilities WHERE host_id = $1 AND name = ANY($2::text[])
+       ), up AS (
+         INSERT INTO cp_host_capabilities AS c (host_id, name, state, reason, since, last_report_at)
+         SELECT $1, t.name, t.state, t.reason, now(), now()
+           FROM unnest($2::text[], $3::text[], $4::text[]) AS t(name, state, reason)
+         ON CONFLICT (host_id, name) DO UPDATE SET
+           state = EXCLUDED.state,
+           reason = EXCLUDED.reason,
+           since = CASE WHEN c.state = EXCLUDED.state THEN c.since ELSE EXCLUDED.since END,
+           last_report_at = EXCLUDED.last_report_at
+         WHERE c.state IS DISTINCT FROM EXCLUDED.state OR c.reason IS DISTINCT FROM EXCLUDED.reason
+         RETURNING c.name, c.state, c.reason, c.since, c.last_report_at
+       )
+       SELECT up.name, up.state, up.reason, up.since, up.last_report_at, prev.state AS previous_state
+         FROM up LEFT JOIN prev ON prev.name = up.name
+        ORDER BY up.name`,
+      [hostId, rows.map((r) => r.name), rows.map((r) => r.state), rows.map((r) => r.reason)]
+    );
+    return res.rows;
+  }
+
+  async listHostCapabilities(hostId) {
+    const res = await this.pool.query(
+      'SELECT name, state, reason, since, last_report_at FROM cp_host_capabilities WHERE host_id = $1 ORDER BY name',
+      [hostId]
+    );
+    return res.rows;
   }
 
   async listSoftware(hostId) {

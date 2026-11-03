@@ -17,7 +17,10 @@
  * host's per-resource allowlist are re-checked at the upgrade
  * (recheckChannelTicket); the lease signs the exact resource and verb so the
  * agent acts only on what was signed; a host that does not advertise the
- * resource's capability is refused agent_unsupported; the ticket is single-use
+ * resource's capability (for a write verb on a new agent, its config_write,
+ * sysctl_write or override_write token; a capability the agent reports
+ * degraded is withdrawn the same way) is refused agent_unsupported with the
+ * reason code; the ticket is single-use
  * (consumed on first upgrade) so it cannot be replayed; and every operation
  * leaves an intent row before the request is forwarded and a result row after
  * (both auditable, the result row retried like tcp_end). A request without a
@@ -34,6 +37,7 @@ const { ticketFromRequest } = require('../controlplane/httpauth');
 const { consumeTicket } = require('../controlplane/tickets');
 const { issueLease, sysServicePayload, sysPackagePayload, sysConfigPayload, sysTweakPayload } = require('../controlplane/lease');
 const { validateServiceBinding, validatePackageBinding, validateConfigBinding, validateTweakBinding } = require('../controlplane/channels');
+const { WRITE_CAPABILITIES } = require('../controlplane/capabilities');
 
 function sha256Hex(s) {
     return crypto.createHash('sha256').update(s, 'utf8').digest('hex');
@@ -92,6 +96,8 @@ const SYS_RESOURCES = {
     },
     'sys:config': {
         capability: 'config',
+        // The write token a mutating verb needs from a new agent.
+        writeCapability: (b) => (b.action === 'write' ? 'config_write' : null),
         leaseAction: 'sys_config',
         frameType: 'sys_config',
         // Returns { ok, binding } where binding is { action, target, content? }.
@@ -121,6 +127,8 @@ const SYS_RESOURCES = {
     },
     'sys:tweak': {
         capability: 'tweak',
+        writeCapability: (b) => (b.verb === 'sysctl-set' ? 'sysctl_write'
+            : b.verb === 'unit-override-set' || b.verb === 'resource-limit-set' ? 'override_write' : null),
         leaseAction: 'sys_tweak',
         frameType: 'sys_tweak',
         // Returns { ok, binding } where binding is the flat { verb, ... }.
@@ -147,6 +155,15 @@ const SYS_RESOURCES = {
     }
 };
 
+// The capability one sys request needs. A write verb needs its *_write token
+// (P1b) from a new agent; an agent whose header carries none of the write
+// tokens is an old agent, whose writes gate on config/tweak as before.
+function requiredCapability(resource, binding, supported) {
+    const write = typeof resource.writeCapability === 'function' ? resource.writeCapability(binding) : null;
+    if (!write) return resource.capability;
+    return WRITE_CAPABILITIES.some((name) => supported.has(name)) ? write : resource.capability;
+}
+
 class SysChannels {
     constructor(fm) {
         this.fm = fm;
@@ -170,8 +187,8 @@ class SysChannels {
         });
     }
 
-    failSocket(ws, code) {
-        sendJSON(ws, { type: 'sys_result', payload: { ok: false, error: code } });
+    failSocket(ws, code, reason = null) {
+        sendJSON(ws, { type: 'sys_result', payload: reason ? { ok: false, error: code, reason } : { ok: false, error: code } });
         if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close(1011);
     }
 
@@ -238,8 +255,9 @@ class SysChannels {
             this.failSocket(ws, 'agent_offline');
             return;
         }
-        if (!fm.agentSupports(hostId, resource.capability)) {
-            this.failSocket(ws, 'agent_unsupported');
+        const capability = requiredCapability(resource, checked.binding, fm.agentSupportedCaps(hostId));
+        if (!fm.agentSupports(hostId, capability)) {
+            this.failSocket(ws, 'agent_unsupported', fm.agentUnsupportedReason(hostId, capability));
             return;
         }
         const actor = row.actor || null;
@@ -388,4 +406,4 @@ class SysChannels {
     }
 }
 
-module.exports = { SysChannels, SYS_ERRORS, SYS_PER_AGENT, SYS_RESOURCES };
+module.exports = { SysChannels, SYS_ERRORS, SYS_PER_AGENT, SYS_RESOURCES, requiredCapability };

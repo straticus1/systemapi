@@ -226,7 +226,7 @@ test('a retired host is left out of resolve, the fleet listing (unless asked), c
     assert.deepEqual(await resolve(r, 'web1'), { status: 409, body: { error: 'ambiguous', matches: 2 } });
     assert.equal((await retire(r, OLD, { reason: 're-enrolled as ' + NEW })).status, 200);
 
-    assert.deepEqual(await resolve(r, 'web1'), { status: 200, body: { host_id: NEW, hostname: 'web1', tenant: 'acme', status: 'online' } });
+    assert.deepEqual(await resolve(r, 'web1'), { status: 200, body: { host_id: NEW, hostname: 'web1', tenant: 'acme', status: 'online', health: 'unknown' } });
     assert.deepEqual(await resolve(r, OLD), { status: 404, body: { error: 'not_found' } });
 
     const listed = await call(r, 'GET', '/api/v1/fleet', { key: 'read-key' });
@@ -257,7 +257,7 @@ test('resolve prefers the single online row over offline rows older than the sta
 
     // Last seen 25 h ago: the online row wins.
     oldRow.last_seen_at = new Date(Date.now() - 25 * HOUR).toISOString();
-    assert.deepEqual(await resolve(r, 'WEB1'), { status: 200, body: { host_id: NEW, hostname: 'web1', tenant: 'acme', status: 'online' } });
+    assert.deepEqual(await resolve(r, 'WEB1'), { status: 200, body: { host_id: NEW, hostname: 'web1', tenant: 'acme', status: 'online', health: 'unknown' } });
 
     // A wider window makes the same row count again; a malformed value is the default.
     r.fm.env.SYSTEMAPI_RESOLVE_STALE_HOURS = '48';

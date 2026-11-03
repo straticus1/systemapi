@@ -257,7 +257,12 @@ class XferGrants {
         }
         const agentWs = fm.connectedAgents && fm.connectedAgents.get(host.host_id);
         if (!agentWs || agentWs.readyState !== WebSocket.OPEN) throw httpError(503, 'agent_offline');
-        if (!fm.agentSupports(host.host_id, 'xfer')) throw httpError(501, 'agent_unsupported');
+        if (!fm.agentSupports(host.host_id, 'xfer')) {
+            const err = httpError(501, 'agent_unsupported');
+            const reason = typeof fm.agentUnsupportedReason === 'function' ? fm.agentUnsupportedReason(host.host_id, 'xfer') : null;
+            if (reason) err.reason = reason;
+            throw err;
+        }
         if (!fm.signer) throw httpError(503, 'internal');
         const actor = principal.userId;
         const perActor = envInt(env, 'SYSTEMAPI_XFER_MAX_PER_ACTOR', PER_ACTOR_DEFAULT, 1, 1000);
