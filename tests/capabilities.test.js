@@ -108,6 +108,30 @@ test('the validator refuses the whole frame: >16 entries, bad or ok-with reason,
   assert.equal(validate(report(many.slice(0, 16))).ok, true);
 });
 
+test('interval_s: an integer from 60 to 3600 is kept per connection; absent is null; anything else refuses the frame', () => {
+  assert.equal(validate(report([])).report.intervalS, null, 'older agents send none');
+  assert.equal(validate(report([], { interval_s: 60 })).report.intervalS, 60);
+  assert.equal(validate(report([], { interval_s: 3600 })).report.intervalS, 3600);
+  for (const bad of [59, 3601, 600.5, '600', null, -1, 1e9, true, [600]]) {
+    assert.deepEqual(validate(report([], { interval_s: bad })), { ok: false, error: 'bad_interval' }, JSON.stringify(bad));
+  }
+  const c = new ConnectionCapabilities(new Set(['pty']), new Set());
+  assert.equal(c.intervalS, null);
+  c.applyReport(validate(report([], { interval_s: 1800 })).report);
+  assert.equal(c.intervalS, 1800);
+  c.applyReport(validate(report([])).report);
+  assert.equal(c.intervalS, null, 'the latest report decides');
+});
+
+test('a write token withdrawn by the degraded header alone answers helper_unit_missing, not probe_error', () => {
+  const c = new ConnectionCapabilities(new Set(['config', 'config_write', 'sysctl_write', 'file']), new Set(['config_write', 'file']));
+  assert.equal(c.supports('config_write'), false);
+  assert.equal(c.unsupportedReason('config_write'), 'helper_unit_missing');
+  assert.equal(c.unsupportedReason('file'), 'probe_error', 'other names keep the dial reason');
+  c.applyReport({ probedAt: NOW, caps: [{ name: 'config_write', state: 'degraded', reason: 'helper_trust_missing' }] });
+  assert.equal(c.unsupportedReason('config_write'), 'helper_trust_missing', 'a report\'s reason wins');
+});
+
 // --- pure: routing ---
 
 test('routing: degraded header before any report, a report cannot add, a missing name keeps its state', () => {
@@ -319,11 +343,12 @@ test('flood: one in flight, a 60 s gap, every refusal counted, 10 violations in 
     const set = r.fm.registry.setHostCapabilities;
     r.fm.registry.setHostCapabilities = async (h, rows) => { await gate; return set(h, rows); };
     send(agent, report([{ name: 'file', state: 'ok' }]));
-    await waitUntil('in flight', () => r.fm.capReportLimits.get(HOST_A) && r.fm.capReportLimits.get(HOST_A).inFlight);
+    const slot = () => r.fm.capWrites.get(r.fm.connectedAgents.get(HOST_A));
+    await waitUntil('in flight', () => slot() && slot().inFlight);
     send(agent, report([{ name: 'file', state: 'ok' }]));
     await waitUntil('in_flight drop', () => r.fm.capReportDrops.get('in_flight') === 1);
     release();
-    await waitUntil('first stored', () => !r.fm.capReportLimits.get(HOST_A).inFlight);
+    await waitUntil('first stored', () => !slot().inFlight);
     assert.equal(r.writes.length, 1);
     // Inside the gap: dropped and counted.
     send(agent, report([{ name: 'file', state: 'degraded', reason: 'probe_error' }]));
@@ -599,7 +624,7 @@ test('the report and probe frames never carry more than names, states and reason
   assert.deepEqual(Object.keys(out.report.caps[0]).sort(), ['name', 'reason', 'state']);
 });
 
-test('a report up to 5 s early is accepted; a slow DB write is dropped work, not a violation, and times out', async () => {
+test('a report up to 5 s early is accepted; a stalled DB write holds its slot (never two writes at once) and its drops are no violations', async () => {
   const r = await rig();
   try {
     const agent = await connectAgent(r);
@@ -611,17 +636,84 @@ test('a report up to 5 s early is accepted; a slow DB write is dropped work, not
     await waitUntil('accepted early', () => r.writes.length === 2);
     assert.equal(r.fm.capReportDrops.get('too_soon') || 0, 0);
 
-    // A write that never finishes times out; the in-flight drops meanwhile are no violations.
-    r.fm.capWriteTimeoutMs = 50;
-    r.fm.registry.setHostCapabilities = () => new Promise(() => {});
+    // A stalled write keeps the slot for as long as it runs: every report
+    // meanwhile is an in_flight drop (never a violation) and never a second
+    // concurrent write.
+    let running = 0;
+    let maxRunning = 0;
+    let calls = 0;
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const set = r.fm.registry.setHostCapabilities.bind(r.fm.registry);
+    r.fm.registry.setHostCapabilities = async (h, rows) => {
+      calls += 1;
+      running += 1;
+      maxRunning = Math.max(maxRunning, running);
+      try { await gate; return await set(h, rows); } finally { running -= 1; }
+    };
+    const slot = r.fm.capWrites.get(r.fm.connectedAgents.get(HOST_A));
     limit.lastAt = 0;
     send(agent, report([{ name: 'file', state: 'ok' }]));
-    await waitUntil('in flight', () => limit.inFlight);
+    await waitUntil('in flight', () => slot.inFlight);
     for (let i = 0; i < 12; i += 1) send(agent, report([{ name: 'file', state: 'ok' }]));
     await waitUntil('drops counted', () => (r.fm.capReportDrops.get('in_flight') || 0) >= 12);
-    await waitUntil('timed out', () => !limit.inFlight);
+    await tick(200);
+    assert.equal(slot.inFlight, true, 'no timeout frees the slot while the write runs');
+    assert.equal(calls, 1);
+    assert.equal(maxRunning, 1);
     assert.equal(agent.box.closeCode, null, 'a slow database never disconnects the agent');
     assert.equal(limit.violations.length, 0);
+    release();
+    await waitUntil('slot freed', () => !slot.inFlight);
+    assert.equal(maxRunning, 1, 'writes for one host never overlapped');
+  } finally { await r.close(); }
+});
+
+test('reconnect while the old socket\'s write is pending: the new first report is accepted, writes run in order, a late completion restores no cache', async () => {
+  const r = await rig();
+  try {
+    const a1 = await connectAgent(r);
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const set = r.fm.registry.setHostCapabilities.bind(r.fm.registry);
+    let running = 0;
+    let maxRunning = 0;
+    const order = [];
+    r.fm.registry.setHostCapabilities = async (h, rows) => {
+      running += 1;
+      maxRunning = Math.max(maxRunning, running);
+      order.push(rows.map((x) => `${x.name}:${x.state}`).join(','));
+      try {
+        if (order.length === 1) await gate;
+        return await set(h, rows);
+      } finally { running -= 1; }
+    };
+    const ws1 = r.fm.connectedAgents.get(HOST_A);
+    send(a1, report([{ name: 'file', state: 'degraded', reason: 'probe_error' }, { name: 'pty', state: 'ok' }]));
+    await waitUntil('old write pending', () => r.fm.capWrites.get(ws1) && r.fm.capWrites.get(ws1).inFlight);
+    a1.ws.terminate();
+    await waitUntil('gone', () => r.fm.connectedAgents.get(HOST_A) !== ws1);
+    const a2 = await connectAgent(r);
+    const ws2 = r.fm.connectedAgents.get(HOST_A);
+    send(a2, report([{ name: 'file', state: 'ok' }]));
+    // Routing took the new report at once, and it was not dropped.
+    await waitUntil('new report applied', () => r.fm.agentSupports(HOST_A, 'file'));
+    assert.equal(r.fm.capReportDrops.get('in_flight'), undefined);
+    assert.equal(r.fm.capReportDrops.get('stale_socket'), undefined);
+    await tick(100);
+    assert.equal(order.length, 1, 'the new write waits behind the old one');
+    release();
+    await waitUntil('both written', () => order.length === 2 && !r.fm.capWrites.get(ws2).inFlight);
+    assert.equal(maxRunning, 1);
+    assert.deepEqual(order, ['file:degraded,pty:ok', 'file:ok']);
+    assert.deepEqual((await r.fm.registry.listHostCapabilities(HOST_A)).map((x) => [x.name, x.state]), [['file', 'ok'], ['pty', 'ok']]);
+    // The old socket's late completion put nothing in the new socket's
+    // cache: an unchanged pty row is still written by the new connection.
+    assert.deepEqual([...r.fm.capWrites.get(ws2).stored.keys()], ['file']);
+    r.fm.capReportGapMs = 0;
+    send(a2, report([{ name: 'file', state: 'ok' }, { name: 'pty', state: 'ok' }]));
+    await waitUntil('pty rewritten', () => order.length === 3);
+    assert.equal(order[2], 'pty:ok');
   } finally { await r.close(); }
 });
 

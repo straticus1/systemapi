@@ -451,6 +451,10 @@ type capReportFrame struct {
 	V        int         `json:"v"`
 	ProbedAt string      `json:"probed_at"`
 	Caps     []capResult `json:"caps"`
+	// IntervalS is --capability-interval in whole seconds (60..3600), so
+	// the control plane times its missing-report alerts to this agent's
+	// cadence rather than its own default.
+	IntervalS int `json:"interval_s"`
 }
 
 // capManager holds the last probe results (for transitions and the
@@ -560,8 +564,11 @@ func closed(quit <-chan struct{}) bool {
 // sendReport probes and writes one capability_report, unless the gap has
 // not passed or quit (the connection) has closed: then it reports false with
 // no error, sends nothing and leaves the gap as it was, so a goroutine of an
-// old connection can never take the next connection's slot.
-func (m *capManager) sendReport(out ptyOut, quit <-chan struct{}) (bool, error) {
+// old connection can never take the next connection's slot. The frame
+// carries the newest applied probe (lastRes): when a newer probe superseded
+// this one, its results are sent, never this probe's stale ones. interval
+// is the connection's report cadence, sent as interval_s.
+func (m *capManager) sendReport(out ptyOut, quit <-chan struct{}, interval time.Duration) (bool, error) {
 	m.mu.Lock()
 	now := time.Now()
 	if closed(quit) || (m.sentAny && now.Sub(m.lastSent) < capReportMinGap) {
@@ -573,7 +580,10 @@ func (m *capManager) sendReport(out ptyOut, quit <-chan struct{}) (bool, error) 
 	m.lastSent, m.sentAny = now, true
 	m.mu.Unlock()
 
-	res := m.probe()
+	m.probe()
+	m.mu.Lock()
+	res := append([]capResult(nil), m.lastRes...)
+	m.mu.Unlock()
 	if closed(quit) {
 		m.mu.Lock()
 		if m.lastSent.Equal(now) {
@@ -583,10 +593,11 @@ func (m *capManager) sendReport(out ptyOut, quit <-chan struct{}) (bool, error) 
 		return false, nil
 	}
 	frame := capReportFrame{
-		Type:     "capability_report",
-		V:        1,
-		ProbedAt: now.UTC().Format(time.RFC3339),
-		Caps:     res,
+		Type:      "capability_report",
+		V:         1,
+		ProbedAt:  now.UTC().Format(time.RFC3339),
+		Caps:      res,
+		IntervalS: capIntervalSeconds(interval),
 	}
 	err := out.WriteJSON(frame)
 	// The gap runs from the write, not from the probe before it.
@@ -620,7 +631,7 @@ func (m *capManager) serve(out ptyOut, probe <-chan struct{}, quit <-chan struct
 				gate = time.NewTimer(wait)
 				gateC = gate.C
 			} else {
-				sent, err := m.sendReport(out, quit)
+				sent, err := m.sendReport(out, quit, interval)
 				if closed(quit) {
 					return
 				}
@@ -661,6 +672,18 @@ func capJitter(d time.Duration) time.Duration {
 		return d
 	}
 	return d - time.Duration(span/2) + time.Duration(n.Int64())
+}
+
+// capIntervalSeconds is interval in whole seconds, held to the
+// --capability-interval bounds (the control plane refuses anything else).
+func capIntervalSeconds(d time.Duration) int {
+	if d < capIntervalMin {
+		d = capIntervalMin
+	}
+	if d > capIntervalMax {
+		d = capIntervalMax
+	}
+	return int(d / time.Second)
 }
 
 // parseCapabilityInterval checks --capability-interval.

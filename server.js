@@ -170,6 +170,13 @@ const capabilityReportDroppedTotal = new promClient.Counter({
     registers: [register]
 });
 
+const capabilityAlertCappedTotal = new promClient.Counter({
+    name: 'systemapi_capability_alert_capped_total',
+    help: 'Capability and host:offline alert opens held back by the per-host hourly cap, by rule',
+    labelNames: ['rule'],
+    registers: [register]
+});
+
 const terminalAuditFailures = new promClient.Counter({
     name: 'systemapi_terminal_audit_failures_total',
     help: 'Terminal end audit rows that could not be written after retries',
@@ -510,6 +517,7 @@ const prometheusMetrics = {
     hostsHealthGauge,
     agentUnsupportedTotal,
     capabilityReportDroppedTotal,
+    capabilityAlertCappedTotal,
     hostTotalGauge,
     hostOnlineGauge,
     hostOfflineGauge

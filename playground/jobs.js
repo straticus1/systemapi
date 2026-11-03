@@ -166,7 +166,9 @@ function jobView(row, { output = true, visible = true } = {}) {
 class SysscriptJobs {
     constructor(fleet) {
         this.fleet = fleet;
-        // Written on the row (agent_instance) and into every conn_id.
+        // Written on the row (agent_instance) and into every conn_id. Random
+        // per process unless boot sets a stable SYSTEMAPI_INSTANCE_ID
+        // (controlplane/index.js), so a restart can find its own stale rows.
         this.instanceId = randomToken(16);
         // Per accepted agent socket: "<instance>:<token>", and when it
         // enrolled (cp_hosts.agent_enrolled_at).
@@ -654,12 +656,18 @@ class SysscriptJobs {
     async requireAgent(hostId) {
         if (this.localSocket(hostId)) {
             if (typeof this.fleet.agentSupports === 'function' && this.fleet.agentSupports(hostId, JOB_CAPABILITY)) return;
-            throw http(501, 'agent_unsupported');
+            this.unsupported();
         }
         const reg = this.fleet.registry;
         const agent = reg && typeof reg.hostAgent === 'function' ? await reg.hostAgent(hostId, { maxAgeS: PRESENCE_FRESH_S }) : null;
         if (!agent) throw http(409, 'agent_offline');
-        if (!agent.caps.includes(JOB_CAPABILITY)) throw http(501, 'agent_unsupported');
+        if (!agent.caps.includes(JOB_CAPABILITY)) this.unsupported();
+    }
+
+    // 501 agent_unsupported for sysscript_jobs, counted like the channels'.
+    unsupported() {
+        if (typeof this.fleet.noteUnsupported === 'function') this.fleet.noteUnsupported(JOB_CAPABILITY);
+        throw http(501, 'agent_unsupported');
     }
 
     // The legacy callers (/execute, /fleet/execute, playbooks, the scheduler

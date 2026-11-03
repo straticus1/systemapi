@@ -258,6 +258,7 @@ class XferGrants {
         const agentWs = fm.connectedAgents && fm.connectedAgents.get(host.host_id);
         if (!agentWs || agentWs.readyState !== WebSocket.OPEN) throw httpError(503, 'agent_offline');
         if (!fm.agentSupports(host.host_id, 'xfer')) {
+            if (typeof fm.noteUnsupported === 'function') fm.noteUnsupported('xfer');
             const err = httpError(501, 'agent_unsupported');
             const reason = typeof fm.agentUnsupportedReason === 'function' ? fm.agentUnsupportedReason(host.host_id, 'xfer') : null;
             if (reason) err.reason = reason;

@@ -8,8 +8,10 @@
 // Wire contract (systemapi-agent): X-SystemAPI-Capabilities names what the
 // binary supports; X-SystemAPI-Capabilities-Degraded names the supported ones
 // whose probe failed at dial; the agent then sends
-// {"type":"capability_report","v":1,"probed_at":RFC3339,"caps":[{name,state,reason}]}
-// after enroll, every ~10 min and on change.
+// {"type":"capability_report","v":1,"probed_at":RFC3339,"caps":[{name,state,reason}],
+// "interval_s":<its --capability-interval in seconds, 60..3600>}
+// after enroll, every cycle and on a capability_probe. interval_s is
+// optional (older agents omit it); present, it must be an integer in range.
 //
 // Threats: an agent (or a stolen agent key) sending reports to make the
 // control plane do unbounded work, store unbounded or arbitrary text, or
@@ -26,6 +28,9 @@
 const REPORT_VERSION = 1;
 const REPORT_MAX_BYTES = 8 * 1024;
 const REPORT_MAX_ENTRIES = 16;
+// The agent's --capability-interval range, in seconds.
+const REPORT_INTERVAL_MIN_S = 60;
+const REPORT_INTERVAL_MAX_S = 3600;
 
 const KNOWN_CAPABILITIES = Object.freeze([
   'pty', 'file', 'tcp', 'xfer', 'service', 'config', 'package', 'tweak',
@@ -57,7 +62,8 @@ function refuse(error) {
 }
 
 // validateCapabilityReport checks a parsed capability_report frame of
-// `bytes` bytes. Returns { ok: true, report: { probedAt, caps }, dropped }
+// `bytes` bytes. Returns { ok: true, report: { probedAt, caps, intervalS },
+// dropped } (intervalS null when the frame has none)
 // (dropped = entries with an unknown name, ignored) or { ok: false, error }
 // with a fixed error code. Nothing from a refused frame is used.
 function validateCapabilityReport(msg, bytes) {
@@ -67,6 +73,12 @@ function validateCapabilityReport(msg, bytes) {
   if (typeof msg.probed_at !== 'string' || !PROBED_AT_RE.test(msg.probed_at)) return refuse('bad_probed_at');
   const probedMs = Date.parse(msg.probed_at);
   if (!Number.isFinite(probedMs)) return refuse('bad_probed_at');
+  let intervalS = null;
+  if (msg.interval_s !== undefined) {
+    const n = msg.interval_s;
+    if (!Number.isInteger(n) || n < REPORT_INTERVAL_MIN_S || n > REPORT_INTERVAL_MAX_S) return refuse('bad_interval');
+    intervalS = n;
+  }
   if (!Array.isArray(msg.caps)) return refuse('bad_caps');
   if (msg.caps.length > REPORT_MAX_ENTRIES) return refuse('too_many');
   const caps = [];
@@ -87,7 +99,7 @@ function validateCapabilityReport(msg, bytes) {
     if (reason !== '' && !CAPABILITY_REASONS.has(reason)) return refuse('bad_reason');
     caps.push({ name: c.name, state: c.state, reason });
   }
-  return { ok: true, report: { probedAt: new Date(probedMs).toISOString(), caps }, dropped };
+  return { ok: true, report: { probedAt: new Date(probedMs).toISOString(), caps, intervalS }, dropped };
 }
 
 // The capability state of one agent connection. supported is the dial
@@ -107,6 +119,9 @@ class ConnectionCapabilities {
     this.reportCount = 0;
     this.lastReportAt = null;
     this.probedAt = null;
+    // The agent's report interval from its latest report (null: none sent,
+    // an older agent; the alert rules then use the control plane's N).
+    this.intervalS = null;
   }
 
   applyReport(report, nowMs = Date.now()) {
@@ -119,6 +134,7 @@ class ConnectionCapabilities {
     this.reportCount += 1;
     this.lastReportAt = nowMs;
     this.probedAt = report.probedAt;
+    this.intervalS = Number.isInteger(report.intervalS) ? report.intervalS : null;
   }
 
   // An agent that advertises any *_write token is a new agent.
@@ -137,7 +153,14 @@ class ConnectionCapabilities {
   // The reason code a refused capability answers with, or null when there is
   // none to give (a capability the agent never advertised, as before).
   unsupportedReason(name) {
-    if (this.withdrawn.has(name)) return this.withdrawn.get(name) || DIAL_DEGRADED_REASON;
+    if (this.withdrawn.has(name)) {
+      const reason = this.withdrawn.get(name);
+      if (reason) return reason;
+      // Withdrawn by the degraded header alone: a write token there means
+      // its helper is missing (the agent probes the helper unit), not a
+      // probe failure.
+      return WRITE_CAPABILITIES.includes(name) ? WRITE_MISSING_REASON : DIAL_DEGRADED_REASON;
+    }
     if (this.supported.has(name)) return null;
     if (WRITE_CAPABILITIES.includes(name) && this.newAgent()) {
       const r = this.reported.get(name);
@@ -189,6 +212,8 @@ module.exports = {
   REPORT_VERSION,
   REPORT_MAX_BYTES,
   REPORT_MAX_ENTRIES,
+  REPORT_INTERVAL_MIN_S,
+  REPORT_INTERVAL_MAX_S,
   KNOWN_CAPABILITIES,
   CAPABILITY_STATES,
   CAPABILITY_REASONS,

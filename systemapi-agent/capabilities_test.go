@@ -306,7 +306,7 @@ func TestCapReportBoundedAndClean(t *testing.T) {
 	e.pkgVersion = func(string) error { return leakyErr }
 	m := newCapManager(e)
 	out := &capFrameSink{}
-	if sent, err := m.sendReport(out, make(chan struct{})); !sent || err != nil {
+	if sent, err := m.sendReport(out, make(chan struct{}), 15*time.Minute); !sent || err != nil {
 		t.Fatalf("sent=%v err=%v", sent, err)
 	}
 	raw := out.raw()
@@ -324,6 +324,9 @@ func TestCapReportBoundedAndClean(t *testing.T) {
 	}
 	if f.Type != "capability_report" || f.V != 1 || len(f.Caps) == 0 || len(f.Caps) > capTokensMax {
 		t.Fatalf("frame %+v", f)
+	}
+	if f.IntervalS != 900 || !strings.Contains(raw[0], `"interval_s":900`) {
+		t.Fatalf("interval_s %d in %s", f.IntervalS, raw[0])
 	}
 	if ts, err := time.Parse(time.RFC3339, f.ProbedAt); err != nil || ts.Location() != time.UTC || !strings.HasSuffix(f.ProbedAt, "Z") {
 		t.Fatalf("probed_at %q", f.ProbedAt)
@@ -975,6 +978,61 @@ func TestCapOlderProbeNeverOverwritesNewer(t *testing.T) {
 	}
 }
 
+// L6: a report whose own probe was superseded by a newer one sends the
+// newer results (lastRes), never its stale ones.
+func TestCapSupersededReportSendsNewest(t *testing.T) {
+	e := fakeCapEnv()
+	var calls atomic.Int32
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	e.tweakRead = func() error {
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release
+			return leakyErr // the report's own, older probe sees tweak broken
+		}
+		return nil // the newer probe sees it ok
+	}
+	m := newCapManager(e)
+	out := &capFrameSink{}
+	done := make(chan struct{})
+	go func() {
+		if sent, err := m.sendReport(out, make(chan struct{}), time.Hour); !sent || err != nil {
+			t.Errorf("sent=%v err=%v", sent, err)
+		}
+		close(done)
+	}()
+	<-entered
+	m.probe() // newer, finishes first
+	close(release)
+	<-done
+	raw := out.raw()
+	if len(raw) != 1 {
+		t.Fatalf("%d frames", len(raw))
+	}
+	var f capReportFrame
+	if err := json.Unmarshal([]byte(raw[0]), &f); err != nil {
+		t.Fatal(err)
+	}
+	if r := capsByName(f.Caps)["tweak"]; r.State != capStateOK {
+		t.Fatalf("superseded report sent the stale result: %+v", r)
+	}
+	if f.IntervalS != 3600 {
+		t.Fatalf("interval_s %d", f.IntervalS)
+	}
+}
+
+func TestCapIntervalSeconds(t *testing.T) {
+	for _, c := range []struct {
+		d    time.Duration
+		want int
+	}{{time.Minute, 60}, {90*time.Second + 500*time.Millisecond, 90}, {10 * time.Minute, 600}, {time.Hour, 3600}, {0, 60}, {2 * time.Hour, 3600}} {
+		if got := capIntervalSeconds(c.d); got != c.want {
+			t.Errorf("capIntervalSeconds(%s) = %d, want %d", c.d, got, c.want)
+		}
+	}
+}
+
 // L6: a closed connection's goroutine never sends a pending report nor
 // reserves the report gap.
 func TestCapClosedConnectionSendsNothing(t *testing.T) {
@@ -982,7 +1040,7 @@ func TestCapClosedConnectionSendsNothing(t *testing.T) {
 	out := &capFrameSink{}
 	quit := make(chan struct{})
 	close(quit)
-	if sent, err := m.sendReport(out, quit); sent || err != nil {
+	if sent, err := m.sendReport(out, quit, time.Hour); sent || err != nil {
 		t.Fatalf("sent=%v err=%v on a closed connection", sent, err)
 	}
 	done := make(chan struct{})
@@ -1003,7 +1061,7 @@ func TestCapClosedConnectionSendsNothing(t *testing.T) {
 	quit2 := make(chan struct{})
 	e.tweakRead = func() error { close(quit2); return nil }
 	m2 := newCapManager(e)
-	if sent, _ := m2.sendReport(out, quit2); sent {
+	if sent, _ := m2.sendReport(out, quit2, time.Hour); sent {
 		t.Fatal("report sent after the connection closed mid-probe")
 	}
 	if len(out.raw()) != 0 || m2.sentAny {

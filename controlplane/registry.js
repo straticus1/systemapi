@@ -768,6 +768,21 @@ function hostHealthValue(health) {
   return health;
 }
 
+// A presence row written within this many seconds means some instance holds
+// the host's socket (the same window as playground/jobs.js PRESENCE_FRESH_S:
+// the holder re-asserts it every 30 s tick). host:offline never opens while
+// one is fresh.
+const OFFLINE_PRESENCE_FRESH_S = 90;
+
+// The capability_alert_resolve audit of an alert closed by a host retire.
+function retiredAlertResolve(row) {
+  const m = /^capability:(.+)$/.exec(row.rule_name);
+  const capability = m && m[1] !== 'reports' ? m[1] : null;
+  return { rule: row.rule_name, capability, state: 'retired', reason: 'retired' };
+}
+
+const isCapabilityAlertRule = (rule) => typeof rule === 'string' && (rule.startsWith('capability:') || rule === 'host:offline');
+
 function driftAlertEntry(run, rep) {
   return {
     tenant_id: run.tenant_id,
@@ -1013,7 +1028,7 @@ class MemoryRegistry {
       rows = rows.filter((h) => h.hostname.toLowerCase().includes(needle));
     }
     rows.sort((a, b) => String(b.last_seen_at || '').localeCompare(String(a.last_seen_at || '')));
-    return rows.map((row) => this.decorate(row));
+    return rows.map((row) => ({ ...this.decorate(row), capability_health: row.capability_health || null }));
   }
 
   async getHost(tenantIds, hostId) {
@@ -1027,11 +1042,12 @@ class MemoryRegistry {
   async resolveHosts(tenantIds, name) {
     const allow = new Set(tenantIds || []);
     const byId = this.hosts.get(name);
-    if (byId && allow.has(byId.tenant_id) && !byId.retired_at) return [this.decorate(byId)];
+    const out = (row) => ({ ...this.decorate(row), capability_health: row.capability_health || null });
+    if (byId && allow.has(byId.tenant_id) && !byId.retired_at) return [out(byId)];
     const needle = String(name).toLowerCase();
     return [...this.hosts.values()]
       .filter((h) => allow.has(h.tenant_id) && !h.retired_at && String(h.hostname).toLowerCase() === needle)
-      .map((row) => this.decorate(row));
+      .map(out);
   }
 
   async touchHost(hostId, fields = {}) {
@@ -1112,9 +1128,33 @@ class MemoryRegistry {
     this.tenantPolicies.set(tenantId, cur);
   }
 
+  // Any status but online also clears the capability health (only the
+  // instance holding a live socket may say ok or degraded).
   async setHostStatus(hostId, status) {
     const row = this.hosts.get(hostId);
-    if (row) row.status = status;
+    if (!row) return;
+    row.status = status;
+    if (status !== 'online') row.capability_health = null;
+  }
+
+  // Boot: every host whose presence names instance (this process, before
+  // it accepts sockets) is offline with no health and no presence. Returns
+  // how many rows changed.
+  async releaseInstanceHosts(instance) {
+    if (!nonEmpty(instance)) return 0;
+    let n = 0;
+    for (const row of this.hosts.values()) {
+      if (row.agent_instance !== instance) continue;
+      row.status = 'offline';
+      row.capability_health = null;
+      row.agent_caps = null;
+      row.agent_instance = null;
+      row.agent_conn_id = null;
+      row.agent_enrolled_at = null;
+      row.agent_seen_at = null;
+      n += 1;
+    }
+    return n;
   }
 
   // The live agent of a host (cp_hosts.agent_caps, agent_instance,
@@ -1167,8 +1207,15 @@ class MemoryRegistry {
     if (!row || row.tenant_id !== tenantId) throw http(404, 'not_found');
     if (row.retired_at) throw http(409, 'already_retired');
     await this.appendAudit(hostRetiredAuditEntry(row, actor, text, forced));
+    // Its active capability and host:offline alerts end with it.
+    for (const alert of this.alerts) {
+      if (alert.host_id !== hostId || !isCapabilityAlertRule(alert.rule_name) || (alert.status !== 'open' && alert.status !== 'ack')) continue;
+      await this.appendAudit(alertAuditEntry(alert, retiredAlertResolve(alert), actor, false));
+      alert.status = 'resolved';
+    }
     row.retired_at = new Date().toISOString();
     row.status = 'offline';
+    row.capability_health = null;
     this.memSync(tenantId, hostId);
     return this.decorate(row);
   }
@@ -1472,6 +1519,10 @@ class MemoryRegistry {
     const rule = alertRule(entry.rule_name);
     const host = this.hosts.get(entry.host_id);
     if (!host || host.retired_at) return null;
+    if (rule === 'host:offline') {
+      const fresh = host.agent_conn_id && host.agent_seen_at && Date.now() - host.agent_seen_at.getTime() < OFFLINE_PRESENCE_FRESH_S * 1000;
+      if (host.status === 'online' || fresh) return null;
+    }
     if (this.alerts.some((a) => a.host_id === entry.host_id && a.rule_name === rule && (a.status === 'open' || a.status === 'ack'))) return null;
     const row = {
       id: this.alertSeq++,
@@ -1503,9 +1554,13 @@ class MemoryRegistry {
     return out;
   }
 
-  async setHostHealth(hostId, health) {
+  // See PgRegistry.setHostHealth.
+  async setHostHealth(hostId, health, instance) {
+    const value = hostHealthValue(health);
     const row = this.hosts.get(hostId);
-    if (row) row.capability_health = hostHealthValue(health);
+    if (!row || !nonEmpty(instance) || row.agent_instance !== instance || row.retired_at) return false;
+    row.capability_health = value;
+    return true;
   }
 
   // See PgRegistry.countHostHealth.
@@ -2582,7 +2637,8 @@ class PgRegistry {
     if (!tenantIds || tenantIds.length === 0) return [];
     const like = query ? `%${escapeLike(query)}%` : null;
     const res = await this.pool.query(
-      `SELECT host_id, tenant_id, hostname, os, platform, ssh_pubkey, status, last_seen_at, tags, created_at, retired_at
+      `SELECT host_id, tenant_id, hostname, os, platform, ssh_pubkey, status, last_seen_at, tags, created_at, retired_at,
+              capability_health
        FROM cp_hosts
        WHERE tenant_id = ANY($1::text[])
          AND ($2::text IS NULL OR hostname ILIKE $2 ESCAPE '\\')
@@ -2594,11 +2650,14 @@ class PgRegistry {
     const sparks = await this.sparklines(ids);
     return res.rows.map((row) => {
       const series = sparks.get(row.host_id) || [];
-      return publicHost({
-        ...row,
-        sparkline: series,
-        cpu_percent: series.length ? series[series.length - 1] : null
-      });
+      return {
+        ...publicHost({
+          ...row,
+          sparkline: series,
+          cpu_percent: series.length ? series[series.length - 1] : null
+        }),
+        capability_health: row.capability_health || null
+      };
     });
   }
 
@@ -2642,13 +2701,13 @@ class PgRegistry {
   async resolveHosts(tenantIds, name) {
     if (!tenantIds || tenantIds.length === 0) return [];
     const byId = await this.pool.query(
-      `SELECT host_id, tenant_id, hostname, status, last_seen_at FROM cp_hosts
+      `SELECT host_id, tenant_id, hostname, status, last_seen_at, capability_health FROM cp_hosts
        WHERE host_id = $1 AND tenant_id = ANY($2::text[]) AND retired_at IS NULL`,
       [name, tenantIds]
     );
     if (byId.rows.length > 0) return byId.rows;
     const res = await this.pool.query(
-      `SELECT host_id, tenant_id, hostname, status, last_seen_at FROM cp_hosts
+      `SELECT host_id, tenant_id, hostname, status, last_seen_at, capability_health FROM cp_hosts
        WHERE lower(hostname) = lower($1) AND tenant_id = ANY($2::text[]) AND retired_at IS NULL
        ORDER BY host_id LIMIT 100`,
       [name, tenantIds]
@@ -2736,8 +2795,28 @@ class PgRegistry {
     if (res.rowCount === 0) throw http(404, 'not_found');
   }
 
+  // Any status but online also clears capability_health.
   async setHostStatus(hostId, status) {
-    await this.pool.query('UPDATE cp_hosts SET status = $2 WHERE host_id = $1', [hostId, status]);
+    await this.pool.query(
+      `UPDATE cp_hosts SET status = $2,
+         capability_health = CASE WHEN $2 = 'online' THEN capability_health ELSE NULL END
+       WHERE host_id = $1`,
+      [hostId, status]
+    );
+  }
+
+  // Boot: every host whose presence names instance (this process, before
+  // it accepts sockets) is offline with no health and no presence. Returns
+  // how many rows changed.
+  async releaseInstanceHosts(instance) {
+    if (!nonEmpty(instance)) return 0;
+    const res = await this.pool.query(
+      `UPDATE cp_hosts SET status = 'offline', capability_health = NULL, agent_caps = NULL, agent_instance = NULL,
+         agent_conn_id = NULL, agent_enrolled_at = NULL, agent_seen_at = NULL
+       WHERE agent_instance = $1`,
+      [instance]
+    );
+    return res.rowCount;
   }
 
   async setAgentPresence(hostId, { caps, instance, connId, enrolledAt }) {
@@ -2790,11 +2869,22 @@ class PgRegistry {
       if (cur.rowCount === 0) throw http(404, 'not_found');
       if (cur.rows[0].retired_at) throw http(409, 'already_retired');
       await client.query(
-        `UPDATE cp_hosts SET retired_at = now(), status = 'offline' WHERE host_id = $1`,
+        `UPDATE cp_hosts SET retired_at = now(), status = 'offline', capability_health = NULL WHERE host_id = $1`,
         [hostId]
       );
       await this.syncHostStatesInTx(client, tenantId, hostId);
       await auditInsert(client, hostRetiredAuditEntry(cur.rows[0], actor, text, forced));
+      // Its active capability and host:offline alerts end with it, each with
+      // its capability_alert_resolve audit row.
+      const ended = await client.query(
+        `UPDATE cp_alert_events SET status = 'resolved'
+          WHERE host_id = $1 AND status IN ('open', 'ack') AND (rule_name LIKE 'capability:%' OR rule_name = 'host:offline')
+         RETURNING id, tenant_id, host_id, rule_name`,
+        [hostId]
+      );
+      for (const alert of ended.rows) {
+        await auditInsert(client, alertAuditEntry(alert, retiredAlertResolve(alert), actor, false));
+      }
       await client.query('COMMIT');
     } catch (err) {
       try { await client.query('ROLLBACK'); } catch { /* connection already failed */ }
@@ -3179,7 +3269,10 @@ class PgRegistry {
   // audit row in the same transaction. The insert goes through
   // cp_alert_events_active_capability_idx (ON CONFLICT DO NOTHING), so an
   // active alert for the same host and rule, from any replica, makes this
-  // return null and write nothing.
+  // return null and write nothing. host:offline also re-checks, in the same
+  // statement, that the host is still offline: not status online and no
+  // presence row fresher than OFFLINE_PRESENCE_FRESH_S (an agent that
+  // reconnected to another replica inside the 5 min window opens nothing).
   async openHostAlert(entry) {
     const rule = alertRule(entry.rule_name);
     const client = await this.pool.connect();
@@ -3189,10 +3282,13 @@ class PgRegistry {
         `INSERT INTO cp_alert_events (tenant_id, host_id, rule_name, severity, message, status)
          SELECT h.tenant_id, h.host_id, $2, $3, $4, 'open' FROM cp_hosts h
           WHERE h.host_id = $1 AND h.retired_at IS NULL
+            AND ($2 <> 'host:offline' OR (
+              h.status <> 'online'
+              AND NOT (h.agent_conn_id IS NOT NULL AND h.agent_seen_at > now() - make_interval(secs => $5::int))))
          ON CONFLICT (host_id, rule_name)
            WHERE status IN ('open', 'ack') AND (rule_name LIKE 'capability:%' OR rule_name = 'host:offline') DO NOTHING
          RETURNING id, tenant_id, host_id, rule_name, metric, value, severity, message, status, created_at`,
-        [entry.host_id, rule, entry.severity || null, entry.message || null]
+        [entry.host_id, rule, entry.severity || null, entry.message || null, OFFLINE_PRESENCE_FRESH_S]
       );
       const row = ins.rows[0] || null;
       if (row) await auditInsert(client, alertAuditEntry(row, entry.audit, entry.actor, true));
@@ -3236,12 +3332,19 @@ class PgRegistry {
   }
 
   // The capability health the instance holding the socket last computed
-  // (ok, degraded or unknown), for the cross-replica gauge.
-  async setHostHealth(hostId, health) {
-    await this.pool.query(
-      'UPDATE cp_hosts SET capability_health = $2 WHERE host_id = $1 AND capability_health IS DISTINCT FROM $2',
-      [hostId, hostHealthValue(health)]
+  // (ok, degraded or unknown), for the cross-replica gauge and the fleet
+  // list. Written only while the presence row names instance (the writer),
+  // so an instance that lost the socket never overwrites the holder's
+  // health. True when the row was written.
+  async setHostHealth(hostId, health, instance) {
+    const value = hostHealthValue(health);
+    if (!nonEmpty(instance)) return false;
+    const res = await this.pool.query(
+      `UPDATE cp_hosts SET capability_health = $2
+        WHERE host_id = $1 AND agent_instance = $3 AND retired_at IS NULL`,
+      [hostId, value, instance]
     );
+    return res.rowCount > 0;
   }
 
   // Live hosts by health: offline unless status is online, else the stored

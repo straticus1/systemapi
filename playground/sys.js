@@ -257,6 +257,7 @@ class SysChannels {
         }
         const capability = requiredCapability(resource, checked.binding, fm.agentSupportedCaps(hostId));
         if (!fm.agentSupports(hostId, capability)) {
+            if (typeof fm.noteUnsupported === 'function') fm.noteUnsupported(capability);
             this.failSocket(ws, 'agent_unsupported', fm.agentUnsupportedReason(hostId, capability));
             return;
         }

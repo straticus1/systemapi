@@ -25,6 +25,15 @@ series disappear. See `api_docs.md` "Prometheus series".
 - `systemapi_hosts_health{state}` - live hosts by health: `ok`, `degraded`, `unknown` (connected, no report yet), `offline`
 - `systemapi_agent_unsupported_total{capability}` - requests refused `agent_unsupported` (capability not routable), per instance
 - `systemapi_capability_report_dropped_total{reason}` - capability reports refused or dropped, by reason code, per instance
+- `systemapi_capability_alert_capped_total{rule}` - alert opens held back by the per-host hourly cap (6), per instance
+
+Cardinality: `systemapi_capability_state` has one series per host and
+stored capability row, up to 13 per host (one per known capability; the
+state label holds a single value per row), so 1,000 hosts is up to ~13,000
+series. `systemapi_hosts_health` is 4 series. The counters are bounded by
+their label sets (13 capabilities plus `other`; the fixed reason codes; 15
+rules plus `other`) and are per instance, not per host: sum them across
+replicas.
 
 Examples:
 ```promql

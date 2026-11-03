@@ -346,6 +346,7 @@ class FileChannels {
             return;
         }
         if (!fm.agentSupports(hostId, 'file')) {
+            if (typeof fm.noteUnsupported === 'function') fm.noteUnsupported('file');
             this.failSocket(ws, 'agent_unsupported', fm.agentUnsupportedReason(hostId, 'file'));
             return;
         }
