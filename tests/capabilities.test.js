@@ -332,8 +332,8 @@ test('flood: one in flight, a 60 s gap, every refusal counted, 10 violations in 
     // Refused frames count as violations too (with the gap out of the way,
     // they reach the validator); the 10th closes the socket.
     r.fm.capReportGapMs = 0;
-    for (let i = 0; i < 7; i += 1) send(agent, { type: 'capability_report', v: 9 });
-    await waitUntil('bad_version drops', () => r.fm.capReportDrops.get('bad_version') === 7);
+    for (let i = 0; i < 8; i += 1) send(agent, { type: 'capability_report', v: 9 });
+    await waitUntil('bad_version drops', () => r.fm.capReportDrops.get('bad_version') === 8);
     assert.equal(agent.box.closeCode, null, 'nine violations: still open');
     send(agent, report([], { probed_at: 'x' }));
     await waitUntil('closed 1008', () => agent.box.closeCode === 1008);
@@ -597,4 +597,44 @@ test('the report and probe frames never carry more than names, states and reason
   const out = validate(report([{ name: 'file', state: 'degraded', reason: 'enosys_openat2', detail: '/srv/secret: EPERM' }]));
   assert.equal(out.ok, true);
   assert.deepEqual(Object.keys(out.report.caps[0]).sort(), ['name', 'reason', 'state']);
+});
+
+test('a report up to 5 s early is accepted; a slow DB write is dropped work, not a violation, and times out', async () => {
+  const r = await rig();
+  try {
+    const agent = await connectAgent(r);
+    send(agent, report([{ name: 'file', state: 'ok' }]));
+    await waitUntil('first stored', () => r.writes.length === 1);
+    const limit = r.fm.capReportLimits.get(HOST_A);
+    limit.lastAt = Date.now() - 56_000; // 56 s ago: inside 60 s, outside the 5 s slack
+    send(agent, report([{ name: 'file', state: 'degraded', reason: 'probe_error' }]));
+    await waitUntil('accepted early', () => r.writes.length === 2);
+    assert.equal(r.fm.capReportDrops.get('too_soon') || 0, 0);
+
+    // A write that never finishes times out; the in-flight drops meanwhile are no violations.
+    r.fm.capWriteTimeoutMs = 50;
+    r.fm.registry.setHostCapabilities = () => new Promise(() => {});
+    limit.lastAt = 0;
+    send(agent, report([{ name: 'file', state: 'ok' }]));
+    await waitUntil('in flight', () => limit.inFlight);
+    for (let i = 0; i < 12; i += 1) send(agent, report([{ name: 'file', state: 'ok' }]));
+    await waitUntil('drops counted', () => (r.fm.capReportDrops.get('in_flight') || 0) >= 12);
+    await waitUntil('timed out', () => !limit.inFlight);
+    assert.equal(agent.box.closeCode, null, 'a slow database never disconnects the agent');
+    assert.equal(limit.violations.length, 0);
+  } finally { await r.close(); }
+});
+
+test('a reconnect forgets this instance\'s write cache: an identical first report is written again', async () => {
+  const r = await rig();
+  try {
+    const a1 = await connectAgent(r);
+    send(a1, report([{ name: 'file', state: 'ok' }]));
+    await waitUntil('first stored', () => r.writes.length === 1);
+    a1.ws.close();
+    await waitUntil('gone', () => r.fm.connectedAgents.get(HOST_A) !== a1.ws);
+    const a2 = await connectAgent(r);
+    send(a2, report([{ name: 'file', state: 'ok' }]));
+    await waitUntil('rewritten after reconnect', () => r.writes.length === 2);
+  } finally { await r.close(); }
 });

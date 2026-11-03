@@ -111,6 +111,13 @@ const AGENT_CLOSE_GRACE_MS = 2000;
 // flight and at least CAP_REPORT_GAP_MS apart; CAP_VIOLATION_MAX refused or
 // dropped frames within CAP_VIOLATION_WINDOW_MS close the socket 1008.
 const CAP_REPORT_GAP_MS = 60_000;
+// Slack on the gap (5 s at the 60 s gap, a twelfth of shorter test gaps):
+// the agent measures from its own last write, so a report delayed in
+// transit can arrive a little early.
+const CAP_REPORT_GAP_SLACK_MS = 5_000;
+// A capability write slower than this is given up (the next report writes
+// every row again), so a slow database never holds a host's slot.
+const CAP_WRITE_TIMEOUT_MS = 5_000;
 const CAP_VIOLATION_WINDOW_MS = 10 * 60_000;
 const CAP_VIOLATION_MAX = 10;
 const AGENT_POLICY_CLOSE = 1008;
@@ -211,6 +218,7 @@ class FleetManager {
         // Refused or dropped capability_report frames by reason code.
         this.capReportDrops = new Map();
         this.capReportGapMs = CAP_REPORT_GAP_MS;
+        this.capWriteTimeoutMs = CAP_WRITE_TIMEOUT_MS;
         this.capViolationWindowMs = CAP_VIOLATION_WINDOW_MS;
         this.capViolationMax = CAP_VIOLATION_MAX;
         // capability:<name>, capability:reports and host:offline alerts
@@ -1033,6 +1041,11 @@ class FleetManager {
             hostId = host.host_id;
             this.hostTenants.set(hostId, host.tenant_id);
             this.agentCaps.set(ws, request.systemapiCapabilities || new Set());
+            // A fresh connection starts from what it reports, not from what
+            // this instance last wrote (another instance may have written
+            // since), and holds no probe credit from an earlier socket.
+            this.capStored.delete(hostId);
+            if (this.capReportLimits.has(hostId)) this.capReportLimits.get(hostId).probeCredit = false;
             this.agentCapState.set(ws, new ConnectionCapabilities(
                 request.systemapiCapabilities || new Set(),
                 request.systemapiCapabilitiesDegraded || new Set()
@@ -1222,13 +1235,15 @@ class FleetManager {
             return;
         }
         const limit = this.capReportLimit(hostId);
+        // A write still running is our side being slow, not the agent
+        // misbehaving: drop and count it, never a violation.
         if (limit.inFlight) {
-            this.capabilityViolation(ws, hostId, keyId, limit, 'in_flight', now);
+            this.noteCapabilityDrop('in_flight');
             return;
         }
         // The first report on a connection and the answer to a server probe
         // are not held to the gap.
-        if (state.reportCount > 0 && !limit.probeCredit && now - limit.lastAt < this.capReportGapMs) {
+        if (state.reportCount > 0 && !limit.probeCredit && now - limit.lastAt < this.capReportGapMs - Math.min(CAP_REPORT_GAP_SLACK_MS, this.capReportGapMs / 12)) {
             this.capabilityViolation(ws, hostId, keyId, limit, 'too_soon', now);
             return;
         }
@@ -1310,7 +1325,15 @@ class FleetManager {
         if (rows.length === 0) return false;
         let changed;
         try {
-            changed = await this.registry.setHostCapabilities(hostId, rows);
+            let timer;
+            const timeout = new Promise((_, reject) => {
+                timer = setTimeout(() => reject(Object.assign(new Error('capability write timed out'), { code: 'write_timeout' })), this.capWriteTimeoutMs);
+            });
+            try {
+                changed = await Promise.race([this.registry.setHostCapabilities(hostId, rows), timeout]);
+            } finally {
+                clearTimeout(timer);
+            }
         } catch (err) {
             this.capStored.delete(hostId);
             console.error(`[Fleet] capability write failed host=${hostId} error=${errorCode(err)}`);
