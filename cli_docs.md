@@ -47,20 +47,23 @@ On every dial the agent sends two headers. Both are comma lists of tokens
 (`^[a-z][a-z0-9_]{0,15}$`, at most 16 tokens and 256 bytes), recomputed on
 each dial:
 
-- `X-SystemAPI-Capabilities`: what this binary supports on this OS with
-  these flags.
-- `X-SystemAPI-Capabilities-Degraded`: the supported ones whose probe failed
-  at dial time. Left out when none failed.
+- `X-SystemAPI-Capabilities`: the capabilities this binary knows on this OS
+  with these flags.
+- `X-SystemAPI-Capabilities-Degraded`: the listed ones that must not be
+  routed to: those whose probe failed at dial time, plus any write token
+  (below) that is absent here. Left out when there are none.
 
 The tokens: `tcp`, `pty`, `file`, `xfer`, `config`, `config_write`, `tweak`,
 `sysctl_write`, `override_write`, `service`, `package`, `sysscript_jobs`,
-`converge`. `config_write`, `sysctl_write` and `override_write` are supported
-on Linux with systemd; their probes need the matching
-`sah-*-helper@.service` template loaded and
-`/etc/systemapi-agent/helper-trust.json` to be a root-owned regular file
-(no symlink) with no group or other write bit (0644, 0640 and 0600 all
-pass) that parses. Without `/run/systemd/system`, only `config_write`,
-`sysctl_write` and `override_write` are not supported (`no_systemd`).
+`converge`. `config_write`, `sysctl_write` and `override_write` are in the
+first header of every new agent on every OS, so the server can tell a new
+agent from an old one; they may be in the degraded header. They work only on
+Linux with systemd; their probes need the matching `sah-*-helper@.service`
+template loaded and `/etc/systemapi-agent/helper-trust.json` to be a
+root-owned regular file (no symlink) with no group or other write bit
+(0644, 0640 and 0600 all pass) that parses. Without `/run/systemd/system`
+they are reported absent `no_systemd` (`unsupported_os` off Linux) and sent
+in both headers.
 `tweak` works wherever `/proc/sys` is readable, and `service` wherever the
 platform's own service backend works (systemd, OpenRC, launchd); `pty`,
 `file`, `tcp` and `sysscript_jobs` keep working.
@@ -71,7 +74,8 @@ also re-checks `--xfer-bin`). `config`: a read-only openat2 open of
 `/etc/hostname`. `tweak`: read `/proc/sys/kernel/hostname`. `service`:
 `systemctl show -p Version --value` (systemd) or `rc-service --version`
 (OpenRC), 5 s timeout. `package`: `dpkg-query --version` or
-`rpm --version`. `pty`: `/dev/ptmx` exists. `sysscript_jobs`, `converge`:
+`rpm --version`; brew is never run, only checked present (as root it must
+be root-owned, else `probe_error`). `pty`: `/dev/ptmx` exists. `sysscript_jobs`, `converge`:
 the flag is on and the state directory exists; a stat error that is not
 "missing" keeps the last known state.
 

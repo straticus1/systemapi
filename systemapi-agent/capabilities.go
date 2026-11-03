@@ -393,13 +393,25 @@ func boundCapResults(in []capResult) []capResult {
 	return out
 }
 
+// capWriteTokens are always in the supported header of a new agent, on every
+// OS: their presence is how the server tells a new agent (write verbs gate on
+// them) from an old one (write verbs gate on config/tweak). Where one is
+// absent (no_systemd, unsupported_os) it is listed as degraded instead, so it
+// is never routed to; the report still says absent with the reason.
+var capWriteTokens = map[string]bool{"config_write": true, "sysctl_write": true, "override_write": true}
+
 // capHeaderValues builds the two dial headers from probe results: every
-// supported (not absent) name, and the degraded ones. Each list holds at
-// most capTokensMax tokens and capHeaderMax bytes.
+// name this binary knows here (not absent, plus the write tokens always),
+// and the degraded ones (plus absent write tokens). Each list holds at most
+// capTokensMax tokens and capHeaderMax bytes.
 func capHeaderValues(results []capResult) (supported, degraded string) {
 	var sup, deg []string
 	for _, r := range boundCapResults(results) {
 		if r.State == capStateAbsent {
+			if capWriteTokens[r.Name] {
+				sup = append(sup, r.Name)
+				deg = append(deg, r.Name)
+			}
 			continue
 		}
 		sup = append(sup, r.Name)
@@ -452,8 +464,11 @@ type capManager struct {
 	last     map[string]capResult
 	lastRes  []capResult // the last complete probe, sorted
 	inFlight int         // probes running now
-	lastSent time.Time
-	sentAny  bool
+	// probeSeq numbers probes as they start; appliedSeq is the newest one
+	// whose results are in last/lastRes.
+	probeSeq, appliedSeq uint64
+	lastSent             time.Time
+	sentAny              bool
 }
 
 var (
@@ -480,6 +495,8 @@ func (m *capManager) probe() []capResult {
 		prev[k] = v
 	}
 	m.inFlight++
+	m.probeSeq++
+	seq := m.probeSeq
 	m.mu.Unlock()
 
 	res := probeCapabilities(m.env, prev)
@@ -487,6 +504,12 @@ func (m *capManager) probe() []capResult {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.inFlight--
+	// Only the newest started probe that finishes is applied: a slow older
+	// probe never overwrites a newer one's results.
+	if seq <= m.appliedSeq {
+		return res
+	}
+	m.appliedSeq = seq
 	for _, r := range res {
 		if p, ok := m.last[r.Name]; !ok || p != r {
 			log.Printf("capability %s: %s %s", r.Name, r.State, r.Reason)
@@ -525,20 +548,40 @@ func (m *capManager) untilAllowed(now time.Time) time.Duration {
 	return m.lastSent.Add(capReportMinGap).Sub(now)
 }
 
+func closed(quit <-chan struct{}) bool {
+	select {
+	case <-quit:
+		return true
+	default:
+		return false
+	}
+}
+
 // sendReport probes and writes one capability_report, unless the gap has
-// not passed (then it reports false with no error).
-func (m *capManager) sendReport(out ptyOut) (bool, error) {
+// not passed or quit (the connection) has closed: then it reports false with
+// no error, sends nothing and leaves the gap as it was, so a goroutine of an
+// old connection can never take the next connection's slot.
+func (m *capManager) sendReport(out ptyOut, quit <-chan struct{}) (bool, error) {
 	m.mu.Lock()
 	now := time.Now()
-	if m.sentAny && now.Sub(m.lastSent) < capReportMinGap {
+	if closed(quit) || (m.sentAny && now.Sub(m.lastSent) < capReportMinGap) {
 		m.mu.Unlock()
 		return false, nil
 	}
 	// Reserve the slot before probing, so a concurrent sender backs off.
+	prevSent, prevAny := m.lastSent, m.sentAny
 	m.lastSent, m.sentAny = now, true
 	m.mu.Unlock()
 
 	res := m.probe()
+	if closed(quit) {
+		m.mu.Lock()
+		if m.lastSent.Equal(now) {
+			m.lastSent, m.sentAny = prevSent, prevAny
+		}
+		m.mu.Unlock()
+		return false, nil
+	}
 	frame := capReportFrame{
 		Type:     "capability_report",
 		V:        1,
@@ -569,12 +612,18 @@ func (m *capManager) serve(out ptyOut, probe <-chan struct{}, quit <-chan struct
 		}
 	}()
 	for {
+		if closed(quit) {
+			return
+		}
 		if want && gateC == nil {
 			if wait := m.untilAllowed(time.Now()); wait > 0 {
 				gate = time.NewTimer(wait)
 				gateC = gate.C
 			} else {
-				sent, err := m.sendReport(out)
+				sent, err := m.sendReport(out, quit)
+				if closed(quit) {
+					return
+				}
 				if err != nil {
 					log.Printf("capability_report not sent; reports stop on this connection")
 					return
@@ -814,7 +863,9 @@ func capPackageBackend() string {
 }
 
 // capPackageVersion runs the backend's version query: dpkg-query for apt,
-// rpm for the rpm family, brew for brew. None takes a lock.
+// rpm for the rpm family. None takes a lock. brew is never executed (it is
+// a user-owned script on macOS, and the agent may be root): only its
+// presence is checked, by brewPresent.
 func capPackageVersion(backend string) error {
 	var bin string
 	switch backend {
@@ -823,7 +874,11 @@ func capPackageVersion(backend string) error {
 	case "dnf", "yum", "zypper":
 		bin = "rpm"
 	case "brew":
-		bin = "brew"
+		path, ok := findExecutable("brew", execDirs)
+		if !ok {
+			return errCapMissing
+		}
+		return brewPresent(path, os.Stat, fileOwnerIDs, os.Geteuid())
 	default:
 		return errCapMissing
 	}
@@ -835,4 +890,29 @@ func capPackageVersion(backend string) error {
 	defer cancel()
 	_, err := jobCommand(ctx, path, "--version").Output()
 	return err
+}
+
+// brewPresent is the brew probe; nothing runs. stat follows the symlink
+// (brew is usually one) to the real file, which must be a regular file. When
+// the agent is root (euid 0) that file must also be root-owned, else it is
+// an error (reported degraded probe_error): a root agent must not treat a
+// user-replaceable binary as healthy.
+func brewPresent(path string, stat func(string) (os.FileInfo, error), owner func(os.FileInfo) (int, int, bool), euid int) error {
+	fi, err := stat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return errCapMissing
+	}
+	if err != nil {
+		return err
+	}
+	if !fi.Mode().IsRegular() {
+		return errCapMissing
+	}
+	if euid == 0 {
+		uid, _, ok := owner(fi)
+		if !ok || uid != 0 {
+			return errors.New("brew is not root-owned")
+		}
+	}
+	return nil
 }

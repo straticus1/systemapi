@@ -199,10 +199,17 @@ func TestCapNoSystemdDegradesNeverBreaks(t *testing.T) {
 			t.Errorf("%s: %+v, want ok", name, r)
 		}
 	}
-	sup, _ := capHeaderValues(probeCapabilities(e, nil))
-	for _, name := range []string{"service", "config_write", "sysctl_write", "override_write"} {
-		if strings.Contains(","+sup+",", ","+name+",") {
-			t.Errorf("%s advertised without systemd: %q", name, sup)
+	sup, deg := capHeaderValues(probeCapabilities(e, nil))
+	if strings.Contains(","+sup+",", ",service,") {
+		t.Errorf("service advertised with no backend: %q", sup)
+	}
+	// The write tokens are still sent (a new agent), and listed degraded.
+	if deg != "config_write,override_write,sysctl_write" {
+		t.Errorf("degraded %q", deg)
+	}
+	for _, name := range []string{"config_write", "sysctl_write", "override_write"} {
+		if !strings.Contains(","+sup+",", ","+name+",") {
+			t.Errorf("%s missing from supported %q", name, sup)
 		}
 	}
 	if !strings.Contains(","+sup+",", ",tweak,") {
@@ -240,7 +247,7 @@ func TestCapOpenRCHost(t *testing.T) {
 		t.Fatalf("dead openrc: %+v", r)
 	}
 	sup, deg := capHeaderValues(probeCapabilities(e, nil))
-	if !strings.Contains(","+sup+",", ",service,") || deg != "service" {
+	if !strings.Contains(","+sup+",", ",service,") || deg != "config_write,override_write,service,sysctl_write" {
 		t.Fatalf("supported %q degraded %q", sup, deg)
 	}
 }
@@ -299,7 +306,7 @@ func TestCapReportBoundedAndClean(t *testing.T) {
 	e.pkgVersion = func(string) error { return leakyErr }
 	m := newCapManager(e)
 	out := &capFrameSink{}
-	if sent, err := m.sendReport(out); !sent || err != nil {
+	if sent, err := m.sendReport(out, make(chan struct{})); !sent || err != nil {
 		t.Fatalf("sent=%v err=%v", sent, err)
 	}
 	raw := out.raw()
@@ -851,6 +858,156 @@ func TestCapHeadersRecomputedOnRedial(t *testing.T) {
 	}
 	if len(reports) == 0 {
 		t.Fatal("no capability_report after enroll")
+	}
+}
+
+// fakeFileInfo is a FileInfo for the brew probe's fake stat.
+type fakeFileInfo struct {
+	mode os.FileMode
+	uid  int
+}
+
+func (f fakeFileInfo) Name() string       { return "brew" }
+func (f fakeFileInfo) Size() int64        { return 1 }
+func (f fakeFileInfo) Mode() os.FileMode  { return f.mode }
+func (f fakeFileInfo) ModTime() time.Time { return time.Time{} }
+func (f fakeFileInfo) IsDir() bool        { return f.mode.IsDir() }
+func (f fakeFileInfo) Sys() interface{}   { return nil }
+
+func fakeOwner(fi os.FileInfo) (int, int, bool) { return fi.(fakeFileInfo).uid, 0, true }
+
+// M1: brew is never executed; as root, a brew not owned by root is a probe
+// error (degraded probe_error), and nothing runs either way.
+func TestBrewProbeChecksPresenceOnly(t *testing.T) {
+	statOf := func(fi fakeFileInfo) func(string) (os.FileInfo, error) {
+		return func(string) (os.FileInfo, error) { return fi, nil }
+	}
+	userBrew := fakeFileInfo{mode: 0o755, uid: 501}
+	rootBrew := fakeFileInfo{mode: 0o755, uid: 0}
+	if err := brewPresent("/opt/homebrew/bin/brew", statOf(userBrew), fakeOwner, 0); err == nil || errors.Is(err, errCapMissing) {
+		t.Fatalf("root agent accepted a user-owned brew: %v", err)
+	}
+	if err := brewPresent("/opt/homebrew/bin/brew", statOf(rootBrew), fakeOwner, 0); err != nil {
+		t.Fatalf("root-owned brew as root: %v", err)
+	}
+	if err := brewPresent("/opt/homebrew/bin/brew", statOf(userBrew), fakeOwner, 501); err != nil {
+		t.Fatalf("user brew for a non-root agent: %v", err)
+	}
+	if err := brewPresent("x", statOf(fakeFileInfo{mode: os.ModeDir | 0o755}), fakeOwner, 0); !errors.Is(err, errCapMissing) {
+		t.Fatalf("a directory is not brew: %v", err)
+	}
+	if err := brewPresent("x", func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }, fakeOwner, 0); !errors.Is(err, errCapMissing) {
+		t.Fatalf("dangling brew symlink: %v", err)
+	}
+	// Through the probe: the user-owned case reports degraded probe_error.
+	e := fakeCapEnv()
+	e.goos = "darwin"
+	e.pkgBackend = func() string { return "brew" }
+	e.pkgVersion = func(string) error {
+		return brewPresent("/opt/homebrew/bin/brew", statOf(userBrew), fakeOwner, 0)
+	}
+	if r := probeOne(t, e, "package"); r.State != capStateDegraded || r.Reason != "probe_error" {
+		t.Fatalf("package with a user brew as root: %+v", r)
+	}
+}
+
+// L1: the write tokens are in the supported header on every new agent; where
+// absent they are also in the degraded header, and the report says absent
+// with its reason.
+func TestCapWriteTokensAlwaysSent(t *testing.T) {
+	noSystemd := fakeCapEnv()
+	noSystemd.systemd = func() bool { return false }
+	mac := fakeCapEnv()
+	mac.goos = "darwin"
+	mac.serviceBackend = func() string { return "launchd" }
+	for _, c := range []struct {
+		name   string
+		e      *capEnv
+		reason string
+	}{{"no systemd", noSystemd, "no_systemd"}, {"macOS", mac, "unsupported_os"}} {
+		res := probeCapabilities(c.e, nil)
+		sup, deg := capHeaderValues(res)
+		got := capsByName(res)
+		for _, name := range []string{"config_write", "sysctl_write", "override_write"} {
+			if !strings.Contains(","+sup+",", ","+name+",") {
+				t.Errorf("%s: %s missing from supported %q", c.name, name, sup)
+			}
+			if !strings.Contains(","+deg+",", ","+name+",") {
+				t.Errorf("%s: %s missing from degraded %q", c.name, name, deg)
+			}
+			if r := got[name]; r.State != capStateAbsent || r.Reason != c.reason {
+				t.Errorf("%s: report %+v, want absent %s", c.name, r, c.reason)
+			}
+		}
+		// Other absent capabilities stay out of both headers.
+		if c.name == "macOS" && (strings.Contains(sup, "file") || strings.Contains(deg, "file")) {
+			t.Errorf("absent file advertised on macOS: %q / %q", sup, deg)
+		}
+	}
+}
+
+// L6: a slow older probe finishing after a newer one does not overwrite it.
+func TestCapOlderProbeNeverOverwritesNewer(t *testing.T) {
+	e := fakeCapEnv()
+	var calls atomic.Int32
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	e.tweakRead = func() error {
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release
+			return leakyErr // the older, slow probe sees tweak broken
+		}
+		return nil // the newer probe sees it ok
+	}
+	m := newCapManager(e)
+	oldDone := make(chan struct{})
+	go func() { m.probe(); close(oldDone) }()
+	<-entered
+	m.probe() // newer, finishes first
+	close(release)
+	<-oldDone
+	if r := capsByName(m.lastRes)["tweak"]; r.State != capStateOK {
+		t.Fatalf("older probe overwrote lastRes: %+v", r)
+	}
+	if r := m.last["tweak"]; r.State != capStateOK {
+		t.Fatalf("older probe overwrote last: %+v", r)
+	}
+}
+
+// L6: a closed connection's goroutine never sends a pending report nor
+// reserves the report gap.
+func TestCapClosedConnectionSendsNothing(t *testing.T) {
+	m := newCapManager(fakeCapEnv())
+	out := &capFrameSink{}
+	quit := make(chan struct{})
+	close(quit)
+	if sent, err := m.sendReport(out, quit); sent || err != nil {
+		t.Fatalf("sent=%v err=%v on a closed connection", sent, err)
+	}
+	done := make(chan struct{})
+	probe := make(chan struct{}, 1)
+	probe <- struct{}{}
+	go func() { m.serve(out, probe, quit, time.Hour); close(done) }()
+	<-done
+	if n := len(out.raw()); n != 0 {
+		t.Fatalf("%d frames from a closed connection", n)
+	}
+	if m.sentAny || !m.lastSent.IsZero() {
+		t.Fatal("a closed connection reserved the report gap")
+	}
+
+	// Closed while its probe runs: nothing is written and the reservation is
+	// given back.
+	e := fakeCapEnv()
+	quit2 := make(chan struct{})
+	e.tweakRead = func() error { close(quit2); return nil }
+	m2 := newCapManager(e)
+	if sent, _ := m2.sendReport(out, quit2); sent {
+		t.Fatal("report sent after the connection closed mid-probe")
+	}
+	if len(out.raw()) != 0 || m2.sentAny {
+		t.Fatal("frame written or gap kept after a mid-probe close")
 	}
 }
 
