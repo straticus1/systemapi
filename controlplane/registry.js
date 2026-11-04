@@ -199,6 +199,15 @@ function channelPolicyAuditEntry(tenantId, hostId, actor, action, reason, tcpPol
 
 // The audit row for a key scope change: the key id (its public part), the
 // tenant the admin acted through, the new and the previous scope sets.
+function keyRevokeAuditEntry(tenantId, actor, keyId, wasActive, tenants) {
+  return {
+    tenant_id: tenantId,
+    actor,
+    action: 'key_revoked',
+    payload: { key_fp: fingerprint(keyId), was_active: wasActive, tenants: [...tenants].sort() }
+  };
+}
+
 function keyScopesAuditEntry(tenantId, actor, keyId, scopes, previous, tenants = [tenantId]) {
   return {
     tenant_id: tenantId,
@@ -1353,6 +1362,11 @@ class MemoryRegistry {
   }
 
   async revokeKey(keyId) {
+    this.revokedKeys.add(keyId);
+  }
+
+  async revokeKeyAudited({ keyId, tenantId, tenants, actor }) {
+    await this.appendAudit(keyRevokeAuditEntry(tenantId, actor, keyId, !this.revokedKeys.has(keyId), tenants));
     this.revokedKeys.add(keyId);
   }
 
@@ -2621,6 +2635,77 @@ class PgRegistry {
     }
   }
 
+  // A new tenant with its own agent identity (scripts/create-tenant.js).
+  // Threats: a second tenant whose agent key reaches the operator's other
+  // tenants (the key belongs to a fresh member of this tenant only, as a
+  // viewer, with no scope rows and bound to the tenant for enroll), an
+  // existing tenant or identity taken over by a re-run (refused, 409), a
+  // typo making an unknown user admin (the admin must already be an admin
+  // member somewhere, 403), and a tenant with no audit row (one
+  // transaction). Does NOT check who runs it: whoever can read the env file
+  // can already write the database. With SYSTEMAPI_REQUIRE_SCOPES=0 the key
+  // gets operator scopes intersected with viewer, still in this tenant only.
+  async createTenant({ tenantId, adminUserId, agentUserId, actor, mintKey }) {
+    if (adminUserId === agentUserId) throw http(400, 'agent_is_admin');
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      // Serializes two runs naming the same new agent member.
+      await client.query("SELECT pg_advisory_xact_lock(hashtext('cp_create_tenant'))");
+      const admin = await client.query(
+        "SELECT 1 FROM cp_members WHERE user_id = $1 AND role = 'admin' LIMIT 1",
+        [adminUserId]
+      );
+      if (admin.rowCount === 0) throw http(403, 'admin_required');
+      const agent = await client.query('SELECT 1 FROM cp_members WHERE user_id = $1 LIMIT 1', [agentUserId]);
+      if (agent.rowCount > 0) throw http(409, 'agent_member_exists');
+      // An id that already holds a key or an OAuth grant would carry it into
+      // this tenant (and an existing key could enroll concurrently and
+      // create a tenant of its own); with none, nothing can act as it yet.
+      const prior = await client.query(
+        `SELECT (SELECT count(*) FROM playground_api_keys WHERE user_id = $1)
+              + (SELECT count(*) FROM cp_oauth_links WHERE user_id = $1)
+              + (SELECT count(*) FROM cp_oauth_access WHERE user_id = $1) AS n`,
+        [agentUserId]
+      );
+      if (Number(prior.rows[0].n) > 0) throw http(409, 'agent_identity_exists');
+      const tenant = await client.query(
+        `INSERT INTO cp_tenants (tenant_id, display_name, owner_user_id)
+         VALUES ($1, $1, $2)
+         ON CONFLICT (tenant_id) DO NOTHING
+         RETURNING tenant_id`,
+        [tenantId, adminUserId]
+      );
+      if (tenant.rowCount === 0) throw http(409, 'tenant_exists');
+      await client.query(
+        "INSERT INTO cp_members (tenant_id, user_id, role) VALUES ($1, $2, 'admin'), ($1, $3, 'viewer')",
+        [tenantId, adminUserId, agentUserId]
+      );
+      const { keyId, keySecret } = await mintKey(client);
+      await auditInsert(client, {
+        tenant_id: tenantId,
+        actor,
+        action: 'tenant_create',
+        payload: {
+          admin_user_id: adminUserId,
+          agent_user_id: agentUserId,
+          agent_role: 'viewer',
+          key_fp: fingerprint(keyId),
+          key_tenant: tenantId,
+          scopes: []
+        }
+      });
+      await client.query('COMMIT');
+      return { tenant_id: tenantId, admin_user_id: adminUserId, agent_user_id: agentUserId, key_id: keyId, key_secret: keySecret };
+    } catch (err) {
+      try { await client.query('ROLLBACK'); } catch { /* connection already failed */ }
+      if (err.code === '23505') throw http(409, 'conflict');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
   async addMember(tenantId, userId, role, email) {
     if (!ROLES.has(role)) throw http(400, 'bad_role');
     const res = await this.pool.query(
@@ -3041,6 +3126,25 @@ class PgRegistry {
         await client.query('INSERT INTO cp_api_scopes (key_id, scope) VALUES ($1, $2)', [keyId, scope]);
       }
       await auditInsert(client, keyScopesAuditEntry(tenantId, actor, keyId, scopes, cur.rows.map((r) => r.scope), tenants));
+      await client.query('COMMIT');
+    } catch (err) {
+      try { await client.query('ROLLBACK'); } catch { /* connection already failed */ }
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  // Admin revoke (POST /api/v1/keys/:keyId/revoke): the deactivation and its
+  // audit row in one transaction. Revoking an inactive key is still audited.
+  async revokeKeyAudited({ keyId, tenantId, tenants, actor }) {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const cur = await client.query('SELECT is_active FROM playground_api_keys WHERE key_id = $1 FOR UPDATE', [keyId]);
+      if (cur.rowCount === 0) throw http(404, 'not_found');
+      await client.query('UPDATE playground_api_keys SET is_active = false WHERE key_id = $1', [keyId]);
+      await auditInsert(client, keyRevokeAuditEntry(tenantId, actor, keyId, cur.rows[0].is_active === true, tenants));
       await client.query('COMMIT');
     } catch (err) {
       try { await client.query('ROLLBACK'); } catch { /* connection already failed */ }

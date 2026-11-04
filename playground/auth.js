@@ -187,7 +187,10 @@ class AuthManager {
       description = null,
       expiresInDays = null,
       ipWhitelist = null,
-      allowedEndpoints = null
+      allowedEndpoints = null,
+      // A key bound to a tenant enrolls agents only into that tenant
+      // (FleetManager.handleConnection, key_tenant_mismatch).
+      tenantId = null
     } = options;
 
     const { keyId, keySecret } = this.generateAPIKey();
@@ -202,11 +205,11 @@ class AuthManager {
     await client.query(`
       INSERT INTO playground_api_keys (
         key_id, key_hash, user_id, name, api_site,
-        description, expires_at, ip_whitelist, allowed_endpoints
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        description, expires_at, ip_whitelist, allowed_endpoints, tenant_id
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
     `, [
       keyId, keyHash, userId, name, this.apiSite,
-      description, expiresAt, ipWhitelist, allowedEndpoints
+      description, expiresAt, ipWhitelist, allowedEndpoints, tenantId
     ]);
 
     return { keyId, keySecret };

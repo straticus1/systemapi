@@ -498,6 +498,7 @@ Rollout and rollback: `docs/sah-sysscript-jobs.md`.
 | POST | `/api/v1/tenants/:tenant/members` |
 | PUT/DELETE | `/api/v1/tenants/:tenant/members/:user/sso` (admin; audited) |
 | POST | `/api/v1/keys/:keyId/scopes` |
+| POST | `/api/v1/keys/:keyId/revoke` |
 | GET/POST/DELETE | `/api/v1/oauth/links` |
 
 ## Threat intelligence

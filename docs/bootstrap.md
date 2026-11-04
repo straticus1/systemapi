@@ -172,13 +172,39 @@ Set these on each host's `systemapi-agent` once the first admin exists.
 
 See `docs/sahconnect-terminal-protocol.md` §6 and §7.
 
+## A second tenant with its own agent key
+
+`enroll` never creates a tenant for a user who already belongs to one
+(`tenant_create_denied`). To add a tenant, such as a test host's
+`afterdark-test`, run this on the server like the bootstrap:
+
+```bash
+node scripts/create-tenant.js --tenant afterdark-test --admin <your user_id> \
+  --agent-member <new user_id, e.g. sahtest1-agent>
+```
+
+In one transaction it creates the tenant, makes `--admin` its admin (that user
+must already be an admin member somewhere), adds `--agent-member` as a
+`viewer`, mints that member an API key bound to the tenant with no scope rows,
+and writes a `tenant_create` audit row. It refuses with `tenant_exists` if the
+tenant exists and `agent_member_exists` if the agent id is already a member of
+any tenant. The key prints once on stdout. Put it in the host's agent env. It
+belongs to a member of this tenant only, is bound to it for enroll, has no API
+scopes and is refused on every `/playground` route (so it cannot mint more
+keys). A leaked test-host key cannot reach your other tenants. The script
+also refuses (`agent_identity_exists`) an agent id that already holds an API
+key or an OAuth grant. Use your own admin key to manage the new tenant, and to
+revoke the agent key with `POST /api/v1/keys/<key_id>/revoke`, which closes
+its live agents.
+
 ## Tests
 
-`npm test` runs `tests/bootstrap.test.js` (the registry transaction on a
-recording client) and `tests/schema.test.js`. The end-to-end test runs against
-a real PostgreSQL and needs a role that may `CREATE DATABASE`:
+`npm test` runs `tests/bootstrap.test.js` and `tests/create-tenant.test.js`
+(the registry transactions on a recording client) and `tests/schema.test.js`.
+The end-to-end tests run against a real PostgreSQL and need a role that may
+`CREATE DATABASE`:
 
 ```bash
 SYSTEMAPI_TEST_DATABASE_URL=postgres://postgres@127.0.0.1:5432/postgres \
-  node --test tests/bootstrap-pg.test.js
+  node --test tests/bootstrap-pg.test.js tests/create-tenant-pg.test.js
 ```

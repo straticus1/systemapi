@@ -1435,6 +1435,25 @@ function mount(app, fleet) {
     res.json({ key_id: req.params.keyId, scopes });
   }));
 
+  // Same rule as the scopes route: only an admin of every tenant the key's
+  // owner belongs to may revoke it (an operator's way to kill a key it does
+  // not own, such as a create-tenant agent key). Deactivation and audit row
+  // are one transaction; live agents on the key are then closed.
+  app.post('/api/v1/keys/:keyId/revoke', wrap(async (req, res) => {
+    const principal = await authenticate(req, fleet);
+    const admins = adminTenantIds(principal);
+    if (admins.length === 0) throw http(403, 'scope_denied');
+    const owner = await lookupKeyOwner(fleet, req.params.keyId);
+    if (!owner) throw http(404, 'not_found');
+    const ownerMemberships = await fleet.registry.membershipsForUser(owner.user_id);
+    const ownerTenants = [...new Set(ownerMemberships.map((m) => m.tenant_id))].sort();
+    if (ownerTenants.length === 0 || !ownerTenants.every((t) => admins.includes(t))) throw http(404, 'not_found');
+    const actor = String(principal.userId);
+    await fleet.registry.revokeKeyAudited({ keyId: req.params.keyId, tenantId: ownerTenants[0], tenants: ownerTenants, actor });
+    const closed = typeof fleet.closeAgentsForKey === 'function' ? await fleet.closeAgentsForKey(req.params.keyId, 'admin_revoked', actor) : 0;
+    res.json({ key_id: req.params.keyId, revoked: true, agents_closed: closed });
+  }));
+
   app.post('/api/v1/oauth/links', wrap(async (req, res) => {
     const principal = await authenticate(req, fleet);
     if (adminTenantIds(principal).length === 0) throw http(403, 'scope_denied');

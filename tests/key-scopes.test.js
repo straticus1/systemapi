@@ -50,6 +50,7 @@ async function rig() {
   const post = (apiKey, keyId, body) => fetch(`${url}/api/v1/keys/${keyId}/scopes`, {
     method: 'POST', headers: { 'x-api-key': apiKey, 'content-type': 'application/json' }, body: JSON.stringify(body)
   }).then(async (res) => ({ status: res.status, body: await res.json() }));
+  post.url = url;
   return { fm, reg, post, close: () => new Promise((r) => { server.closeAllConnections(); server.close(r); }) };
 }
 
@@ -115,5 +116,47 @@ test('if the audit row cannot be written, the scopes stay as they were', async (
     const out = await r.post('admin-acme', 'k-op', { scopes: ['admin'] });
     assert.equal(out.status, 500);
     assert.deepEqual(r.reg.scopes.get('k-op'), ['hosts:read']);
+  } finally { await r.close(); }
+});
+
+// POST /api/v1/keys/:keyId/revoke: the same owner-tenant rule, the key
+// deactivated and audited, live agents on it closed.
+test('revoke: an admin of every owner tenant revokes the key, audited, and agents on it are closed', async () => {
+  const r = await rig();
+  try {
+    const closed = [];
+    r.fm.closeAgentsForKey = async (keyId, reason, actor) => { closed.push([keyId, reason, actor]); return 1; };
+    const url = r.post.url;
+    const out = await fetch(`${url}/api/v1/keys/k-op/revoke`, { method: 'POST', headers: { 'x-api-key': 'admin-acme' } })
+      .then(async (res) => ({ status: res.status, body: await res.json() }));
+    assert.equal(out.status, 200, JSON.stringify(out.body));
+    assert.deepEqual(out.body, { key_id: 'k-op', revoked: true, agents_closed: 1 });
+    assert.equal(await r.reg.keyActive('k-op'), false);
+    assert.deepEqual(closed, [['k-op', 'admin_revoked', 'user-1']]);
+    const rows = r.reg.audit.filter((a) => a.action === 'key_revoked');
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].tenant_id, 'acme');
+    assert.equal(rows[0].payload.was_active, true);
+    assert.deepEqual(rows[0].payload.tenants, ['acme']);
+    assert.ok(!JSON.stringify(rows[0]).includes('"k-op"'), 'the audit row names the key by fingerprint');
+    assert.equal((await r.reg.verifyAudit()).ok, true);
+    // A second revoke is still audited, with was_active false.
+    const again = await fetch(`${url}/api/v1/keys/k-op/revoke`, { method: 'POST', headers: { 'x-api-key': 'admin-acme' } });
+    assert.equal(again.status, 200);
+    const all = r.reg.audit.filter((a) => a.action === 'key_revoked');
+    assert.deepEqual(all.map((a) => a.payload.was_active), [true, false]);
+  } finally { await r.close(); }
+});
+
+test('revoke: refused (404) for an admin who does not administer every owner tenant, and for an unknown key; 403 with no admin anywhere', async () => {
+  const r = await rig();
+  try {
+    const url = r.post.url;
+    const call = (apiKey, keyId) => fetch(`${url}/api/v1/keys/${keyId}/revoke`, { method: 'POST', headers: { 'x-api-key': apiKey } }).then((res) => res.status);
+    assert.equal(await call('admin-acme', 'k-beta'), 404);
+    assert.equal(await call('admin-acme', 'k-nope'), 404);
+    assert.equal(await call('op-acme', 'k-self-op'), 403);
+    assert.equal(await r.reg.keyActive('k-beta'), true);
+    assert.equal(r.reg.audit.filter((a) => a.action === 'key_revoked').length, 0);
   } finally { await r.close(); }
 });
