@@ -47,6 +47,11 @@ const RETRY_UNRECORDED_S = 60;
 // Retries stop this far inside TIME_SKEW_S, so a put that takes up to
 // SINK_TIMEOUT_MS still lands within the verifier's skew.
 const RETRY_WINDOW_S = 540;
+// Per tick, retries run after the checkpoint, newest first, at most
+// RETRY_MAX_ROWS checkpoints and for at most RETRY_BUDGET_MS (a black-holed
+// sink costs SINK_TIMEOUT_MS a put), and stop early for a forced checkpoint.
+const RETRY_MAX_ROWS = 10;
+const RETRY_BUDGET_MS = 20000;
 const LIST_MAX_OBJECTS = 200000;
 // How far a note's signed time may be from the sink's LastModified before
 // the verifier calls it backdated; also the window for retrying a failed put
@@ -300,17 +305,35 @@ function s3Sink(cfg, { client = null } = {}) {
     responseChecksumValidation: 'WHEN_REQUIRED'
   });
   const send = (cmd) => c.send(cmd, { abortSignal: AbortSignal.timeout(SINK_TIMEOUT_MS) });
+  let conditional = true;
   return {
     id: cfg.id,
+    // 'ok', or 'exists' when the key is already there (If-None-Match: *, so
+    // a key is never written twice; AWS S3, R2 and MinIO take it). A store
+    // that answers 501 NotImplemented to the header is sent plain puts from
+    // then on.
     async put(key, body) {
       const buf = Buffer.from(body, 'utf8');
-      await send(new s3.PutObjectCommand({
+      const input = {
         Bucket: cfg.bucket,
         Key: key,
         Body: buf,
         ContentType: 'text/plain; charset=utf-8',
         ContentMD5: crypto.createHash('md5').update(buf).digest('base64')
-      }));
+      };
+      if (conditional) {
+        try {
+          await send(new s3.PutObjectCommand({ ...input, IfNoneMatch: '*' }));
+          return 'ok';
+        } catch (err) {
+          const status = err && err.$metadata ? err.$metadata.httpStatusCode : undefined;
+          if (status === 412 || (err && err.name === 'PreconditionFailed')) return 'exists';
+          if (status !== 501 && !(err && err.name === 'NotImplemented')) throw err;
+          conditional = false;
+        }
+      }
+      await send(new s3.PutObjectCommand(input));
+      return 'ok';
     },
     async list(prefix) {
       const out = [];
@@ -347,20 +370,33 @@ class AuditAnchor {
     this.now = now;
     this.running = null;
     this.forcePending = false;
+    this.forceDeferred = false;
+    // The own verifier key, to check a stored note before re-putting it.
+    this.vkey = parseVkey(config.vkey || vkeyOf(originOf(config.deployment), config.signer.publicKeyRaw));
   }
 
-  // Called from the 30 s control tick: retries failed sink puts, then writes
-  // a checkpoint when the last one is an interval old. One run at a time; a
-  // forced request during a run runs right after it.
+  // Called from the 30 s control tick: writes a checkpoint when the last one
+  // is an interval old, then retries failed sink puts within a budget. One
+  // run at a time; a forced request during a run runs right after it, and a
+  // forced one coalesced away (see checkpointDue) runs on the next tick.
   tick() {
     if (this.running) return this.running;
     this.running = (async () => {
       try {
-        await this.retryFailed();
+        if (this.forceDeferred) {
+          this.forceDeferred = false;
+          this.forcePending = true;
+        }
+        const written = new Set();
         do {
-          const force = this.forcePending;
-          this.forcePending = false;
-          await this.checkpoint(force);
+          do {
+            const force = this.forcePending;
+            this.forcePending = false;
+            const cp = await this.checkpoint(force);
+            if (cp) written.add(cp.id);
+            else if (force) this.forceDeferred = true;
+          } while (this.forcePending);
+          await this.retryFailed(written);
         } while (this.forcePending);
       } finally {
         this.running = null;
@@ -373,27 +409,45 @@ class AuditAnchor {
   // (or never recorded, after RETRY_UNRECORDED_S: a crash between insert and
   // put), while the note time is within RETRY_WINDOW_S of now (inside
   // TIME_SKEW_S), so a late put never trips the verifier's
-  // anchor_time_mismatch.
-  async retryFailed() {
+  // anchor_time_mismatch. The stored note must verify with this key and
+  // match its row, or it is not sent (retry_note_mismatch). skip: ids
+  // written in this tick.
+  async retryFailed(skip = new Set()) {
     if (typeof this.registry.recentAuditCheckpoints !== 'function') return;
-    const nowS = Math.floor(this.now() / 1000);
+    const started = this.now();
+    const nowS = Math.floor(started / 1000);
     let rows;
     try {
-      rows = await this.registry.recentAuditCheckpoints(this.config.deployment, nowS - RETRY_WINDOW_S, nowS + RETRY_WINDOW_S);
+      rows = await this.registry.recentAuditCheckpoints(this.config.deployment, nowS - RETRY_WINDOW_S, nowS + RETRY_WINDOW_S, RETRY_MAX_ROWS);
     } catch (err) {
       this.logger.error(`[anchor] retry scan failed: db_error ${errName(err)}`);
       return;
     }
     for (const cp of rows) {
+      if (skip.has(cp.id)) continue;
       const status = cp.sink_status || {};
-      for (const sink of this.sinks) {
+      const due = this.sinks.filter((sink) => {
         const st = status[sink.id];
-        if (st === 'ok' || (st === undefined && nowS - cp.note_time < RETRY_UNRECORDED_S)) continue;
+        return st !== 'ok' && !(st === undefined && nowS - cp.note_time < RETRY_UNRECORDED_S);
+      });
+      if (due.length === 0) continue;
+      let parsed = null;
+      try {
+        parsed = parseNote(Buffer.from(cp.note, 'utf8'), this.vkey);
+      } catch {
+        parsed = null;
+      }
+      if (!parsed || parsed.seq !== cp.seq || parsed.time !== cp.note_time || parsed.head !== cp.head) {
+        this.logger.error('[anchor] retry refused: retry_note_mismatch');
+        continue;
+      }
+      for (const sink of due) {
+        if (this.forcePending || this.now() - started > RETRY_BUDGET_MS) return;
         let result = 'put_failed';
         try {
-          await sink.put(objectKey(cp.deployment, cp.seq, cp.note_time), cp.note);
+          const out = await sink.put(objectKey(cp.deployment, cp.seq, cp.note_time), cp.note);
           result = 'ok';
-          this.logger.log(`[anchor] ${sink.id} put retried: ok`);
+          this.logger.log(`[anchor] ${sink.id} put retried: ${out === 'exists' ? 'exists' : 'ok'}`);
         } catch (err) {
           this.logger.error(`[anchor] ${sink.id} put retry failed: ${errName(err)}`);
         }
@@ -430,10 +484,12 @@ class AuditAnchor {
     if (!cp) return null;
     if (cp.clock_warning) this.logger.error(`[anchor] ${cp.clock_warning}`);
     const key = objectKey(deployment, cp.seq, cp.note_time);
-    // Each sink on its own: one failing never holds the other.
+    // Each sink on its own: one failing never holds the other. 'exists' (the
+    // key is already there) counts as written.
     const results = await Promise.all(this.sinks.map(async (sink) => {
       try {
-        await sink.put(key, cp.note);
+        const out = await sink.put(key, cp.note);
+        if (out === 'exists') this.logger.error(`[anchor] ${sink.id} put: key_exists`);
         return [sink.id, 'ok'];
       } catch (err) {
         this.logger.error(`[anchor] ${sink.id} put failed: ${errName(err)}`);

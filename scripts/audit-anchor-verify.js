@@ -23,11 +23,14 @@
 //   anchor_time_mismatch   a note's signed time is far from the sink's LastModified
 //   anchor_sink_mismatch   two notes hold different heads for one seq, or (both
 //                          sinks read) a key older than 600 s is in one sink only
-// --ack FILE: a reviewed, off-box JSON list of { code, sink, seq | key, why };
-// a matching reason is reported under acked_reasons and does not fail the
-// run (WORM objects cannot be deleted, so an old alarm would otherwise fire
-// forever and bury new ones). --since <unix>: notes signed before it are not
-// fetched or judged; the gap rule runs from it.
+// --ack FILE: a reviewed, off-box JSON list of { code, sink, key, why };
+// a reason naming exactly that code, sink and object key is reported under
+// acked_reasons and does not fail the run (WORM objects cannot be deleted,
+// so an old alarm would otherwise fire forever and bury new ones).
+// chain_broken, staleness and an empty sink can never be acked. Gap and
+// staleness judge only notes whose signed time is within 600 s of their
+// LastModified. --since <unix>: notes signed before it are not fetched or
+// judged; the gap rule runs from it.
 // With --export, pass --now <unix time the export was taken>: notes signed
 // after it are skipped (they may name rows the export does not hold), and
 // the staleness check runs against that time. The run is only as honest as
@@ -64,7 +67,11 @@ const ACK_MAX = 1000;
 // once now - last >= cadence, so one missed checkpoint leaves notes 2x the
 // cadence plus up to a tick or two apart. 300 s covers that and clock jitter.
 const GAP_SLACK_S = 300;
-const ACK_CODES = new Set(['chain_broken', 'anchor_rewrite', 'anchor_truncation', 'anchor_gap', 'anchor_seq_regression',
+// Codes an ack may name, always by object key. chain_broken is not one: the
+// chain is not verified past a break, so an ack would blind everything after
+// it (a known, reviewed fork goes into KNOWN_FORKS in controlplane/chain.js).
+// Staleness and empty-sink gaps carry no key and can never be acked.
+const ACK_CODES = new Set(['anchor_rewrite', 'anchor_truncation', 'anchor_gap', 'anchor_seq_regression',
   'anchor_bad_signature', 'anchor_note_invalid', 'anchor_time_mismatch', 'anchor_sink_mismatch']);
 const HEX64_RE = /^[0-9a-f]{64}$/;
 
@@ -103,10 +110,10 @@ function parseArgs(argv, env) {
   return { vkey, sink, cadenceS, nowS, nowGiven: out.now !== undefined, sinceS, exportFile: out.export, ackFile: out.ack };
 }
 
-// The reviewed ack file: a JSON array of { code, sink, seq | key, why }.
-// An acked reason is still reported but does not fail the run. Every entry
-// must name a known code and a non-empty why; sink is the reason's sink (or
-// null for chain_broken and a mismatch without one).
+// The reviewed ack file: a JSON array of { code, sink, key, why }, where key
+// is the object key the reason names. An acked reason is still reported but
+// does not fail the run. Every field is required: a known code (see
+// ACK_CODES), sink1 or sink2, the exact key, and a non-empty why.
 function parseAcks(text) {
   let data;
   try {
@@ -116,22 +123,22 @@ function parseAcks(text) {
   }
   if (!Array.isArray(data) || data.length > ACK_MAX) throw fail('ack_invalid');
   return data.map((a) => {
-    if (!a || typeof a !== 'object' || !ACK_CODES.has(a.code) || typeof a.why !== 'string' ||
-      a.why.trim() === '' || a.why.length > 500) throw fail('ack_invalid');
-    const sink = a.sink === undefined || a.sink === null ? null : a.sink;
-    if (sink !== null && sink !== 'sink1' && sink !== 'sink2') throw fail('ack_invalid');
-    const hasSeq = a.seq !== undefined;
-    const hasKey = a.key !== undefined;
-    if (hasSeq === hasKey) throw fail('ack_invalid');
-    if (hasSeq && a.seq !== null && !Number.isSafeInteger(a.seq)) throw fail('ack_invalid');
-    if (hasKey && (typeof a.key !== 'string' || a.key.length > 512)) throw fail('ack_invalid');
-    return hasSeq ? { code: a.code, sink, seq: a.seq } : { code: a.code, sink, key: a.key };
+    if (!a || typeof a !== 'object' || Array.isArray(a)) throw fail('ack_invalid');
+    const extra = Object.keys(a).filter((k) => !['code', 'sink', 'key', 'why'].includes(k));
+    if (extra.length > 0 || !ACK_CODES.has(a.code) || (a.sink !== 'sink1' && a.sink !== 'sink2') ||
+      typeof a.key !== 'string' || a.key === '' || a.key.length > 512 ||
+      typeof a.why !== 'string' || a.why.trim() === '' || a.why.length > 500) {
+      throw fail('ack_invalid');
+    }
+    return { code: a.code, sink: a.sink, key: a.key };
   });
 }
 
+// A reason with no key (staleness, an empty sink, chain_broken) never
+// matches.
 function acked(reason, acks) {
-  return acks.some((a) => a.code === reason.code && a.sink === (reason.sink ?? null) &&
-    ('seq' in a ? a.seq === (reason.seq ?? null) : a.key === reason.key));
+  if (typeof reason.key !== 'string') return false;
+  return acks.some((a) => a.code === reason.code && a.sink === reason.sink && a.key === reason.key);
 }
 
 function sameHash(a, b) {
@@ -215,7 +222,7 @@ async function readSink(sink, vkey, { sinceS = null, untilS = null } = {}) {
     if (fromKey && ((sinceS !== null && fromKey.time < sinceS) || (untilS !== null && fromKey.time > untilS))) continue;
     if (fromKey) keys.set(obj.key, fromKey.time);
     if (!fromKey || !(obj.size > 0) || obj.size > NOTE_MAX_BYTES || !obj.lastModified) {
-      reasons.push({ code: 'anchor_note_invalid', sink: sink.id, key: String(obj.key).slice(0, 200) });
+      reasons.push({ code: 'anchor_note_invalid', sink: sink.id, key: String(obj.key).slice(0, 512) });
       continue;
     }
     let body;
@@ -237,10 +244,11 @@ async function readSink(sink, vkey, { sinceS = null, untilS = null } = {}) {
       reasons.push({ code: 'anchor_note_invalid', sink: sink.id, key: obj.key });
       continue;
     }
-    if (Math.abs(Math.floor(obj.lastModified.getTime() / 1000) - note.time) > TIME_SKEW_S) {
-      reasons.push({ code: 'anchor_time_mismatch', sink: sink.id, seq: note.seq });
+    const lastModifiedS = Math.floor(obj.lastModified.getTime() / 1000);
+    if (Math.abs(lastModifiedS - note.time) > TIME_SKEW_S) {
+      reasons.push({ code: 'anchor_time_mismatch', sink: sink.id, seq: note.seq, key: obj.key });
     }
-    notes.push({ key: obj.key, ...note });
+    notes.push({ key: obj.key, ...note, lastModifiedS });
   }
   return { notes, keys, reasons };
 }
@@ -257,7 +265,7 @@ function check({ bySink, rows, cadenceS, nowS, sinceS = null, acks = [], forks =
   for (const n of all) {
     const seen = headBySeq.get(n.seq);
     if (!seen) headBySeq.set(n.seq, n.head);
-    else if (!sameHash(seen, n.head)) reasons.push({ code: 'anchor_sink_mismatch', seq: n.seq });
+    else if (!sameHash(seen, n.head)) reasons.push({ code: 'anchor_sink_mismatch', sink: n.sink, seq: n.seq, key: n.key });
   }
   // Both sinks read: a key one holds and the other lacks, past the retry
   // window, is a mismatch too.
@@ -273,7 +281,7 @@ function check({ bySink, rows, cadenceS, nowS, sinceS = null, acks = [], forks =
   }
   const seqs = [...new Set(all.map((n) => n.seq))];
   const chain = verifyRows(rows, forks, { legacyMaxSeq: legacy, headsAt: seqs });
-  if (!chain.ok) reasons.push({ code: 'chain_broken', seq: chain.broken_at });
+  if (!chain.ok) reasons.push({ code: 'chain_broken', sink: null, seq: chain.broken_at });
   const maxSeq = rows.length ? rows[rows.length - 1].seq : 0;
   const rowBySeq = chain.ok ? new Map() : new Map(rows.map((r) => [r.seq, r]));
   for (const n of all) {
@@ -290,21 +298,29 @@ function check({ bySink, rows, cadenceS, nowS, sinceS = null, acks = [], forks =
     }
     if (head === undefined || !sameHash(head, n.head)) reasons.push({ code: 'anchor_rewrite', sink: n.sink, seq: n.seq, key: n.key });
   }
-  // Per sink: anchors at most 2x the cadence apart, the last one recent, and
-  // seq never going back as time goes on.
+  // Per sink: anchors at most 2x the cadence (+ slack) apart, the last one
+  // recent, and seq never going back as time goes on. Timeliness counts only
+  // notes whose signed time is within TIME_SKEW_S of the sink's LastModified
+  // (a far-future or backdated note cannot hold off the staleness check,
+  // even once its time_mismatch is acked), judged at min(time, LastModified
+  // + skew). A gap names the note that ends it; staleness and an empty sink
+  // name no key, so they cannot be acked.
   const limit = 2 * cadenceS + GAP_SLACK_S;
   for (const id of Object.keys(bySink)) {
-    const notes = [...bySink[id].notes].sort((a, b) => a.time - b.time || a.seq - b.seq);
+    const notes = bySink[id].notes
+      .filter((n) => n.lastModifiedS === undefined || Math.abs(n.time - n.lastModifiedS) <= TIME_SKEW_S)
+      .map((n) => ({ ...n, at: n.lastModifiedS === undefined ? n.time : Math.min(n.time, n.lastModifiedS + TIME_SKEW_S) }))
+      .sort((a, b) => a.at - b.at || a.seq - b.seq);
     if (notes.length === 0) {
       reasons.push({ code: 'anchor_gap', sink: id, seq: null });
       continue;
     }
-    if (sinceS !== null && notes[0].time - sinceS > limit) reasons.push({ code: 'anchor_gap', sink: id, seq: notes[0].seq });
+    if (sinceS !== null && notes[0].at - sinceS > limit) reasons.push({ code: 'anchor_gap', sink: id, seq: notes[0].seq, key: notes[0].key });
     for (let i = 1; i < notes.length; i += 1) {
-      if (notes[i].time - notes[i - 1].time > limit) reasons.push({ code: 'anchor_gap', sink: id, seq: notes[i].seq });
-      if (notes[i].seq < notes[i - 1].seq) reasons.push({ code: 'anchor_seq_regression', sink: id, seq: notes[i].seq });
+      if (notes[i].at - notes[i - 1].at > limit) reasons.push({ code: 'anchor_gap', sink: id, seq: notes[i].seq, key: notes[i].key });
+      if (notes[i].seq < notes[i - 1].seq) reasons.push({ code: 'anchor_seq_regression', sink: id, seq: notes[i].seq, key: notes[i].key });
     }
-    if (nowS - notes[notes.length - 1].time > limit) reasons.push({ code: 'anchor_gap', sink: id, seq: notes[notes.length - 1].seq });
+    if (nowS - notes[notes.length - 1].at > limit) reasons.push({ code: 'anchor_gap', sink: id, seq: null, stale: true });
   }
   const open = reasons.filter((r) => !acked(r, acks));
   const done = reasons.filter((r) => acked(r, acks));

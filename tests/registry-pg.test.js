@@ -1739,6 +1739,15 @@ test('audit checkpoints: one per interval across replicas, the head read under t
   await registry.setAuditCheckpointSink(cp.id, 'sink2', 'put_failed');
   const merged = await pool.query('SELECT sink_status FROM cp_audit_checkpoints WHERE id = $1', [cp.id]);
   assert.deepEqual(merged.rows[0].sink_status, { sink1: 'ok', sink2: 'ok' });
+  await registry.setAuditCheckpointSinks(cp.id, { sink1: 'put_failed', sink2: 'put_failed', sink3: 'put_failed' });
+  const guarded = await pool.query('SELECT sink_status FROM cp_audit_checkpoints WHERE id = $1', [cp.id]);
+  assert.deepEqual(guarded.rows[0].sink_status, { sink1: 'ok', sink2: 'ok', sink3: 'put_failed' });
+  // A forced checkpoint never runs more than 1 s ahead of the clock.
+  const forced = `${deployment}-x`;
+  const x1 = await registry.createAuditCheckpoint({ deployment: forced, nowS, minGapS: 0, sign });
+  const x2 = await registry.createAuditCheckpoint({ deployment: forced, nowS, minGapS: 0, sign });
+  assert.equal(x2.note_time, x1.note_time + 1);
+  assert.equal(await registry.createAuditCheckpoint({ deployment: forced, nowS, minGapS: 0, sign }), null);
   // A checkpoint far in the future (a wrong clock) does not stall the next.
   const future = `${deployment}-f`;
   const f1 = await registry.createAuditCheckpoint({ deployment: future, nowS, minGapS: 3600, sign });

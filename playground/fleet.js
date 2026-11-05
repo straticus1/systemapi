@@ -60,6 +60,7 @@ const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 const { demoKeyAllowed, agentAuthFromRequest, ticketFromRequest, originAllowed } = require('../controlplane/httpauth');
 const { validateTenant, validateHostId, validateHostname, validateSSHPublicKey } = require('../controlplane/sshkey');
 const { consumeTicket } = require('../controlplane/tickets');
+const { errName: anchorErrName } = require('../controlplane/anchor');
 const { issueLease, terminalPayload } = require('../controlplane/lease');
 const { fingerprint, randomToken } = require('../controlplane/token');
 const { zscore } = require('../controlplane/stats');
@@ -674,8 +675,8 @@ class FleetManager {
         // The row is written; an anchor failure must not end the session.
         try {
             if (this.anchor) this.anchor.noteAudit(row);
-        } catch {
-            console.error('[anchor] trigger failed');
+        } catch (err) {
+            console.error(`[anchor] trigger failed: ${anchorErrName(err)}`);
         }
         return row;
     }

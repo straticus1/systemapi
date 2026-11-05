@@ -125,9 +125,11 @@ async function auditInsert(client, entry) {
 }
 
 // Whether a checkpoint is due: none yet, or the last is at least minGapS
-// old (0 for a forced one, which is always due). Note times rise strictly,
-// so two checkpoints in one second (a forced one beside the hourly one) get
-// distinct object keys. A last time more than CHECKPOINT_FUTURE_S ahead of
+// old (0 for a forced one). Note times rise strictly, so two checkpoints in
+// one second (a forced one beside the hourly one) get distinct object keys;
+// a forced one is coalesced (null: the caller runs it next tick) when the
+// last time is already past now, so forced times never run more than 1 s
+// ahead of the clock. A last time more than CHECKPOINT_FUTURE_S ahead of
 // the clock (a clock that was wrong) would stall anchoring until the clock
 // caught up: it is due now, at one past the newest sane time (sane: not
 // ahead of now + CHECKPOINT_FUTURE_S), so the new key clashes with no sane
@@ -139,6 +141,7 @@ function checkpointDue(lastTime, nowS, minGapS, saneLast = null) {
     return { time: Math.max(nowS, saneLast === null ? 0 : saneLast + 1), future: true };
   }
   if (minGapS > 0 && nowS - lastTime < minGapS) return null;
+  if (minGapS <= 0 && lastTime > nowS) return null;
   return { time: Math.max(nowS, lastTime + 1) };
 }
 
@@ -1353,16 +1356,19 @@ class MemoryRegistry {
   }
 
   // Checkpoints of this deployment with a note time in [fromTime, toTime],
-  // for the put retry.
-  async recentAuditCheckpoints(deployment, fromTime, toTime) {
+  // newest first, at most limit, for the put retry.
+  async recentAuditCheckpoints(deployment, fromTime, toTime, limit = 10) {
     return this.checkpoints
       .filter((c) => c.deployment === deployment && c.note_time >= fromTime && c.note_time <= toTime)
+      .reverse()
+      .slice(0, limit)
       .map((c) => ({ ...c, sink_status: { ...c.sink_status } }));
   }
 
   async setAuditCheckpointSinks(id, status) {
     const row = this.checkpoints.find((c) => c.id === id);
-    if (row) row.sink_status = { ...row.sink_status, ...status };
+    if (!row) return;
+    for (const [k, v] of Object.entries(status)) if (row.sink_status[k] !== 'ok') row.sink_status = { ...row.sink_status, [k]: v };
   }
 
   async setAuditCheckpointSink(id, sinkId, status) {
@@ -3167,8 +3173,16 @@ class PgRegistry {
     }
   }
 
+  // Each sink's outcome, merged; a sink already recorded ok (a replica's
+  // retry got there first) stays ok.
   async setAuditCheckpointSinks(id, status) {
-    await this.pool.query('UPDATE cp_audit_checkpoints SET sink_status = sink_status || $2::jsonb WHERE id = $1', [id, JSON.stringify(status)]);
+    await this.pool.query(
+      `UPDATE cp_audit_checkpoints SET sink_status = sink_status || (
+         SELECT coalesce(jsonb_object_agg(e.key, e.value), '{}'::jsonb) FROM jsonb_each($2::jsonb) AS e
+         WHERE (cp_audit_checkpoints.sink_status ->> e.key) IS DISTINCT FROM 'ok')
+       WHERE id = $1`,
+      [id, JSON.stringify(status)]
+    );
   }
 
   // One sink's outcome; an ok already recorded (by a replica's retry) stays.
@@ -3181,12 +3195,12 @@ class PgRegistry {
   }
 
   // Checkpoints of this deployment with a note time in [fromTime, toTime],
-  // for the put retry.
-  async recentAuditCheckpoints(deployment, fromTime, toTime) {
+  // newest first, at most limit, for the put retry.
+  async recentAuditCheckpoints(deployment, fromTime, toTime, limit = 10) {
     const res = await this.pool.query(
       `SELECT id, deployment, seq, head, note_time, note, sink_status FROM cp_audit_checkpoints
-       WHERE deployment = $1 AND note_time >= $2 AND note_time <= $3 ORDER BY id ASC LIMIT 100`,
-      [deployment, fromTime, toTime]
+       WHERE deployment = $1 AND note_time >= $2 AND note_time <= $3 ORDER BY id DESC LIMIT $4`,
+      [deployment, fromTime, toTime, limit]
     );
     return res.rows.map((r) => ({ ...r, id: Number(r.id), seq: Number(r.seq), note_time: Number(r.note_time) }));
   }

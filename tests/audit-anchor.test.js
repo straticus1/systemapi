@@ -61,8 +61,10 @@ function memorySink(id, { failPut = false } = {}) {
     async put(key, body) {
       this.puts += 1;
       if (this.failPut) throw Object.assign(new Error('boom'), { name: 'AccessDenied' });
-      if (objects.has(key)) throw Object.assign(new Error('locked'), { name: 'ObjectLocked' });
+      // If-None-Match: * semantics: an existing key is never rewritten.
+      if (objects.has(key)) return 'exists';
       objects.set(key, { body: Buffer.from(body, 'utf8'), lastModified: new Date((clock ? clock() : Date.now())) });
+      return 'ok';
     },
     async list(prefix) {
       return [...objects.entries()].filter(([k]) => k.startsWith(prefix)).sort(([a], [b]) => (a < b ? -1 : 1))
@@ -543,7 +545,7 @@ test('audit-checkpoint-pubkey prints only the verifier key, and never the seed',
 
 // --- review follow-ups ------------------------------------------------------------
 
-test('two break-glass starts right after a periodic checkpoint give three checkpoints', async () => {
+test('two break-glass starts right after a periodic checkpoint give three checkpoints, never more than 1 s ahead', async () => {
   const r = rig();
   await r.append();
   await r.anchor.tick();
@@ -552,10 +554,21 @@ test('two break-glass starts right after a periodic checkpoint give three checkp
     r.anchor.noteAudit(bg);
     await r.anchor.running;
   }
-  assert.equal(r.registry.checkpoints.length, 3);
-  const times = r.registry.checkpoints.map((c) => c.note_time);
-  assert.deepEqual(times, [T0, T0 + 1, T0 + 2]);
+  // The second one in the same second is coalesced to the next tick.
+  assert.deepEqual(r.registry.checkpoints.map((c) => c.note_time), [T0, T0 + 1]);
+  r.advance(30);
+  await r.anchor.tick();
+  assert.deepEqual(r.registry.checkpoints.map((c) => c.note_time), [T0, T0 + 1, T0 + 30]);
+  assert.equal(r.registry.checkpoints[2].seq, 3);
   assert.equal(r.sinks[0].objects.size, 3);
+  // Many forced in one second: none runs ahead of the clock by more than 1 s.
+  const many = rig();
+  await many.anchor.tick();
+  for (let i = 0; i < 5; i += 1) {
+    many.anchor.noteAudit(await many.append('terminal_start', { purpose: 'breakglass:open' }));
+    await many.anchor.running;
+  }
+  for (const c of many.registry.checkpoints) assert.ok(c.note_time <= many.nowS() + 1);
 });
 
 test('a last checkpoint far in the future does not stall anchoring; keys stay unique', async () => {
@@ -743,4 +756,189 @@ test('production refuses to boot with a set but invalid anchoring config; elsewh
   assert.throws(() => anchor.createAnchor({ env: { ...baseEnv(), NODE_ENV: 'production' }, registry: null, logger: quiet }), { code: 'registry_unavailable' });
   assert.equal(anchor.createAnchor({ env: { NODE_ENV: 'production', SYSTEMAPI_ED25519_SEED: LEASE_SEED }, registry, logger: quiet }), null);
   assert.ok(anchor.createAnchor({ env: { ...baseEnv(), NODE_ENV: 'production' }, registry, logger: quiet, sinkFactory: (c) => memorySink(c.id) }));
+});
+
+// --- re-review follow-ups ------------------------------------------------------------
+
+function ackFileRun(r, acks, extra = []) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'anchor-'));
+  const file = path.join(dir, 'audit.json');
+  const ackFile = path.join(dir, 'ack.json');
+  fs.writeFileSync(file, JSON.stringify(r.registry.audit));
+  fs.writeFileSync(ackFile, typeof acks === 'string' ? acks : JSON.stringify(acks));
+  const env = { SYSTEMAPI_ANCHOR_VKEY: vkeyText() };
+  return verify.run(['--export', file, '--ack', ackFile, ...extra], { env, sinks: r.sinks })
+    .finally(() => fs.rmSync(dir, { recursive: true, force: true }));
+}
+
+test('acks are by object key only: seq-keyed, null, chain_broken and unknown-field acks are refused', async () => {
+  const r = rig();
+  await runHours(r, 2);
+  const now = ['--now', String(r.nowS())];
+  for (const bad of [
+    [{ code: 'anchor_bad_signature', sink: 'sink1', seq: null, why: 'x' }],
+    [{ code: 'anchor_gap', sink: 'sink1', seq: 2, why: 'x' }],
+    [{ code: 'anchor_note_invalid', sink: 'sink1', key: null, why: 'x' }],
+    [{ code: 'anchor_note_invalid', sink: null, key: 'k', why: 'x' }],
+    [{ code: 'chain_broken', sink: 'sink1', key: 'k', why: 'x' }],
+    [{ code: 'anchor_gap', sink: 'sink1', key: 'k', seq: 2, why: 'x' }]
+  ]) {
+    await assert.rejects(ackFileRun(r, bad, now), { code: 'ack_invalid' });
+  }
+});
+
+test('an ack for one key does not hide a bad signature elsewhere, even with seq null', async () => {
+  const r = rig();
+  await runHours(r, 2);
+  const forgedKey = anchor.objectKey(DEPLOY, 1, T0 + 7);
+  for (const s1 of r.sinks) s1.objects.set(forgedKey, { body: Buffer.from(note({ seq: 1, time: T0 + 7 }, 'ef'.repeat(32))), lastModified: new Date((T0 + 7) * 1000) });
+  const bySink = await readAll(r);
+  const hidden = verify.check({ bySink, rows: r.registry.audit, cadenceS: HOUR, nowS: r.nowS(), forks: [],
+    acks: [{ code: 'anchor_bad_signature', sink: 'sink1', seq: null }, { code: 'anchor_bad_signature', sink: 'sink1', key: 'other' }] });
+  assert.deepEqual(hidden.reasons.map((x) => [x.code, x.sink, x.key]),
+    [['anchor_bad_signature', 'sink1', forgedKey], ['anchor_bad_signature', 'sink2', forgedKey]]);
+  assert.equal(hidden.acked, 0);
+});
+
+test('a gap ack does not hide a later staleness alarm at the same seq (quiet deployment)', async () => {
+  const r = rig();
+  await r.append();
+  // Hourly heartbeats at seq 1, a 3 h outage, more heartbeats, then silence.
+  for (let i = 0; i < 2; i += 1) { await r.anchor.tick(); r.advance(HOUR); }
+  r.advance(3 * HOUR);
+  for (let i = 0; i < 2; i += 1) { await r.anchor.tick(); r.advance(HOUR); }
+  const first = verify.check({ bySink: { sink1: await verify.readSink(r.sinks[0], anchor.parseVkey(vkeyText())) }, rows: r.registry.audit, cadenceS: HOUR, nowS: r.nowS(), forks: [] });
+  const gap = first.reasons.find((x) => x.code === 'anchor_gap');
+  assert.ok(gap && gap.key && gap.seq === 1);
+  const acks = [{ code: 'anchor_gap', sink: 'sink1', key: gap.key }];
+  const bySink = { sink1: await verify.readSink(r.sinks[0], anchor.parseVkey(vkeyText())) };
+  const ok = verify.check({ bySink, rows: r.registry.audit, cadenceS: HOUR, nowS: r.nowS(), forks: [], acks });
+  assert.equal(ok.ok, true);
+  assert.equal(ok.acked, 1);
+  // Anchoring stops: staleness at the same seq has no key and fires.
+  const later = verify.check({ bySink, rows: r.registry.audit, cadenceS: HOUR, nowS: r.nowS() + 5 * HOUR, forks: [], acks });
+  assert.equal(later.ok, false);
+  assert.deepEqual(later.reasons, [{ code: 'anchor_gap', sink: 'sink1', seq: null, stale: true }]);
+});
+
+test('a far-future note, acked, cannot hold off the staleness check', async () => {
+  const r = rig();
+  await runHours(r, 2);
+  const s1 = r.sinks[0];
+  const y2100 = 4102444800;
+  const head = r.registry.audit[1].row_hash;
+  const futureKey = anchor.objectKey(DEPLOY, 2, y2100);
+  s1.objects.set(futureKey, { body: Buffer.from(note({ seq: 2, head, time: y2100 })), lastModified: new Date(r.nowS() * 1000) });
+  const vkey = anchor.parseVkey(vkeyText());
+  const acks = [{ code: 'anchor_time_mismatch', sink: 'sink1', key: futureKey }];
+  const fresh = verify.check({ bySink: { sink1: await verify.readSink(s1, vkey) }, rows: r.registry.audit, cadenceS: HOUR, nowS: r.nowS(), forks: [], acks });
+  assert.deepEqual(fresh.reasons, []);
+  assert.equal(fresh.acked, 1);
+  // No further notes: a year later the sink is stale, whatever the 2100 note says.
+  const later = verify.check({ bySink: { sink1: await verify.readSink(s1, vkey) }, rows: r.registry.audit, cadenceS: HOUR, nowS: r.nowS() + 365 * 86400, forks: [], acks });
+  assert.deepEqual(later.reasons, [{ code: 'anchor_gap', sink: 'sink1', seq: null, stale: true }]);
+});
+
+test('every note-level reason carries its object key', async () => {
+  const r = rig();
+  await runHours(r, 3);
+  const rows = r.registry.audit.map((x) => ({ ...x }));
+  rows[2].row_hash = 'ab'.repeat(32);
+  const out = verify.check({ bySink: await readAll(r), rows: rows.slice(0, 2).concat([{ ...rows[2], prev_hash: rows[1].row_hash, row_hash: rowHash(rows[1].row_hash, { ...rows[2], payload: { e: 1 } }), payload: { e: 1 } }]),
+    cadenceS: HOUR, nowS: r.nowS() + 10 * HOUR, forks: [] });
+  for (const reason of out.reasons) {
+    if (reason.stale) continue;
+    assert.equal(typeof reason.key, 'string', JSON.stringify(reason));
+  }
+  assert.ok(out.reasons.some((x) => x.code === 'anchor_rewrite'));
+});
+
+test('the checkpoint is written before retries, and retries stop at the time budget', async () => {
+  const r = rig();
+  let nowMs = T0 * 1000;
+  const stuck = { id: 'sink2', puts: 0, async put() { this.puts += 1; nowMs += 15000; throw Object.assign(new Error('t'), { name: 'TimeoutError' }); } };
+  const sinks = [r.sinks[0], stuck];
+  const a = new anchor.AuditAnchor({ config: r.config, registry: r.registry, sinks, logger: quiet, now: () => nowMs });
+  for (let i = 0; i < 5; i += 1) {
+    await r.append();
+    await a.checkpoint(true);
+    nowMs += 1000;
+  }
+  assert.equal(r.registry.checkpoints.length, 5);
+  stuck.puts = 0;
+  // A break-glass request: its checkpoint is written before any retry.
+  await r.append('terminal_start', { purpose: 'breakglass:open' });
+  a.forcePending = true;
+  await a.tick();
+  assert.equal(r.registry.checkpoints.length, 6, 'checkpoint first');
+  assert.equal(r.sinks[0].objects.size, 6);
+  // 1 put for the new checkpoint, then the 20 s budget allows 2 retries.
+  assert.equal(stuck.puts, 3);
+});
+
+test('a stored note that does not verify or match its row is never re-put', async () => {
+  const r = rig({ failSink2: true });
+  await r.append();
+  await r.anchor.checkpoint(false);
+  r.sinks[1].failPut = false;
+  r.registry.checkpoints[0].note = r.registry.checkpoints[0].note.replace('\n1\n', '\n2\n');
+  r.advance(30);
+  await r.anchor.tick();
+  assert.equal(r.sinks[1].objects.size, 0);
+  assert.ok(r.logs.includes('[anchor] retry refused: retry_note_mismatch'));
+  // A valid note for another row is refused too.
+  const r2 = rig({ failSink2: true });
+  await r2.append();
+  await r2.anchor.checkpoint(false);
+  r2.sinks[1].failPut = false;
+  r2.registry.checkpoints[0].head = 'cc'.repeat(32);
+  r2.advance(30);
+  await r2.anchor.tick();
+  assert.equal(r2.sinks[1].objects.size, 0);
+});
+
+test('the S3 adapter puts with If-None-Match, treats 412 as already there, and falls back once on 501', async () => {
+  const cfg = anchor.loadAnchorConfig(baseEnv()).sinks[0];
+  const seen = [];
+  let answer = null;
+  const client = { async send(cmd) { seen.push(cmd.input); if (answer) { const a = answer; answer = null; throw a; } return {}; } };
+  const sink = anchor.s3Sink(cfg, { client });
+  assert.equal(await sink.put('k1', 'a'), 'ok');
+  assert.equal(seen[0].IfNoneMatch, '*');
+  answer = Object.assign(new Error('pf'), { name: 'PreconditionFailed', $metadata: { httpStatusCode: 412 } });
+  assert.equal(await sink.put('k1', 'a'), 'exists');
+  answer = Object.assign(new Error('x'), { name: 'AccessDenied', $metadata: { httpStatusCode: 403 } });
+  await assert.rejects(sink.put('k2', 'a'), { name: 'AccessDenied' });
+  answer = Object.assign(new Error('ni'), { name: 'NotImplemented', $metadata: { httpStatusCode: 501 } });
+  assert.equal(await sink.put('k3', 'a'), 'ok');
+  assert.equal(seen[seen.length - 1].IfNoneMatch, undefined);
+  await sink.put('k4', 'a');
+  assert.equal(seen[seen.length - 1].IfNoneMatch, undefined, 'plain puts from then on');
+});
+
+test('a first-write status never downgrades an ok a retry already recorded', async () => {
+  const r = rig();
+  await r.append();
+  const cp = await r.anchor.checkpoint(false);
+  await r.registry.setAuditCheckpointSinks(cp.id, { sink1: 'put_failed', sink2: 'put_failed' });
+  assert.deepEqual(r.registry.checkpoints[0].sink_status, { sink1: 'ok', sink2: 'ok' });
+});
+
+test('a throwing anchor trigger does not fail the terminal audit write, and logs only a code', async () => {
+  const FleetManager = require('../playground/fleet');
+  const row = { seq: 1, action: 'terminal_start', payload: { purpose: 'breakglass:open' } };
+  const fake = {
+    registry: { async appendAudit() { return row; } },
+    anchor: { noteAudit() { throw Object.assign(new Error(`leak ${SEED}`), { code: 'boom' }); } }
+  };
+  const errors = [];
+  const orig = console.error;
+  console.error = (...a) => errors.push(a.join(' '));
+  try {
+    const out = await FleetManager.prototype.auditTerminal.call(fake, { tenantId: 't', hostId: 'h', actor: 'a' }, 'terminal_start', row.payload);
+    assert.equal(out, row);
+  } finally {
+    console.error = orig;
+  }
+  assert.deepEqual(errors, ['[anchor] trigger failed: boom']);
 });

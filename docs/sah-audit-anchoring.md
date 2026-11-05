@@ -33,13 +33,17 @@ where a database attacker cannot change it, and has a second host check it.
   action yet. When one exists, add it to `isTrigger`. Replicas that share the
   database write one checkpoint per interval between them, because the "due?"
   check and the insert happen under the chain lock. A forced checkpoint is
-  always written, one second after the last if it falls in the same second.
+  written at once, or one second after the last if that one falls in the
+  same second. If the last time is already ahead of the clock, the forced
+  checkpoint is coalesced into the next tick (30 s), so note times never run
+  more than 1 s ahead of wall-clock time.
   If the last checkpoint's time is more than 600 s ahead of the clock (a
   clock that was wrong), the log says `[anchor] last_checkpoint_in_future`
   and a checkpoint is written now. Its time is one second past the newest
   sane note, so every object key stays unique. The verifier will flag the
   future note (`anchor_time_mismatch`, and possibly `anchor_seq_regression`);
-  ack it after review.
+  ack it by its key after review. Acking it does not let it hold off the
+  staleness check (see the verifier section).
 - **What.** Under the chain-wide advisory lock, the control plane reads
   `max(seq)` and its `row_hash` (seq 0 and the genesis hash if the chain is
   empty) and signs a C2SP signed note:
@@ -67,9 +71,17 @@ where a database attacker cannot change it, and has a second host check it.
   `checkpoints/<deployment>/<seq, 19 digits>-<unix time>.note`. Each sink is
   written on its own. A failed sink is recorded as `put_failed` and logged as
   `[anchor] sinkN put failed: <error name>`. It does not block the other sink
-  or the chain. On the following ticks the stored note is PUT again under the
-  same key to each sink whose put failed (or, after 60 s, never recorded an
-  outcome). Retries stop 540 s after the note time, inside the verifier's
+  or the chain. Each tick writes its checkpoint first, then retries. A retry
+  PUTs the stored note again under the same key to each sink whose put failed
+  (or, after 60 s, never recorded an outcome). Retries go newest first, at
+  most 10 checkpoints and 20 s per tick, and stop early when a break-glass
+  checkpoint is waiting. That way a black-holed sink (15 s per put) cannot
+  hold back a scheduled or forced checkpoint. Before a re-put, the stored note
+  must verify with the checkpoint key and match its row's seq, time and
+  head. Otherwise it is not sent, and the log says
+  `[anchor] retry refused: retry_note_mismatch`. A status already recorded
+  as `ok` (by a replica's retry) is never downgraded. Retries stop 540 s
+  after the note time, inside the verifier's
   600 s LastModified skew, so a late put never looks backdated. A put still
   missing after that is one missed checkpoint for that sink. The verifier's
   gap rule (2x the cadence plus 300 s) allows for one missed checkpoint, and
@@ -114,7 +126,16 @@ plan is DarkStorage (the `systemapi-audits` provider) as sink 1, and
 Cloudflare R2 as sink 2, the mirror.
 
 The client uses plain `PutObject`, `ListObjectsV2` and `GetObject`, with
-path-style URLs. It does not send Object Lock or retention headers on
+path-style URLs. Every put sends `If-None-Match: *`, so the same key is never
+written twice. AWS S3, Cloudflare R2 and MinIO support this conditional put
+(R2's S3 API page lists `If-None-Match` for PutObject, and concurrent writers
+get `412 PreconditionFailed`). A 412 means the key is already there and
+counts as written. On the first put, which should never meet an existing
+key, the log says `[anchor] sinkN put: key_exists`; the verifier then
+judges whatever body is stored there. A store that answers
+`501 NotImplemented` to the header gets plain puts from then on, and that
+sink loses the write-once guarantee (Object Lock versioning still keeps
+every version). Check how DarkStorage answers before relying on it. It does not send Object Lock or retention headers on
 requests. Retention must be the bucket default, and R2 does not accept those
 headers. It sends `Content-MD5` because S3 refuses uploads to a bucket with
 default retention when no integrity header is present. Checksums are added
@@ -200,12 +221,30 @@ past incident would raise the same alarm on every run and bury new ones.
 the verifier's repo:
 
 ```json
-[{ "code": "anchor_time_mismatch", "sink": "sink1", "seq": 1042, "why": "clock step 2026-11-05, INC-12" }]
+[{ "code": "anchor_time_mismatch", "sink": "sink1",
+   "key": "checkpoints/prod-1/0000000000000001042-4102444800.note",
+   "why": "clock step 2026-11-05, INC-12" }]
 ```
 
-Each entry names a code, the sink (or `null` for `chain_broken` and seq
-mismatches), exactly one of `seq` or `key`, and a non-empty `why`. A matching
+Each entry needs all four fields: a code, the sink (`sink1` or `sink2`), the
+exact object key the reason names, and a non-empty `why`. Seq-keyed and
+wildcard acks are refused (`ack_invalid`), because one seq repeats across
+heartbeats in a quiet deployment. Every note-level reason carries its key.
+For `anchor_gap`, that is the key of the note that ends the gap. A matching
 reason is still listed under `acked_reasons` but does not fail the run.
+
+Some reasons can never be acked:
+
+- `chain_broken`, because nothing past the break is verified. A reviewed
+  fork belongs in `KNOWN_FORKS` (`controlplane/chain.js`).
+- Staleness, meaning the newest anchor is too old (`stale: true`, no key).
+- An empty sink.
+
+A note whose signed time is more than 600 s from its `LastModified`
+(far-future or backdated) never counts toward the gap and staleness checks.
+Notes are judged at `min(time, LastModified + 600)`. So a year-2100 note,
+even once its mismatch is acked, cannot hide a sink that has stopped
+receiving anchors.
 `--since <unix>` skips fetching and judging notes signed before the cut-off,
 and the gap rule then starts from it. Use it to drop history once an
 incident is closed, or to keep the per-run GET count bounded.
@@ -215,7 +254,7 @@ incident is closed, or to keep the per-run GET count bounded.
 | `chain_broken` | The rows do not verify on their own. |
 | `anchor_rewrite` | The head at an anchored seq differs, or that row is gone (rewrite). At or after a `chain_broken` seq, the anchored head is compared with the stored `row_hash`. |
 | `anchor_truncation` | An anchored seq is greater than the current `max(seq)`. |
-| `anchor_gap` | A sink has no anchor for more than 2x the cadence plus 300 s, its newest anchor is older than that, or it has none at all (suppression). |
+| `anchor_gap` | A sink has no anchor for more than 2x the cadence plus 300 s (key: the note ending the gap), its newest anchor is older than that (`stale`, no key), or it has none at all (suppression). Only notes whose time is within 600 s of `LastModified` count. |
 | `anchor_seq_regression` | A later anchor names a lower seq than an earlier one. |
 | `anchor_bad_signature` | A note is not signed by this key (tampered, or signed by another key). |
 | `anchor_note_invalid` | A note is unparseable, garbage, over 4 KiB, or listed without a `LastModified`, or its object key does not match its seq and time. |
