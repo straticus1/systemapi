@@ -902,7 +902,8 @@ test('the S3 adapter puts with If-None-Match, treats 412 as already there, and f
   const seen = [];
   let answer = null;
   const client = { async send(cmd) { seen.push(cmd.input); if (answer) { const a = answer; answer = null; throw a; } return {}; } };
-  const sink = anchor.s3Sink(cfg, { client });
+  const logs = [];
+  const sink = anchor.s3Sink(cfg, { client, logger: { error: (m) => logs.push(m) } });
   assert.equal(await sink.put('k1', 'a'), 'ok');
   assert.equal(seen[0].IfNoneMatch, '*');
   answer = Object.assign(new Error('pf'), { name: 'PreconditionFailed', $metadata: { httpStatusCode: 412 } });
@@ -914,6 +915,7 @@ test('the S3 adapter puts with If-None-Match, treats 412 as already there, and f
   assert.equal(seen[seen.length - 1].IfNoneMatch, undefined);
   await sink.put('k4', 'a');
   assert.equal(seen[seen.length - 1].IfNoneMatch, undefined, 'plain puts from then on');
+  assert.deepEqual(logs, ['[anchor] sink1 conditional_put_unsupported']);
 });
 
 test('a first-write status never downgrades an ok a retry already recorded', async () => {
@@ -941,4 +943,33 @@ test('a throwing anchor trigger does not fail the terminal audit write, and logs
     console.error = orig;
   }
   assert.deepEqual(errors, ['[anchor] trigger failed: boom']);
+});
+
+test('a retry that finds the key already there is stored ok and logged as an error', async () => {
+  const r = rig({ failSink2: true });
+  await r.append();
+  const cp = await r.anchor.checkpoint(false);
+  // The first put landed after all (reported failed): the key is there.
+  r.sinks[1].objects.set(cp.key, { body: Buffer.from(cp.note), lastModified: new Date(T0 * 1000) });
+  r.sinks[1].failPut = false;
+  r.advance(30);
+  await r.anchor.tick();
+  assert.equal(r.registry.checkpoints[0].sink_status.sink2, 'ok');
+  assert.ok(r.logs.includes('[anchor] sink2 put retried: key_exists'));
+});
+
+test('a backdated note inside a gap does not close it, and is a time mismatch', async () => {
+  const r = rig();
+  await r.append();
+  await r.anchor.tick();
+  r.advance(4 * HOUR);
+  await r.anchor.tick();
+  const s1 = r.sinks[0];
+  const t = T0 + 2 * HOUR;
+  const key = anchor.objectKey(DEPLOY, 1, t);
+  s1.objects.set(key, { body: Buffer.from(note({ seq: 1, head: r.registry.audit[0].row_hash, time: t })), lastModified: new Date((t + HOUR) * 1000) });
+  const out = verify.check({ bySink: { sink1: await verify.readSink(s1, anchor.parseVkey(vkeyText())) }, rows: r.registry.audit, cadenceS: HOUR, nowS: r.nowS(), forks: [] });
+  assert.deepEqual(out.reasons.map((x) => x.code).sort(), ['anchor_gap', 'anchor_time_mismatch']);
+  assert.equal(out.reasons.find((x) => x.code === 'anchor_time_mismatch').key, key);
+  assert.notEqual(out.reasons.find((x) => x.code === 'anchor_gap').key, key);
 });

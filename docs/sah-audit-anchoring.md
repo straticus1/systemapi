@@ -35,8 +35,12 @@ where a database attacker cannot change it, and has a second host check it.
   check and the insert happen under the chain lock. A forced checkpoint is
   written at once, or one second after the last if that one falls in the
   same second. If the last time is already ahead of the clock, the forced
-  checkpoint is coalesced into the next tick (30 s), so note times never run
-  more than 1 s ahead of wall-clock time.
+  checkpoint is deferred, and each tick tries it again until the clock
+  passes the last note time. That is normally the next tick. It can take up to
+  about 600 s. Beyond that, the future-clock path below writes at once. Note
+  times therefore never run more than 1 s ahead of wall-clock time. A
+  deferred request lives in process memory and is lost on restart. In that
+  case the next scheduled checkpoint covers the break-glass row.
   If the last checkpoint's time is more than 600 s ahead of the clock (a
   clock that was wrong), the log says `[anchor] last_checkpoint_in_future`
   and a checkpoint is written now. Its time is one second past the newest
@@ -75,7 +79,10 @@ where a database attacker cannot change it, and has a second host check it.
   PUTs the stored note again under the same key to each sink whose put failed
   (or, after 60 s, never recorded an outcome). Retries go newest first, at
   most 10 checkpoints and 20 s per tick, and stop early when a break-glass
-  checkpoint is waiting. That way a black-holed sink (15 s per put) cannot
+  checkpoint is waiting. A retry that finds the key already there (`412`)
+  is stored as `ok` and logged as `[anchor] sinkN put retried: key_exists`.
+  The database cannot tell a planted object from ours, so the verifier,
+  which reads and checks the body, is the real check. That way a black-holed sink (15 s per put) cannot
   hold back a scheduled or forced checkpoint. Before a re-put, the stored note
   must verify with the checkpoint key and match its row's seq, time and
   head. Otherwise it is not sent, and the log says
@@ -133,7 +140,8 @@ get `412 PreconditionFailed`). A 412 means the key is already there and
 counts as written. On the first put, which should never meet an existing
 key, the log says `[anchor] sinkN put: key_exists`; the verifier then
 judges whatever body is stored there. A store that answers
-`501 NotImplemented` to the header gets plain puts from then on, and that
+`501 NotImplemented` to the header gets plain puts from then on (logged once
+as `[anchor] sinkN conditional_put_unsupported`), and that
 sink loses the write-once guarantee (Object Lock versioning still keeps
 every version). Check how DarkStorage answers before relying on it. It does not send Object Lock or retention headers on
 requests. Retention must be the bucket default, and R2 does not accept those
@@ -283,5 +291,9 @@ verifier applies is the same one the writer follows.
   shows up as `anchor_time_mismatch`. If that attacker also has delete or
   retention-bypass rights on every sink, the anchors give no protection.
 - **No public log or witness.** That is option 2B (Sigsum) or 2C (Tessera).
+- **Follow-up: version listing.** The verifier reads only the current version
+  of each key. A plain put on a versioned bucket (the 501 fallback, or a
+  planted write) can hide an earlier version behind a newer one.
+  `ListObjectVersions` would show every version. It is not done yet.
 - **Without `--since`, the verifier reads every note on every run.** That is
   about 9k GETs per sink per year at hourly cadence.

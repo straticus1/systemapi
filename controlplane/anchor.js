@@ -294,7 +294,7 @@ function loadAnchorConfig(env, { leasePublicKey = null } = {}) {
 // bucket with default retention without an integrity header; it is not a
 // security control. Path-style, and checksums only when an operation needs
 // one (some S3-compatible stores refuse the newer checksum headers).
-function s3Sink(cfg, { client = null } = {}) {
+function s3Sink(cfg, { client = null, logger = console } = {}) {
   const s3 = require('@aws-sdk/client-s3');
   const c = client || new s3.S3Client({
     region: cfg.region,
@@ -330,6 +330,7 @@ function s3Sink(cfg, { client = null } = {}) {
           if (status === 412 || (err && err.name === 'PreconditionFailed')) return 'exists';
           if (status !== 501 && !(err && err.name === 'NotImplemented')) throw err;
           conditional = false;
+          logger.error(`[anchor] ${cfg.id} conditional_put_unsupported`);
         }
       }
       await send(new s3.PutObjectCommand(input));
@@ -447,7 +448,11 @@ class AuditAnchor {
         try {
           const out = await sink.put(objectKey(cp.deployment, cp.seq, cp.note_time), cp.note);
           result = 'ok';
-          this.logger.log(`[anchor] ${sink.id} put retried: ${out === 'exists' ? 'exists' : 'ok'}`);
+          // exists: the key was already there (most likely our first put
+          // landed but reported a failure). Stored as ok; the database cannot
+          // tell a planted object from ours, the verifier checks the body.
+          if (out === 'exists') this.logger.error(`[anchor] ${sink.id} put retried: key_exists`);
+          else this.logger.log(`[anchor] ${sink.id} put retried: ok`);
         } catch (err) {
           this.logger.error(`[anchor] ${sink.id} put retry failed: ${errName(err)}`);
         }
@@ -525,7 +530,7 @@ function createAnchor({ env, registry, leasePublicKey = null, logger = console, 
     return off(config.reason);
   }
   if (!registry || typeof registry.createAuditCheckpoint !== 'function') return off('registry_unavailable');
-  const sinks = config.sinks.map((s) => sinkFactory(s));
+  const sinks = config.sinks.map((s) => sinkFactory(s, { logger }));
   const fp = crypto.createHash('sha256').update(config.signer.publicKeyRaw).digest('hex');
   logger.log(`[anchor] on: deployment=${config.deployment} interval_s=${config.intervalS} sinks=${sinks.map((s) => s.id).join(',')} key sha256:${fp}`);
   return new AuditAnchor({ config, registry, sinks, logger });
