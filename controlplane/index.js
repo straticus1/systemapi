@@ -1,8 +1,8 @@
 // Threats: starting the API without a signer, and running a schedule twice in
 // the same UTC minute. Boot failure in production is fatal. The audit anchor
-// (controlplane/anchor.js) runs in the same tick when configured; a bad
-// anchoring config turns anchoring off with a reason code and does not stop
-// boot. Does NOT listen.
+// (controlplane/anchor.js) runs in the same tick when configured; a set but
+// invalid anchoring config stops boot in production (its reason code) and
+// turns anchoring off elsewhere. Does NOT listen.
 'use strict';
 
 const { loadSigner } = require('./keys');

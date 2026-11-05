@@ -125,11 +125,20 @@ async function auditInsert(client, entry) {
 }
 
 // Whether a checkpoint is due: none yet, or the last is at least minGapS
-// old (0 for a forced one). Note times rise strictly, so two checkpoints in
-// one second (a forced one beside the hourly one) get distinct object keys.
-function checkpointDue(lastTime, nowS, minGapS) {
+// old (0 for a forced one, which is always due). Note times rise strictly,
+// so two checkpoints in one second (a forced one beside the hourly one) get
+// distinct object keys. A last time more than CHECKPOINT_FUTURE_S ahead of
+// the clock (a clock that was wrong) would stall anchoring until the clock
+// caught up: it is due now, at one past the newest sane time (sane: not
+// ahead of now + CHECKPOINT_FUTURE_S), so the new key clashes with no sane
+// note and no future one; the caller logs last_checkpoint_in_future.
+const CHECKPOINT_FUTURE_S = 600;
+function checkpointDue(lastTime, nowS, minGapS, saneLast = null) {
   if (lastTime === null || lastTime === undefined) return { time: nowS };
-  if (nowS - lastTime < minGapS) return null;
+  if (lastTime > nowS + CHECKPOINT_FUTURE_S) {
+    return { time: Math.max(nowS, saneLast === null ? 0 : saneLast + 1), future: true };
+  }
+  if (minGapS > 0 && nowS - lastTime < minGapS) return null;
   return { time: Math.max(nowS, lastTime + 1) };
 }
 
@@ -1328,22 +1337,37 @@ class MemoryRegistry {
   async createAuditCheckpoint({ deployment, nowS, minGapS, sign }) {
     const run = this.auditChain.then(() => {
       const tail = this.audit[this.audit.length - 1];
-      const last = [...this.checkpoints].reverse().find((c) => c.deployment === deployment);
-      const due = checkpointDue(last && last.note_time, nowS, minGapS);
+      const mine = this.checkpoints.filter((c) => c.deployment === deployment);
+      const last = mine[mine.length - 1];
+      const sane = mine.map((c) => c.note_time).filter((t) => t <= nowS + CHECKPOINT_FUTURE_S);
+      const due = checkpointDue(last && last.note_time, nowS, minGapS, sane.length ? Math.max(...sane) : null);
       if (!due) return null;
       const seq = tail ? tail.seq : 0;
       const head = tail ? tail.row_hash : GENESIS;
       const row = { id: this.checkpoints.length + 1, deployment, seq, head, note_time: due.time, note: sign({ seq, head, time: due.time }), sink_status: {} };
       this.checkpoints.push(row);
-      return { ...row };
+      return due.future ? { ...row, clock_warning: 'last_checkpoint_in_future' } : { ...row };
     });
     this.auditChain = run.then(() => {}, () => {});
     return run;
   }
 
+  // Checkpoints of this deployment with a note time in [fromTime, toTime],
+  // for the put retry.
+  async recentAuditCheckpoints(deployment, fromTime, toTime) {
+    return this.checkpoints
+      .filter((c) => c.deployment === deployment && c.note_time >= fromTime && c.note_time <= toTime)
+      .map((c) => ({ ...c, sink_status: { ...c.sink_status } }));
+  }
+
   async setAuditCheckpointSinks(id, status) {
     const row = this.checkpoints.find((c) => c.id === id);
-    if (row) row.sink_status = { ...status };
+    if (row) row.sink_status = { ...row.sink_status, ...status };
+  }
+
+  async setAuditCheckpointSink(id, sinkId, status) {
+    const row = this.checkpoints.find((c) => c.id === id);
+    if (row && row.sink_status[sinkId] !== 'ok') row.sink_status = { ...row.sink_status, [sinkId]: status };
   }
 
   async listAudit(tenantIds, limit = 100) {
@@ -3110,7 +3134,16 @@ class PgRegistry {
         'SELECT note_time FROM cp_audit_checkpoints WHERE deployment = $1 ORDER BY id DESC LIMIT 1',
         [deployment]
       );
-      const due = checkpointDue(last.rows[0] ? Number(last.rows[0].note_time) : null, nowS, minGapS);
+      const lastTime = last.rows[0] ? Number(last.rows[0].note_time) : null;
+      let saneLast = null;
+      if (lastTime !== null && lastTime > nowS + CHECKPOINT_FUTURE_S) {
+        const sane = await client.query(
+          'SELECT max(note_time) AS t FROM cp_audit_checkpoints WHERE deployment = $1 AND note_time <= $2',
+          [deployment, nowS + CHECKPOINT_FUTURE_S]
+        );
+        saneLast = sane.rows[0].t === null ? null : Number(sane.rows[0].t);
+      }
+      const due = checkpointDue(lastTime, nowS, minGapS, saneLast);
       if (!due) {
         await client.query('ROLLBACK');
         return null;
@@ -3124,7 +3157,8 @@ class PgRegistry {
         [deployment, seq, head, due.time, note]
       );
       await client.query('COMMIT');
-      return { id: Number(ins.rows[0].id), deployment, seq, head, note_time: due.time, note };
+      const out = { id: Number(ins.rows[0].id), deployment, seq, head, note_time: due.time, note };
+      return due.future ? { ...out, clock_warning: 'last_checkpoint_in_future' } : out;
     } catch (err) {
       try { await client.query('ROLLBACK'); } catch { /* already closed */ }
       throw err;
@@ -3134,7 +3168,27 @@ class PgRegistry {
   }
 
   async setAuditCheckpointSinks(id, status) {
-    await this.pool.query('UPDATE cp_audit_checkpoints SET sink_status = $2::jsonb WHERE id = $1', [id, JSON.stringify(status)]);
+    await this.pool.query('UPDATE cp_audit_checkpoints SET sink_status = sink_status || $2::jsonb WHERE id = $1', [id, JSON.stringify(status)]);
+  }
+
+  // One sink's outcome; an ok already recorded (by a replica's retry) stays.
+  async setAuditCheckpointSink(id, sinkId, status) {
+    await this.pool.query(
+      `UPDATE cp_audit_checkpoints SET sink_status = sink_status || jsonb_build_object($2::text, $3::text)
+       WHERE id = $1 AND (sink_status ->> $2::text) IS DISTINCT FROM 'ok'`,
+      [id, sinkId, status]
+    );
+  }
+
+  // Checkpoints of this deployment with a note time in [fromTime, toTime],
+  // for the put retry.
+  async recentAuditCheckpoints(deployment, fromTime, toTime) {
+    const res = await this.pool.query(
+      `SELECT id, deployment, seq, head, note_time, note, sink_status FROM cp_audit_checkpoints
+       WHERE deployment = $1 AND note_time >= $2 AND note_time <= $3 ORDER BY id ASC LIMIT 100`,
+      [deployment, fromTime, toTime]
+    );
+    return res.rows.map((r) => ({ ...r, id: Number(r.id), seq: Number(r.seq), note_time: Number(r.note_time) }));
   }
 
   async listAudit(tenantIds, limit = 100) {

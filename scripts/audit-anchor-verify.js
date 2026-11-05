@@ -9,27 +9,40 @@
 // it is not on argv) or a JSON export (--export), recomputes it with
 // verifyRows (KNOWN_FORKS applied, SYSTEMAPI_AUDIT_LEGACY_MAX_SEQ honored)
 // and checks every anchored seq in one pass. Exit 0: clean. Exit 1: one
-// JSON line on stdout with fixed reason codes:
+// JSON line on stdout { ok, max_seq, anchors, reasons, acked, acked_reasons }
+// with fixed reason codes:
 //   chain_broken           the rows do not verify on their own
-//   anchor_rewrite         the head at an anchored seq differs, or the row is gone
+//   anchor_rewrite         the head at an anchored seq differs (compared with
+//                          the stored row_hash at or past a break), or the row is gone
 //   anchor_truncation      an anchored seq is past the current max(seq)
-//   anchor_gap             no anchor for more than 2x the cadence (or none at all)
+//   anchor_gap             no anchor for more than 2x the cadence + 300 s (or none)
 //   anchor_seq_regression  a later anchor names a lower seq than an earlier one
 //   anchor_bad_signature   a note not signed by this key
-//   anchor_note_invalid    a note that does not parse, is oversized, or whose
-//                          object key does not match its contents
+//   anchor_note_invalid    a note that does not parse, is oversized, has no
+//                          LastModified, or whose object key does not match it
 //   anchor_time_mismatch   a note's signed time is far from the sink's LastModified
-//   anchor_sink_mismatch   two sinks hold different heads for the same seq
+//   anchor_sink_mismatch   two notes hold different heads for one seq, or (both
+//                          sinks read) a key older than 600 s is in one sink only
+// --ack FILE: a reviewed, off-box JSON list of { code, sink, seq | key, why };
+// a matching reason is reported under acked_reasons and does not fail the
+// run (WORM objects cannot be deleted, so an old alarm would otherwise fire
+// forever and bury new ones). --since <unix>: notes signed before it are not
+// fetched or judged; the gap rule runs from it.
 // With --export, pass --now <unix time the export was taken>: notes signed
 // after it are skipped (they may name rows the export does not hold), and
-// the staleness check runs against that time.
-// Exit 2: usage or an operational failure (sink_unavailable, db_unavailable,
-// export_invalid), code only on stderr. Does NOT prove rows after the last
-// anchor (they are checked only as a chain), does NOT check created_at (not
-// in the v2 row hash), and is only as good as whoever reads its exit code.
+// the staleness check runs against that time. The run is only as honest as
+// that --now.
+// Exit 2: usage or an operational failure (sink_unavailable,
+// sink_list_too_large, sink_config_invalid, db_unavailable, export_invalid,
+// ack_invalid, vkey_invalid), code only on stderr. Exit 2 must page like
+// exit 1: a verifier that cannot read is a verifier that sees nothing. Does
+// NOT prove rows after the last anchor (they are checked only as a chain),
+// does NOT check created_at (not in the v2 row hash), and is only as good as
+// whoever reads its exit code.
 //
 // Usage: node scripts/audit-anchor-verify.js [--vkey <vkey>] [--export <file.json>]
 //          [--sink sink1|sink2|all] [--cadence-s <300..86400>] [--now <unix>]
+//          [--since <unix>] [--ack <file.json>]
 // The export is a JSON array of cp_audit rows (seq, prev_hash, row_hash,
 // tenant_id, host_id, actor, action, payload), or { "rows": [...] }.
 'use strict';
@@ -38,14 +51,21 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const { verifyRows, legacyMaxSeq, KNOWN_FORKS } = require('../controlplane/chain');
 const {
-  NOTE_MAX_BYTES, errName, intervalOf, parseNote, parseObjectKey, parseVkey, prefixOf, s3Sink, sinkConfigs
+  NOTE_MAX_BYTES, TIME_SKEW_S, errName, intervalOf, parseNote, parseObjectKey, parseVkey, prefixOf, s3Sink, sinkConfigs
 } = require('../controlplane/anchor');
 
 const USAGE = 'usage: node scripts/audit-anchor-verify.js [--vkey <vkey>] [--export <file.json>] '
-  + '[--sink sink1|sink2|all] [--cadence-s <300..86400>] [--now <unix>]';
-const VALUE_FLAGS = new Set(['--vkey', '--export', '--sink', '--cadence-s', '--now']);
+  + '[--sink sink1|sink2|all] [--cadence-s <300..86400>] [--now <unix>] [--since <unix>] [--ack <file.json>]';
+const VALUE_FLAGS = new Set(['--vkey', '--export', '--sink', '--cadence-s', '--now', '--since', '--ack']);
 const EXPORT_MAX_BYTES = 1024 * 1024 * 1024;
-const TIME_SKEW_S = 600;
+const ACK_MAX_BYTES = 1024 * 1024;
+const ACK_MAX = 1000;
+// Slack on the 2x-cadence gap rule: the writer ticks every 30 s and writes
+// once now - last >= cadence, so one missed checkpoint leaves notes 2x the
+// cadence plus up to a tick or two apart. 300 s covers that and clock jitter.
+const GAP_SLACK_S = 300;
+const ACK_CODES = new Set(['chain_broken', 'anchor_rewrite', 'anchor_truncation', 'anchor_gap', 'anchor_seq_regression',
+  'anchor_bad_signature', 'anchor_note_invalid', 'anchor_time_mismatch', 'anchor_sink_mismatch']);
 const HEX64_RE = /^[0-9a-f]{64}$/;
 
 function fail(code) {
@@ -75,7 +95,43 @@ function parseArgs(argv, env) {
     if (!/^[0-9]{1,12}$/.test(out.now)) throw fail('usage');
     nowS = Number(out.now);
   }
-  return { vkey, sink, cadenceS, nowS, nowGiven: out.now !== undefined, exportFile: out.export };
+  let sinceS = null;
+  if (out.since !== undefined) {
+    if (!/^[0-9]{1,12}$/.test(out.since) || Number(out.since) > nowS) throw fail('usage');
+    sinceS = Number(out.since);
+  }
+  return { vkey, sink, cadenceS, nowS, nowGiven: out.now !== undefined, sinceS, exportFile: out.export, ackFile: out.ack };
+}
+
+// The reviewed ack file: a JSON array of { code, sink, seq | key, why }.
+// An acked reason is still reported but does not fail the run. Every entry
+// must name a known code and a non-empty why; sink is the reason's sink (or
+// null for chain_broken and a mismatch without one).
+function parseAcks(text) {
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw fail('ack_invalid');
+  }
+  if (!Array.isArray(data) || data.length > ACK_MAX) throw fail('ack_invalid');
+  return data.map((a) => {
+    if (!a || typeof a !== 'object' || !ACK_CODES.has(a.code) || typeof a.why !== 'string' ||
+      a.why.trim() === '' || a.why.length > 500) throw fail('ack_invalid');
+    const sink = a.sink === undefined || a.sink === null ? null : a.sink;
+    if (sink !== null && sink !== 'sink1' && sink !== 'sink2') throw fail('ack_invalid');
+    const hasSeq = a.seq !== undefined;
+    const hasKey = a.key !== undefined;
+    if (hasSeq === hasKey) throw fail('ack_invalid');
+    if (hasSeq && a.seq !== null && !Number.isSafeInteger(a.seq)) throw fail('ack_invalid');
+    if (hasKey && (typeof a.key !== 'string' || a.key.length > 512)) throw fail('ack_invalid');
+    return hasSeq ? { code: a.code, sink, seq: a.seq } : { code: a.code, sink, key: a.key };
+  });
+}
+
+function acked(reason, acks) {
+  return acks.some((a) => a.code === reason.code && a.sink === (reason.sink ?? null) &&
+    ('seq' in a ? a.seq === (reason.seq ?? null) : a.key === reason.key));
 }
 
 function sameHash(a, b) {
@@ -120,7 +176,14 @@ function normalizeRows(rows, code) {
 
 async function rowsFromDatabase(url) {
   const { Pool } = require('pg');
-  const pool = new Pool({ connectionString: url, max: 1, statement_timeout: 120000, options: '-c default_transaction_read_only=on' });
+  const pool = new Pool({
+    connectionString: url,
+    max: 1,
+    connectionTimeoutMillis: 15000,
+    statement_timeout: 120000,
+    query_timeout: 130000,
+    options: '-c default_transaction_read_only=on'
+  });
   try {
     const res = await pool.query('SELECT seq, prev_hash, row_hash, tenant_id, host_id, actor, action, payload FROM cp_audit ORDER BY seq ASC');
     return normalizeRows(res.rows, 'db_invalid');
@@ -132,21 +195,26 @@ async function rowsFromDatabase(url) {
   }
 }
 
-// Every note in one sink: { notes: [{ key, seq, head, time }], reasons }.
-async function readSink(sink, vkey) {
+// Every note in one sink: { notes: [{ key, seq, head, time }], keys (every
+// well-named key in the window), reasons }. Keys whose time is outside
+// [sinceS, untilS] are not fetched.
+async function readSink(sink, vkey, { sinceS = null, untilS = null } = {}) {
   const reasons = [];
   const notes = [];
+  const keys = new Map();
   let listed;
   try {
     listed = await sink.list(prefixOf(vkey.deployment));
   } catch (err) {
-    const e = fail('sink_unavailable');
+    const e = fail(err && err.code === 'sink_list_too_large' ? 'sink_list_too_large' : 'sink_unavailable');
     e.detail = `${sink.id} ${errName(err)}`;
     throw e;
   }
   for (const obj of listed) {
     const fromKey = parseObjectKey(vkey.deployment, obj.key);
-    if (!fromKey || !(obj.size > 0) || obj.size > NOTE_MAX_BYTES) {
+    if (fromKey && ((sinceS !== null && fromKey.time < sinceS) || (untilS !== null && fromKey.time > untilS))) continue;
+    if (fromKey) keys.set(obj.key, fromKey.time);
+    if (!fromKey || !(obj.size > 0) || obj.size > NOTE_MAX_BYTES || !obj.lastModified) {
       reasons.push({ code: 'anchor_note_invalid', sink: sink.id, key: String(obj.key).slice(0, 200) });
       continue;
     }
@@ -169,16 +237,18 @@ async function readSink(sink, vkey) {
       reasons.push({ code: 'anchor_note_invalid', sink: sink.id, key: obj.key });
       continue;
     }
-    if (obj.lastModified && Math.abs(Math.floor(obj.lastModified.getTime() / 1000) - note.time) > TIME_SKEW_S) {
+    if (Math.abs(Math.floor(obj.lastModified.getTime() / 1000) - note.time) > TIME_SKEW_S) {
       reasons.push({ code: 'anchor_time_mismatch', sink: sink.id, seq: note.seq });
     }
     notes.push({ key: obj.key, ...note });
   }
-  return { notes, reasons };
+  return { notes, keys, reasons };
 }
 
-// The checks over notes already read. bySink: { sinkId: { notes, reasons } }.
-function check({ bySink, rows, cadenceS, nowS, forks = KNOWN_FORKS, legacy = 0 }) {
+// The checks over notes already read. bySink: { sinkId: { notes, keys,
+// reasons } }. sinceS: the judging cut-off (the gap rule runs from it).
+// acks: parsed ack entries; acked reasons are reported apart and do not fail.
+function check({ bySink, rows, cadenceS, nowS, sinceS = null, acks = [], forks = KNOWN_FORKS, legacy = 0 }) {
   const reasons = [];
   for (const id of Object.keys(bySink)) reasons.push(...bySink[id].reasons);
   const all = Object.keys(bySink).flatMap((id) => bySink[id].notes.map((n) => ({ ...n, sink: id })));
@@ -189,41 +259,73 @@ function check({ bySink, rows, cadenceS, nowS, forks = KNOWN_FORKS, legacy = 0 }
     if (!seen) headBySeq.set(n.seq, n.head);
     else if (!sameHash(seen, n.head)) reasons.push({ code: 'anchor_sink_mismatch', seq: n.seq });
   }
+  // Both sinks read: a key one holds and the other lacks, past the retry
+  // window, is a mismatch too.
+  const ids = Object.keys(bySink);
+  if (ids.length === 2) {
+    for (const [a, b] of [[ids[0], ids[1]], [ids[1], ids[0]]]) {
+      for (const [key, time] of bySink[a].keys || []) {
+        if (nowS - time > TIME_SKEW_S && !(bySink[b].keys || new Map()).has(key)) {
+          reasons.push({ code: 'anchor_sink_mismatch', sink: b, key });
+        }
+      }
+    }
+  }
   const seqs = [...new Set(all.map((n) => n.seq))];
   const chain = verifyRows(rows, forks, { legacyMaxSeq: legacy, headsAt: seqs });
   if (!chain.ok) reasons.push({ code: 'chain_broken', seq: chain.broken_at });
   const maxSeq = rows.length ? rows[rows.length - 1].seq : 0;
+  const rowBySeq = chain.ok ? new Map() : new Map(rows.map((r) => [r.seq, r]));
   for (const n of all) {
     if (n.seq > maxSeq) {
-      reasons.push({ code: 'anchor_truncation', sink: n.sink, seq: n.seq });
+      reasons.push({ code: 'anchor_truncation', sink: n.sink, seq: n.seq, key: n.key });
       continue;
     }
-    const head = chain.heads_at[n.seq];
-    if (head === undefined && !chain.ok && n.seq >= chain.broken_at) continue;
-    if (head === undefined || !sameHash(head, n.head)) reasons.push({ code: 'anchor_rewrite', sink: n.sink, seq: n.seq });
+    // At or past a break there is no verified head: compare with the stored
+    // row_hash at that seq instead, so a rewrite there still shows.
+    let head = chain.heads_at[n.seq];
+    if (head === undefined && !chain.ok && n.seq >= chain.broken_at) {
+      const row = rowBySeq.get(n.seq);
+      head = row ? row.row_hash : undefined;
+    }
+    if (head === undefined || !sameHash(head, n.head)) reasons.push({ code: 'anchor_rewrite', sink: n.sink, seq: n.seq, key: n.key });
   }
   // Per sink: anchors at most 2x the cadence apart, the last one recent, and
   // seq never going back as time goes on.
-  const limit = 2 * cadenceS;
+  const limit = 2 * cadenceS + GAP_SLACK_S;
   for (const id of Object.keys(bySink)) {
     const notes = [...bySink[id].notes].sort((a, b) => a.time - b.time || a.seq - b.seq);
     if (notes.length === 0) {
       reasons.push({ code: 'anchor_gap', sink: id, seq: null });
       continue;
     }
+    if (sinceS !== null && notes[0].time - sinceS > limit) reasons.push({ code: 'anchor_gap', sink: id, seq: notes[0].seq });
     for (let i = 1; i < notes.length; i += 1) {
       if (notes[i].time - notes[i - 1].time > limit) reasons.push({ code: 'anchor_gap', sink: id, seq: notes[i].seq });
       if (notes[i].seq < notes[i - 1].seq) reasons.push({ code: 'anchor_seq_regression', sink: id, seq: notes[i].seq });
     }
     if (nowS - notes[notes.length - 1].time > limit) reasons.push({ code: 'anchor_gap', sink: id, seq: notes[notes.length - 1].seq });
   }
-  return { ok: reasons.length === 0, max_seq: maxSeq, anchors: all.length, reasons };
+  const open = reasons.filter((r) => !acked(r, acks));
+  const done = reasons.filter((r) => acked(r, acks));
+  return { ok: open.length === 0, max_seq: maxSeq, anchors: all.length, reasons: open, acked: done.length, acked_reasons: done };
 }
 
 // Returns the check result. sinks, readFile, statFile and dbRows are
 // injectable for tests.
 async function run(argv, { env = process.env, sinks = null, readFile = fs.readFileSync, statFile = fs.statSync, dbRows = rowsFromDatabase } = {}) {
   const args = parseArgs(argv, env);
+  let acks = [];
+  if (args.ackFile !== undefined) {
+    let text;
+    try {
+      if (statFile(args.ackFile).size > ACK_MAX_BYTES) throw fail('ack_invalid');
+      text = readFile(args.ackFile, 'utf8');
+    } catch (err) {
+      throw err.code === 'ack_invalid' ? err : fail('ack_invalid');
+    }
+    acks = parseAcks(text);
+  }
   if (args.exportFile === undefined && !env.SYSTEMAPI_ANCHOR_VERIFY_DATABASE_URL) throw fail('usage');
   // Notes first, rows second: a checkpoint written in between then names a
   // seq the rows already hold, never one past them (a false truncation).
@@ -241,10 +343,9 @@ async function run(argv, { env = process.env, sinks = null, readFile = fs.readFi
   if (chosen.length === 0) throw fail('sink_config_invalid');
   const bySink = {};
   for (const sink of chosen) {
-    const read = await readSink(sink, args.vkey);
-    // --now (an export's time): notes signed after it are not judged.
-    if (args.nowGiven) read.notes = read.notes.filter((n) => n.time <= args.nowS);
-    bySink[sink.id] = read;
+    // --now (an export's time): notes signed after it are not judged;
+    // --since: nor are notes before it.
+    bySink[sink.id] = await readSink(sink, args.vkey, { sinceS: args.sinceS, untilS: args.nowGiven ? args.nowS : null });
   }
   let rows;
   if (args.exportFile !== undefined) {
@@ -259,7 +360,7 @@ async function run(argv, { env = process.env, sinks = null, readFile = fs.readFi
   } else if (env.SYSTEMAPI_ANCHOR_VERIFY_DATABASE_URL) {
     rows = await dbRows(env.SYSTEMAPI_ANCHOR_VERIFY_DATABASE_URL);
   }
-  return check({ bySink, rows, cadenceS: args.cadenceS, nowS: args.nowS, legacy: legacyMaxSeq(env) });
+  return check({ bySink, rows, cadenceS: args.cadenceS, nowS: args.nowS, sinceS: args.sinceS, acks, legacy: legacyMaxSeq(env) });
 }
 
 async function main() {
@@ -276,4 +377,4 @@ async function main() {
 
 if (require.main === module) main();
 
-module.exports = { run, check, readSink, rowsFromExport, parseArgs };
+module.exports = { run, check, readSink, rowsFromExport, parseArgs, parseAcks, GAP_SLACK_S };

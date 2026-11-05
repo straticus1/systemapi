@@ -1731,6 +1731,21 @@ test('audit checkpoints: one per interval across replicas, the head read under t
   const stored = await pool.query('SELECT seq, head, note, sink_status FROM cp_audit_checkpoints WHERE id = $1', [cp.id]);
   assert.deepEqual(stored.rows[0].sink_status, { sink1: 'ok', sink2: 'put_failed' });
   assert.equal(Number(stored.rows[0].seq), cp.seq);
+  // The retry path: the recent list, and a per-sink merge that never
+  // downgrades an ok.
+  const recent = await registry.recentAuditCheckpoints(deployment, nowS - 540, nowS + 540);
+  assert.deepEqual(recent.map((c) => [c.id, c.seq, c.note_time]), [[cp.id, cp.seq, cp.note_time]]);
+  await registry.setAuditCheckpointSink(cp.id, 'sink2', 'ok');
+  await registry.setAuditCheckpointSink(cp.id, 'sink2', 'put_failed');
+  const merged = await pool.query('SELECT sink_status FROM cp_audit_checkpoints WHERE id = $1', [cp.id]);
+  assert.deepEqual(merged.rows[0].sink_status, { sink1: 'ok', sink2: 'ok' });
+  // A checkpoint far in the future (a wrong clock) does not stall the next.
+  const future = `${deployment}-f`;
+  const f1 = await registry.createAuditCheckpoint({ deployment: future, nowS, minGapS: 3600, sign });
+  await pool.query('UPDATE cp_audit_checkpoints SET note_time = $2 WHERE id = $1', [f1.id, nowS + 86400]);
+  const f2 = await registry.createAuditCheckpoint({ deployment: future, nowS: nowS + 60, minGapS: 3600, sign });
+  assert.equal(f2.clock_warning, 'last_checkpoint_in_future');
+  assert.equal(f2.note_time, nowS + 60);
   // The anchor loop on this database, then the verifier over a read-only
   // connection: clean, then a rewrite of an anchored row is caught.
   const objects = new Map();

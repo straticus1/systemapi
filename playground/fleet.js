@@ -671,7 +671,12 @@ class FleetManager {
             action,
             payload
         });
-        if (this.anchor) this.anchor.noteAudit(row);
+        // The row is written; an anchor failure must not end the session.
+        try {
+            if (this.anchor) this.anchor.noteAudit(row);
+        } catch {
+            console.error('[anchor] trigger failed');
+        }
         return row;
     }
 

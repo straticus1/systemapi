@@ -7,12 +7,16 @@
 // PUTs it to one or two S3-compatible sinks that must be WORM (Object Lock in
 // compliance mode, a PutObject-only credential). An off-box verifier
 // (scripts/audit-anchor-verify.js) holding only the public key compares the
-// anchors with the rows. The extension line "chain sha256-linear-v2" says the
-// hash is a linear chain head, not a Merkle root, so no tlog tool reads it as
-// a tlog-checkpoint. Anchoring is off unless seed, deployment and a sink are
-// all set and valid; a bad value turns it off with a fixed reason code and
-// never prints the seed or a credential. A failed sink write is recorded per
-// sink and never blocks the other sink or the chain. Does NOT prevent a
+// anchors with the rows. The extension line "chain sha256-linear-v2" tells a
+// human reader the hash is a linear chain head, not a Merkle root; C2SP
+// allows extension lines, so a tlog tool may still parse the note. What keeps
+// it apart from any tlog checkpoint is the dedicated key and origin (a later
+// Sigsum or Tessera log, 2B/2C, must use another origin and another key).
+// Anchoring is off unless seed, deployment and a sink are all set and valid;
+// a bad value turns it off with a fixed reason code (in production it stops
+// boot) and never prints the seed or a credential. A failed sink write is
+// recorded per sink, retried under the same key for RETRY_WINDOW_S, and never
+// blocks the other sink or the chain. Does NOT prevent a
 // rewrite (it detects one at the next verifier run, if someone reads the
 // alarm); does NOT protect created_at (not in the v2 row hash); does NOT hide
 // activity timing (each break-glass start adds a checkpoint); does NOT survive
@@ -37,7 +41,17 @@ const INTERVAL_MAX_S = 86400;
 const SINK_IDS = ['sink1', 'sink2'];
 const SINK_FIELDS = ['ENDPOINT', 'BUCKET', 'REGION', 'ACCESS_KEY_ID', 'SECRET_ACCESS_KEY'];
 const SINK_TIMEOUT_MS = 15000;
+// A checkpoint with no recorded outcome for a sink is retried only after
+// this long (its first put may still be in flight on another replica).
+const RETRY_UNRECORDED_S = 60;
+// Retries stop this far inside TIME_SKEW_S, so a put that takes up to
+// SINK_TIMEOUT_MS still lands within the verifier's skew.
+const RETRY_WINDOW_S = 540;
 const LIST_MAX_OBJECTS = 200000;
+// How far a note's signed time may be from the sink's LastModified before
+// the verifier calls it backdated; also the window for retrying a failed put
+// and the limit on a checkpoint time ahead of the clock.
+const TIME_SKEW_S = 600;
 const LOOPBACK = new Set(['127.0.0.1', 'localhost', '[::1]']);
 const SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
 const ALG_ED25519 = 0x01;
@@ -335,13 +349,14 @@ class AuditAnchor {
     this.forcePending = false;
   }
 
-  // Called from the 30 s control tick; writes a checkpoint when the last one
-  // is an interval old. One run at a time; a forced request during a run
-  // runs right after it.
+  // Called from the 30 s control tick: retries failed sink puts, then writes
+  // a checkpoint when the last one is an interval old. One run at a time; a
+  // forced request during a run runs right after it.
   tick() {
     if (this.running) return this.running;
     this.running = (async () => {
       try {
+        await this.retryFailed();
         do {
           const force = this.forcePending;
           this.forcePending = false;
@@ -352,6 +367,43 @@ class AuditAnchor {
       }
     })();
     return this.running;
+  }
+
+  // Re-puts the stored note under the SAME key to each sink whose put failed
+  // (or never recorded, after RETRY_UNRECORDED_S: a crash between insert and
+  // put), while the note time is within RETRY_WINDOW_S of now (inside
+  // TIME_SKEW_S), so a late put never trips the verifier's
+  // anchor_time_mismatch.
+  async retryFailed() {
+    if (typeof this.registry.recentAuditCheckpoints !== 'function') return;
+    const nowS = Math.floor(this.now() / 1000);
+    let rows;
+    try {
+      rows = await this.registry.recentAuditCheckpoints(this.config.deployment, nowS - RETRY_WINDOW_S, nowS + RETRY_WINDOW_S);
+    } catch (err) {
+      this.logger.error(`[anchor] retry scan failed: db_error ${errName(err)}`);
+      return;
+    }
+    for (const cp of rows) {
+      const status = cp.sink_status || {};
+      for (const sink of this.sinks) {
+        const st = status[sink.id];
+        if (st === 'ok' || (st === undefined && nowS - cp.note_time < RETRY_UNRECORDED_S)) continue;
+        let result = 'put_failed';
+        try {
+          await sink.put(objectKey(cp.deployment, cp.seq, cp.note_time), cp.note);
+          result = 'ok';
+          this.logger.log(`[anchor] ${sink.id} put retried: ok`);
+        } catch (err) {
+          this.logger.error(`[anchor] ${sink.id} put retry failed: ${errName(err)}`);
+        }
+        try {
+          await this.registry.setAuditCheckpointSink(cp.id, sink.id, result);
+        } catch (err) {
+          this.logger.error(`[anchor] sink status write failed: ${errName(err)}`);
+        }
+      }
+    }
   }
 
   // An appended audit row; a trigger row asks for a checkpoint now.
@@ -376,6 +428,7 @@ class AuditAnchor {
       return null;
     }
     if (!cp) return null;
+    if (cp.clock_warning) this.logger.error(`[anchor] ${cp.clock_warning}`);
     const key = objectKey(deployment, cp.seq, cp.note_time);
     // Each sink on its own: one failing never holds the other.
     const results = await Promise.all(this.sinks.map(async (sink) => {
@@ -397,18 +450,25 @@ class AuditAnchor {
   }
 }
 
-// The anchor for this process, or null (logged with its reason code).
+// The anchor for this process, or null (logged with its reason code). Under
+// NODE_ENV=production a set but invalid config throws its reason code (boot
+// stops), as keys.js does for an ephemeral lease key.
 function createAnchor({ env, registry, leasePublicKey = null, logger = console, sinkFactory = s3Sink }) {
   const config = loadAnchorConfig(env, { leasePublicKey });
+  const off = (reason) => {
+    // Production fails closed: anchoring was asked for and cannot run.
+    if (env.NODE_ENV === 'production') throw anchorError(reason);
+    logger.error(`[anchor] off: ${reason}`);
+    return null;
+  };
   if (!config.enabled) {
-    if (config.reason === 'anchor_off') logger.log('[anchor] off');
-    else logger.error(`[anchor] off: ${config.reason}`);
-    return null;
+    if (config.reason === 'anchor_off') {
+      logger.log('[anchor] off');
+      return null;
+    }
+    return off(config.reason);
   }
-  if (!registry || typeof registry.createAuditCheckpoint !== 'function') {
-    logger.error('[anchor] off: registry_unavailable');
-    return null;
-  }
+  if (!registry || typeof registry.createAuditCheckpoint !== 'function') return off('registry_unavailable');
   const sinks = config.sinks.map((s) => sinkFactory(s));
   const fp = crypto.createHash('sha256').update(config.signer.publicKeyRaw).digest('hex');
   logger.log(`[anchor] on: deployment=${config.deployment} interval_s=${config.intervalS} sinks=${sinks.map((s) => s.id).join(',')} key sha256:${fp}`);
@@ -418,6 +478,7 @@ function createAnchor({ env, registry, leasePublicKey = null, logger = console, 
 module.exports = {
   CHAIN_EXT,
   NOTE_MAX_BYTES,
+  TIME_SKEW_S,
   INTERVAL_MIN_S,
   INTERVAL_MAX_S,
   AuditAnchor,

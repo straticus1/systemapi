@@ -55,9 +55,12 @@ function memorySink(id, { failPut = false } = {}) {
   return {
     id,
     objects,
+    failPut,
+    puts: 0,
     setClock(fn) { clock = fn; },
     async put(key, body) {
-      if (failPut) throw Object.assign(new Error('boom'), { name: 'AccessDenied' });
+      this.puts += 1;
+      if (this.failPut) throw Object.assign(new Error('boom'), { name: 'AccessDenied' });
       if (objects.has(key)) throw Object.assign(new Error('locked'), { name: 'ObjectLocked' });
       objects.set(key, { body: Buffer.from(body, 'utf8'), lastModified: new Date((clock ? clock() : Date.now())) });
     },
@@ -356,7 +359,7 @@ test('the verifier passes a clean chain anchored every hour on both sinks', asyn
   const r = rig();
   await runHours(r, 5);
   const out = verify.check({ bySink: await readAll(r), rows: r.registry.audit, cadenceS: HOUR, nowS: r.nowS(), forks: [] });
-  assert.deepEqual(out, { ok: true, max_seq: 5, anchors: 10, reasons: [] });
+  assert.deepEqual(out, { ok: true, max_seq: 5, anchors: 10, reasons: [], acked: 0, acked_reasons: [] });
 });
 
 test('a row rewritten after it was anchored (and the chain recomputed) is anchor_rewrite', async () => {
@@ -536,4 +539,208 @@ test('audit-checkpoint-pubkey prints only the verifier key, and never the seed',
   assert.equal(badDep.stderr, 'anchor_deployment_invalid\n');
   assert.equal(badDep.stderr.includes(SEED), false);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// --- review follow-ups ------------------------------------------------------------
+
+test('two break-glass starts right after a periodic checkpoint give three checkpoints', async () => {
+  const r = rig();
+  await r.append();
+  await r.anchor.tick();
+  for (let i = 0; i < 2; i += 1) {
+    const bg = await r.append('terminal_start', { purpose: 'breakglass:open' });
+    r.anchor.noteAudit(bg);
+    await r.anchor.running;
+  }
+  assert.equal(r.registry.checkpoints.length, 3);
+  const times = r.registry.checkpoints.map((c) => c.note_time);
+  assert.deepEqual(times, [T0, T0 + 1, T0 + 2]);
+  assert.equal(r.sinks[0].objects.size, 3);
+});
+
+test('a last checkpoint far in the future does not stall anchoring; keys stay unique', async () => {
+  const r = rig();
+  await r.append();
+  await r.anchor.tick();
+  // A clock that ran a day ahead wrote one checkpoint.
+  r.registry.checkpoints.push({ ...r.registry.checkpoints[0], id: 2, note_time: T0 + 86400, sink_status: {} });
+  r.advance(HOUR);
+  await r.append();
+  await r.anchor.tick();
+  assert.equal(r.registry.checkpoints.length, 3);
+  const fresh = r.registry.checkpoints[2];
+  assert.equal(fresh.note_time, r.nowS());
+  assert.ok(r.logs.includes('[anchor] last_checkpoint_in_future'));
+  // The next tick is the normal interval rule again.
+  r.advance(60);
+  await r.anchor.tick();
+  assert.equal(r.registry.checkpoints.length, 3);
+  // The clock repeats a sane second: the time is one past the newest sane note.
+  r.registry.checkpoints.push({ ...fresh, id: 4, note_time: T0 + 86400, sink_status: {} });
+  r.advance(-120);
+  await r.anchor.tick();
+  assert.equal(r.registry.checkpoints[4].note_time, fresh.note_time + 1);
+  assert.equal(new Set(r.registry.checkpoints.map((c) => `${c.seq}-${c.note_time}`)).size, 5);
+});
+
+test('a failed put is retried under the same key inside the window, and not after it', async () => {
+  const r = rig({ failSink2: true });
+  await r.append();
+  const cp = await r.anchor.checkpoint(false);
+  assert.deepEqual(r.registry.checkpoints[0].sink_status, { sink1: 'ok', sink2: 'put_failed' });
+  r.advance(30);
+  await r.anchor.tick();
+  assert.equal(r.sinks[1].objects.size, 0);
+  r.sinks[1].failPut = false;
+  r.advance(30);
+  await r.anchor.tick();
+  assert.deepEqual([...r.sinks[1].objects.keys()], [cp.key]);
+  assert.equal(r.sinks[1].objects.get(cp.key).body.toString(), cp.note);
+  assert.deepEqual(r.registry.checkpoints[0].sink_status, { sink1: 'ok', sink2: 'ok' });
+  const putsOk = r.sinks[0].puts;
+  await r.anchor.tick();
+  assert.equal(r.sinks[0].puts, putsOk, 'an ok sink is never re-put');
+  // Past the window: no late put that the verifier would call backdated.
+  const late = rig({ failSink2: true });
+  await late.append();
+  await late.anchor.checkpoint(false);
+  late.sinks[1].failPut = false;
+  late.advance(560);
+  await late.anchor.tick();
+  assert.equal(late.sinks[1].objects.size, 0);
+  assert.equal(late.registry.checkpoints[0].sink_status.sink2, 'put_failed');
+});
+
+test('one missed checkpoint with 30 s ticks stays inside the gap rule (2x cadence + slack)', async () => {
+  const r = rig();
+  await r.append();
+  for (let t = 0; t < 5 * HOUR; t += 30) {
+    // Sink 2 is down from 1h55m to 2h15m, past the retry window of the 2h note.
+    r.sinks[1].failPut = t >= HOUR + 55 * 60 && t < 2 * HOUR + 15 * 60;
+    if (t % 600 === 0) await r.append('x', { t });
+    await r.anchor.tick();
+    r.advance(30);
+  }
+  const bySink = await readAll(r);
+  const times = bySink.sink2.notes.map((n) => n.time).sort((a, b) => a - b);
+  const maxGap = Math.max(...times.slice(1).map((t, i) => t - times[i]));
+  assert.ok(maxGap >= 2 * HOUR, `gap ${maxGap}`);
+  const out = verify.check({ bySink, rows: r.registry.audit, cadenceS: HOUR, nowS: r.nowS(), forks: [] });
+  assert.deepEqual(out.reasons.filter((x) => x.code !== 'anchor_sink_mismatch'), []);
+  assert.deepEqual(out.reasons.map((x) => [x.code, x.sink]), [['anchor_sink_mismatch', 'sink2']]);
+  // The slack: 7201 s apart is fine, 2x cadence + 301 is not.
+  const mk = (times2) => ({ sink1: { notes: times2.map((t, i) => ({ key: `k${i}`, seq: 1, head: r.registry.audit[0].row_hash, time: t })), reasons: [] } });
+  const rows1 = r.registry.audit.slice(0, 1);
+  assert.deepEqual(verify.check({ bySink: mk([T0, T0 + 7201]), rows: rows1, cadenceS: HOUR, nowS: T0 + 7201, forks: [] }).reasons, []);
+  assert.deepEqual(codes(verify.check({ bySink: mk([T0, T0 + 2 * HOUR + verify.GAP_SLACK_S + 1]), rows: rows1, cadenceS: HOUR, nowS: T0 + 3 * HOUR, forks: [] })), ['anchor_gap']);
+});
+
+test('a key in one sink and missing from the other is anchor_sink_mismatch once past the skew window', async () => {
+  const r = rig();
+  await runHours(r, 3);
+  const [first] = [...r.sinks[1].objects.keys()];
+  r.sinks[1].objects.delete(first);
+  const out = verify.check({ bySink: await readAll(r), rows: r.registry.audit, cadenceS: HOUR, nowS: r.nowS(), forks: [] });
+  assert.deepEqual(out.reasons, [{ code: 'anchor_sink_mismatch', sink: 'sink2', key: first }]);
+  // A key only seconds old is not judged yet (its put may still be retried).
+  const fresh = rig({ failSink2: true });
+  await fresh.append();
+  await fresh.anchor.checkpoint(false);
+  const recent = verify.check({ bySink: await readAll(fresh), rows: fresh.registry.audit, cadenceS: HOUR, nowS: fresh.nowS() + 60, forks: [] });
+  assert.equal(codes(recent).includes('anchor_sink_mismatch'), false);
+});
+
+test('after chain_broken an anchored head is still compared with the stored row_hash', async () => {
+  const r = rig();
+  await runHours(r, 4);
+  const rows = r.registry.audit.map((x) => ({ ...x }));
+  rows[1].payload = { i: 'edited' };
+  rows[3].row_hash = 'ff'.repeat(32);
+  const out = verify.check({ bySink: await readAll(r), rows, cadenceS: HOUR, nowS: r.nowS(), forks: [] });
+  assert.deepEqual([...new Set(out.reasons.map((x) => `${x.code}:${x.seq}`))], ['chain_broken:2', 'anchor_rewrite:4']);
+});
+
+test('a note listed without LastModified is anchor_note_invalid', async () => {
+  const r = rig();
+  await runHours(r, 1);
+  const s1 = r.sinks[0];
+  const list = s1.list.bind(s1);
+  s1.list = async (prefix) => (await list(prefix)).map((o) => ({ ...o, lastModified: null }));
+  const read = await verify.readSink(s1, anchor.parseVkey(vkeyText()));
+  assert.deepEqual(read.reasons.map((x) => x.code), ['anchor_note_invalid']);
+  assert.equal(read.notes.length, 0);
+});
+
+test('a listing over the object cap is its own exit-2 code', async () => {
+  const r = rig();
+  const big = { id: 'sink1', async list() { throw anchor.anchorError('sink_list_too_large'); } };
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'anchor-'));
+  const file = path.join(dir, 'audit.json');
+  fs.writeFileSync(file, '[]');
+  await assert.rejects(verify.run(['--export', file], { env: { SYSTEMAPI_ANCHOR_VKEY: vkeyText() }, sinks: [big] }), { code: 'sink_list_too_large' });
+  void r;
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('--ack keeps reviewed alarms reported but passing, and --since skips notes before a cut-off', async () => {
+  const r = rig();
+  await runHours(r, 4);
+  const s1 = r.sinks[0];
+  const junkKey = anchor.objectKey(DEPLOY, 9, T0 + 5);
+  s1.objects.set(junkKey, { body: crypto.randomBytes(40), lastModified: new Date((T0 + 5) * 1000) });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'anchor-'));
+  const file = path.join(dir, 'audit.json');
+  const ackFile = path.join(dir, 'ack.json');
+  fs.writeFileSync(file, JSON.stringify(r.registry.audit));
+  const env = { SYSTEMAPI_ANCHOR_VKEY: vkeyText() };
+  const now = String(r.nowS());
+  const failing = await verify.run(['--export', file, '--now', now], { env, sinks: r.sinks });
+  assert.equal(failing.ok, false);
+  assert.deepEqual(failing.reasons.map((x) => x.code).sort(), ['anchor_note_invalid', 'anchor_sink_mismatch']);
+  fs.writeFileSync(ackFile, JSON.stringify([
+    { code: 'anchor_note_invalid', sink: 'sink1', key: junkKey, why: 'test junk, reviewed 2026-11-05' },
+    { code: 'anchor_sink_mismatch', sink: 'sink2', key: junkKey, why: 'same junk, sink1 only' }
+  ]));
+  const ackedRun = await verify.run(['--export', file, '--now', now, '--ack', ackFile], { env, sinks: r.sinks });
+  assert.equal(ackedRun.ok, true);
+  assert.equal(ackedRun.acked, 2);
+  assert.deepEqual(ackedRun.reasons, []);
+  // An ack for another key does not hide a new alarm.
+  fs.writeFileSync(ackFile, JSON.stringify([{ code: 'anchor_note_invalid', sink: 'sink1', key: 'other', why: 'x' }]));
+  assert.equal((await verify.run(['--export', file, '--now', now, '--ack', ackFile], { env, sinks: r.sinks })).ok, false);
+  // Malformed ack files are refused.
+  for (const bad of ['nope', '{}', '[{"code":"anchor_gap","why":"x"}]', '[{"code":"made_up","seq":1,"why":"x"}]',
+    '[{"code":"anchor_gap","seq":1,"why":""}]', '[{"code":"anchor_gap","seq":1,"key":"k","why":"x"}]', '[{"code":"anchor_gap","sink":"sink9","seq":1,"why":"x"}]']) {
+    fs.writeFileSync(ackFile, bad);
+    await assert.rejects(verify.run(['--export', file, '--ack', ackFile], { env, sinks: r.sinks }), { code: 'ack_invalid' });
+  }
+  // --since after the junk: it is not fetched or judged, and the gap rule
+  // runs from the cut-off.
+  const since = await verify.run(['--export', file, '--now', now, '--since', String(T0 + HOUR)], { env, sinks: r.sinks });
+  assert.equal(since.ok, true);
+  assert.equal(since.anchors, 6);
+  const lateSince = await verify.run(['--export', file, '--now', String(T0 + 6 * HOUR), '--since', String(T0 + 4 * HOUR - 1)], { env, sinks: r.sinks });
+  assert.ok(codes(lateSince).includes('anchor_gap'));
+  await assert.rejects(verify.run(['--export', file, '--now', now, '--since', String(r.nowS() + 1)], { env, sinks: r.sinks }), { code: 'usage' });
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('production refuses to boot with a set but invalid anchoring config; elsewhere it logs and stays off', () => {
+  const registry = new MemoryRegistry({});
+  const bad = [
+    [baseEnv({ SYSTEMAPI_ED25519_SEED: SEED }), 'anchor_seed_reuses_lease_key'],
+    [baseEnv({ SYSTEMAPI_AUDIT_DEPLOYMENT: 'Bad' }), 'anchor_deployment_invalid'],
+    [baseEnv({ SYSTEMAPI_ANCHOR_SINK1_BUCKET: '' }), 'anchor_sink_invalid']
+  ];
+  for (const [env, code] of bad) {
+    assert.throws(() => anchor.createAnchor({ env: { ...env, NODE_ENV: 'production' }, registry, logger: quiet }), (err) => {
+      assert.equal(err.code, code);
+      assert.equal(String(err.message).includes(SEED), false);
+      return true;
+    });
+    assert.equal(anchor.createAnchor({ env, registry, logger: quiet }), null);
+  }
+  assert.throws(() => anchor.createAnchor({ env: { ...baseEnv(), NODE_ENV: 'production' }, registry: null, logger: quiet }), { code: 'registry_unavailable' });
+  assert.equal(anchor.createAnchor({ env: { NODE_ENV: 'production', SYSTEMAPI_ED25519_SEED: LEASE_SEED }, registry, logger: quiet }), null);
+  assert.ok(anchor.createAnchor({ env: { ...baseEnv(), NODE_ENV: 'production' }, registry, logger: quiet, sinkFactory: (c) => memorySink(c.id) }));
 });
