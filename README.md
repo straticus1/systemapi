@@ -40,6 +40,17 @@ carries explicit entitlements.
 - When `DARKSTORAGE_ACCESS_KEY` and `DARKSTORAGE_SECRET_KEY` are set, each
   script result's SHA-256 is also written to the `systemapi-audits` S3 bucket.
   The PostgreSQL audit chain is the record of truth.
+- Audit anchoring (`docs/sah-audit-anchoring.md`), off unless configured:
+  every `SYSTEMAPI_AUDIT_CHECKPOINT_INTERVAL_S` (default 3600, 300 to 86400)
+  and right after a break-glass terminal start, the chain head is signed with
+  `SYSTEMAPI_AUDIT_CHECKPOINT_SEED` (64 hex; must not be the lease key) as a
+  signed note for `SYSTEMAPI_AUDIT_DEPLOYMENT` and PUT to
+  `SYSTEMAPI_ANCHOR_SINK1_{ENDPOINT,BUCKET,REGION,ACCESS_KEY_ID,SECRET_ACCESS_KEY}`
+  and, optionally, `SYSTEMAPI_ANCHOR_SINK2_*` (buckets in Object Lock
+  compliance mode, PutObject-only credential). `scripts/audit-anchor-verify.js`
+  checks them off-box with `SYSTEMAPI_ANCHOR_VKEY` (from
+  `scripts/audit-checkpoint-pubkey.js`), read-only sink credentials and
+  `SYSTEMAPI_ANCHOR_VERIFY_DATABASE_URL` or `--export`.
 - CVE lookup runs only when `DARKAPI_KEY` is set. Nothing invents CVE ids.
 
 `modules/` used to hold unwired quantum-crypto, blockchain and fake ML code.
@@ -93,5 +104,6 @@ An image built natively on Apple Silicon fails on amd64 nodes with
 - `api_docs.md`: REST and WebSocket routes.
 - `cli_docs.md`: agent flags, CLI commands, Sysscript modules and entitlements.
 - `docs/sah-sysscript-jobs.md`: async sysscript jobs, rollout and rollback.
+- `docs/sah-audit-anchoring.md`: signed audit-chain checkpoints and the off-box verifier.
 - `SECURITY_REVIEW.md`: controls that hold and known residuals.
 - `docs/sah-suite.md`: how SystemAPI fits the wider suite.

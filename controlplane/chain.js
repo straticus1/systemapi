@@ -15,8 +15,10 @@
 // sibling and both share the pinned parent; pinned rows must carry the v2
 // (every-column) hash. Editing or deleting either pinned row, inserting rows
 // between them, or replaying a pin fails. Does NOT protect: a full rewrite of
-// later rows (compare the recorded head), truncation of the tail, or the
-// columns legacy (pre-2026-10-14) rows did not hash.
+// later rows (compare the recorded head; controlplane/anchor.js signs it to
+// WORM sinks and scripts/audit-anchor-verify.js compares off-box), truncation
+// of the tail (the same), or the columns legacy (pre-2026-10-14) rows did not
+// hash.
 'use strict';
 
 const crypto = require('node:crypto');
@@ -72,12 +74,19 @@ function rowHash(prevHash, row) {
 
 // verifyRows walks rows in seq order. forks defaults to KNOWN_FORKS (tests
 // pass their own); legacyMaxSeq is the last seq allowed the payload-only hash
-// (0: none).
-function verifyRows(rows, forks = KNOWN_FORKS, { legacyMaxSeq = 0 } = {}) {
+// (0: none). headsAt (seqs) adds heads_at: { seq: row_hash } for each asked
+// seq found among the verified rows, in the same pass (0 is GENESIS); on a
+// break it holds the heads verified before it. Without headsAt the result is
+// unchanged.
+function verifyRows(rows, forks = KNOWN_FORKS, { legacyMaxSeq = 0, headsAt = null } = {}) {
   let prev = GENESIS;
   let last = null;
   const used = new Set();
   const accepted = [];
+  const want = headsAt ? new Set(headsAt) : null;
+  const heads = {};
+  if (want && want.has(0)) heads[0] = GENESIS;
+  const done = (out) => (want ? { ...out, heads_at: heads } : out);
   for (const row of rows) {
     const pin = forks.find((f) => f.row_hash === row.row_hash);
     const pinnedSibling = forks.some((f) => f.sibling_row_hash === row.row_hash);
@@ -85,22 +94,23 @@ function verifyRows(rows, forks = KNOWN_FORKS, { legacyMaxSeq = 0 } = {}) {
       const ok = pin && !used.has(pin) && pin.seq === row.seq && pin.prev_hash === row.prev_hash &&
         last && last.seq === pin.sibling_seq && last.row_hash === pin.sibling_row_hash &&
         last.prev_hash === row.prev_hash;
-      if (!ok) return { ok: false, broken_at: row.seq };
+      if (!ok) return done({ ok: false, broken_at: row.seq });
       used.add(pin);
       accepted.push(row.seq);
     } else if (pin) {
       // The pinned row links in line: its sibling is gone.
-      return { ok: false, broken_at: row.seq };
+      return done({ ok: false, broken_at: row.seq });
     }
     const v2 = rowHash(row.prev_hash, row) === row.row_hash;
     const legacyOk = row.seq <= legacyMaxSeq && chainHash(row.prev_hash, row.payload) === row.row_hash;
     if (!v2 && (pin || pinnedSibling || !legacyOk)) {
-      return { ok: false, broken_at: row.seq };
+      return done({ ok: false, broken_at: row.seq });
     }
     prev = row.row_hash;
     last = row;
+    if (want && want.has(row.seq)) heads[row.seq] = row.row_hash;
   }
-  return accepted.length > 0 ? { ok: true, head: prev, known_forks: accepted } : { ok: true, head: prev };
+  return done(accepted.length > 0 ? { ok: true, head: prev, known_forks: accepted } : { ok: true, head: prev });
 }
 
 // SYSTEMAPI_AUDIT_LEGACY_MAX_SEQ: a non-negative integer, else 0.

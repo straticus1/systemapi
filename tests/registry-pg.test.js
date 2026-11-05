@@ -5,7 +5,8 @@
 // channel-policy CLI's single-transaction write, and the sysscript job methods (cross-tenant
 // getJob/listJobs/requestJobCancel/transitionJob, atomic caps, NOTIFY only after COMMIT, a
 // two-registry dispatch claim, and two FleetManagers dispatching, waiting and cancelling across
-// instances through LISTEN/NOTIFY). A fresh database per run with the schema applied by
+// instances through LISTEN/NOTIFY), and audit checkpoints (one per interval across registries, verified
+// over a read-only connection). A fresh database per run with the schema applied by
 // createRegistry. Needs SYSTEMAPI_TEST_DATABASE_URL (a role that may CREATE DATABASE); it fails,
 // not skips, without it. Not part of npm test.
 //
@@ -1701,4 +1702,66 @@ test('host:offline: two FleetManagers on one database; a disconnect on one and a
     // The closed socket's presence clear lands before the pool ends.
     await waitUntil('presence cleared', async () => (await hostRow()).agent_instance === null, 8000);
   }
+});
+
+test('audit checkpoints: one per interval across replicas, the head read under the chain lock, verified over a read-only connection', async () => {
+  const anchor = require('../controlplane/anchor');
+  const verify = require('../scripts/audit-anchor-verify');
+  const seed = '5a'.repeat(32);
+  const deployment = `pg-${crypto.randomBytes(3).toString('hex')}`;
+  const signer = anchor.anchorSigner(seed);
+  const sign = (f) => anchor.signNote(signer, { deployment, ...f });
+  const other = new PgRegistry(pool, {});
+  const nowS = Math.floor(Date.now() / 1000);
+  // Appends racing two replicas' checkpoints: each checkpoint names a
+  // committed tail, and only one of the two is written for the interval.
+  const appends = Array.from({ length: 10 }, (_, i) => registry.appendAudit({ tenant_id: null, actor: 'pg-test', action: 'anchor_probe', payload: { i } }));
+  const [a, b] = await Promise.all([
+    registry.createAuditCheckpoint({ deployment, nowS, minGapS: 3600, sign }),
+    other.createAuditCheckpoint({ deployment, nowS, minGapS: 3600, sign })
+  ]);
+  await Promise.all(appends);
+  const written = [a, b].filter(Boolean);
+  assert.equal(written.length, 1);
+  const cp = written[0];
+  const at = await pool.query('SELECT row_hash FROM cp_audit WHERE seq = $1', [cp.seq]);
+  assert.equal(at.rows[0].row_hash, cp.head);
+  assert.equal(await registry.createAuditCheckpoint({ deployment, nowS: nowS + 3599, minGapS: 3600, sign }), null);
+  await registry.setAuditCheckpointSinks(cp.id, { sink1: 'ok', sink2: 'put_failed' });
+  const stored = await pool.query('SELECT seq, head, note, sink_status FROM cp_audit_checkpoints WHERE id = $1', [cp.id]);
+  assert.deepEqual(stored.rows[0].sink_status, { sink1: 'ok', sink2: 'put_failed' });
+  assert.equal(Number(stored.rows[0].seq), cp.seq);
+  // The anchor loop on this database, then the verifier over a read-only
+  // connection: clean, then a rewrite of an anchored row is caught.
+  const objects = new Map();
+  const sink = {
+    id: 'sink1',
+    async put(key, body) { objects.set(key, { body: Buffer.from(body), lastModified: new Date((nowS + 3600) * 1000) }); },
+    async list(prefix) { return [...objects].filter(([k]) => k.startsWith(prefix)).map(([key, o]) => ({ key, size: o.body.length, lastModified: o.lastModified })); },
+    async get(key) { return objects.get(key).body; }
+  };
+  const config = { deployment, intervalS: 3600, signer };
+  const a2 = new anchor.AuditAnchor({ config, registry, sinks: [sink], logger: { log() {}, error() {} }, now: () => (nowS + 3600) * 1000 });
+  const fresh = await a2.checkpoint(false);
+  assert.deepEqual(fresh.sink_status, { sink1: 'ok' });
+  const vkey = anchor.vkeyOf(anchor.originOf(deployment), signer.publicKeyRaw);
+  const env = { SYSTEMAPI_ANCHOR_VKEY: vkey, SYSTEMAPI_ANCHOR_VERIFY_DATABASE_URL: withDatabase(BASE, DB) };
+  const clean = await verify.run(['--now', String(nowS + 3600)], { env, sinks: [sink] });
+  assert.deepEqual(clean.reasons, []);
+  // The anchored tail edited and its hash recomputed: the chain alone
+  // verifies, the anchor does not match.
+  const { rowHash } = require('../controlplane/chain');
+  const original = (await pool.query('SELECT * FROM cp_audit WHERE seq = $1', [fresh.seq])).rows[0];
+  const edited = { ...original, payload: { i: 'edited' } };
+  await pool.query('UPDATE cp_audit SET payload = $2::jsonb, row_hash = $3 WHERE seq = $1',
+    [fresh.seq, JSON.stringify(edited.payload), rowHash(original.prev_hash, edited)]);
+  try {
+    assert.equal((await registry.verifyAudit()).ok, true);
+    const caught = await verify.run(['--now', String(nowS + 3600)], { env, sinks: [sink] });
+    assert.deepEqual(caught.reasons.map((r) => r.code), ['anchor_rewrite']);
+  } finally {
+    await pool.query('UPDATE cp_audit SET payload = $2::jsonb, row_hash = $3 WHERE seq = $1',
+      [fresh.seq, JSON.stringify(original.payload), original.row_hash]);
+  }
+  assert.equal((await registry.verifyAudit()).ok, true);
 });

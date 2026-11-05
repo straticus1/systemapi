@@ -501,6 +501,14 @@ Rollout and rollback: `docs/sah-sysscript-jobs.md`.
 | POST | `/api/v1/keys/:keyId/revoke` |
 | GET/POST/DELETE | `/api/v1/oauth/links` |
 
+`/api/v1/audit/verify` recomputes the chain inside the control plane. A full
+rewrite from some seq on, or a truncated tail, still verifies there. Audit
+anchoring (`docs/sah-audit-anchoring.md`) signs the chain head every interval
+and after each break-glass start, writes it to WORM buckets as
+`checkpoints/<deployment>/<seq>-<time>.note`, and keeps a copy in
+`cp_audit_checkpoints`. `scripts/audit-anchor-verify.js` checks it from another
+host. There is no HTTP route for checkpoints.
+
 ## Threat intelligence
 
 `GET /api/v1/threat-intel/ip/:ip`, `/domain/:domain`, `/otx/:indicator`,

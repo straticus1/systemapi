@@ -661,15 +661,18 @@ class FleetManager {
         attempt().catch((err) => console.error('[Fleet] terminal end audit failed:', err.message));
     }
 
+    // A break-glass start is anchored right away (controlplane/anchor.js).
     async auditTerminal(session, action, payload) {
         if (!this.registry) throw new Error('registry_unavailable');
-        return this.registry.appendAudit({
+        const row = await this.registry.appendAudit({
             tenant_id: session.tenantId,
             host_id: session.hostId,
             actor: session.actor,
             action,
             payload
         });
+        if (this.anchor) this.anchor.noteAudit(row);
+        return row;
     }
 
     // Returns the live session only when this agent connection owns it.

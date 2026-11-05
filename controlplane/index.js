@@ -1,11 +1,15 @@
 // Threats: starting the API without a signer, and running a schedule twice in
-// the same UTC minute. Boot failure in production is fatal. Does NOT listen.
+// the same UTC minute. Boot failure in production is fatal. The audit anchor
+// (controlplane/anchor.js) runs in the same tick when configured; a bad
+// anchoring config turns anchoring off with a reason code and does not stop
+// boot. Does NOT listen.
 'use strict';
 
 const { loadSigner } = require('./keys');
 const { createRegistry } = require('./registry');
 const { mount, deliverWebhooks } = require('./router');
 const { issueLease } = require('./lease');
+const { createAnchor } = require('./anchor');
 
 function attach(app, fleet, env = process.env, logger = console) {
   fleet.env = env;
@@ -54,6 +58,8 @@ async function boot(fleet, env = process.env, logger = console) {
   // Async sysscript jobs: this instance listens for dispatch, cancel and
   // state events; every tick sweeps overdue jobs and runs the fallback scan.
   if (fleet.jobs) fleet.jobs.listen();
+  // Signed chain-head checkpoints to the WORM sinks, off unless configured.
+  fleet.anchor = createAnchor({ env, registry, leasePublicKey: fleet.signer ? fleet.signer.publicKeyRaw : null, logger });
   const timer = setInterval(() => {
     tickSchedules(fleet, logger).catch((err) => logger.error('[control] schedule tick failed:', err.message));
     refreshGauges(fleet).catch((err) => logger.error('[control] gauge refresh failed:', err.message));
@@ -61,6 +67,7 @@ async function boot(fleet, env = process.env, logger = console) {
     if (typeof fleet.tickCapabilityAlerts === 'function') {
       fleet.tickCapabilityAlerts().catch((err) => logger.error('[control] capability alert tick failed:', err.message));
     }
+    if (fleet.anchor) fleet.anchor.tick().catch(() => logger.error('[anchor] tick failed'));
   }, 30000);
   if (typeof timer.unref === 'function') timer.unref();
   fleet.scheduleTimer = timer;

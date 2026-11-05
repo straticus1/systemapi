@@ -124,6 +124,15 @@ async function auditInsert(client, entry) {
   return ins.rows[0];
 }
 
+// Whether a checkpoint is due: none yet, or the last is at least minGapS
+// old (0 for a forced one). Note times rise strictly, so two checkpoints in
+// one second (a forced one beside the hourly one) get distinct object keys.
+function checkpointDue(lastTime, nowS, minGapS) {
+  if (lastTime === null || lastTime === undefined) return { time: nowS };
+  if (nowS - lastTime < minGapS) return null;
+  return { time: Math.max(nowS, lastTime + 1) };
+}
+
 // The audit row for an SSO bind or unbind. The sub is recorded as a
 // fingerprint, never in clear.
 function ssoAuditEntry(tenantId, userId, sub, previous, actor) {
@@ -900,6 +909,7 @@ class MemoryRegistry {
     this.audit = [];
     this.auditSeq = 1;
     this.auditChain = Promise.resolve();
+    this.checkpoints = [];
     this.webhooks = [];
     this.schedules = [];
     this.comments = [];
@@ -1311,6 +1321,29 @@ class MemoryRegistry {
 
   async verifyAudit() {
     return verifyRows(this.audit, undefined, { legacyMaxSeq: legacyMaxSeq(this.env) });
+  }
+
+  // The memory twin of PgRegistry.createAuditCheckpoint, serialized with
+  // appendAudit as the chain lock serializes it there.
+  async createAuditCheckpoint({ deployment, nowS, minGapS, sign }) {
+    const run = this.auditChain.then(() => {
+      const tail = this.audit[this.audit.length - 1];
+      const last = [...this.checkpoints].reverse().find((c) => c.deployment === deployment);
+      const due = checkpointDue(last && last.note_time, nowS, minGapS);
+      if (!due) return null;
+      const seq = tail ? tail.seq : 0;
+      const head = tail ? tail.row_hash : GENESIS;
+      const row = { id: this.checkpoints.length + 1, deployment, seq, head, note_time: due.time, note: sign({ seq, head, time: due.time }), sink_status: {} };
+      this.checkpoints.push(row);
+      return { ...row };
+    });
+    this.auditChain = run.then(() => {}, () => {});
+    return run;
+  }
+
+  async setAuditCheckpointSinks(id, status) {
+    const row = this.checkpoints.find((c) => c.id === id);
+    if (row) row.sink_status = { ...status };
   }
 
   async listAudit(tenantIds, limit = 100) {
@@ -3058,6 +3091,50 @@ class PgRegistry {
       'SELECT seq, prev_hash, row_hash, tenant_id, host_id, actor, action, payload FROM cp_audit ORDER BY seq ASC'
     );
     return verifyRows(res.rows.map((row) => ({ ...row, seq: Number(row.seq) })), undefined, { legacyMaxSeq: legacyMaxSeq(this.env) });
+  }
+
+  // Signs and stores one checkpoint of the chain head. Under the chain-wide
+  // audit lock (no append can land between the head read and the insert), it
+  // reads max(seq) and its row_hash and this deployment's last checkpoint;
+  // returns null when that one is less than minGapS old (so replicas sharing
+  // the database write one per interval). sign gets { seq, head, time } and
+  // returns the note text. The sinks are written after COMMIT, never under
+  // the lock.
+  async createAuditCheckpoint({ deployment, nowS, minGapS, sign }) {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock($1::int, $2::int)', [AUDIT_LOCK_NS, AUDIT_LOCK_KEY]);
+      const tail = await client.query('SELECT seq, row_hash FROM cp_audit ORDER BY seq DESC LIMIT 1');
+      const last = await client.query(
+        'SELECT note_time FROM cp_audit_checkpoints WHERE deployment = $1 ORDER BY id DESC LIMIT 1',
+        [deployment]
+      );
+      const due = checkpointDue(last.rows[0] ? Number(last.rows[0].note_time) : null, nowS, minGapS);
+      if (!due) {
+        await client.query('ROLLBACK');
+        return null;
+      }
+      const seq = tail.rows[0] ? Number(tail.rows[0].seq) : 0;
+      const head = tail.rows[0] ? tail.rows[0].row_hash : GENESIS;
+      const note = sign({ seq, head, time: due.time });
+      const ins = await client.query(
+        `INSERT INTO cp_audit_checkpoints (deployment, seq, head, note_time, note)
+         VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+        [deployment, seq, head, due.time, note]
+      );
+      await client.query('COMMIT');
+      return { id: Number(ins.rows[0].id), deployment, seq, head, note_time: due.time, note };
+    } catch (err) {
+      try { await client.query('ROLLBACK'); } catch { /* already closed */ }
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async setAuditCheckpointSinks(id, status) {
+    await this.pool.query('UPDATE cp_audit_checkpoints SET sink_status = $2::jsonb WHERE id = $1', [id, JSON.stringify(status)]);
   }
 
   async listAudit(tenantIds, limit = 100) {
