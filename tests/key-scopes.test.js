@@ -160,3 +160,22 @@ test('revoke: refused (404) for an admin who does not administer every owner ten
     assert.equal(r.reg.audit.filter((a) => a.action === 'key_revoked').length, 0);
   } finally { await r.close(); }
 });
+
+// The owner's memberships are read inside the revoke itself, not before it:
+// an owner who joins a tenant the admin does not administer after the
+// route looked the key up is refused, and the key stays active.
+test('revoke: a membership the owner gains after the key lookup is seen by the revoke (404, key active, no audit row)', async () => {
+  const r = await rig();
+  try {
+    const lookup = r.fm.db.query;
+    r.fm.db.query = async (sql, params) => {
+      const out = await lookup(sql, params);
+      await r.reg.addMember('beta', 'user-3', 'viewer', null); // lands between lookup and revoke
+      return out;
+    };
+    const res = await fetch(`${r.post.url}/api/v1/keys/k-op/revoke`, { method: 'POST', headers: { 'x-api-key': 'admin-acme' } });
+    assert.equal(res.status, 404);
+    assert.equal(await r.reg.keyActive('k-op'), true);
+    assert.equal(r.reg.audit.filter((a) => a.action === 'key_revoked').length, 0);
+  } finally { await r.close(); }
+});

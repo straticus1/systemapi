@@ -95,6 +95,25 @@ const DRIFT_CLAIM_LOCK_KEY = 3;
 // enroll, retire: every syncHostStates): namespace 'STAT', key
 // hashtext(tenant_id).
 const STATE_LOCK_NS = 0x53544154;
+// The per-member lock (namespace 'MEMB', key hashtext(user_id)): every write
+// that changes which tenants a member id belongs to (addMember, createTenant,
+// bootstrapAdmin) and every check that authorizes on that set inside a write
+// (revokeKeyAudited) take it, so the set cannot change between the check and
+// the write. Taken before the audit chain lock.
+const MEMBER_LOCK_NS = 0x4d454d42;
+
+async function memberLockInTx(client, userId) {
+  await client.query('SELECT pg_advisory_xact_lock($1::int, hashtext($2))', [MEMBER_LOCK_NS, String(userId)]);
+}
+
+// The owner tenants a key revoke may act on: every tenant the owner belongs
+// to must be one the actor administers, else 404 (the key is not theirs to
+// see). Shared by both registries so the rule is one rule.
+function revokeOwnerTenants(memberTenantIds, adminTenants) {
+  const tenants = [...new Set(memberTenantIds)].sort();
+  if (tenants.length === 0 || !tenants.every((t) => adminTenants.includes(t))) throw http(404, 'not_found');
+  return tenants;
+}
 
 // Appends one chained audit row inside the caller's transaction. The tail is
 // read only under the chain-wide transaction lock: a row lock alone (FOR
@@ -218,8 +237,6 @@ function channelPolicyAuditEntry(tenantId, hostId, actor, action, reason, tcpPol
   };
 }
 
-// The audit row for a key scope change: the key id (its public part), the
-// tenant the admin acted through, the new and the previous scope sets.
 function keyRevokeAuditEntry(tenantId, actor, keyId, wasActive, tenants) {
   return {
     tenant_id: tenantId,
@@ -228,6 +245,9 @@ function keyRevokeAuditEntry(tenantId, actor, keyId, wasActive, tenants) {
     payload: { key_fp: fingerprint(keyId), was_active: wasActive, tenants: [...tenants].sort() }
   };
 }
+
+// The audit row for a key scope change: the key id (its public part), the
+// tenant the admin acted through, the new and the previous scope sets.
 
 function keyScopesAuditEntry(tenantId, actor, keyId, scopes, previous, tenants = [tenantId]) {
   return {
@@ -1428,9 +1448,13 @@ class MemoryRegistry {
     this.revokedKeys.add(keyId);
   }
 
-  async revokeKeyAudited({ keyId, tenantId, tenants, actor }) {
-    await this.appendAudit(keyRevokeAuditEntry(tenantId, actor, keyId, !this.revokedKeys.has(keyId), tenants));
+  // The owner's memberships are read here, with no await before the audit
+  // write, so no membership change interleaves between check and revoke.
+  async revokeKeyAudited({ keyId, ownerUserId, adminTenants, actor }) {
+    const tenants = revokeOwnerTenants(this.tenantIdsOf(ownerUserId), adminTenants);
+    await this.appendAudit(keyRevokeAuditEntry(tenants[0], actor, keyId, !this.revokedKeys.has(keyId), tenants));
     this.revokedKeys.add(keyId);
+    return { tenant_id: tenants[0], tenants };
   }
 
   async recentAlert(hostId, ruleName, withinMs, now = Date.now()) {
@@ -2642,6 +2666,7 @@ class PgRegistry {
     try {
       await client.query('BEGIN');
       await client.query("SELECT pg_advisory_xact_lock(hashtext('cp_bootstrap_admin'))");
+      await memberLockInTx(client, userId);
       // ssoBindInTx below takes this lock after the first audit row; taking
       // it now keeps the audit chain lock last (see auditInsert).
       if (typeof sub === 'string') await client.query("SELECT pg_advisory_xact_lock(hashtext('cp_members.sso_sub'))");
@@ -2715,6 +2740,7 @@ class PgRegistry {
       await client.query('BEGIN');
       // Serializes two runs naming the same new agent member.
       await client.query("SELECT pg_advisory_xact_lock(hashtext('cp_create_tenant'))");
+      for (const id of [adminUserId, agentUserId].sort()) await memberLockInTx(client, id);
       const admin = await client.query(
         "SELECT 1 FROM cp_members WHERE user_id = $1 AND role = 'admin' LIMIT 1",
         [adminUserId]
@@ -2769,16 +2795,29 @@ class PgRegistry {
     }
   }
 
+  // Under the member lock (see memberLockInTx): a concurrent key revoke
+  // either sees this membership or finishes before it lands.
   async addMember(tenantId, userId, role, email) {
     if (!ROLES.has(role)) throw http(400, 'bad_role');
-    const res = await this.pool.query(
-      `INSERT INTO cp_members (tenant_id, user_id, role, email)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (tenant_id, user_id) DO UPDATE SET role = EXCLUDED.role, email = COALESCE(EXCLUDED.email, cp_members.email)
-       RETURNING tenant_id, user_id, email, role`,
-      [tenantId, userId, role, email || null]
-    );
-    return res.rows[0];
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await memberLockInTx(client, userId);
+      const res = await client.query(
+        `INSERT INTO cp_members (tenant_id, user_id, role, email)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (tenant_id, user_id) DO UPDATE SET role = EXCLUDED.role, email = COALESCE(EXCLUDED.email, cp_members.email)
+         RETURNING tenant_id, user_id, email, role`,
+        [tenantId, userId, role, email || null]
+      );
+      await client.query('COMMIT');
+      return res.rows[0];
+    } catch (err) {
+      try { await client.query('ROLLBACK'); } catch { /* connection already failed */ }
+      throw err;
+    } finally {
+      client.release();
+    }
   }
 
   async listHosts(tenantIds, query, { includeRetired = false } = {}) {
@@ -3280,17 +3319,29 @@ class PgRegistry {
     }
   }
 
-  // Admin revoke (POST /api/v1/keys/:keyId/revoke): the deactivation and its
-  // audit row in one transaction. Revoking an inactive key is still audited.
-  async revokeKeyAudited({ keyId, tenantId, tenants, actor }) {
+  // Admin revoke (POST /api/v1/keys/:keyId/revoke): the authorization, the
+  // deactivation and its audit row in one transaction. Revoking an inactive
+  // key is still audited.
+  // Threats: a TOCTOU where the owner joins a tenant the actor does not
+  // administer between the check and the revoke (the key row is locked, then
+  // the member lock, and the memberships are read under it; every membership
+  // write takes the same lock), a key row swapped to another owner (the
+  // locked row must name ownerUserId). Does NOT re-check the
+  // actor's own admin role inside the transaction (it can come from SSO
+  // groups, which the database does not hold).
+  async revokeKeyAudited({ keyId, ownerUserId, adminTenants, actor }) {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
-      const cur = await client.query('SELECT is_active FROM playground_api_keys WHERE key_id = $1 FOR UPDATE', [keyId]);
-      if (cur.rowCount === 0) throw http(404, 'not_found');
+      const cur = await client.query('SELECT user_id, is_active FROM playground_api_keys WHERE key_id = $1 FOR UPDATE', [keyId]);
+      if (cur.rowCount === 0 || cur.rows[0].user_id !== ownerUserId) throw http(404, 'not_found');
+      await memberLockInTx(client, ownerUserId);
+      const mem = await client.query('SELECT tenant_id FROM cp_members WHERE user_id = $1', [ownerUserId]);
+      const tenants = revokeOwnerTenants(mem.rows.map((r) => r.tenant_id), adminTenants);
       await client.query('UPDATE playground_api_keys SET is_active = false WHERE key_id = $1', [keyId]);
-      await auditInsert(client, keyRevokeAuditEntry(tenantId, actor, keyId, cur.rows[0].is_active === true, tenants));
+      await auditInsert(client, keyRevokeAuditEntry(tenants[0], actor, keyId, cur.rows[0].is_active === true, tenants));
       await client.query('COMMIT');
+      return { tenant_id: tenants[0], tenants };
     } catch (err) {
       try { await client.query('ROLLBACK'); } catch { /* connection already failed */ }
       throw err;

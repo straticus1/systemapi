@@ -1424,6 +1424,70 @@ test('setScopesAudited replaces a key\'s scopes and writes the audit row in one 
   assert.equal((await registry.verifyAudit()).ok, true);
 });
 
+// Threats: a revoke authorized on a stale membership set. The owner's
+// memberships are read inside the revoke transaction under the member lock
+// that addMember also takes, so a membership landing concurrently is either
+// seen (404, key active) or lands after the revoke commits.
+test('revokeKeyAudited: a concurrent membership change is seen by the check; an admin of only one owner tenant is refused', async () => {
+  const sfx = crypto.randomBytes(3).toString('hex');
+  const [ta, tb, owner, key] = [`rva${sfx}`, `rvb${sfx}`, `rvowner${sfx}`, `rvkey${sfx}`];
+  await pool.query('INSERT INTO cp_tenants (tenant_id, display_name, owner_user_id) VALUES ($1, $1, $3), ($2, $2, $3)', [ta, tb, 'rv-admin']);
+  await registry.addMember(ta, owner, 'viewer', null);
+  await pool.query(
+    `INSERT INTO playground_api_keys (key_id, key_hash, user_id, name, api_site) VALUES ($1, 'x', $2, 'rv', 'systemapi')`,
+    [key, owner]
+  );
+  const active = async () => (await pool.query('SELECT is_active FROM playground_api_keys WHERE key_id = $1', [key])).rows[0].is_active;
+  const revokes = async () => (await pool.query("SELECT count(*)::int AS n FROM cp_audit WHERE action = 'key_revoked' AND payload->>'key_fp' = $1",
+    [crypto.createHash('sha256').update(key).digest('hex')])).rows[0].n;
+
+  // A membership write in flight (holding the member lock) when the revoke starts.
+  const tx = await pool.connect();
+  try {
+    await tx.query('BEGIN');
+    await tx.query('SELECT pg_advisory_xact_lock($1::int, hashtext($2))', [0x4d454d42, owner]);
+    await tx.query("INSERT INTO cp_members (tenant_id, user_id, role) VALUES ($1, $2, 'viewer')", [tb, owner]);
+    const pending = registry.revokeKeyAudited({ keyId: key, ownerUserId: owner, adminTenants: [ta], actor: 'rv-admin' });
+    const settled = pending.then(() => 'resolved', (err) => err);
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(await active(), true, 'the revoke waits on the member lock');
+    await tx.query('COMMIT');
+    const out = await settled;
+    assert.equal(out.status, 404, String(out));
+    assert.equal(out.code, 'not_found');
+  } finally {
+    tx.release();
+  }
+  assert.equal(await active(), true);
+  assert.equal(await revokes(), 0);
+
+  // A wrong owner id (the row names someone else) is refused.
+  await assert.rejects(registry.revokeKeyAudited({ keyId: key, ownerUserId: 'someone-else', adminTenants: [ta, tb], actor: 'rv-admin' }),
+    (err) => err.status === 404);
+  // Racing many addMember calls against one revoke: the revoke never succeeds
+  // for an owner that ends up in a tenant the admin does not administer.
+  const tc = `rvc${sfx}`;
+  await pool.query('INSERT INTO cp_tenants (tenant_id, display_name, owner_user_id) VALUES ($1, $1, $2)', [tc, 'rv-admin']);
+  const results = await Promise.allSettled([
+    registry.revokeKeyAudited({ keyId: key, ownerUserId: owner, adminTenants: [ta, tb], actor: 'rv-admin' }),
+    registry.addMember(tc, owner, 'viewer', null)
+  ]);
+  assert.equal(results[1].status, 'fulfilled');
+  if (results[0].status === 'fulfilled') {
+    // The revoke committed first: it saw only ta and tb.
+    assert.equal(await active(), false);
+    assert.equal(await revokes(), 1);
+  } else {
+    assert.equal(results[0].reason.status, 404);
+    assert.equal(await active(), true);
+    assert.equal(await revokes(), 0);
+  }
+  // An admin of all three revokes it.
+  await registry.revokeKeyAudited({ keyId: key, ownerUserId: owner, adminTenants: [ta, tb, tc], actor: 'rv-admin' });
+  assert.equal(await active(), false);
+  assert.equal((await registry.verifyAudit()).ok, true);
+});
+
 test('setHostCapabilities writes only changed rows in one statement, keeps since on a reason change, and returns the previous state', async () => {
   const host = '44444444-4444-4444-8444-444444444444';
   let statements = 0;
