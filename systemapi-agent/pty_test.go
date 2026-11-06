@@ -617,7 +617,7 @@ func TestPTYRecorderOverflowEndsSession(t *testing.T) {
 func TestPTYBreakglassKeepsAdsshAndIsRecorded(t *testing.T) {
 	h := newPTYHarness(t)
 	bin := t.TempDir()
-	if err := os.WriteFile(filepath.Join(bin, "adssh"), []byte("#!/bin/sh\necho \"policy=$ADSSH_POLICY key=$SYSTEMAPI_API_KEY\"\nexit 7\n"), 0o700); err != nil {
+	if err := os.WriteFile(filepath.Join(bin, "adssh"), []byte("#!/bin/sh\necho \"policy=$ADSSH_POLICY key=$SYSTEMAPI_API_KEY\"\necho \"emergency=$ADSSH_SASH_EMERGENCY\"\nexit 7\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+":/usr/bin:/bin")
@@ -631,7 +631,7 @@ func TestPTYBreakglassKeepsAdsshAndIsRecorded(t *testing.T) {
 		t.Fatalf("exit %v", p)
 	}
 	out := h.out.text(sid)
-	if !strings.Contains(out, "policy="+filepath.Join(h.dir, "breakglass.rego")) || strings.Contains(out, "leak-me") {
+	if !strings.Contains(out, "policy="+filepath.Join(h.dir, "breakglass.rego")) || strings.Contains(out, "leak-me") || !strings.Contains(out, "emergency=1") {
 		t.Fatalf("adssh env: %q", out)
 	}
 	key, err := loadRecordingKey(h.dir)

@@ -4,7 +4,9 @@
 // session freezing the agent, and processes a shell leaves behind. On Linux,
 // pty and pty_root exec sash with a verified sash/1 grant; a missing binary
 // is sash_missing; a bad grant does not fall open to bash; the agent does
-// not hold the grant private key. Each
+// not hold the grant private key. Break-glass still execs adssh, sets
+// ADSSH_SASH_EMERGENCY, and does not attach a fleet grant or the emergency
+// seed. Each
 // session is keyed by a server-generated session id and needs a signed lease
 // bound to that id, its deadline and its phase (start or renew); it ends at
 // the deadline or when the last renewed lease expires, whichever is first.
@@ -436,6 +438,18 @@ func recordingMode(cfg ptySettings, euid int) string {
 	return recordingUserOwned
 }
 
+func sashEnvToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < 0x20 || r > 0x7e || r == '<' || r == '>' || r == '&' || r == '=' {
+			return false
+		}
+	}
+	return true
+}
+
 func sessionEnv(id *ptyIdentity, extra []string) []string {
 	path := os.Getenv("PATH")
 	if path == "" {
@@ -534,10 +548,27 @@ func startPTYSession(out ptyOut, hostID, stateDir string, req ptyStartRequest, n
 			ptyStatusError(out, sid, "pty_start_failed")
 			return
 		}
+		actor := req.Actor
+		if actor == "" {
+			actor = id.name
+		}
+		nonce := ""
+		if req.Lease != nil {
+			nonce = req.Lease.NonceHex
+		}
+		if !deadline.After(now) || !sashEnvToken(actor) || !sashEnvToken(hostID) || !sashEnvToken(nonce) {
+			ptyStatusError(out, sid, "pty_start_failed")
+			return
+		}
 		argv0 = path
 		env = sessionEnv(id, []string{
 			"ADSSH_POLICY=" + policy,
 			"ADSSH_AUDIT_LOG=" + filepath.Join(stateDir, "breakglass-audit.log"),
+			"ADSSH_SASH_EMERGENCY=1",
+			"ADSSH_SASH_ACTOR=" + actor,
+			"ADSSH_SASH_HOST=" + hostID,
+			"ADSSH_SASH_LEASE=" + nonce,
+			"ADSSH_SASH_EXP=" + strconv.FormatInt(deadline.Unix(), 10),
 		})
 	}
 

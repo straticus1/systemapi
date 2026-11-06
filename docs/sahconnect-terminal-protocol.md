@@ -127,7 +127,11 @@ expires. A dead server therefore cannot leave a shell running for long.
   user with `--pty-allow-agent-user`, so the shell's user can edit the
   record), or `off` (`--pty-record=false`).
 - An ordinary session execs `sash` and does not call `adssh`. Break-glass still runs
-  `adssh` and is also recorded by the agent.
+  `adssh` and is also recorded by the agent. When `ADSSH_SASH_EMERGENCY` is `1`,
+  `true`, or `yes`, that adssh signs a sash/1 grant with purpose emergency using
+  the per-host seed and execs `sash --session`. A fleet signature on that grant
+  is `grant_bad_sig`. The agent does not hold the seed and does not put a fleet
+  grant on the break-glass frame.
 - If the record cannot be opened or written, or the recorder cannot keep up,
   the session is refused or ended. It never runs unrecorded and never drops
   bytes. A refusal at start is `recording_unavailable`, including when the
