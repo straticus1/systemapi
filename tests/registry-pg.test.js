@@ -145,6 +145,78 @@ test('channel-policy writes the host policy and its audit row together, or neith
   assert.equal(await audits(), 1);
 });
 
+test('policy API writes (P2): if_version under the row lock, the tenant twin with host_id null, revert lookup, rollback', async () => {
+  const { policyVersion, pickColumns, clearPolicy, inheritPolicy } = require('../controlplane/policyrules');
+  const HOST_Q = 'a2a2a2a2-a2a2-4a2a-8a2a-a2a2a2a2a2a2';
+  await registry.enroll({ tenantId: 'pgpol', userId: 'user-pol', keyId: 'kq', hostId: HOST_Q, hostname: 'q.example', os: '', platform: '', sshPubkey: opensshEd25519(6) });
+  const hostCols = async () => pickColumns((await pool.query('SELECT tcp_policy, file_policy, service_policy, package_policy, config_policy, tweak_policy FROM cp_hosts WHERE host_id = $1', [HOST_Q])).rows[0]);
+  const named = (cols) => ({ tcpPolicy: cols.tcp_policy, filePolicy: cols.file_policy, servicePolicy: cols.service_policy, packagePolicy: cols.package_policy, configPolicy: cols.config_policy, tweakPolicy: cols.tweak_policy });
+  const v0 = policyVersion(await hostCols());
+  const out = await registry.setHostChannelPolicyAudited({ tenantId: 'pgpol', hostId: HOST_Q, ...named(clearPolicy()), actor: 'user-pol', action: 'channel_policy_clear', reason: 'pg', ifVersion: v0, extra: { policy_schema: 2, via: 'key', key_fp: 'abc' } });
+  // The version the registry returns is what a read of the jsonb columns hashes to.
+  assert.equal(out.version, policyVersion(await hostCols()));
+  const row = await registry.policyAuditRow(out.audit_seq);
+  assert.equal(row.host_id, HOST_Q);
+  assert.equal(row.tenant_id, 'pgpol');
+  assert.equal(row.payload.policy_schema, 2);
+  assert.equal(row.payload.previous_tweak_policy, null);
+  assert.equal(await registry.policyAuditRow(0), null);
+  assert.equal(await registry.policyAuditRow(2 ** 40), null);
+  // A stale version is 409 and nothing changes.
+  const auditCount = async () => (await pool.query('SELECT count(*)::int AS n FROM cp_audit')).rows[0].n;
+  const n = await auditCount();
+  await assert.rejects(registry.setHostChannelPolicyAudited({ tenantId: 'pgpol', hostId: HOST_Q, ...named(inheritPolicy()), actor: 'x', action: 'channel_policy_inherit', reason: 'pg', ifVersion: v0 }),
+    (err) => err.status === 409 && err.code === 'version_conflict');
+  assert.equal(await auditCount(), n);
+  assert.equal(policyVersion(await hostCols()), out.version);
+
+  // The tenant twin.
+  const t0 = await registry.tenantChannelPolicies('pgpol');
+  assert.deepEqual(t0, inheritPolicy());
+  assert.equal(await registry.tenantChannelPolicies('no-such-tenant'), null);
+  const next = { ...inheritPolicy(), package_policy: { names: ['curl'] } };
+  const t = await registry.setTenantChannelPolicyAudited({ tenantId: 'pgpol', ...named(next), actor: 'user-pol', action: 'channel_policy_tenant_set', reason: 'pg', ifVersion: policyVersion(t0), extra: { policy_schema: 2 } });
+  assert.deepEqual(await registry.tenantChannelPolicies('pgpol'), next);
+  assert.equal(t.version, policyVersion(await registry.tenantChannelPolicies('pgpol')));
+  const trow = await registry.policyAuditRow(t.audit_seq);
+  assert.equal(trow.host_id, null);
+  assert.equal(trow.action, 'channel_policy_tenant_set');
+  assert.equal(trow.payload.previous_package_policy, null);
+  await assert.rejects(registry.setTenantChannelPolicyAudited({ tenantId: 'pgpol', ...named(clearPolicy()), actor: 'x', action: 'channel_policy_tenant_clear', reason: 'pg', ifVersion: policyVersion(t0) }),
+    (err) => err.code === 'version_conflict');
+  await assert.rejects(registry.setTenantChannelPolicyAudited({ tenantId: 'nope', ...named(clearPolicy()), actor: 'x', action: 'channel_policy_tenant_clear', reason: 'pg' }),
+    (err) => err.status === 404);
+  // A failed audit row rolls the tenant write back.
+  await pool.query(`CREATE FUNCTION test_refuse_audit2() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN RAISE EXCEPTION 'audit refused by test'; END $$`);
+  await pool.query('CREATE TRIGGER test_refuse_audit2 BEFORE INSERT ON cp_audit FOR EACH ROW EXECUTE FUNCTION test_refuse_audit2()');
+  try {
+    await assert.rejects(registry.setTenantChannelPolicyAudited({ tenantId: 'pgpol', ...named(clearPolicy()), actor: 'x', action: 'channel_policy_tenant_clear', reason: 'pg', ifVersion: t.version }), /audit refused/);
+  } finally {
+    await pool.query('DROP TRIGGER test_refuse_audit2 ON cp_audit');
+    await pool.query('DROP FUNCTION test_refuse_audit2()');
+  }
+  assert.deepEqual(await registry.tenantChannelPolicies('pgpol'), next);
+  assert.equal((await registry.verifyAudit()).ok, true);
+});
+
+test('step-up device flow on PostgreSQL: a fresh code keeps the approver auth_time and copies it onto the token', async () => {
+  const oauth = require('../controlplane/oauth');
+  await registry.enroll({ tenantId: 'pgauth', userId: 'user-auth', keyId: 'ka', hostId: 'a3a3a3a3-a3a3-4a3a-8a3a-a3a3a3a3a3a3', hostname: 'a.example', os: '', platform: '', sshPubkey: opensshEd25519(7) });
+  await pool.query("UPDATE cp_members SET sso_sub = 'sub-auth' WHERE user_id = 'user-auth'");
+  const env = { NODE_ENV: 'test', SYSTEMAPI_PUBLIC_URL: 'https://api.systemapi.test' };
+  const at = Math.floor(Date.now() / 1000) - 3;
+  const fresh = await oauth.startDevice(registry, 'user-auth', env, {}, Date.now(), { fresh: true });
+  await assert.rejects(oauth.approveUserCode(registry, fresh.user_code, { id: 'sub-auth', auth_time: at - 600 }), (err) => err.code === 'reauth_required');
+  await oauth.approveUserCode(registry, fresh.user_code, { id: 'sub-auth', auth_time: at });
+  const token = await oauth.pollToken(registry, fresh.device_code, env);
+  assert.equal((await oauth.userForAccessToken(registry, token.access_token)).auth_time, at);
+  const plain = await oauth.startDevice(registry, 'user-auth', env, {});
+  await oauth.approveUserCode(registry, plain.user_code, { id: 'sub-auth', auth_time: at });
+  const plainToken = await oauth.pollToken(registry, plain.device_code, env);
+  assert.equal((await oauth.userForAccessToken(registry, plainToken.access_token)).auth_time, null);
+});
+
 test('channel-policy main() against the database prints the summary and never the credentials', async () => {
   const { main } = require('../scripts/channel-policy');
   // Its own host row, so the test does not depend on the enroll test running first.

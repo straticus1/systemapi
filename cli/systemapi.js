@@ -16,6 +16,12 @@
 // succeeded, 1 any other end (or an error), 3 still running (the job id is
 // printed). Output the server hides from this key is never fetched another
 // way; the CLI says so on stderr.
+// policy show|set|diff|clear|inherit|revert drive /api/v1/hosts/<id>/channel-policy
+// (or /api/v1/tenants/<t>/channel-policy with --tenant). Every write first
+// reads the version and asks for a dry run; it applies only without
+// --dry-run, and a dangerous change only with --confirm-dangerous (and a
+// token from login --fresh: the server refuses API keys for those). With no
+// SYSTEMAPI_API_KEY, policy reads the token from SYSTEMAPI_TOKEN_FILE.
 'use strict';
 
 const fs = require('node:fs');
@@ -59,7 +65,13 @@ function usage() {
     '  jobs wait <job-id> [--wait <s>]',
     '  jobs cancel <job-id>',
     '  jobs list [--host <id>] [--status <status>]',
-    '  login <username>'
+    '  login [--fresh] <username>',
+    '  policy show (--host <id> | --tenant <t>)',
+    '  policy set|diff (--host <id> | --tenant <t>) --reason <text> [--dry-run] [--confirm-dangerous] <grant flags>',
+    '    grant flags (repeatable): --tcp-local <port> --file-read <dir> --file-write <dir> --service <unit>',
+    '      --package <name> --config <dir> --tweak-sysctl <key> --tweak-unit <unit>',
+    '  policy clear|inherit (--host <id> | --tenant <t>) --reason <text> [--dry-run] [--confirm-dangerous]',
+    '  policy revert --host <id> --audit-seq <n> --reason <text> [--apply] [--confirm-dangerous]'
   ].join('\n');
 }
 
@@ -266,12 +278,17 @@ function writeTokenFile(file, token) {
 }
 
 async function login(argv) {
-  if (argv.length !== 1) fail(2, usage());
-  const username = argv[0];
+  const fresh = argv[0] === '--fresh';
+  const rest = fresh ? argv.slice(1) : argv;
+  if (rest.length !== 1 || rest[0].startsWith('--')) fail(2, usage());
+  const username = rest[0];
   const base = controlUrl();
   const tokenFile = process.env.SYSTEMAPI_TOKEN_FILE;
   if (typeof tokenFile !== 'string' || !path.isAbsolute(tokenFile)) fail(2, 'token_file_rejected');
-  const started = await requestPublic(base, 'POST', '/oauth/device', { username });
+  // --fresh asks for a step-up token: the browser must sign in to After
+  // Dark SSO again (at most 5 min before approving) and the page says the
+  // token can make dangerous policy changes.
+  const started = await requestPublic(base, 'POST', '/oauth/device', fresh ? { username, fresh: '1' } : { username });
   if (started.status === 429) fail(1, 'slow_down');
   if (started.status !== 200) fail(1, started.status === 403 ? 'login_denied' : 'login_failed');
   const device = started.parsed && started.parsed.device_code;
@@ -582,13 +599,132 @@ async function jobs(argv) {
   fail(2, usage());
 }
 
+const POLICY_GRANT_FLAGS = new Map([['--tcp-local', 'tcp_local'], ['--file-read', 'file_read'], ['--file-write', 'file_write'],
+  ['--service', 'service'], ['--package', 'package'], ['--config', 'config'], ['--tweak-sysctl', 'tweak_sysctl'], ['--tweak-unit', 'tweak_unit']]);
+const POLICY_VERBS = new Set(['show', 'set', 'diff', 'clear', 'inherit', 'revert']);
+const TENANT_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
+
+// The grant values are checked by the server (controlplane/policyrules.js);
+// here only their count and shape, so nothing odd reaches a URL.
+function parsePolicyArgs(argv) {
+  const verb = argv[0];
+  if (!POLICY_VERBS.has(verb)) fail(2, usage());
+  const opts = { verb, host: '', tenant: '', reason: '', auditSeq: null, dryRun: false, apply: false, confirm: false, grants: {} };
+  for (let i = 1; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--dry-run' || arg === '--apply' || arg === '--confirm-dangerous') {
+      const field = arg === '--dry-run' ? 'dryRun' : arg === '--apply' ? 'apply' : 'confirm';
+      if (opts[field]) fail(2, usage());
+      opts[field] = true;
+      continue;
+    }
+    const value = argv[i + 1];
+    if (value === undefined || value.startsWith('--')) fail(2, 'missing value for ' + arg);
+    i += 1;
+    if (POLICY_GRANT_FLAGS.has(arg)) {
+      if (verb !== 'set' && verb !== 'diff') fail(2, arg + ' is only for set and diff');
+      const key = POLICY_GRANT_FLAGS.get(arg);
+      if (value.length > 4096) fail(2, 'invalid ' + arg);
+      (opts.grants[key] = opts.grants[key] || []).push(key === 'tcp_local' && /^[1-9][0-9]{0,4}$/.test(value) ? Number(value) : value);
+    } else if (arg === '--host' || arg === '--tenant' || arg === '--reason' || arg === '--audit-seq') {
+      const field = { '--host': 'host', '--tenant': 'tenant', '--reason': 'reason', '--audit-seq': 'auditSeq' }[arg];
+      if (opts[field]) fail(2, usage());
+      opts[field] = value;
+    } else {
+      fail(2, usage());
+    }
+  }
+  if (Boolean(opts.host) === Boolean(opts.tenant)) fail(2, usage());
+  if (opts.tenant && (!TENANT_RE.test(opts.tenant) || verb === 'revert')) fail(2, usage());
+  if (verb === 'show') {
+    if (opts.reason || opts.dryRun || opts.apply || opts.confirm || opts.auditSeq) fail(2, usage());
+  } else if (!opts.reason.trim()) {
+    fail(2, verb + ' needs --reason');
+  }
+  if (verb === 'revert') {
+    if (!/^[1-9][0-9]{0,15}$/.test(opts.auditSeq || '') || opts.dryRun) fail(2, usage());
+    opts.auditSeq = Number(opts.auditSeq);
+  } else if (opts.auditSeq || opts.apply) {
+    fail(2, usage());
+  }
+  if (verb === 'diff') opts.dryRun = true;
+  return opts;
+}
+
+// SYSTEMAPI_API_KEY, else the device token at SYSTEMAPI_TOKEN_FILE (written
+// by login; a dangerous change needs one from login --fresh).
+function policyConfig() {
+  const key = process.env.SYSTEMAPI_API_KEY;
+  if (typeof key === 'string' && key.trim() !== '') return loadConfig();
+  const file = process.env.SYSTEMAPI_TOKEN_FILE;
+  if (typeof file !== 'string' || !path.isAbsolute(file)) fail(2, 'missing SYSTEMAPI_API_KEY, SYSTEMAPI_TOKEN_FILE');
+  let token;
+  try {
+    token = fs.readFileSync(file, { encoding: 'utf8', flag: fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW }).trim();
+  } catch {
+    fail(2, 'token_file_rejected');
+  }
+  if (token.length < 16 || token.length > 512 || /\s/.test(token)) fail(2, 'token_file_rejected');
+  return { url: controlUrl(), key: token };
+}
+
+async function policy(argv) {
+  const opts = parsePolicyArgs(argv);
+  const cfg = policyConfig();
+  const base = opts.host
+    ? '/api/v1/hosts/' + encodeURIComponent(requireHost(opts.host)) + '/channel-policy'
+    : '/api/v1/tenants/' + encodeURIComponent(opts.tenant) + '/channel-policy';
+  const current = await request(cfg, 'GET', base);
+  if (current.status >= 400) fail(1, errorText(current.parsed, cfg.key));
+  if (!current.parsed || typeof current.parsed.version !== 'string') fail(1, 'bad_response');
+  if (opts.verb === 'show') {
+    await emit(JSON.stringify(current.parsed) + '\n', cfg.key);
+    return;
+  }
+  const body = { reason: opts.reason, if_version: current.parsed.version };
+  let pathname = base;
+  if (opts.verb === 'set' || opts.verb === 'diff') body.grants = opts.grants;
+  else if (opts.verb === 'revert') {
+    pathname = base + '/revert';
+    body.audit_seq = opts.auditSeq;
+  } else pathname = base + '/' + opts.verb;
+  const method = opts.verb === 'set' || opts.verb === 'diff' ? 'PUT' : 'POST';
+  // A revert without apply is the server's dry run.
+  const dry = await request(cfg, method, pathname, body, opts.verb === 'revert' ? {} : { query: { dry_run: '1' } });
+  if (dry.status >= 400) fail(1, errorText(dry.parsed, cfg.key));
+  if (!dry.parsed || !Array.isArray(dry.parsed.dangerous)) fail(1, 'bad_response');
+  if (opts.dryRun || (opts.verb === 'revert' && !opts.apply)) {
+    await emit(JSON.stringify(dry.parsed) + '\n', cfg.key);
+    return;
+  }
+  if (dry.parsed.dangerous.length > 0) {
+    if (!opts.confirm) {
+      await emit(JSON.stringify(dry.parsed) + '\n', cfg.key);
+      fail(1, 'dangerous_unconfirmed: rerun with --confirm-dangerous (and a login --fresh token)');
+    }
+    body.confirm_dangerous = dry.parsed.dangerous;
+  }
+  if (opts.verb === 'revert') body.apply = true;
+  const done = await request(cfg, method, pathname, body);
+  if (done.status >= 400) {
+    const reason = done.parsed && typeof done.parsed.reason === 'string' ? ': ' + visible(done.parsed.reason, cfg.key) : '';
+    fail(1, errorText(done.parsed, cfg.key) + reason);
+  }
+  if (!done.parsed || typeof done.parsed !== 'object') fail(1, 'bad_response');
+  await emit(JSON.stringify(done.parsed) + '\n', cfg.key);
+}
+
 async function main() {
   const argv = process.argv.slice(2);
   const cmd = argv[0];
-  const known = new Set(['hosts', 'exec', 'metrics', 'audit', 'breakglass-ticket', 'host-json', 'login', 'retire', 'jobs']);
+  const known = new Set(['hosts', 'exec', 'metrics', 'audit', 'breakglass-ticket', 'host-json', 'login', 'retire', 'jobs', 'policy']);
   if (!cmd || !known.has(cmd)) fail(2, usage());
   if (cmd === 'login') {
     await login(argv.slice(1));
+    return;
+  }
+  if (cmd === 'policy') {
+    await policy(argv.slice(1));
     return;
   }
   if (cmd === 'jobs') {
@@ -705,4 +841,4 @@ if (require.main === module) {
 }
 
 // For tests.
-module.exports = { defaultWaitUntil };
+module.exports = { defaultWaitUntil, parsePolicyArgs };

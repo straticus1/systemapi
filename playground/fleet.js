@@ -1221,6 +1221,37 @@ class FleetManager {
         return true;
     }
 
+    // Channel-policy writes (plan P2d): the live sessions on this replica
+    // whose host matches match(hostId, tenantId): tcp (each mesh stream is a
+    // tcp session too), file, xfer, and the mesh sessions themselves.
+    policySessions(match) {
+        const out = [];
+        for (const s of this.tcp.sessions.values()) if (!s.ended && match(s.hostId, s.tenantId)) out.push(['tcp', s]);
+        for (const s of this.file.sessions.values()) if (!s.ended && match(s.hostId, s.tenantId)) out.push(['file', s]);
+        for (const g of this.xfer.grants.values()) if (g.state === 'live' && match(g.hostId, g.tenantId)) out.push(['xfer', g]);
+        for (const m of this.mesh.sessions.values()) if (!m.ended && match(m.hostId, m.tenantId)) out.push(['mesh', m]);
+        return out;
+    }
+
+    // Renews each matching session now instead of at its next 30 s tick.
+    // Renewal re-checks the grant against the stored policy and ends one it
+    // no longer allows with stopped; that session's own end row (tcp_end,
+    // file_end, xfer_result, mesh_end) audits the stop. A mesh session
+    // re-checks its scope; its streams re-check the tcp policy as tcp
+    // sessions. This replica only: a cross-replica fan-out (LISTEN/NOTIFY,
+    // as jobs) waits for a second replica. Returns how many were renewed.
+    renewPolicySessions(match) {
+        const list = this.policySessions(match);
+        for (const [kind, s] of list) {
+            const run = kind === 'tcp' ? this.tcp.renew(s)
+                : kind === 'file' ? this.file.renew(s)
+                    : kind === 'xfer' ? this.xfer.renew(s)
+                        : this.mesh.recheck(s);
+            run.catch((err) => console.error(`[Fleet] ${kind} policy renewal failed:`, err.message));
+        }
+        return list.length;
+    }
+
     // True when capability is in the live agent's effective set: advertised
     // on dial, minus the degraded header, minus what the latest report on
     // this connection marks degraded or absent (sysscript_jobs and converge

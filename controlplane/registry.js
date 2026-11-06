@@ -22,6 +22,7 @@ const { scopesForKeyRows } = require('./authz');
 const { escapeLike, efficiency: efficiencyOf } = require('./stats');
 const { fingerprint } = require('./token');
 const { assertPolicyShape } = require('./channels');
+const { policyVersion, pickColumns } = require('./policyrules');
 const { demoKeyAllowed } = require('./httpauth');
 const { sshKeyMaterial } = require('./sshkey');
 const { alertAuditEntry, ALERT_RULE_RE } = require('./capalerts');
@@ -192,15 +193,18 @@ async function ssoBindInTx(client, { tenantId, userId, sub, actor }) {
   return { tenant_id: tenantId, user_id: userId, bound: sub !== null };
 }
 
-// The audit row for a host channel policy write: why, and the new and the
-// previous policies of both columns.
-function channelPolicyAuditEntry(tenantId, hostId, actor, action, reason, tcpPolicy, filePolicy, prevTcp, prevFile, servicePolicy = null, prevService = null, packagePolicy = null, prevPackage = null, configPolicy = null, prevConfig = null, tweakPolicy = null, prevTweak = null) {
+// The audit row for a host (or, hostId null, tenant) channel policy write:
+// why, and the new and the previous values of all six columns. extra adds
+// fixed fields (policy_schema, the actor's key fingerprint, the dangerous
+// list, revert_of); it never replaces the recorded policies.
+function channelPolicyAuditEntry(tenantId, hostId, actor, action, reason, tcpPolicy, filePolicy, prevTcp, prevFile, servicePolicy = null, prevService = null, packagePolicy = null, prevPackage = null, configPolicy = null, prevConfig = null, tweakPolicy = null, prevTweak = null, extra = null) {
   return {
     tenant_id: tenantId,
     host_id: hostId,
     actor,
     action,
     payload: {
+      ...(extra || {}),
       reason: reason ?? null,
       tcp_policy: tcpPolicy,
       file_policy: filePolicy,
@@ -216,6 +220,17 @@ function channelPolicyAuditEntry(tenantId, hostId, actor, action, reason, tcpPol
       previous_tweak_policy: prevTweak ?? null
     }
   };
+}
+
+// A version mismatch under the row lock: another write landed since the
+// caller read the policy.
+function assertPolicyVersion(prev, ifVersion) {
+  if (ifVersion === undefined) return;
+  if (policyVersion(pickColumns(prev)) !== ifVersion) throw http(409, 'version_conflict');
+}
+
+function auditPolicyFields(row) {
+  return row ? { seq: Number(row.seq), tenant_id: row.tenant_id, host_id: row.host_id, action: row.action, payload: row.payload } : null;
 }
 
 // The audit row for a key scope change: the key id (its public part), the
@@ -1127,7 +1142,10 @@ class MemoryRegistry {
 
   // All three host columns and their audit row together: the row is written
   // first and the policy changes only once it is in (see PgRegistry).
-  async setHostChannelPolicyAudited({ tenantId, hostId, tcpPolicy, filePolicy, servicePolicy = null, packagePolicy = null, configPolicy = null, tweakPolicy = null, actor, action, reason }) {
+  // ifVersion (the routes) must equal policyVersion of the current columns,
+  // else 409 version_conflict and nothing is written. Returns the audit seq
+  // and the new version.
+  async setHostChannelPolicyAudited({ tenantId, hostId, tcpPolicy, filePolicy, servicePolicy = null, packagePolicy = null, configPolicy = null, tweakPolicy = null, actor, action, reason, ifVersion, extra = null }) {
     const row = this.hosts.get(hostId);
     if (!row || row.tenant_id !== tenantId) throw http(404, 'not_found');
     assertPolicyShape('tcp', tcpPolicy);
@@ -1137,7 +1155,8 @@ class MemoryRegistry {
     assertPolicyShape('config', configPolicy);
     assertPolicyShape('tweak', tweakPolicy);
     const cur = this.hostPolicies.get(hostId) || {};
-    await this.appendAudit(channelPolicyAuditEntry(tenantId, hostId, actor, action, reason, tcpPolicy, filePolicy, cur.tcp_policy, cur.file_policy, servicePolicy, cur.service_policy, packagePolicy, cur.package_policy, configPolicy, cur.config_policy, tweakPolicy, cur.tweak_policy));
+    assertPolicyVersion(cur, ifVersion);
+    const audit = await this.appendAudit(channelPolicyAuditEntry(tenantId, hostId, actor, action, reason, tcpPolicy, filePolicy, cur.tcp_policy, cur.file_policy, servicePolicy, cur.service_policy, packagePolicy, cur.package_policy, configPolicy, cur.config_policy, tweakPolicy, cur.tweak_policy, extra));
     this.hostPolicies.set(hostId, {
       tcp_policy: tcpPolicy === null ? null : JSON.parse(JSON.stringify(tcpPolicy)),
       file_policy: filePolicy === null ? null : JSON.parse(JSON.stringify(filePolicy)),
@@ -1146,6 +1165,36 @@ class MemoryRegistry {
       config_policy: configPolicy === null ? null : JSON.parse(JSON.stringify(configPolicy)),
       tweak_policy: tweakPolicy === null ? null : JSON.parse(JSON.stringify(tweakPolicy))
     });
+    return { audit_seq: audit.seq, version: policyVersion({ tcp_policy: tcpPolicy, file_policy: filePolicy, service_policy: servicePolicy, package_policy: packagePolicy, config_policy: configPolicy, tweak_policy: tweakPolicy }) };
+  }
+
+  // The tenant's six raw columns, or null for an unknown tenant.
+  async tenantChannelPolicies(tenantId) {
+    if (!this.tenants.has(tenantId)) return null;
+    return pickColumns(this.tenantPolicies.get(tenantId) || {});
+  }
+
+  // The tenant twin of setHostChannelPolicyAudited (P2a): the audit row has
+  // host_id null; the row is written first and the policy changes only once
+  // it is in.
+  async setTenantChannelPolicyAudited({ tenantId, tcpPolicy, filePolicy, servicePolicy, packagePolicy, configPolicy, tweakPolicy, actor, action, reason, ifVersion, extra = null }) {
+    if (!this.tenants.has(tenantId)) throw http(404, 'not_found');
+    const next = { tcp_policy: tcpPolicy, file_policy: filePolicy, service_policy: servicePolicy, package_policy: packagePolicy, config_policy: configPolicy, tweak_policy: tweakPolicy };
+    for (const key of POLICY_COLUMNS) {
+      if (next[key] === undefined) throw http(400, 'bad_policy');
+      assertPolicyShape(POLICY_KIND[key], next[key]);
+    }
+    const cur = this.tenantPolicies.get(tenantId) || {};
+    assertPolicyVersion(cur, ifVersion);
+    const audit = await this.appendAudit(channelPolicyAuditEntry(tenantId, null, actor, action, reason, tcpPolicy, filePolicy, cur.tcp_policy, cur.file_policy, servicePolicy, cur.service_policy, packagePolicy, cur.package_policy, configPolicy, cur.config_policy, tweakPolicy, cur.tweak_policy, extra));
+    this.tenantPolicies.set(tenantId, JSON.parse(JSON.stringify(next)));
+    return { audit_seq: audit.seq, version: policyVersion(next) };
+  }
+
+  // One audit row by seq for a policy revert; the caller checks its tenant,
+  // host and action.
+  async policyAuditRow(seq) {
+    return auditPolicyFields(this.audit.find((r) => r.seq === seq));
   }
 
   async setTenantChannelPolicy(tenantId, fields) {
@@ -2895,7 +2944,7 @@ class PgRegistry {
   // One transaction on one client: lock the host row (it must belong to
   // tenantId), replace the three policy columns, append the audit row with the
   // old and new policies. Any failure rolls all of it back.
-  async setHostChannelPolicyAudited({ tenantId, hostId, tcpPolicy, filePolicy, servicePolicy = null, packagePolicy = null, configPolicy = null, tweakPolicy = null, actor, action, reason }) {
+  async setHostChannelPolicyAudited({ tenantId, hostId, tcpPolicy, filePolicy, servicePolicy = null, packagePolicy = null, configPolicy = null, tweakPolicy = null, actor, action, reason, ifVersion, extra = null }) {
     assertPolicyShape('tcp', tcpPolicy);
     assertPolicyShape('file', filePolicy);
     assertPolicyShape('service', servicePolicy);
@@ -2911,20 +2960,74 @@ class PgRegistry {
       );
       if (cur.rowCount === 0) throw http(404, 'not_found');
       const prev = cur.rows[0];
+      assertPolicyVersion(prev, ifVersion);
       await client.query(
         'UPDATE cp_hosts SET tcp_policy = $2::jsonb, file_policy = $3::jsonb, service_policy = $4::jsonb, package_policy = $5::jsonb, config_policy = $6::jsonb, tweak_policy = $7::jsonb WHERE host_id = $1',
         [hostId, tcpPolicy === null ? null : JSON.stringify(tcpPolicy), filePolicy === null ? null : JSON.stringify(filePolicy),
           servicePolicy === null ? null : JSON.stringify(servicePolicy), packagePolicy === null ? null : JSON.stringify(packagePolicy),
           configPolicy === null ? null : JSON.stringify(configPolicy), tweakPolicy === null ? null : JSON.stringify(tweakPolicy)]
       );
-      await auditInsert(client, channelPolicyAuditEntry(tenantId, hostId, actor, action, reason, tcpPolicy, filePolicy, prev.tcp_policy, prev.file_policy, servicePolicy, prev.service_policy, packagePolicy, prev.package_policy, configPolicy, prev.config_policy, tweakPolicy, prev.tweak_policy));
+      const audit = await auditInsert(client, channelPolicyAuditEntry(tenantId, hostId, actor, action, reason, tcpPolicy, filePolicy, prev.tcp_policy, prev.file_policy, servicePolicy, prev.service_policy, packagePolicy, prev.package_policy, configPolicy, prev.config_policy, tweakPolicy, prev.tweak_policy, extra));
       await client.query('COMMIT');
+      return { audit_seq: audit && audit.seq !== undefined ? Number(audit.seq) : null, version: policyVersion({ tcp_policy: tcpPolicy, file_policy: filePolicy, service_policy: servicePolicy, package_policy: packagePolicy, config_policy: configPolicy, tweak_policy: tweakPolicy }) };
     } catch (err) {
       try { await client.query('ROLLBACK'); } catch { /* connection already failed */ }
       throw err;
     } finally {
       client.release();
     }
+  }
+
+  async tenantChannelPolicies(tenantId) {
+    const res = await this.pool.query(
+      'SELECT tcp_policy, file_policy, service_policy, package_policy, config_policy, tweak_policy FROM cp_tenants WHERE tenant_id = $1',
+      [tenantId]
+    );
+    return res.rows[0] ? pickColumns(res.rows[0]) : null;
+  }
+
+  // The tenant twin of setHostChannelPolicyAudited (P2a): lock the cp_tenants
+  // row, check ifVersion, replace all six columns, append the audit row with
+  // host_id null; one transaction on one client.
+  async setTenantChannelPolicyAudited({ tenantId, tcpPolicy, filePolicy, servicePolicy, packagePolicy, configPolicy, tweakPolicy, actor, action, reason, ifVersion, extra = null }) {
+    const next = { tcp_policy: tcpPolicy, file_policy: filePolicy, service_policy: servicePolicy, package_policy: packagePolicy, config_policy: configPolicy, tweak_policy: tweakPolicy };
+    for (const key of POLICY_COLUMNS) {
+      if (next[key] === undefined) throw http(400, 'bad_policy');
+      assertPolicyShape(POLICY_KIND[key], next[key]);
+    }
+    const json = (v) => (v === null ? null : JSON.stringify(v));
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const cur = await client.query(
+        'SELECT tcp_policy, file_policy, service_policy, package_policy, config_policy, tweak_policy FROM cp_tenants WHERE tenant_id = $1 FOR UPDATE',
+        [tenantId]
+      );
+      if (cur.rowCount === 0) throw http(404, 'not_found');
+      const prev = cur.rows[0];
+      assertPolicyVersion(prev, ifVersion);
+      await client.query(
+        'UPDATE cp_tenants SET tcp_policy = $2::jsonb, file_policy = $3::jsonb, service_policy = $4::jsonb, package_policy = $5::jsonb, config_policy = $6::jsonb, tweak_policy = $7::jsonb WHERE tenant_id = $1',
+        [tenantId, json(tcpPolicy), json(filePolicy), json(servicePolicy), json(packagePolicy), json(configPolicy), json(tweakPolicy)]
+      );
+      const audit = await auditInsert(client, channelPolicyAuditEntry(tenantId, null, actor, action, reason, tcpPolicy, filePolicy, prev.tcp_policy, prev.file_policy, servicePolicy, prev.service_policy, packagePolicy, prev.package_policy, configPolicy, prev.config_policy, tweakPolicy, prev.tweak_policy, extra));
+      await client.query('COMMIT');
+      return { audit_seq: audit && audit.seq !== undefined ? Number(audit.seq) : null, version: policyVersion(next) };
+    } catch (err) {
+      try { await client.query('ROLLBACK'); } catch { /* connection already failed */ }
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async policyAuditRow(seq) {
+    if (!Number.isSafeInteger(seq) || seq < 1) return null;
+    const res = await this.pool.query(
+      'SELECT seq, tenant_id, host_id, action, payload FROM cp_audit WHERE seq = $1',
+      [seq]
+    );
+    return auditPolicyFields(res.rows[0]);
   }
 
   // table and key are fixed identifiers from the two callers above, never
