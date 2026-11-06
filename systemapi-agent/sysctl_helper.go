@@ -150,8 +150,12 @@ func sysctlSetViaHelper(key, value string, lease *Lease) error {
 	if !sysctlValueOK(value) {
 		return fmt.Errorf("sysctl value not allowed")
 	}
-	if lease == nil {
-		return fmt.Errorf("sysctl set refused: lease_missing")
+	payload, err := sysTweakLeasePayload("sysctl-set", key, value, "", "", "", "")
+	if err != nil {
+		return fmt.Errorf("sysctl not allowed")
+	}
+	if code := helperPreflight("sys_tweak", payload, lease, time.Now()); code != "" {
+		return fmt.Errorf("sysctl set refused: %s", code)
 	}
 	if err := os.MkdirAll(sysctlHelperStateDir, 0o700); err != nil {
 		return fmt.Errorf("handoff dir: %w", err)

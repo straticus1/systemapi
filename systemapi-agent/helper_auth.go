@@ -126,6 +126,54 @@ func helperAuthorize(action, payload string, lease *Lease, now time.Time) string
 	return ""
 }
 
+// helperDispatchPrefix keys a helper dispatch in the agent's nonce cache
+// (rememberNonce). It is not hex, so it never collides with the entry
+// authorizeCommand records for the same nonce at the channel gate.
+const helperDispatchPrefix = "helper:"
+
+// helperPreflight is the AGENT-side check every mutation helper handoff runs
+// before it writes a request or triggers the privileged unit. It returns ""
+// when lease is a lease for exactly action+payload, signed by the agent's
+// pinned control key for the enrolled host and inside its time window, and
+// this agent has not dispatched a helper for its nonce before; else a stable
+// code from the helperAuthorize set. The caller rebuilds payload from what
+// the helper will write.
+//
+// Threats: a caller handing a non-nil lease of the wrong capability (a
+// terminal pty/pty_root lease from a sash session), a sys lease for another
+// target, content or value, an expired, wrong-host or forged lease, or the
+// same lease twice, any of which would otherwise start the root helper unit
+// before the helper itself refuses. It does NOT replace the helper's own
+// check (helperAuthorize), which stays authoritative against a compromised
+// agent.
+//
+// Nonce handling: this never touches the helper's durable store, so the
+// helper consumes the nonce exactly once (no double consume). It records the
+// dispatch in the agent's in-memory cache under helperDispatchPrefix, checked
+// and recorded under identityMu, so two concurrent handoffs with one lease
+// cannot both pass; that entry is separate from the one authorizeCommand
+// records, so a lease that passed the channel gate still passes here. A
+// restart clears the cache; the helper's durable store still refuses a replay.
+func helperPreflight(action, payload string, lease *Lease, now time.Time) string {
+	if lease == nil {
+		return "lease_missing"
+	}
+	identityMu.Lock()
+	pub := controlPub
+	host := enrolledHostID
+	identityMu.Unlock()
+	if len(pub) != ed25519.PublicKeySize || host == "" {
+		return "not_enrolled"
+	}
+	if err := verifyLease(pub, lease, host, action, payload, now); err != nil {
+		return "lease_" + err.Error()
+	}
+	if err := rememberNonce(helperDispatchPrefix+lease.NonceHex, now); err != nil {
+		return "replay"
+	}
+	return ""
+}
+
 // trustedNode checks that info is owned by helperTrustOwnerUID, is not a
 // symlink, and is not group/other writable.
 func trustedNode(info os.FileInfo) error {
