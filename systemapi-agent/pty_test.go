@@ -430,6 +430,34 @@ func TestPTYIdentityDropsToConfiguredUser(t *testing.T) {
 	}
 }
 
+func TestSashShellEnvReplacesPasswdShell(t *testing.T) {
+	base := []string{"PATH=/bin", "SHELL=/bin/bash", "HOME=/home/ops"}
+	got, ok := replaceSashShell(base, "/usr/local/bin/sash")
+	if !ok {
+		t.Fatal("refused a safe path")
+	}
+	joined := strings.Join(got, "\n")
+	if strings.Contains(joined, "/bin/bash") || !strings.Contains(joined, "SHELL=/usr/local/bin/sash") {
+		t.Fatalf("shell %s", joined)
+	}
+	if !strings.Contains(joined, "PATH=/bin") || !strings.Contains(joined, "HOME=/home/ops") {
+		t.Fatalf("other env %s", joined)
+	}
+	if base[1] != "SHELL=/bin/bash" {
+		t.Fatal("mutated input")
+	}
+	added, ok := replaceSashShell([]string{"PATH=/bin"}, "/usr/bin/sash")
+	if !ok || strings.Join(added, "\n") != "PATH=/bin\nSHELL=/usr/bin/sash" {
+		t.Fatalf("missing shell %v", added)
+	}
+	for _, bad := range []string{"", "/bin/sash\n", "/bin/sash=x", "/tmp/sash&", "sash\x00bin", "sash<bin", "sash>bin", "sash\x7fpath"} {
+		got, ok = replaceSashShell(base, bad)
+		if ok || got != nil {
+			t.Fatalf("accepted unsafe path")
+		}
+	}
+}
+
 func writeScript(t *testing.T, body string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "shell.sh")

@@ -4,7 +4,10 @@
 // session freezing the agent, and processes a shell leaves behind. On Linux,
 // pty and pty_root exec sash with a verified sash/1 grant; a missing binary
 // is sash_missing; a bad grant does not fall open to bash; the agent does
-// not hold the grant private key. Break-glass still execs adssh, sets
+// not hold the grant private key. After that login succeeds, SHELL is the
+// looked-up sash path. A path that is not a safe env token does not start,
+// and the path is not logged. The passwd shell is not left in SHELL.
+// Break-glass still execs adssh, sets
 // ADSSH_SASH_EMERGENCY, and does not attach a fleet grant or the emergency
 // seed. Each
 // session is keyed by a server-generated session id and needs a signed lease
@@ -38,6 +41,7 @@ import (
 	"regexp"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -472,6 +476,27 @@ func sessionEnv(id *ptyIdentity, extra []string) []string {
 	return stripChildEnv(append(env, extra...), nil)
 }
 
+// replaceSashShell sets SHELL to the looked-up sash binary. The passwd shell
+// is not advertised. A path that is not a safe env token refuses the
+// session; the path is not returned.
+func replaceSashShell(env []string, argv0 string) ([]string, bool) {
+	if !sashEnvToken(argv0) {
+		return nil, false
+	}
+	out := append([]string(nil), env...)
+	replaced := false
+	for i, e := range out {
+		if strings.HasPrefix(e, "SHELL=") {
+			out[i] = "SHELL=" + argv0
+			replaced = true
+		}
+	}
+	if !replaced {
+		out = append(out, "SHELL="+argv0)
+	}
+	return out, true
+}
+
 func clampSize(n, fallback int) uint16 {
 	if n == 0 {
 		return uint16(fallback)
@@ -661,6 +686,22 @@ func startPTYSession(out ptyOut, hostID, stateDir string, req ptyStartRequest, n
 			ptyStatusError(out, sid, code)
 			return
 		}
+		next, ok := replaceSashShell(env, argv0)
+		if !ok {
+			sashCloseExtras(sashExtra)
+			if sashStop != nil {
+				sashStop()
+			}
+			if s.rec != nil {
+				if _, ferr := s.rec.finish(map[string]interface{}{"reason": "start_failed"}); ferr != nil {
+					log.Printf("sash session recording finish failed")
+				}
+			}
+			log.Printf("sash session refused: shell_token")
+			ptyStatusError(out, sid, "pty_start_failed")
+			return
+		}
+		env = next
 		s.sashStop = sashStop
 	}
 
