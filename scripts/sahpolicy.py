@@ -55,7 +55,7 @@ def credentials():
                 key = f.read(1024).strip()
         except OSError:
             sys.exit("sahpolicy: token_file_rejected")
-    if len(key) < 16 or re.search(r"\s", key):
+    if len(key) < 8 or re.search(r"\s", key):
         sys.exit("sahpolicy: the key or token is malformed")
     return base, key
 
