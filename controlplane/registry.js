@@ -1143,11 +1143,13 @@ class MemoryRegistry {
   // All three host columns and their audit row together: the row is written
   // first and the policy changes only once it is in (see PgRegistry).
   // ifVersion (the routes) must equal policyVersion of the current columns,
-  // else 409 version_conflict and nothing is written. Returns the audit seq
-  // and the new version.
-  async setHostChannelPolicyAudited({ tenantId, hostId, tcpPolicy, filePolicy, servicePolicy = null, packagePolicy = null, configPolicy = null, tweakPolicy = null, actor, action, reason, ifVersion, extra = null }) {
+  // and tenantVersion (optional) that of the tenant's, else 409
+  // version_conflict and nothing is written; a retired host is 409
+  // host_retired. Returns the audit seq and the new version.
+  async setHostChannelPolicyAudited({ tenantId, hostId, tcpPolicy, filePolicy, servicePolicy = null, packagePolicy = null, configPolicy = null, tweakPolicy = null, actor, action, reason, ifVersion, tenantVersion, extra = null }) {
     const row = this.hosts.get(hostId);
     if (!row || row.tenant_id !== tenantId) throw http(404, 'not_found');
+    if (row.retired_at) throw http(409, 'host_retired');
     assertPolicyShape('tcp', tcpPolicy);
     assertPolicyShape('file', filePolicy);
     assertPolicyShape('service', servicePolicy);
@@ -1156,6 +1158,7 @@ class MemoryRegistry {
     assertPolicyShape('tweak', tweakPolicy);
     const cur = this.hostPolicies.get(hostId) || {};
     assertPolicyVersion(cur, ifVersion);
+    assertPolicyVersion(this.tenantPolicies.get(tenantId) || {}, tenantVersion);
     const audit = await this.appendAudit(channelPolicyAuditEntry(tenantId, hostId, actor, action, reason, tcpPolicy, filePolicy, cur.tcp_policy, cur.file_policy, servicePolicy, cur.service_policy, packagePolicy, cur.package_policy, configPolicy, cur.config_policy, tweakPolicy, cur.tweak_policy, extra));
     this.hostPolicies.set(hostId, {
       tcp_policy: tcpPolicy === null ? null : JSON.parse(JSON.stringify(tcpPolicy)),
@@ -2942,9 +2945,11 @@ class PgRegistry {
   }
 
   // One transaction on one client: lock the host row (it must belong to
-  // tenantId), replace the three policy columns, append the audit row with the
-  // old and new policies. Any failure rolls all of it back.
-  async setHostChannelPolicyAudited({ tenantId, hostId, tcpPolicy, filePolicy, servicePolicy = null, packagePolicy = null, configPolicy = null, tweakPolicy = null, actor, action, reason, ifVersion, extra = null }) {
+  // tenantId; retired is 409 host_retired), check ifVersion, and with
+  // tenantVersion the tenant's columns under FOR SHARE (409
+  // version_conflict), replace the six policy columns, append the audit row
+  // with the old and new policies. Any failure rolls all of it back.
+  async setHostChannelPolicyAudited({ tenantId, hostId, tcpPolicy, filePolicy, servicePolicy = null, packagePolicy = null, configPolicy = null, tweakPolicy = null, actor, action, reason, ifVersion, tenantVersion, extra = null }) {
     assertPolicyShape('tcp', tcpPolicy);
     assertPolicyShape('file', filePolicy);
     assertPolicyShape('service', servicePolicy);
@@ -2955,12 +2960,24 @@ class PgRegistry {
     try {
       await client.query('BEGIN');
       const cur = await client.query(
-        'SELECT tcp_policy, file_policy, service_policy, package_policy, config_policy, tweak_policy FROM cp_hosts WHERE host_id = $1 AND tenant_id = $2 FOR UPDATE',
+        'SELECT tcp_policy, file_policy, service_policy, package_policy, config_policy, tweak_policy, retired_at FROM cp_hosts WHERE host_id = $1 AND tenant_id = $2 FOR UPDATE',
         [hostId, tenantId]
       );
       if (cur.rowCount === 0) throw http(404, 'not_found');
       const prev = cur.rows[0];
+      if (prev.retired_at) throw http(409, 'host_retired');
       assertPolicyVersion(prev, ifVersion);
+      // The tenant side the caller judged the write against (its dangerous
+      // list): held FOR SHARE, so a tenant write cannot land between this
+      // check and the commit.
+      if (tenantVersion !== undefined) {
+        const tenant = await client.query(
+          'SELECT tcp_policy, file_policy, service_policy, package_policy, config_policy, tweak_policy FROM cp_tenants WHERE tenant_id = $1 FOR SHARE',
+          [tenantId]
+        );
+        if (tenant.rowCount === 0) throw http(404, 'not_found');
+        assertPolicyVersion(tenant.rows[0], tenantVersion);
+      }
       await client.query(
         'UPDATE cp_hosts SET tcp_policy = $2::jsonb, file_policy = $3::jsonb, service_policy = $4::jsonb, package_policy = $5::jsonb, config_policy = $6::jsonb, tweak_policy = $7::jsonb WHERE host_id = $1',
         [hostId, tcpPolicy === null ? null : JSON.stringify(tcpPolicy), filePolicy === null ? null : JSON.stringify(filePolicy),

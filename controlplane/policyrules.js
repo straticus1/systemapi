@@ -367,6 +367,15 @@ function dangerousEntries(beforeEff, afterEff) {
   return [...dangerousOf(afterEff)].filter((e) => !before.has(e)).sort();
 }
 
+// The dangerous entries a host write grants: newly effective, or newly
+// explicit at host level. Pinning a tenant-granted dangerous entry on the
+// host is dangerous too: the pin keeps it after the tenant narrows.
+function hostDangerousEntries(hostBefore, hostAfter, tenantCols) {
+  const effective = dangerousEntries(effectiveOf(hostBefore, tenantCols), effectiveOf(hostAfter, tenantCols));
+  const explicit = dangerousEntries(effectiveOf(hostBefore, null), effectiveOf(hostAfter, null));
+  return [...new Set([...effective, ...explicit])].sort();
+}
+
 // The columns that change, with their old and new stored values.
 function diffColumns(before, after) {
   const out = {};
@@ -432,6 +441,7 @@ module.exports = {
   effectiveColumns,
   unitProtected,
   dangerousEntries,
+  hostDangerousEntries,
   diffColumns,
   grantsOf
 };

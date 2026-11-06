@@ -200,6 +200,43 @@ test('policy API writes (P2): if_version under the row lock, the tenant twin wit
   assert.equal((await registry.verifyAudit()).ok, true);
 });
 
+test('policy API host writes: tenantVersion checked under FOR SHARE (a tenant write in flight is waited for), retired is 409', async () => {
+  const { policyVersion, clearPolicy, inheritPolicy } = require('../controlplane/policyrules');
+  const HOST_S = 'a3a3a3a3-a3a3-4a3a-8a3a-a3a3a3a3a3a3';
+  await registry.enroll({ tenantId: 'pgshare', userId: 'user-share', keyId: 'ks', hostId: HOST_S, hostname: 's.example', os: '', platform: '', sshPubkey: opensshEd25519(7) });
+  const named = (cols) => ({ tcpPolicy: cols.tcp_policy, filePolicy: cols.file_policy, servicePolicy: cols.service_policy, packagePolicy: cols.package_policy, configPolicy: cols.config_policy, tweakPolicy: cols.tweak_policy });
+  const t0 = policyVersion(await registry.tenantChannelPolicies('pgshare'));
+  const write = (tenantVersion) => registry.setHostChannelPolicyAudited({ tenantId: 'pgshare', hostId: HOST_S, ...named(clearPolicy()), actor: 'x', action: 'channel_policy_clear', reason: 'pg', ifVersion: undefined, tenantVersion, extra: { policy_schema: 2 } });
+  // A stale tenant version is 409 and writes nothing.
+  const n = (await pool.query('SELECT count(*)::int AS n FROM cp_audit')).rows[0].n;
+  await assert.rejects(write('0'.repeat(64)), (err) => err.status === 409 && err.code === 'version_conflict');
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM cp_audit')).rows[0].n, n);
+  // A tenant write holding the row: the host write waits for it, then sees
+  // the new tenant columns and refuses.
+  const other = await pool.connect();
+  try {
+    await other.query('BEGIN');
+    await other.query('SELECT 1 FROM cp_tenants WHERE tenant_id = $1 FOR UPDATE', ['pgshare']);
+    let settled = false;
+    const pending = write(t0).then(() => { settled = 'ok'; }, (err) => { settled = err.code; });
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(settled, false, 'the host write must wait for the tenant row');
+    await other.query('UPDATE cp_tenants SET package_policy = $2::jsonb WHERE tenant_id = $1', ['pgshare', JSON.stringify({ names: ['curl'] })]);
+    await other.query('COMMIT');
+    await pending;
+    assert.equal(settled, 'version_conflict');
+  } finally {
+    other.release();
+  }
+  const t1 = policyVersion(await registry.tenantChannelPolicies('pgshare'));
+  const ok = await write(t1);
+  assert.ok(ok.audit_seq > 0);
+  // Retired: 409 host_retired under the row lock.
+  await registry.retireHost({ tenantId: 'pgshare', hostId: HOST_S, actor: 'x', reason: 'gone', forced: false });
+  await assert.rejects(registry.setHostChannelPolicyAudited({ tenantId: 'pgshare', hostId: HOST_S, ...named(inheritPolicy()), actor: 'x', action: 'channel_policy_inherit', reason: 'pg' }),
+    (err) => err.status === 409 && err.code === 'host_retired');
+});
+
 test('channel-policy main() against the database prints the summary and never the credentials', async () => {
   const { main } = require('../scripts/channel-policy');
   // Its own host row, so the test does not depend on the enroll test running first.

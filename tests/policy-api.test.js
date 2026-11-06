@@ -400,6 +400,51 @@ test('dangerous classes: protected unit globs, bare names and sockets; /etc conf
   }
 });
 
+test('pinning a tenant-granted dangerous entry on the host needs step-up; the tenant side is checked again at the write', async () => {
+  const r = await rig();
+  try {
+    const reg = r.fm.registry;
+    await reg.setTenantChannelPolicy('acme', { package_policy: { names: ['curl'] }, tcp_policy: { allow: [{ local: true, ports: [22] }] } });
+    let v = await version(r);
+    // Already in force through the tenant, but newly explicit on the host.
+    const dry = await call(r, 'PUT', `${P()}?dry_run=1`, { body: { reason: 'r', if_version: v, grants: { package: ['curl'] } } });
+    assert.deepEqual(dry.body.dangerous, ['package:curl']);
+    const key = await call(r, 'PUT', P(), { body: { reason: 'r', if_version: v, grants: { package: ['curl'] }, confirm_dangerous: ['package:curl'] } });
+    assert.equal(key.status, 403);
+    assert.equal(key.body.error, 'step_up_required');
+    // A host pin of a safe kind stays an API-key change.
+    const safe = await call(r, 'PUT', P(), { body: { reason: 'r', if_version: v, grants: { tcp_local: [22] } } });
+    assert.equal(safe.status, 200, JSON.stringify(safe.body));
+    assert.deepEqual(safe.body.dangerous, []);
+    v = safe.body.version;
+    // A tenant write landing between the route's read and the host write:
+    // the dangerous list was judged on the old tenant side, so 409.
+    await reg.setTenantChannelPolicy('acme', { package_policy: null });
+    const orig = reg.channelPolicies.bind(reg);
+    let once = true;
+    reg.channelPolicies = async (id) => {
+      const value = await orig(id);
+      if (once) {
+        once = false;
+        await reg.setTenantChannelPolicy('acme', { package_policy: { names: ['nginx'] } });
+      }
+      return value;
+    };
+    const rows = policyRows(r).length;
+    const raced = await call(r, 'POST', `${P()}/inherit`, { body: { reason: 'r', if_version: v } });
+    reg.channelPolicies = orig;
+    assert.equal(raced.status, 409, JSON.stringify(raced.body));
+    assert.equal(raced.body.error, 'version_conflict');
+    assert.equal(policyRows(r).length, rows);
+    // Retired under the write itself (memory twin of the row lock check).
+    await reg.retireHost({ tenantId: 'acme', hostId: HOST_A, actor: 'user-1', reason: 'gone', forced: false });
+    await assert.rejects(reg.setHostChannelPolicyAudited({ tenantId: 'acme', hostId: HOST_A, ...nulls(), actor: 'x', action: 'channel_policy_inherit', reason: 'r' }),
+      (err) => err.status === 409 && err.code === 'host_retired');
+  } finally {
+    await r.close();
+  }
+});
+
 test('CSRF: a cookie session needs JSON and an allowed Origin; a form body is refused for everyone', async () => {
   const r = await rig();
   try {

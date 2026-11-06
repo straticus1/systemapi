@@ -238,7 +238,11 @@ covering `.socket` and `@` instances: `ssh*`, `sshd*`, `sahcore*`,
 `NetworkManager*`, `systemd-resolved*`, `systemd-logind*`, `*.target`,
 `nftables*`, `ufw*`, `firewalld*`, `iptables*`), and every tenant write
 (`tenant_write`). Only entries the write newly grants count: keeping or
-narrowing is not dangerous; restoring one is. A dangerous write needs
+narrowing is not dangerous; restoring one is. On a host, an entry newly
+explicit on the host counts too, even when the tenant default already
+grants it (the pin outlives a later tenant narrowing). The tenant columns
+the list was judged against are checked again under the write's lock
+(`FOR SHARE`; a tenant write in between is 409 `version_conflict`). A dangerous write needs
 `confirm_dangerous` equal to the dry run's list (409
 `{"error":"dangerous_unconfirmed","dangerous"}`) and a session principal
 (cookie or device token) whose `auth_time` is at most 5 minutes old (403

@@ -202,7 +202,7 @@ function mountPolicyRoutes(app, fleet, h) {
       refuse(res, 409, { error: 'version_conflict', version });
       return;
     }
-    const dangerous = rules.dangerousEntries(rules.effectiveOf(hostCols, tenantCols), rules.effectiveOf(next, tenantCols));
+    const dangerous = rules.hostDangerousEntries(hostCols, next, tenantCols);
     const match = (hostId) => hostId === host.host_id;
     if (dryRun) {
       res.json({
@@ -235,6 +235,9 @@ function mountPolicyRoutes(app, fleet, h) {
         action,
         reason,
         ifVersion,
+        // The dangerous list was computed against these tenant columns; the
+        // registry checks them again under the lock.
+        tenantVersion: rules.policyVersion(tenantCols),
         extra: { policy_schema: rules.POLICY_SCHEMA, ...actorFields(principal), dangerous, ...(revertOf === null ? {} : { revert_of: revertOf }) }
       });
     } catch (err) {
