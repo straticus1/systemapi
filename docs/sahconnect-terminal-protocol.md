@@ -96,7 +96,7 @@ server's allowlist (`SYSTEMAPI_ALLOWED_ORIGINS`).
 |---|---|
 | `{"type":"pty_status","payload":{"status":"starting"}}` | The ticket was accepted and the agent was asked to start. |
 | `{"type":"pty_status","payload":{"status":"started","session_id":"..."}}` | The shell is running. |
-| `{"type":"pty_status","payload":{"error":"<code>"}}` | Failure. Codes: `ticket_invalid`, `scope_denied`, `agent_offline`, `lease_required`, `pty_user_unset`, `account_unmapped`, `recording_unavailable`, `root_unavailable`, `pty_start_failed`, `internal`. `root_unavailable` means the host cannot run a `terminal:root` shell: the agent is not root, or it would not record the session itself. The socket is then closed with code 1011. |
+| `{"type":"pty_status","payload":{"error":"<code>"}}` | Failure. Codes: `ticket_invalid`, `scope_denied`, `agent_offline`, `lease_required`, `pty_user_unset`, `account_unmapped`, `recording_unavailable`, `root_unavailable`, `pty_start_failed`, `internal`, `grant_missing`, `grant_bad_shape`, `grant_star`, `grant_bad_sig`, `grant_expired`, `grant_purpose`, `grant_binding`, `sash_missing`. `root_unavailable` means the host cannot run a `terminal:root` shell: the agent is not root, or it would not record the session itself. The sash codes are Linux login: `grant_missing` is no grant, `grant_bad_shape` is not a `sash/1` document, `grant_star` is an entitlement `*`, `grant_bad_sig` is a bad signature or public key, `grant_expired` is `exp` before now, `grant_purpose` is the wrong purpose for the action, `grant_binding` is a host, actor, or `lease_id` mismatch, and `sash_missing` is no `sash` binary. The agent does not fall open to bash. A code outside this set is `internal`. The socket is then closed with code 1011. |
 | `{"type":"pty_exit","payload":{"session_id":"...","code":N,"reason":"exited"\|"max_duration"\|"agent_disconnected"\|"stopped"}}` | The session ended. `code` is the shell's exit status, or -1 when there is none. The server then closes with code 1000. |
 
 ## 4. Session lifetime
@@ -126,7 +126,7 @@ expires. A dead server therefore cannot leave a shell running for long.
   as another user, or as root), `user_owned` (the agent runs as an ordinary
   user with `--pty-allow-agent-user`, so the shell's user can edit the
   record), or `off` (`--pty-record=false`).
-- `adssh` is not needed for an ordinary session. Break-glass still runs
+- An ordinary session execs `sash` and does not call `adssh`. Break-glass still runs
   `adssh` and is also recorded by the agent.
 - If the record cannot be opened or written, or the recorder cannot keep up,
   the session is refused or ended. It never runs unrecorded and never drops
@@ -162,7 +162,12 @@ expires. A dead server therefore cannot leave a shell running for long.
 - **Server → agent.** `pty_start` carries `"actor": "<user id>"`, the
   identity that asked for the ticket. `file_open` and `xfer_grant` already
   carry `actor`. The actor rides the authenticated agent socket; it is not
-  in the signed lease.
+  in the signed lease. On Linux, `pty` and `pty_root` may also carry a
+  signed `sash/1` `grant` object (not a string) and `sash_targets`
+  (`units`, `packages`, `configs`, `sysctls`, `files`). The grant is signed
+  with `SASH_GRANT_ED25519_SEED`, which the agent does not hold. Those
+  policy lists ride beside the grant; they are not fields inside the signed
+  document. darwin and windows ignore both and keep the passwd shell.
 - **Agent.** `--pty-user-map <file>` maps each identity to its own Unix
   account (`identity = unixuser` lines; the file is `0600` or stricter and
   owned by root or the agent user). Terminal, file and xfer sessions resolve

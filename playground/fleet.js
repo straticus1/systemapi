@@ -3,6 +3,9 @@
  * Agents dial out. The control plane never opens an inbound SSH port.
  * Threats: query-string API keys, unsigned exec, and a demo key in production.
  * A missing lease is a refusal. This file does not store the API key.
+ * A sash login grant is signed with SASH_GRANT_ED25519_SEED when that seed is
+ * set; the seed is never logged, a malformed seed refuses the session, and an
+ * unset seed omits the grant.
  * Terminal sessions: one server-generated session id per socket; agent
  * output is routed only to the session that the same agent connection owns;
  * client frames over 64 KiB close with 1009; a client whose send buffer
@@ -66,6 +69,7 @@ const { fingerprint, randomToken } = require('../controlplane/token');
 const { zscore } = require('../controlplane/stats');
 const { readPlaybook } = require('../controlplane/playbooks');
 const { parseCapabilities, effectivePolicies } = require('../controlplane/channels');
+const { buildSashTerminalGrant } = require('../controlplane/sashgrant');
 const {
     validateCapabilityReport, ConnectionCapabilities, expectedCapabilities, hostHealth, KNOWN_CAPABILITIES, CAPABILITY_STATES
 } = require('../controlplane/capabilities');
@@ -135,7 +139,9 @@ const PURPOSE_ACTIONS = new Map([
 ]);
 const PTY_ERRORS = new Set([
     'ticket_invalid', 'scope_denied', 'agent_offline', 'lease_required',
-    'pty_user_unset', 'account_unmapped', 'recording_unavailable', 'root_unavailable', 'pty_start_failed', 'internal'
+    'pty_user_unset', 'account_unmapped', 'recording_unavailable', 'root_unavailable', 'pty_start_failed', 'internal',
+    'grant_missing', 'grant_bad_shape', 'grant_star', 'grant_bad_sig', 'grant_expired',
+    'grant_purpose', 'grant_binding', 'sash_missing'
 ]);
 const PTY_EXIT_REASONS = new Set(['exited', 'max_duration', 'stopped']);
 const B64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
@@ -490,32 +496,77 @@ class FleetManager {
             startTimer: null,
             finalTimer: null,
             endReason: null,
-            endCode: -1
+            endCode: -1,
+            ptyStartSent: false
         };
         this.terminalSessions.set(sessionId, session);
         ws.on('message', (buf, isBinary) => this.onTerminalClientMessage(session, buf, isBinary));
         ws.on('close', () => this.endTerminal(session, 'client_closed', -1, { notifyAgent: true }));
         sendJSON(ws, { type: 'pty_status', payload: { status: 'starting' } });
-        sendJSON(agentWs, {
-            type: 'pty_start',
-            session_id: sessionId,
-            request_id: sessionId,
-            action,
-            rows,
-            cols,
-            deadline_unix: deadlineUnix,
-            // The agent picks the Unix account from this identity when it
-            // has a --pty-user-map (one account per identity).
-            actor: actor === null ? '' : String(actor),
-            lease
+        const sendStart = (extra = {}) => {
+            if (session.ended) return;
+            session.ptyStartSent = true;
+            sendJSON(agentWs, {
+                type: 'pty_start',
+                session_id: sessionId,
+                request_id: sessionId,
+                action,
+                rows,
+                cols,
+                deadline_unix: deadlineUnix,
+                // The agent picks the Unix account from this identity when it
+                // has a --pty-user-map (one account per identity).
+                actor: actor === null ? '' : String(actor),
+                lease,
+                ...extra
+            });
+        };
+        const arm = () => {
+            session.renewTimer = unref(setInterval(() => this.renewTerminal(session), this.ptyRenewMs));
+            session.maxTimer = unref(setTimeout(() => {
+                this.endTerminal(session, 'max_duration', -1, { notifyAgent: true, notifyClient: true });
+            }, maxSeconds * 1000));
+            session.startTimer = unref(setTimeout(() => {
+                if (!session.started) {
+                    this.endTerminal(session, 'start_timeout', -1, { error: 'internal', notifyAgent: session.ptyStartSent === true });
+                }
+            }, this.ptyStartTimeoutMs));
+        };
+        // Unset seed stays synchronous and omits the grant. A set seed signs
+        // after the timers are armed; a bad seed or a policy failure refuses
+        // the session and does not send pty_start.
+        let sashRaw = null;
+        if (action !== 'breakglass' && actor) sashRaw = this.env && this.env.SASH_GRANT_ED25519_SEED;
+        if (!sashRaw) { sendStart(); arm(); return; }
+        if (!/^[0-9a-fA-F]{64}$/.test(sashRaw)) {
+            this.endTerminal(session, 'internal', -1, { error: 'internal', notifyAgent: false });
+            return;
+        }
+        arm();
+        effectivePolicies(this.registry, hostId).then((policies) => {
+            if (session.ended) return;
+            let built;
+            try {
+                built = buildSashTerminalGrant(sashRaw, {
+                    actor: String(actor),
+                    host: hostId,
+                    purpose: action === 'pty_root' ? 'terminal:root' : 'terminal:open',
+                    exp: deadlineUnix,
+                    lease_id: lease.nonce_hex,
+                    policies
+                });
+            } catch {
+                if (session.ended) return;
+                console.error('[Fleet] sash grant refused');
+                this.endTerminal(session, 'internal', -1, { error: 'internal', notifyAgent: false });
+                return;
+            }
+            sendStart({ grant: built.grant, sash_targets: built.targets });
+        }).catch(() => {
+            if (session.ended) return;
+            console.error('[Fleet] sash grant refused');
+            this.endTerminal(session, 'internal', -1, { error: 'internal', notifyAgent: false });
         });
-        session.renewTimer = unref(setInterval(() => this.renewTerminal(session), this.ptyRenewMs));
-        session.maxTimer = unref(setTimeout(() => {
-            this.endTerminal(session, 'max_duration', -1, { notifyAgent: true, notifyClient: true });
-        }, maxSeconds * 1000));
-        session.startTimer = unref(setTimeout(() => {
-            if (!session.started) this.endTerminal(session, 'start_timeout', -1, { error: 'internal', notifyAgent: true });
-        }, this.ptyStartTimeoutMs));
     }
 
     renewTerminal(session) {

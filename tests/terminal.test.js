@@ -13,6 +13,7 @@ const { MemoryRegistry } = require('../controlplane/registry');
 const { TEST_SEED, privateKeyFromSeed, rawPublicKey, buildSigner } = require('../controlplane/keys');
 const { issueTicket } = require('../controlplane/tickets');
 const { verifyLease, terminalPayload } = require('../controlplane/lease');
+const { verifySashGrant } = require('../controlplane/sashgrant');
 
 const HOST_A = '11111111-1111-4111-8111-111111111111';
 const PUBLIC_KEY = crypto.createPublicKey(privateKeyFromSeed(TEST_SEED));
@@ -147,6 +148,8 @@ test('pty_start carries a signed, session-bound lease, sizes and a deadline', as
     assert.equal(ok.ok, true);
     assert.equal(start.lease.action, 'pty');
     assert.equal(start.lease.host_id, HOST_A);
+    assert.equal(start.grant, undefined);
+    assert.equal(start.sash_targets, undefined);
     assert.deepEqual(client.box.frames[0], { type: 'pty_status', payload: { status: 'starting' } });
 
     const root = openClient(r, { purpose: 'terminal:root' });
@@ -942,6 +945,203 @@ test('an agent that overruns its channel credit is disconnected', async () => {
     assert.equal(ledger.receive('tcs_aaaaaaaaaaaaaaaa', 1024), true);
     assert.equal(ledger.receive('tcs_aaaaaaaaaaaaaaaa', 1), false);
     await waitUntil('agent disconnected', () => !r.fm.connectedAgents.has(HOST_A));
+  } finally {
+    await r.close();
+  }
+});
+
+const SASH_SEED = '22'.repeat(32);
+const SASH_EMER_SEED = '33'.repeat(32);
+
+function sashPubs() {
+  const fleet = rawPublicKey(privateKeyFromSeed(Buffer.from(SASH_SEED, 'hex')));
+  const emer = rawPublicKey(privateKeyFromSeed(Buffer.from(SASH_EMER_SEED, 'hex')));
+  return { fleet, emer };
+}
+
+function openWith(r, { purpose = 'terminal:open', actor = 'user-1' } = {}) {
+  const ticket = issueTicket(r.fm.tickets, { hostId: HOST_A, purpose, tenantId: 'acme', actor });
+  const ws = r.track(new WebSocket(`${r.base}/api/v1/systems/terminal/${HOST_A}?ticket=${ticket}&purpose=${purpose}`));
+  return { ws, box: collect(ws) };
+}
+
+function readPolicies() {
+  return {
+    host_tcp_policy: null,
+    host_service_policy: { units: ['nginx'] },
+    host_package_policy: { names: ['curl'] },
+    host_config_policy: { paths: ['/etc/ssh/sshd_config'] },
+    host_tweak_policy: { sysctls: ['net.ipv4.ip_forward'] },
+    host_file_policy: {
+      roots: [
+        { path: '/var/log', read: true },
+        { path: '/tmp', read: false, write: true },
+        { path: '~', read: true }
+      ]
+    }
+  };
+}
+
+test('a set sash seed signs a ps-only grant when the host has no channel policy', async () => {
+  const r = await rig({ SASH_GRANT_ED25519_SEED: SASH_SEED });
+  try {
+    const agent = await connectAgent(r);
+    const client = openClient(r);
+    const start = await waitUntil('pty_start', () => agentFrames(agent, 'pty_start')[0]);
+    assert.equal(start.actor, 'user-1');
+    assert.equal(typeof start.grant, 'object');
+    assert.equal(start.grant.purpose, 'terminal:open');
+    assert.equal(start.grant.exp, start.deadline_unix);
+    assert.equal(start.grant.lease_id, start.lease.nonce_hex);
+    assert.deepEqual(start.grant.entitlements, ['ps']);
+    assert.deepEqual(start.grant.file_read, []);
+    assert.deepEqual(start.grant.file_write, []);
+    assert.equal(start.grant.allow_private, false);
+    assert.deepEqual(start.sash_targets, { units: [], packages: [], configs: [], sysctls: [], files: [] });
+    const { fleet, emer } = sashPubs();
+    const checked = verifySashGrant(JSON.stringify(start.grant), fleet, emer);
+    assert.equal(checked.ok, true, checked.error);
+    assert.equal(checked.grant.actor, 'user-1');
+    assert.equal(checked.grant.host, HOST_A);
+    sendStarted(agent, start.session_id);
+    await waitUntil('started', () => client.box.frames.find((f) => f.type === 'pty_status' && f.payload.status === 'started'));
+  } finally {
+    await r.close();
+  }
+});
+
+test('a set sash seed carries the read entitlements that survive channel policy', async () => {
+  const r = await rig({ SASH_GRANT_ED25519_SEED: SASH_SEED });
+  try {
+    const agent = await connectAgent(r);
+    r.fm.registry.channelPolicies = async () => readPolicies();
+    const client = openClient(r, { purpose: 'terminal:root' });
+    const start = await waitUntil('pty_start', () => agentFrames(agent, 'pty_start')[0]);
+    assert.equal(start.action, 'pty_root');
+    assert.equal(start.grant.purpose, 'terminal:root');
+    assert.equal(start.grant.exp, start.deadline_unix);
+    assert.equal(start.grant.lease_id, start.lease.nonce_hex);
+    assert.deepEqual(start.grant.entitlements, ['ps', 'unit.status', 'package.query', 'sysctl.get', 'config.read', 'file.read']);
+    assert.deepEqual(start.grant.file_read, ['/var/log']);
+    assert.deepEqual(start.sash_targets, {
+      units: ['nginx'],
+      packages: ['curl'],
+      configs: ['/etc/ssh/sshd_config'],
+      sysctls: ['net.ipv4.ip_forward'],
+      files: ['/var/log']
+    });
+    const { fleet, emer } = sashPubs();
+    const checked = verifySashGrant(JSON.stringify(start.grant), fleet, emer);
+    assert.equal(checked.ok, true, checked.error);
+    assert.equal(checked.grant.purpose, 'terminal:root');
+    sendStarted(agent, start.session_id, { recording: 'agent' });
+    await waitUntil('started', () => client.box.frames.find((f) => f.type === 'pty_status' && f.payload.status === 'started'));
+  } finally {
+    await r.close();
+  }
+});
+
+test('breakglass and an empty actor omit the sash grant even when the seed is set', async () => {
+  const r = await rig({ SASH_GRANT_ED25519_SEED: SASH_SEED });
+  try {
+    const agent = await connectAgent(r);
+    const glass = openWith(r, { purpose: 'breakglass:open', actor: 'user-1' });
+    const glassStart = await waitUntil('breakglass start', () => agentFrames(agent, 'pty_start')[0]);
+    assert.equal(glassStart.action, 'breakglass');
+    assert.equal(glassStart.grant, undefined);
+    assert.equal(glassStart.sash_targets, undefined);
+    const bare = openWith(r, { actor: null });
+    const bareStart = await waitUntil('bare start', () => agentFrames(agent, 'pty_start')[1]);
+    assert.equal(bareStart.action, 'pty');
+    assert.equal(bareStart.actor, '');
+    assert.equal(bareStart.grant, undefined);
+    assert.equal(bareStart.sash_targets, undefined);
+    glass.ws.close();
+    bare.ws.close();
+  } finally {
+    await r.close();
+  }
+});
+
+test('a malformed sash seed fails closed and does not send pty_start', async () => {
+  const r = await rig({ SASH_GRANT_ED25519_SEED: 'not-a-key' });
+  try {
+    const agent = await connectAgent(r);
+    const client = openClient(r);
+    await waitUntil('refused', () => client.box.closeCode === 1011);
+    assert.equal(client.box.frames[0].payload.status, 'starting');
+    assert.deepEqual(client.box.frames.at(-1), { type: 'pty_status', payload: { error: 'internal' } });
+    assert.equal(agentFrames(agent, 'pty_start').length, 0);
+    assert.equal(agentFrames(agent, 'pty_stop').length, 0);
+  } finally {
+    await r.close();
+  }
+});
+
+test('a sash grant that cannot be built fails closed without logging the seed', async () => {
+  const r = await rig({ SASH_GRANT_ED25519_SEED: SASH_SEED });
+  const lines = [];
+  const orig = console.error;
+  console.error = (...args) => { lines.push(args.map(String).join(' ')); };
+  try {
+    const agent = await connectAgent(r);
+    r.fm.registry.channelPolicies = async () => ({
+      host_file_policy: { roots: [{ path: '/var/log&x', read: true }] }
+    });
+    const client = openClient(r);
+    await waitUntil('refused', () => client.box.closeCode === 1011);
+    assert.deepEqual(client.box.frames.at(-1), { type: 'pty_status', payload: { error: 'internal' } });
+    assert.equal(agentFrames(agent, 'pty_start').length, 0);
+    assert.equal(lines.some((line) => line.includes('sash grant refused')), true);
+    assert.equal(lines.some((line) => line.includes(SASH_SEED)), false);
+  } finally {
+    console.error = orig;
+    await r.close();
+  }
+});
+
+test('a channel policy lookup that throws fails closed and does not send pty_start', async () => {
+  const r = await rig({ SASH_GRANT_ED25519_SEED: SASH_SEED });
+  const lines = [];
+  const orig = console.error;
+  console.error = (...args) => { lines.push(args.map(String).join(' ')); };
+  try {
+    const agent = await connectAgent(r);
+    r.fm.registry.channelPolicies = async () => { throw new Error(`policy-${SASH_SEED}`); };
+    const client = openClient(r);
+    await waitUntil('refused', () => client.box.closeCode === 1011);
+    assert.equal(client.box.frames[0].payload.status, 'starting');
+    assert.deepEqual(client.box.frames.at(-1), { type: 'pty_status', payload: { error: 'internal' } });
+    assert.equal(agentFrames(agent, 'pty_start').length, 0);
+    assert.equal(agentFrames(agent, 'pty_stop').length, 0);
+    assert.equal(lines.some((line) => line.includes('sash grant refused')), true);
+    assert.equal(lines.some((line) => line.includes(SASH_SEED)), false);
+  } finally {
+    console.error = orig;
+    await r.close();
+  }
+});
+
+test('a start timeout before pty_start was sent does not notify the agent', async () => {
+  const r = await rig({ SASH_GRANT_ED25519_SEED: SASH_SEED });
+  r.fm.ptyStartTimeoutMs = 50;
+  try {
+    const agent = await connectAgent(r);
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    r.fm.registry.channelPolicies = () => gate;
+    const client = openClient(r);
+    await waitUntil('timeout', () => client.box.closeCode === 1011);
+    assert.equal(client.box.frames.at(-1).payload.error, 'internal');
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(agentFrames(agent, 'pty_start').length, 0);
+    assert.equal(agentFrames(agent, 'pty_stop').length, 0);
+    release({
+      host_tcp_policy: null, host_file_policy: null, host_service_policy: null,
+      host_package_policy: null, host_config_policy: null, host_tweak_policy: null
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(agentFrames(agent, 'pty_start').length, 0);
   } finally {
     await r.close();
   }

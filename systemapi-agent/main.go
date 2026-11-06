@@ -22,25 +22,27 @@ import (
 
 // CommandMessage is an incoming WebSocket message from the control plane.
 type CommandMessage struct {
-	Type         string        `json:"type"`
-	Script       string        `json:"script"`
-	Entitlements *Entitlements `json:"entitlements"`
-	RequestID    string        `json:"request_id"`
-	JobID        string        `json:"job_id,omitempty"`
-	TimeoutS     int           `json:"timeout_s,omitempty"`
-	Data         string        `json:"data,omitempty"`
-	DataB64      string        `json:"data_b64,omitempty"`
-	SessionID    string        `json:"session_id,omitempty"`
-	DeadlineUnix int64         `json:"deadline_unix,omitempty"`
-	Rows         int           `json:"rows,omitempty"`
-	Cols         int           `json:"cols,omitempty"`
-	Action       string        `json:"action,omitempty"`
-	Lease        *Lease        `json:"lease,omitempty"`
-	Actor        string        `json:"actor,omitempty"`
-	WatchID      string        `json:"watch_id,omitempty"`
-	Mode         string        `json:"mode,omitempty"`
-	Reason       string        `json:"reason,omitempty"`
-	Override     bool          `json:"override,omitempty"`
+	Type         string          `json:"type"`
+	Script       string          `json:"script"`
+	Entitlements *Entitlements   `json:"entitlements"`
+	RequestID    string          `json:"request_id"`
+	JobID        string          `json:"job_id,omitempty"`
+	TimeoutS     int             `json:"timeout_s,omitempty"`
+	Data         string          `json:"data,omitempty"`
+	DataB64      string          `json:"data_b64,omitempty"`
+	SessionID    string          `json:"session_id,omitempty"`
+	DeadlineUnix int64           `json:"deadline_unix,omitempty"`
+	Rows         int             `json:"rows,omitempty"`
+	Cols         int             `json:"cols,omitempty"`
+	Action       string          `json:"action,omitempty"`
+	Lease        *Lease          `json:"lease,omitempty"`
+	Actor        string          `json:"actor,omitempty"`
+	Grant        json.RawMessage `json:"grant,omitempty"`
+	SashTargets  *sashTargets    `json:"sash_targets,omitempty"`
+	WatchID      string          `json:"watch_id,omitempty"`
+	Mode         string          `json:"mode,omitempty"`
+	Reason       string          `json:"reason,omitempty"`
+	Override     bool            `json:"override,omitempty"`
 	// A sysscript_job frame with kind "converge" carries the bundle and,
 	// in Mode, check or apply; ExpectPlan is "-" for check.
 	Kind       string `json:"kind,omitempty"`
@@ -118,6 +120,8 @@ func main() {
 	stateBackupDirFlag := flag.String("state-backup-dir", stateBackupDir, "directory for desired-state file backups (absolute, root-only; must not overlap any write grant, or file changes that need a backup fail)")
 	capReportsFlag := flag.Bool("capability-reports", true, "send capability_report frames after enroll and on capability_probe; =false sends none (the dial headers, degraded one included, are still sent)")
 	capIntervalFlag := flag.Duration("capability-interval", capIntervalDefault, "how often capabilities are re-probed and reported (1m..60m, +/-10% jitter)")
+	sashFleetPubFlag := flag.String("sash-fleet-pub", "", "file of the raw 32-byte Ed25519 public key that verifies fleet sash/1 grants")
+	sashEmerPubFlag := flag.String("sash-emergency-pub", "", "file of the raw 32-byte Ed25519 public key that verifies emergency sash/1 grants")
 	flag.Parse()
 	if err := parseCapabilityInterval(*capIntervalFlag); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -155,6 +159,8 @@ func main() {
 		RecordMaxBytes: *ptyRecordMaxFlag,
 		RecordMinFree:  *ptyRecordMinFreeFlag,
 		Tenant:         *tenantFlag,
+		SashFleetPub:   *sashFleetPubFlag,
+		SashEmerPub:    *sashEmerPubFlag,
 	}
 	if *ptyUserMapFlag != "" {
 		m, err := loadPTYUserMap(*ptyUserMapFlag, os.Geteuid())
@@ -349,6 +355,11 @@ func processIncomingMessage(out ptyOut, hostID, stateDir string, message []byte)
 
 	case "pty_start":
 		log.Printf("pty_start %s action=%s", cmd.SessionID, cmd.Action)
+		var targets *sashTargets
+		if cmd.SashTargets != nil {
+			copied := copySashTargets(*cmd.SashTargets)
+			targets = &copied
+		}
 		startPTYSession(out, hostID, stateDir, ptyStartRequest{
 			SessionID:    cmd.SessionID,
 			Action:       cmd.Action,
@@ -357,6 +368,8 @@ func processIncomingMessage(out ptyOut, hostID, stateDir string, message []byte)
 			DeadlineUnix: cmd.DeadlineUnix,
 			Actor:        cmd.Actor,
 			Lease:        cmd.Lease,
+			Grant:        append([]byte(nil), cmd.Grant...),
+			SashTargets:  targets,
 		}, time.Now())
 
 	case "pty_renew":

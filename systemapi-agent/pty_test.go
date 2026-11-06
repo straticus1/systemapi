@@ -162,9 +162,13 @@ func (h *ptyHarness) start(t *testing.T, action string, leaseExp, deadline int64
 	t.Helper()
 	sid := newSessionID(t)
 	lease := signLease(t, h.priv, ptyTestHost, action, terminalPayload(sid, deadline, "start"), leaseExp)
-	startPTYSession(h.out, ptyTestHost, h.dir, ptyStartRequest{
+	req := ptyStartRequest{
 		SessionID: sid, Action: action, Rows: 24, Cols: 80, DeadlineUnix: deadline, Lease: lease,
-	}, time.Now())
+	}
+	if attachSashTestGrant != nil {
+		attachSashTestGrant(t, &req)
+	}
+	startPTYSession(h.out, ptyTestHost, h.dir, req, time.Now())
 	return sid
 }
 

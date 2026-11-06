@@ -1,7 +1,10 @@
 // Threats: a terminal that outlives its lease, one session reading or
 // writing another session's PTY, a root shell opened with an operator lease,
 // an unrecorded shell, a shell that reads the agent's credentials, one stuck
-// session freezing the agent, and processes a shell leaves behind. Each
+// session freezing the agent, and processes a shell leaves behind. On Linux,
+// pty and pty_root exec sash with a verified sash/1 grant; a missing binary
+// is sash_missing; a bad grant does not fall open to bash; the agent does
+// not hold the grant private key. Each
 // session is keyed by a server-generated session id and needs a signed lease
 // bound to that id, its deadline and its phase (start or renew); it ends at
 // the deadline or when the last renewed lease expires, whichever is first.
@@ -139,6 +142,11 @@ type ptySettings struct {
 	// session; empty means ptyNoticeDefault. Tenant is appended to it.
 	Notice string
 	Tenant string
+	// SashFleetPub and SashEmerPub are files of one raw 32-byte Ed25519
+	// public key each. They are read when a Linux login starts. A missing
+	// or wrong-sized file refuses that session.
+	SashFleetPub string
+	SashEmerPub  string
 }
 
 var (
@@ -174,6 +182,10 @@ type ptySession struct {
 
 	reapMu sync.Mutex
 	reaped bool
+
+	// sashStop closes the parent end of the verb socket. Nil off Linux and
+	// for break-glass. The wait path calls it once.
+	sashStop func()
 }
 
 type ptyStartRequest struct {
@@ -184,6 +196,10 @@ type ptyStartRequest struct {
 	DeadlineUnix int64
 	Actor        string
 	Lease        *Lease
+	// Grant is the signed sash/1 document. SashTargets is the channel
+	// policy beside it. Both are empty when the server omitted them.
+	Grant       []byte
+	SashTargets *sashTargets
 }
 
 type ptyIdentity struct {
@@ -576,7 +592,41 @@ func startPTYSession(out ptyOut, hostID, stateDir string, req ptyStartRequest, n
 		s.rec = rec
 	}
 
-	cmd := exec.Command(argv0)
+	args := []string(nil)
+	var sashExtra []*os.File
+	var sashStop func()
+	if sashLogin(req.Action) {
+		leaseID := ""
+		if req.Lease != nil {
+			leaseID = req.Lease.NonceHex
+		}
+		var targets sashTargets
+		if req.SashTargets != nil {
+			targets = copySashTargets(*req.SashTargets)
+		}
+		leaseFn := func() time.Time {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			return s.leaseExp
+		}
+		var sashErr error
+		argv0, args, sashExtra, sashStop, sashErr = prepareSash(req.Grant, ptyCfg.SashFleetPub, ptyCfg.SashEmerPub, sashBind{
+			Action: req.Action, Host: hostID, Actor: req.Actor, LeaseID: leaseID, Now: now,
+		}, targets, leaseFn, id)
+		if sashErr != nil {
+			code := sashStatusCode(sashErr)
+			if s.rec != nil {
+				_, _ = s.rec.finish(map[string]interface{}{"reason": "start_failed"})
+			}
+			log.Printf("sash session refused: %s", code)
+			ptyStatusError(out, sid, code)
+			return
+		}
+		s.sashStop = sashStop
+	}
+
+	cmd := exec.Command(argv0, args...)
+	cmd.ExtraFiles = sashExtra
 	cmd.Env = env
 	cmd.Dir = id.home
 	if st, err := os.Stat(id.home); err != nil || !st.IsDir() {
@@ -584,6 +634,11 @@ func startPTYSession(out ptyOut, hostID, stateDir string, req ptyStartRequest, n
 	}
 	ptmx, err := startWithIdentity(cmd, id, &pty.Winsize{Rows: clampSize(req.Rows, ptyDefaultRows), Cols: clampSize(req.Cols, ptyDefaultCols)})
 	if err != nil {
+		sashCloseExtras(sashExtra)
+		if sashStop != nil {
+			sashStop()
+			s.sashStop = nil
+		}
 		log.Printf("Failed to start PTY: %v", err)
 		if s.rec != nil {
 			_, _ = s.rec.finish(map[string]interface{}{"reason": "start_failed"})
@@ -591,6 +646,7 @@ func startPTYSession(out ptyOut, hostID, stateDir string, req ptyStartRequest, n
 		ptyStatusError(out, sid, "pty_start_failed")
 		return
 	}
+	sashCloseExtras(sashExtra)
 	s.cmd = cmd
 	s.ptmx = ptmx
 
@@ -661,6 +717,9 @@ func startPTYSession(out ptyOut, hostID, stateDir string, req ptyStartRequest, n
 			time.Sleep(ptyKillGrace)
 			signalTree(pid, syscall.SIGKILL)
 		}
+		if s.sashStop != nil {
+			s.sashStop()
+		}
 		code := -1
 		if cmd.ProcessState != nil {
 			code = cmd.ProcessState.ExitCode()
@@ -705,6 +764,20 @@ func startPTYSession(out ptyOut, hostID, stateDir string, req ptyStartRequest, n
 		ptyMu.Unlock()
 		_ = out.WriteJSON(ResponseMessage{Type: "pty_exit", SessionID: sid, Payload: payload})
 	}()
+}
+
+// sashCloseExtras closes the parent's copies of the fds passed to the
+// child. The child already holds its own duplicates after Start. A second
+// close is not an error worth a second log line.
+func sashCloseExtras(files []*os.File) {
+	for _, f := range files {
+		if f == nil {
+			continue
+		}
+		if err := f.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			log.Printf("sash session pipe close failed")
+		}
+	}
 }
 
 // inputLoop is the only writer to this session's PTY, so a shell that stops
