@@ -17,11 +17,12 @@ import (
 // whose target is outside the grant or the delivered policy, a journal verb
 // (there is no reader), a hard-denied sysctl or a sysctl value the setter
 // would refuse, and a helper call after the session lease has expired. The
-// check order is lease, entitlement, policy, helper. A failed re-check
-// returns "denied" and does not call the helper. journal is not a journalctl
-// shell-out. file.write uses file_write roots and the delivered files_write
-// list, not the read roots. Does NOT import sash. Does NOT mint a sys lease
-// to call the helpers.
+// check order is lease, history, entitlement, policy, helper. history is
+// not an entitlement: the store key is the verified actor and host. A
+// failed re-check returns "denied" and does not call the helper. journal
+// is not a journalctl shell-out. file.write uses file_write roots and the
+// delivered files_write list, not the read roots. Does NOT import sash.
+// Does NOT mint a sys lease to call the helpers.
 
 var errSashDenied = errors.New("denied")
 
@@ -106,8 +107,15 @@ func sashLeaseLive(leaseFn func() time.Time) bool {
 }
 
 func sashDispatch(g sashGrant, targets sashTargets, leaseFn func() time.Time, id *ptyIdentity, v sashCall) (sashResult, error) {
+	return sashDispatchAt(g, targets, leaseFn, id, v, sashHistoryRoot)
+}
+
+func sashDispatchAt(g sashGrant, targets sashTargets, leaseFn func() time.Time, id *ptyIdentity, v sashCall, histRoot string) (sashResult, error) {
 	if !sashLeaseLive(leaseFn) {
 		return sashResult{}, errSashDenied
+	}
+	if v.Key == "history" {
+		return sashHistory(g, v, histRoot)
 	}
 	if v.Key == "journal" || !sashEntitled(g, v.Key) {
 		return sashResult{}, errSashDenied

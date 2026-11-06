@@ -16,7 +16,10 @@
 // --pty-allow-agent-user is set, because the shell would then run as the
 // agent's own user and could read its key and state. "pty_root" is a
 // separate lease action. The agent records every input and output byte in an
-// HMAC-chained file (recorder.go) unless --pty-record=false. Every session
+// HMAC-chained file (recorder.go) unless --pty-record=false. A private
+// sash session still records. Suggestion history is files under the agent
+// state directory, keyed by the verified actor and host, not a file in
+// the pty user's home. Every session
 // starts with a monitoring notice, and watching goes through watch.go. Each session has
 // its own bounded input queue and writer goroutine; an overflow ends that
 // session only. Ending a session signals its process group and, on Linux,
@@ -627,6 +630,11 @@ func startPTYSession(out ptyOut, hostID, stateDir string, req ptyStartRequest, n
 	var sashExtra []*os.File
 	var sashStop func()
 	if sashLogin(req.Action) {
+		if stateDir == "" {
+			sashHistoryRoot = ""
+		} else {
+			sashHistoryRoot = filepath.Join(stateDir, "sash-history")
+		}
 		leaseID := ""
 		if req.Lease != nil {
 			leaseID = req.Lease.NonceHex

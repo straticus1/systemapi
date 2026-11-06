@@ -131,9 +131,10 @@ func prepareSash(grant []byte, fleetPath, emerPath string, b sashBind, targets s
 		writeOne(fleetW, fleetCopy)
 		writeOne(emerW, emerCopy)
 	}()
+	histRoot := sashHistoryRoot
 	go func() {
 		serr := sashServe(parent, func(call sashCall) (sashResult, error) {
-			return sashDispatch(verified, targetsCopy, leaseFn, id, call)
+			return sashDispatchAt(verified, targetsCopy, leaseFn, id, call, histRoot)
 		})
 		if serr != nil && !errors.Is(serr, io.EOF) && !sashPipeGone(serr) {
 			log.Printf("sash verb serve ended")
