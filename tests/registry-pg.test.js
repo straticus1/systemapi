@@ -200,23 +200,6 @@ test('policy API writes (P2): if_version under the row lock, the tenant twin wit
   assert.equal((await registry.verifyAudit()).ok, true);
 });
 
-test('step-up device flow on PostgreSQL: a fresh code keeps the approver auth_time and copies it onto the token', async () => {
-  const oauth = require('../controlplane/oauth');
-  await registry.enroll({ tenantId: 'pgauth', userId: 'user-auth', keyId: 'ka', hostId: 'a3a3a3a3-a3a3-4a3a-8a3a-a3a3a3a3a3a3', hostname: 'a.example', os: '', platform: '', sshPubkey: opensshEd25519(7) });
-  await pool.query("UPDATE cp_members SET sso_sub = 'sub-auth' WHERE user_id = 'user-auth'");
-  const env = { NODE_ENV: 'test', SYSTEMAPI_PUBLIC_URL: 'https://api.systemapi.test' };
-  const at = Math.floor(Date.now() / 1000) - 3;
-  const fresh = await oauth.startDevice(registry, 'user-auth', env, {}, Date.now(), { fresh: true });
-  await assert.rejects(oauth.approveUserCode(registry, fresh.user_code, { id: 'sub-auth', auth_time: at - 600 }), (err) => err.code === 'reauth_required');
-  await oauth.approveUserCode(registry, fresh.user_code, { id: 'sub-auth', auth_time: at });
-  const token = await oauth.pollToken(registry, fresh.device_code, env);
-  assert.equal((await oauth.userForAccessToken(registry, token.access_token)).auth_time, at);
-  const plain = await oauth.startDevice(registry, 'user-auth', env, {});
-  await oauth.approveUserCode(registry, plain.user_code, { id: 'sub-auth', auth_time: at });
-  const plainToken = await oauth.pollToken(registry, plain.device_code, env);
-  assert.equal((await oauth.userForAccessToken(registry, plainToken.access_token)).auth_time, null);
-});
-
 test('channel-policy main() against the database prints the summary and never the credentials', async () => {
   const { main } = require('../scripts/channel-policy');
   // Its own host row, so the test does not depend on the enroll test running first.
@@ -1860,4 +1843,21 @@ test('audit checkpoints: one per interval across replicas, the head read under t
       [fresh.seq, JSON.stringify(original.payload), original.row_hash]);
   }
   assert.equal((await registry.verifyAudit()).ok, true);
+});
+
+test('step-up device flow on PostgreSQL: a fresh code keeps the approver auth_time and copies it onto the token', async () => {
+  const oauth = require('../controlplane/oauth');
+  await registry.enroll({ tenantId: 'pgauth', userId: 'user-auth', keyId: 'ka', hostId: 'a3a3a3a3-a3a3-4a3a-8a3a-a3a3a3a3a3a3', hostname: 'a.example', os: '', platform: '', sshPubkey: opensshEd25519(7) });
+  await pool.query("UPDATE cp_members SET sso_sub = 'sub-auth' WHERE user_id = 'user-auth'");
+  const env = { NODE_ENV: 'test', SYSTEMAPI_PUBLIC_URL: 'https://api.systemapi.test' };
+  const at = Math.floor(Date.now() / 1000) - 3;
+  const fresh = await oauth.startDevice(registry, 'user-auth', env, {}, Date.now(), { fresh: true });
+  await assert.rejects(oauth.approveUserCode(registry, fresh.user_code, { id: 'sub-auth', auth_time: at - 600 }), (err) => err.code === 'reauth_required');
+  await oauth.approveUserCode(registry, fresh.user_code, { id: 'sub-auth', auth_time: at });
+  const token = await oauth.pollToken(registry, fresh.device_code, env);
+  assert.equal((await oauth.userForAccessToken(registry, token.access_token)).auth_time, at);
+  const plain = await oauth.startDevice(registry, 'user-auth', env, {});
+  await oauth.approveUserCode(registry, plain.user_code, { id: 'sub-auth', auth_time: at });
+  const plainToken = await oauth.pollToken(registry, plain.device_code, env);
+  assert.equal((await oauth.userForAccessToken(registry, plainToken.access_token)).auth_time, null);
 });
