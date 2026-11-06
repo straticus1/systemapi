@@ -237,12 +237,17 @@ function channelPolicyAuditEntry(tenantId, hostId, actor, action, reason, tcpPol
   };
 }
 
-function keyRevokeAuditEntry(tenantId, actor, keyId, wasActive, tenants) {
+// The audit row for a key revoke, written in the first of the owner's
+// tenants. It names no other tenant: anyone who can read this tenant's audit
+// would otherwise learn the names of tenants they may not be a member of.
+// The count records that the key reached further (the actor administers
+// every one of them, so it can list them itself).
+function keyRevokeAuditEntry(tenantId, actor, keyId, wasActive, ownerTenantCount) {
   return {
     tenant_id: tenantId,
     actor,
     action: 'key_revoked',
-    payload: { key_fp: fingerprint(keyId), was_active: wasActive, tenants: [...tenants].sort() }
+    payload: { key_fp: fingerprint(keyId), was_active: wasActive, owner_tenant_count: ownerTenantCount }
   };
 }
 
@@ -1452,9 +1457,9 @@ class MemoryRegistry {
   // write, so no membership change interleaves between check and revoke.
   async revokeKeyAudited({ keyId, ownerUserId, adminTenants, actor }) {
     const tenants = revokeOwnerTenants(this.tenantIdsOf(ownerUserId), adminTenants);
-    await this.appendAudit(keyRevokeAuditEntry(tenants[0], actor, keyId, !this.revokedKeys.has(keyId), tenants));
+    await this.appendAudit(keyRevokeAuditEntry(tenants[0], actor, keyId, !this.revokedKeys.has(keyId), tenants.length));
     this.revokedKeys.add(keyId);
-    return { tenant_id: tenants[0], tenants };
+    return { tenant_id: tenants[0], owner_tenant_count: tenants.length };
   }
 
   async recentAlert(hostId, ruleName, withinMs, now = Date.now()) {
@@ -3326,7 +3331,8 @@ class PgRegistry {
   // administer between the check and the revoke (the key row is locked, then
   // the member lock, and the memberships are read under it; every membership
   // write takes the same lock), a key row swapped to another owner (the
-  // locked row must name ownerUserId). Does NOT re-check the
+  // locked row must name ownerUserId), and foreign tenant names in this
+  // tenant's audit (the row holds a count only). Does NOT re-check the
   // actor's own admin role inside the transaction (it can come from SSO
   // groups, which the database does not hold).
   async revokeKeyAudited({ keyId, ownerUserId, adminTenants, actor }) {
@@ -3339,9 +3345,9 @@ class PgRegistry {
       const mem = await client.query('SELECT tenant_id FROM cp_members WHERE user_id = $1', [ownerUserId]);
       const tenants = revokeOwnerTenants(mem.rows.map((r) => r.tenant_id), adminTenants);
       await client.query('UPDATE playground_api_keys SET is_active = false WHERE key_id = $1', [keyId]);
-      await auditInsert(client, keyRevokeAuditEntry(tenants[0], actor, keyId, cur.rows[0].is_active === true, tenants));
+      await auditInsert(client, keyRevokeAuditEntry(tenants[0], actor, keyId, cur.rows[0].is_active === true, tenants.length));
       await client.query('COMMIT');
-      return { tenant_id: tenants[0], tenants };
+      return { tenant_id: tenants[0], owner_tenant_count: tenants.length };
     } catch (err) {
       try { await client.query('ROLLBACK'); } catch { /* connection already failed */ }
       throw err;

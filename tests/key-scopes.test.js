@@ -137,7 +137,8 @@ test('revoke: an admin of every owner tenant revokes the key, audited, and agent
     assert.equal(rows.length, 1);
     assert.equal(rows[0].tenant_id, 'acme');
     assert.equal(rows[0].payload.was_active, true);
-    assert.deepEqual(rows[0].payload.tenants, ['acme']);
+    assert.equal(rows[0].payload.owner_tenant_count, 1);
+    assert.equal('tenants' in rows[0].payload, false);
     assert.ok(!JSON.stringify(rows[0]).includes('"k-op"'), 'the audit row names the key by fingerprint');
     assert.equal((await r.reg.verifyAudit()).ok, true);
     // A second revoke is still audited, with was_active false.
@@ -177,5 +178,26 @@ test('revoke: a membership the owner gains after the key lookup is seen by the r
     assert.equal(res.status, 404);
     assert.equal(await r.reg.keyActive('k-op'), true);
     assert.equal(r.reg.audit.filter((a) => a.action === 'key_revoked').length, 0);
+  } finally { await r.close(); }
+});
+
+// Threats: the revoke row lives in one tenant's audit, readable by that
+// tenant's members; it must not name the owner's other tenants.
+test('revoke: the audit row of a key whose owner is in two tenants names neither the other tenant nor the key id', async () => {
+  const r = await rig();
+  try {
+    await r.reg.addMember('beta', 'user-1', 'admin', null); // admin of acme and beta
+    await r.reg.addMember('beta', 'user-3', 'viewer', null); // k-op's owner now in both
+    const res = await fetch(`${r.post.url}/api/v1/keys/k-op/revoke`, { method: 'POST', headers: { 'x-api-key': 'admin-acme' } });
+    assert.equal(res.status, 200);
+    const rows = r.reg.audit.filter((a) => a.action === 'key_revoked');
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].tenant_id, 'acme');
+    assert.equal(rows[0].payload.owner_tenant_count, 2);
+    const text = JSON.stringify(rows[0]);
+    assert.ok(!text.includes('beta'), text);
+    assert.ok(!text.includes('"k-op"'), text);
+    // An acme member reading acme's audit sees no beta row either.
+    assert.equal((await r.reg.listAudit(['acme'], 100)).some((a) => JSON.stringify(a).includes('beta')), false);
   } finally { await r.close(); }
 });

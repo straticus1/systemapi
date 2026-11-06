@@ -1485,6 +1485,12 @@ test('revokeKeyAudited: a concurrent membership change is seen by the check; an 
   // An admin of all three revokes it.
   await registry.revokeKeyAudited({ keyId: key, ownerUserId: owner, adminTenants: [ta, tb, tc], actor: 'rv-admin' });
   assert.equal(await active(), false);
+  // The audit row names no tenant but its own (a count of the owner's tenants).
+  const row = (await pool.query("SELECT tenant_id, payload FROM cp_audit WHERE action = 'key_revoked' AND payload->>'key_fp' = $1 ORDER BY seq DESC LIMIT 1",
+    [crypto.createHash('sha256').update(key).digest('hex')])).rows[0];
+  assert.equal(row.tenant_id, [ta, tb, tc].sort()[0]);
+  assert.equal(row.payload.owner_tenant_count, 3);
+  for (const t of [ta, tb, tc].filter((t) => t !== row.tenant_id)) assert.ok(!JSON.stringify(row.payload).includes(t), t);
   assert.equal((await registry.verifyAudit()).ok, true);
 });
 
