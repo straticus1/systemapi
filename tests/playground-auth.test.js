@@ -246,12 +246,17 @@ const { authenticate } = require('../controlplane/router');
 // Just the playground_api_keys statements the key routes and key checks run.
 function keysPool() {
   const rows = [];
+  const members = [];
   async function query(sql, params = []) {
     const q = sql.replace(/\s+/g, ' ').trim();
     if (q.startsWith('INSERT INTO playground_api_keys')) {
       const [key_id, key_hash, user_id, name, api_site, description] = params;
-      rows.push({ key_id, key_hash, user_id, name, api_site, description, is_active: true, is_locked: false, created_at: new Date() });
+      rows.push({ key_id, key_hash, user_id, name, api_site, description, tenant_id: params[9] ?? null, is_active: true, is_locked: false, created_at: new Date() });
       return { rows: [], rowCount: 1 };
+    }
+    if (q === 'SELECT tenant_id FROM cp_members WHERE user_id = $1 ORDER BY tenant_id') {
+      const r = members.filter((m) => m.user_id === params[0]).map((m) => ({ tenant_id: m.tenant_id })).sort((a, b) => a.tenant_id.localeCompare(b.tenant_id));
+      return { rows: r, rowCount: r.length };
     }
     if (q.includes('FROM playground_api_keys WHERE key_id = $1 AND api_site = $2 AND is_active = true AND is_locked = false')) {
       const r = rows.filter((k) => k.key_id === params[0] && k.api_site === params[1] && k.is_active && !k.is_locked);
@@ -280,7 +285,7 @@ function keysPool() {
     if (q.startsWith('UPDATE playground_api_keys SET last_used_at')) return { rows: [], rowCount: 1 };
     throw new Error(`unexpected SQL in test pool: ${q}`);
   }
-  return { rows, query, async connect() { return { query, release() {} }; } };
+  return { rows, members, query, async connect() { return { query, release() {} }; } };
 }
 
 test('a JWT whose sub equals a member id cannot list, lock or delete that member\'s keys, and its key has no tenant powers', async () => {
@@ -355,5 +360,64 @@ test('a JWT whose sub equals a member id cannot list, lock or delete that member
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
     }
+  }
+});
+
+// Threats: a key-authenticated caller minting an unbound sibling key that
+// escapes its tenant binding (enrolls anywhere the owner is a member).
+test('POST /api-keys with an API key: the new key is bound to the caller key\'s tenant, or to one tenant of the caller, else refused', async () => {
+  const pool = keysPool();
+  const addKey = async (keyId, userId, tenantId) => {
+    const secret = `${keyId}.${keyId}secret`;
+    pool.rows.push({ key_id: keyId, key_hash: await bcrypt.hash(secret, 4), user_id: userId, name: keyId, api_site: 'systemapi',
+      tenant_id: tenantId, is_active: true, is_locked: false, created_at: new Date() });
+    return secret;
+  };
+  const bound = await addKey('ak_live_boundkey00000', 'agent-1', 'acme');
+  const multi = await addKey('ak_live_multikey00000', 'ops-1', null);
+  const single = await addKey('ak_live_singlekey0000', 'solo-1', null);
+  const none = await addKey('ak_live_nomemberkey00', 'nobody-1', null);
+  pool.members.push({ tenant_id: 'acme', user_id: 'agent-1' }, { tenant_id: 'beta', user_id: 'agent-1' },
+    { tenant_id: 'acme', user_id: 'ops-1' }, { tenant_id: 'beta', user_id: 'ops-1' }, { tenant_id: 'solo', user_id: 'solo-1' });
+
+  const app = express();
+  app.use(express.json());
+  app.use('/playground', createPlaygroundRouter({ db: pool, redis: null, keycloakURL: 'https://unused.test', keycloakRealm: 'unused', keycloakClientID: 'systemapi-client', apiSite: 'systemapi', baseURL: 'http://127.0.0.1' }));
+  const server = await new Promise((resolve) => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
+  const base = `http://127.0.0.1:${server.address().port}/playground`;
+  const mint = (secret, body) => fetch(`${base}/api-keys`, { method: 'POST', headers: { 'x-api-key': secret, 'content-type': 'application/json' }, body: JSON.stringify(body) })
+    .then(async (res) => ({ status: res.status, body: await res.json() }));
+  const tenantOf = (keyId) => pool.rows.find((k) => k.key_id === keyId).tenant_id;
+  try {
+    // A bound key: the new key inherits the binding; another tenant is refused.
+    const a = await mint(bound, { name: 'sibling' });
+    assert.equal(a.status, 201, JSON.stringify(a.body));
+    assert.equal(a.body.tenant_id, 'acme');
+    assert.equal(tenantOf(a.body.key_id), 'acme');
+    const before = pool.rows.length;
+    assert.equal((await mint(bound, { name: 'escape', tenant_id: 'beta' })).status, 403);
+    assert.equal((await mint(bound, { name: 'escape', tenant_id: 7 })).status, 400);
+    assert.equal(pool.rows.length, before, 'nothing minted on refusal');
+
+    // An unbound key of a member of two tenants: must name one it belongs to.
+    const amb = await mint(multi, { name: 'x' });
+    assert.equal(amb.status, 400);
+    assert.equal(amb.body.error, 'tenant_required');
+    assert.equal((await mint(multi, { name: 'x', tenant_id: 'gamma' })).status, 403);
+    const b = await mint(multi, { name: 'x', tenant_id: 'beta' });
+    assert.equal(b.status, 201);
+    assert.equal(tenantOf(b.body.key_id), 'beta');
+
+    // An unbound key of a member of one tenant: bound to it.
+    const c = await mint(single, { name: 'y' });
+    assert.equal(c.status, 201);
+    assert.equal(tenantOf(c.body.key_id), 'solo');
+
+    // A key whose owner is in no tenant: refused.
+    assert.equal((await mint(none, { name: 'z' })).status, 400);
+    assert.equal(pool.rows.filter((k) => k.tenant_id == null && !['ak_live_multikey00000', 'ak_live_singlekey0000', 'ak_live_nomemberkey00'].includes(k.key_id)).length, 0,
+      'no unbound key was minted for a key caller');
+  } finally {
+    server.close();
   }
 });

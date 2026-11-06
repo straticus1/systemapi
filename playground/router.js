@@ -186,10 +186,45 @@ function createPlaygroundRouter(config) {
         return res.status(400).json({ error: 'Missing required field: name' });
       }
 
+      // Threats: a key-authenticated caller (a tenant-bound agent key, or a
+      // key of a member of several tenants) minting an unbound sibling key
+      // that enrolls agents into any tenant the owner belongs to, escaping
+      // the binding (FleetManager key_tenant_mismatch). A key caller's new
+      // key is always bound: to the caller key's tenant when it has one
+      // (a different tenant_id in the body is refused), else to the body's
+      // tenant_id, which must be a tenant the caller is a member of, else to
+      // the caller's only tenant; otherwise refused (fail closed). JWT
+      // callers ("oidc:<sub>", no tenant powers) keep unbound keys. Does NOT
+      // narrow the new key's endpoint or IP allowlists to the caller key's.
+      let tenantId = null;
+      if (req.authKind === 'api_key') {
+        const wanted = req.body.tenant_id;
+        if (wanted !== undefined && wanted !== null && typeof wanted !== 'string') {
+          return res.status(400).json({ error: 'bad_tenant_id' });
+        }
+        if (req.apiKeyTenantId) {
+          if (wanted != null && wanted !== req.apiKeyTenantId) {
+            return res.status(403).json({ error: 'key_tenant_mismatch' });
+          }
+          tenantId = req.apiKeyTenantId;
+        } else {
+          const members = await db.query('SELECT tenant_id FROM cp_members WHERE user_id = $1 ORDER BY tenant_id', [req.userId]);
+          const tenants = members.rows.map((r) => r.tenant_id);
+          if (wanted != null) {
+            if (!tenants.includes(wanted)) return res.status(403).json({ error: 'not_a_member' });
+            tenantId = wanted;
+          } else if (tenants.length === 1) {
+            tenantId = tenants[0];
+          } else {
+            return res.status(400).json({ error: 'tenant_required', message: 'Name tenant_id: a key minted with an API key is bound to one tenant' });
+          }
+        }
+      }
+
       const { keyId, keySecret } = await authManager.createAPIKey(
         req.userId,
         name,
-        { description, expiresInDays: expires_in_days, ipWhitelist: ip_whitelist, allowedEndpoints: allowed_endpoints }
+        { description, expiresInDays: expires_in_days, ipWhitelist: ip_whitelist, allowedEndpoints: allowed_endpoints, tenantId }
       );
 
       // Fetch created key details
@@ -197,7 +232,7 @@ function createPlaygroundRouter(config) {
       try {
         const result = await client.query(`
           SELECT key_id, name, description, api_site, created_at, expires_at,
-                 last_used_at, is_locked, is_active
+                 last_used_at, is_locked, is_active, tenant_id
           FROM playground_api_keys
           WHERE key_id = $1
         `, [keyId]);
@@ -219,6 +254,7 @@ function createPlaygroundRouter(config) {
           last_used_at: row.last_used_at,
           is_locked: row.is_locked,
           is_active: row.is_active,
+          tenant_id: row.tenant_id ?? null,
           warning: 'Store this API key securely. It will not be shown again.'
         });
       } finally {

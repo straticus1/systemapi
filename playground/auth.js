@@ -220,11 +220,21 @@ class AuthManager {
    * @returns {Promise<string|null>} user_id or null
    */
   async verifyAPIKey(keyId, keySecret, ipAddress = null, endpoint = null) {
+    const details = await this.verifyAPIKeyDetails(keyId, keySecret, ipAddress, endpoint);
+    return details ? details.userId : null;
+  }
+
+  /**
+   * As verifyAPIKey, but also returns the key's tenant binding
+   * (playground_api_keys.tenant_id, null when unbound).
+   * @returns {Promise<{userId: string, tenantId: string|null}|null>}
+   */
+  async verifyAPIKeyDetails(keyId, keySecret, ipAddress = null, endpoint = null) {
     const client = await this.db.connect();
     try {
       const result = await client.query(`
         SELECT user_id, key_hash, is_locked, is_active, expires_at,
-               ip_whitelist, allowed_endpoints
+               ip_whitelist, allowed_endpoints, tenant_id
         FROM playground_api_keys
         WHERE key_id = $1 AND api_site = $2
       `, [keyId, this.apiSite]);
@@ -273,7 +283,7 @@ class AuthManager {
         WHERE key_id = $1
       `, [keyId]);
 
-      return user_id;
+      return { userId: user_id, tenantId: row.tenant_id ?? null };
     } finally {
       client.release();
     }
@@ -337,6 +347,9 @@ class AuthManager {
   authMiddleware() {
     return async (req, res, next) => {
       let userId = null;
+      // Set only when the caller authenticated with an API key: the key's
+      // tenant binding (null when unbound). POST /api-keys reads it.
+      let apiKeyTenantId;
 
       // Try API key first (X-API-Key header)
       const apiKeyHeader = req.headers['x-api-key'];
@@ -347,12 +360,16 @@ class AuthManager {
           : [null, null];
 
         if (keyId && keySecret) {
-          userId = await this.verifyAPIKey(
+          const details = await this.verifyAPIKeyDetails(
             keyId,
             keySecret,
             req.ip,
             req.path
           );
+          if (details) {
+            userId = details.userId;
+            apiKeyTenantId = details.tenantId;
+          }
         }
       }
 
@@ -368,6 +385,8 @@ class AuthManager {
       // Attach user_id to request
       req.userId = userId;
       req.isAuthenticated = !!userId;
+      req.authKind = !userId ? null : (apiKeyTenantId !== undefined ? 'api_key' : 'jwt');
+      req.apiKeyTenantId = apiKeyTenantId ?? null;
 
       next();
     };

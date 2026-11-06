@@ -99,7 +99,7 @@ app.listen(3000, () => {
 ```
 
 ### API Key Management
-- `POST /playground/api-keys` - Create new API key (auth required)
+- `POST /playground/api-keys` - Create new API key (auth required). Called with an API key, the new key is always tenant-bound: to the caller key's tenant if it has one (a different `tenant_id` is 403), else to the body's `tenant_id` (must be one of the caller's tenants, 403 otherwise), else to the caller's only tenant; with none or several and no `tenant_id`, 400 `tenant_required`. JWT callers get unbound keys (they have no tenant powers).
 - `GET /playground/api-keys` - List user's API keys (auth required)
 - `DELETE /playground/api-keys/:keyId` - Delete API key (auth required)
 - `PATCH /playground/api-keys/:keyId/lock` - Lock/unlock API key (auth required)
