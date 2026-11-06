@@ -997,7 +997,9 @@ test('a set sash seed signs a ps-only grant when the host has no channel policy'
     assert.deepEqual(start.grant.file_read, []);
     assert.deepEqual(start.grant.file_write, []);
     assert.equal(start.grant.allow_private, false);
-    assert.deepEqual(start.sash_targets, { units: [], packages: [], configs: [], sysctls: [], files: [] });
+    assert.deepEqual(start.sash_targets, {
+      units: [], packages: [], configs: [], sysctls: [], files: [], files_write: []
+    });
     const { fleet, emer } = sashPubs();
     const checked = verifySashGrant(JSON.stringify(start.grant), fleet, emer);
     assert.equal(checked.ok, true, checked.error);
@@ -1021,14 +1023,19 @@ test('a set sash seed carries the read entitlements that survive channel policy'
     assert.equal(start.grant.purpose, 'terminal:root');
     assert.equal(start.grant.exp, start.deadline_unix);
     assert.equal(start.grant.lease_id, start.lease.nonce_hex);
-    assert.deepEqual(start.grant.entitlements, ['ps', 'unit.status', 'package.query', 'sysctl.get', 'config.read', 'file.read']);
+    assert.deepEqual(start.grant.entitlements, [
+      'ps', 'unit.status', 'unit.restart', 'package.query', 'package.install',
+      'sysctl.get', 'sysctl.set', 'config.read', 'file.read', 'file.write'
+    ]);
     assert.deepEqual(start.grant.file_read, ['/var/log']);
+    assert.deepEqual(start.grant.file_write, ['/tmp']);
     assert.deepEqual(start.sash_targets, {
       units: ['nginx'],
       packages: ['curl'],
       configs: ['/etc/ssh/sshd_config'],
       sysctls: ['net.ipv4.ip_forward'],
-      files: ['/var/log']
+      files: ['/var/log'],
+      files_write: ['/tmp']
     });
     const { fleet, emer } = sashPubs();
     const checked = verifySashGrant(JSON.stringify(start.grant), fleet, emer);

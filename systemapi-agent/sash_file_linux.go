@@ -4,20 +4,25 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"log"
 	"os"
-	"os/exec"
 )
 
-// Threats: sash asking the agent to open a path the grant did not name, a
-// helper that returns a secret after a failed status, and a nil identity
-// reaching the credential drop. file.read goes through the existing file
-// helper. A failed spawn or a bad path returns denied and no bytes. Does
-// NOT os.Open the request path. Does NOT shell out. Does NOT call Wait
-// unless Start succeeded.
+// Threats: sash asking the agent to open or replace a path the grant did
+// not name, a helper that returns a secret after a failed status, a nil
+// identity reaching the credential drop, and a write that keeps its temp
+// file after a failed commit. file.read and file.write go through the
+// existing file helper (write_open, write_chunk, write_commit, write_abort).
+// A failed spawn, a bad path, or a transport error returns denied and no
+// bytes. An operational helper error is exit 1 and does not return the
+// path or the body. Does NOT os.Open the request path. Does NOT shell out.
+// Does NOT call Wait unless Start succeeded. Does NOT use the file-channel
+// upload registry.
 
 func sashFileDefault(id *ptyIdentity, op, root, rel string) (sashResult, error) {
 	if id == nil || checkFilePath(rel) != "" {
@@ -32,6 +37,109 @@ func sashFileDefault(id *ptyIdentity, op, root, rel string) (sashResult, error) 
 	case "stat":
 		helperOp = "stat"
 	default:
+		return sashResult{}, errSashDenied
+	}
+	return sashFileRun(id, root, func(w *bufio.Writer, r *bufio.Reader) (sashResult, error) {
+		switch helperOp {
+		case "read":
+			return sashFileRead(w, r, rel)
+		case "list":
+			return sashFileList(w, r, rel)
+		case "stat":
+			return sashFileStat(w, r, rel)
+		default:
+			return sashResult{}, errSashDenied
+		}
+	})
+}
+
+// sashFileWriteDefault replaces one file under root. rel "." is the
+// directory itself and is refused before the helper starts. An empty body
+// is a real write. Shell ">" overwrites.
+func sashFileWriteDefault(id *ptyIdentity, root, rel string, body []byte) (sashResult, error) {
+	if id == nil || rel == "." || checkFilePath(rel) != "" || len(body) > fileReadMax {
+		return sashResult{}, errSashDenied
+	}
+	uploadID, err := newUploadID()
+	if err != nil {
+		log.Printf("sash file write id failed")
+		return sashResult{}, errSashDenied
+	}
+	sum := sha256.Sum256(body)
+	hexSum := hex.EncodeToString(sum[:])
+	size := int64(len(body))
+	overwrite := true
+	return sashFileRun(id, root, func(w *bufio.Writer, r *bufio.Reader) (sashResult, error) {
+		opened, err := sashHelperResp(w, r, fileReq{
+			Op: "write_open", Path: rel, Size: &size, SHA256: hexSum,
+			Overwrite: &overwrite, UploadID: uploadID,
+		})
+		if err != nil {
+			return sashResult{}, errSashDenied
+		}
+		if opened.Error != "" {
+			return sashResult{Kind: "bytes", Exit: 1}, nil
+		}
+		off := int64(0)
+		for off < size {
+			n := int64(fileChunkMax)
+			if remain := size - off; remain < n {
+				n = remain
+			}
+			chunk := body[off : off+n]
+			chunkOff := off
+			if err := writeHelperJSON(w, fileReq{Op: "write_chunk", Offset: &chunkOff}); err != nil {
+				return sashAbortDenied(w, r)
+			}
+			if err := writeHelperFrame(w, frameBinary, chunk); err != nil {
+				return sashAbortDenied(w, r)
+			}
+			if err := w.Flush(); err != nil {
+				return sashAbortDenied(w, r)
+			}
+			resp, err := sashReadHelperResp(r)
+			if err != nil {
+				return sashAbortDenied(w, r)
+			}
+			if resp.Error != "" {
+				return sashAbortExit(w, r)
+			}
+			off += n
+		}
+		committed, err := sashHelperResp(w, r, fileReq{Op: "write_commit"})
+		if err != nil {
+			return sashAbortDenied(w, r)
+		}
+		if committed.Error != "" {
+			return sashAbortExit(w, r)
+		}
+		return sashResult{Kind: "bytes", Exit: 0}, nil
+	})
+}
+
+// sashAbortDenied tries to drop the temp file, then fails closed.
+func sashAbortDenied(w *bufio.Writer, r *bufio.Reader) (sashResult, error) {
+	if _, err := sashHelperResp(w, r, fileReq{Op: "write_abort"}); err != nil {
+		return sashResult{}, errSashDenied
+	}
+	return sashResult{}, errSashDenied
+}
+
+// sashAbortExit tries to drop the temp file, then reports the helper's
+// operational failure. An abort response that names an error is ignored.
+// An abort that cannot be sent fails closed.
+func sashAbortExit(w *bufio.Writer, r *bufio.Reader) (sashResult, error) {
+	if _, err := sashHelperResp(w, r, fileReq{Op: "write_abort"}); err != nil {
+		return sashResult{}, errSashDenied
+	}
+	return sashResult{Kind: "bytes", Exit: 1}, nil
+}
+
+// sashFileRun starts the file helper, inits it, runs fn, then closes the
+// pipes and Wait. A nil identity never reaches the credential drop. Wait
+// runs only after Start. A non-zero Wait after a successful op fails closed.
+func sashFileRun(id *ptyIdentity, root string, fn func(w *bufio.Writer, r *bufio.Reader) (sashResult, error)) (sashResult, error) {
+	if id == nil {
 		return sashResult{}, errSashDenied
 	}
 	cmd, err := startFileHelperProc(id)
@@ -52,7 +160,13 @@ func sashFileDefault(id *ptyIdentity, op, root, rel string) (sashResult, error) 
 		sashFileClose(stdout)
 		return sashResult{}, errSashDenied
 	}
-	res, opErr := sashFileOps(stdin, stdout, id, helperOp, root, rel)
+	w := bufio.NewWriter(stdin)
+	r := bufio.NewReader(stdout)
+	var res sashResult
+	opErr := sashFileInit(w, r, id, root)
+	if opErr == nil {
+		res, opErr = fn(w, r)
+	}
 	cerr := sashFileClose(stdin)
 	oerr := sashFileClose(stdout)
 	werr := cmd.Wait()
@@ -63,6 +177,20 @@ func sashFileDefault(id *ptyIdentity, op, root, rel string) (sashResult, error) 
 		return sashResult{}, errSashDenied
 	}
 	return res, nil
+}
+
+func sashFileInit(w *bufio.Writer, r *bufio.Reader, id *ptyIdentity, root string) error {
+	if err := writeHelperJSON(w, fileReq{Op: "init", Root: root, Home: id.home, FileMax: fileReadMax}); err != nil {
+		return errSashDenied
+	}
+	if err := w.Flush(); err != nil {
+		return errSashDenied
+	}
+	resp, err := sashReadHelperResp(r)
+	if err != nil || resp.Error != "" {
+		return errSashDenied
+	}
+	return nil
 }
 
 func sashFileCloseBad(err error) bool {
@@ -80,40 +208,26 @@ func sashFileClose(c io.Closer) error {
 	return err
 }
 
-func sashFileOps(stdin io.Writer, stdout io.Reader, id *ptyIdentity, helperOp, root, rel string) (sashResult, error) {
-	w := bufio.NewWriter(stdin)
-	r := bufio.NewReader(stdout)
-	if err := writeHelperJSON(w, fileReq{Op: "init", Root: root, Home: id.home, FileMax: fileReadMax}); err != nil {
-		return sashResult{}, errSashDenied
-	}
-	if err := w.Flush(); err != nil {
-		return sashResult{}, errSashDenied
-	}
-	kind, payload, err := readHelperFrame(r)
-	if err != nil || kind != frameJSON {
-		return sashResult{}, errSashDenied
-	}
-	initResp, err := decodeFileResp(payload)
-	if err != nil || initResp.Error != "" {
-		return sashResult{}, errSashDenied
-	}
-	switch helperOp {
-	case "read":
-		return sashFileRead(w, r, rel)
-	case "list":
-		return sashFileList(w, r, rel)
-	case "stat":
-		return sashFileStat(w, r, rel)
-	default:
-		return sashResult{}, errSashDenied
-	}
-}
-
 func sashHelperCall(w *bufio.Writer, req fileReq) error {
 	if err := writeHelperJSON(w, req); err != nil {
 		return err
 	}
 	return w.Flush()
+}
+
+func sashHelperResp(w *bufio.Writer, r *bufio.Reader, req fileReq) (fileResp, error) {
+	if err := sashHelperCall(w, req); err != nil {
+		return fileResp{}, err
+	}
+	return sashReadHelperResp(r)
+}
+
+func sashReadHelperResp(r *bufio.Reader) (fileResp, error) {
+	kind, payload, err := readHelperFrame(r)
+	if err != nil || kind != frameJSON {
+		return fileResp{}, errSashDenied
+	}
+	return decodeFileResp(payload)
 }
 
 func decodeFileResp(payload []byte) (fileResp, error) {
@@ -164,11 +278,7 @@ func sashFileList(w *bufio.Writer, r *bufio.Reader, rel string) (sashResult, err
 	if err := sashHelperCall(w, fileReq{Op: "list", Path: rel, Limit: &limit}); err != nil {
 		return sashResult{}, errSashDenied
 	}
-	kind, payload, err := readHelperFrame(r)
-	if err != nil || kind != frameJSON {
-		return sashResult{}, errSashDenied
-	}
-	resp, err := decodeFileResp(payload)
+	resp, err := sashReadHelperResp(r)
 	if err != nil {
 		return sashResult{}, errSashDenied
 	}
@@ -204,11 +314,7 @@ func sashFileStat(w *bufio.Writer, r *bufio.Reader, rel string) (sashResult, err
 	if err := sashHelperCall(w, fileReq{Op: "stat", Path: rel}); err != nil {
 		return sashResult{}, errSashDenied
 	}
-	kind, payload, err := readHelperFrame(r)
-	if err != nil || kind != frameJSON {
-		return sashResult{}, errSashDenied
-	}
-	resp, err := decodeFileResp(payload)
+	resp, err := sashReadHelperResp(r)
 	if err != nil {
 		return sashResult{}, errSashDenied
 	}
@@ -237,8 +343,6 @@ func sashFieldString(v any) string {
 	}
 }
 
-// bytesReader exists so decodeFileResp does not import bytes under a name
-// the file helper already uses loosely. strings is not required.
 func bytesReader(b []byte) io.Reader {
 	return &sashByteReader{b: b}
 }
@@ -255,6 +359,3 @@ func (r *sashByteReader) Read(p []byte) (int, error) {
 	r.b = r.b[n:]
 	return n, nil
 }
-
-// Keep exec imported for the file's build: startFileHelperProc returns *exec.Cmd.
-var _ = exec.ErrNotFound

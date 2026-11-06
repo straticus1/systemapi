@@ -166,30 +166,51 @@ function takeSysctls(policies) {
   return out;
 }
 
-function takeFiles(policies) {
+function takeFileRoots(policies) {
   if (!policies || typeof policies !== 'object') return [];
   const file = policies.file;
   if (file == null) return [];
   if (typeof file !== 'object' || Array.isArray(file)) throw shape();
   if (file.roots == null) return [];
   if (!Array.isArray(file.roots)) throw shape();
+  return file.roots;
+}
+
+function takeFiles(policies) {
   const out = [];
-  for (const entry of file.roots) {
+  for (const entry of takeFileRoots(policies)) {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw shape();
     const p = entry.path;
     if (typeof p !== 'string' || p.length === 0 || !canonOK(p)) throw shape();
     if (p === '~' || p === '*' || !p.startsWith('/') || goPathClean(p) !== p) continue;
     if (entry.read !== true) continue;
-    if (!filePolicyAllows(file, 'file:read', p)) continue;
+    if (!filePolicyAllows(policies.file, 'file:read', p)) continue;
     out.push(p);
   }
   return out;
 }
 
-// buildSashTerminalGrant signs a login grant. file_write stays empty.
-// journal and every write entitlement are omitted. policies may be the
-// effectivePolicies object (null sections are empty) or a fixture that still
-// contains "*".
+// sash file.write is not a file-channel session. That session can also read,
+// which is why filePolicyAllows('file:write') requires entry.read. A
+// write-only root (the fleet fixture /tmp) is a real write root, so this
+// keeps entry.write === true and does not call filePolicyAllows.
+function takeWriteFiles(policies) {
+  const out = [];
+  for (const entry of takeFileRoots(policies)) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw shape();
+    const p = entry.path;
+    if (typeof p !== 'string' || p.length === 0 || !canonOK(p)) throw shape();
+    if (p === '~' || p === '*' || !p.startsWith('/') || goPathClean(p) !== p) continue;
+    if (entry.write !== true) continue;
+    out.push(p);
+  }
+  return out;
+}
+
+// buildSashTerminalGrant signs a login grant. journal is omitted. A write
+// entitlement is present only when its delivered list is non-empty.
+// policies may be the effectivePolicies object (null sections are empty) or
+// a fixture that still contains "*".
 function buildSashTerminalGrant(seedHex, opts) {
   const o = opts || {};
   if (!BUILD_PURPOSES.has(o.purpose)) throw shape();
@@ -202,12 +223,14 @@ function buildSashTerminalGrant(seedHex, opts) {
   const configs = takeConfigs(o.policies);
   const sysctls = takeSysctls(o.policies);
   const files = takeFiles(o.policies);
+  const writeFiles = takeWriteFiles(o.policies);
   const entitlements = ['ps'];
-  if (units.length) entitlements.push('unit.status');
-  if (packages.length) entitlements.push('package.query');
-  if (sysctls.length) entitlements.push('sysctl.get');
+  if (units.length) entitlements.push('unit.status', 'unit.restart');
+  if (packages.length) entitlements.push('package.query', 'package.install');
+  if (sysctls.length) entitlements.push('sysctl.get', 'sysctl.set');
   if (configs.length) entitlements.push('config.read');
   if (files.length) entitlements.push('file.read');
+  if (writeFiles.length) entitlements.push('file.write');
   const document = signSashDocument({
     v: 'sash/1',
     actor: o.actor,
@@ -217,13 +240,13 @@ function buildSashTerminalGrant(seedHex, opts) {
     lease_id: o.lease_id,
     entitlements,
     file_read: files,
-    file_write: [],
+    file_write: writeFiles,
     allow_private: false
   }, seedHex);
   return {
     document,
     grant: document,
-    targets: { units, packages, configs, sysctls, files }
+    targets: { units, packages, configs, sysctls, files, files_write: writeFiles }
   };
 }
 

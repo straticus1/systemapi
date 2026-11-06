@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path"
 	"runtime"
 	"strconv"
@@ -13,12 +14,14 @@ import (
 )
 
 // Threats: a patched sash asking for a verb the grant does not name, a write
-// or journal verb on this read-only path, a path outside the granted roots
-// or the delivered policy, a hard-denied sysctl, and a helper call after the
-// session lease has expired. The check order is lease, entitlement, policy,
-// helper. A failed re-check returns "denied" and does not call the helper.
-// journal has no reader here and is not a journalctl shell-out. Does NOT
-// import sash. Does NOT mint a sys lease to call the helpers.
+// whose target is outside the grant or the delivered policy, a journal verb
+// (there is no reader), a hard-denied sysctl or a sysctl value the setter
+// would refuse, and a helper call after the session lease has expired. The
+// check order is lease, entitlement, policy, helper. A failed re-check
+// returns "denied" and does not call the helper. journal is not a journalctl
+// shell-out. file.write uses file_write roots and the delivered files_write
+// list, not the read roots. Does NOT import sash. Does NOT mint a sys lease
+// to call the helpers.
 
 var errSashDenied = errors.New("denied")
 
@@ -29,13 +32,33 @@ type sashProc struct {
 }
 
 var (
-	sashProcs        = sashProcsDefault
-	sashUnitStatus   = sashUnitStatusDefault
-	sashPackageQuery = sashPackageQueryDefault
-	sashSysctlGet    = sashSysctlGetDefault
-	sashConfigRead   = sashConfigReadDefault
-	sashFile         = sashFileDefault
+	sashProcs          = sashProcsDefault
+	sashUnitStatus     = sashUnitStatusDefault
+	sashPackageQuery   = sashPackageQueryDefault
+	sashSysctlGet      = sashSysctlGetDefault
+	sashConfigRead     = sashConfigReadDefault
+	sashFile           = sashFileDefault
+	sashUnitRestart    = sashUnitRestartDefault
+	sashPackageInstall = sashPackageInstallDefault
+	sashSysctlSet      = sashSysctlSetDefault
+	sashFileWrite      = sashFileWriteDefault
 )
+
+func sashUnitRestartDefault(name string) (string, error) {
+	if runtime.GOOS != "linux" {
+		return "", fmt.Errorf("requires linux")
+	}
+	mgr := selectServiceManager(detectFamily(runtime.GOOS, nil))
+	return mgr.Action(context.Background(), "restart", name)
+}
+
+func sashPackageInstallDefault(name string, allow []string) error {
+	return installPackage(context.Background(), name, allow)
+}
+
+func sashSysctlSetDefault(key, value string, allow []string) error {
+	return hostSysctlSet(key, value, allow)
+}
 
 func sashProcsDefault() ([]sashProc, error) {
 	list, err := process.Processes()
@@ -82,20 +105,11 @@ func sashLeaseLive(leaseFn func() time.Time) bool {
 	return !time.Now().After(leaseFn())
 }
 
-func sashWriteKey(key string) bool {
-	switch key {
-	case "unit.restart", "package.install", "sysctl.set", "file.write", "journal":
-		return true
-	default:
-		return false
-	}
-}
-
 func sashDispatch(g sashGrant, targets sashTargets, leaseFn func() time.Time, id *ptyIdentity, v sashCall) (sashResult, error) {
 	if !sashLeaseLive(leaseFn) {
 		return sashResult{}, errSashDenied
 	}
-	if sashWriteKey(v.Key) || !sashEntitled(g, v.Key) {
+	if v.Key == "journal" || !sashEntitled(g, v.Key) {
 		return sashResult{}, errSashDenied
 	}
 	switch v.Key {
@@ -103,14 +117,22 @@ func sashDispatch(g sashGrant, targets sashTargets, leaseFn func() time.Time, id
 		return sashDoPS()
 	case "unit.status":
 		return sashDoUnit(targets, v)
+	case "unit.restart":
+		return sashDoUnitRestart(targets, v)
 	case "package.query":
 		return sashDoPackage(targets, v)
+	case "package.install":
+		return sashDoPackageInstall(targets, v)
 	case "sysctl.get":
 		return sashDoSysctl(targets, v)
+	case "sysctl.set":
+		return sashDoSysctlSet(targets, v)
 	case "config.read":
 		return sashDoConfig(targets, v)
 	case "file.read":
 		return sashDoFile(g, targets, id, v)
+	case "file.write":
+		return sashDoFileWrite(g, targets, id, v)
 	default:
 		return sashResult{}, errSashDenied
 	}
@@ -275,4 +297,71 @@ func sashDoFile(g sashGrant, targets sashTargets, id *ptyIdentity, v sashCall) (
 		return sashResult{}, errSashDenied
 	}
 	return sashFile(id, op, root, rel)
+}
+
+func sashDoUnitRestart(targets sashTargets, v sashCall) (sashResult, error) {
+	if len(v.Argv) != 3 || v.Argv[0] != "unit" || v.Argv[1] != "restart" {
+		return sashResult{}, errSashDenied
+	}
+	name := v.Argv[2]
+	if !serviceNameRE.MatchString(name) || !exactGrant(targets.Units, name) {
+		return sashResult{}, errSashDenied
+	}
+	out, err := sashUnitRestart(name)
+	if err != nil {
+		return sashResult{Kind: "bytes", Exit: 1}, nil
+	}
+	return sashResult{Kind: "bytes", Bytes: []byte(out), Exit: 0}, nil
+}
+
+func sashDoPackageInstall(targets sashTargets, v sashCall) (sashResult, error) {
+	if len(v.Argv) != 3 || v.Argv[0] != "package" || v.Argv[1] != "install" {
+		return sashResult{}, errSashDenied
+	}
+	name := v.Argv[2]
+	if !packageNameRE.MatchString(name) || !exactGrant(targets.Packages, name) {
+		return sashResult{}, errSashDenied
+	}
+	if err := sashPackageInstall(name, targets.Packages); err != nil {
+		return sashResult{Kind: "bytes", Exit: 1}, nil
+	}
+	return sashResult{Kind: "bytes", Exit: 0}, nil
+}
+
+func sashDoSysctlSet(targets sashTargets, v sashCall) (sashResult, error) {
+	if len(v.Argv) != 4 || v.Argv[0] != "sysctl" || v.Argv[1] != "set" {
+		return sashResult{}, errSashDenied
+	}
+	key, value := v.Argv[2], v.Argv[3]
+	if sysctlDenied(key) || !sysctlKeyOK(key) || !sysctlValueOK(value) || !exactGrant(targets.Sysctls, key) {
+		return sashResult{}, errSashDenied
+	}
+	if err := sashSysctlSet(key, value, targets.Sysctls); err != nil {
+		return sashResult{Kind: "bytes", Exit: 1}, nil
+	}
+	return sashResult{Kind: "bytes", Exit: 0}, nil
+}
+
+// sashDoFileWrite refuses before the helper when the path is not a file
+// under both the grant's file_write roots and the delivered files_write
+// list. The read roots are not consulted. An empty body is a real write.
+func sashDoFileWrite(g sashGrant, targets sashTargets, id *ptyIdentity, v sashCall) (sashResult, error) {
+	if v.Path == "" || len(v.Argv) != 2 || v.Argv[0] != ">" || v.Argv[1] != v.Path {
+		return sashResult{}, errSashDenied
+	}
+	if len(v.Body) > fileReadMax || len(targets.FilesWrite) == 0 {
+		return sashResult{}, errSashDenied
+	}
+	root, ok := sashLongestRoot(g.FileWrite, v.Path)
+	if !ok {
+		return sashResult{}, errSashDenied
+	}
+	if _, ok = sashLongestRoot(targets.FilesWrite, v.Path); !ok {
+		return sashResult{}, errSashDenied
+	}
+	if v.Path == root {
+		return sashResult{}, errSashDenied
+	}
+	rel := strings.TrimPrefix(v.Path, root+"/")
+	return sashFileWrite(id, root, rel, append([]byte(nil), v.Body...))
 }

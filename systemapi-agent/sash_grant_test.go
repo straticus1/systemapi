@@ -217,14 +217,17 @@ func TestSashGrantNodeInterop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verify node grant: %v", err)
 	}
-	wantEnt := []string{"ps", "unit.status", "package.query", "sysctl.get", "config.read", "file.read"}
+	wantEnt := []string{
+		"ps", "unit.status", "unit.restart", "package.query", "package.install",
+		"sysctl.get", "sysctl.set", "config.read", "file.read", "file.write",
+	}
 	if strings.Join(g.Entitlements, ",") != strings.Join(wantEnt, ",") {
 		t.Fatalf("entitlements %v", g.Entitlements)
 	}
 	if strings.Join(g.FileRead, ",") != "/var/log" {
 		t.Fatalf("file_read %v", g.FileRead)
 	}
-	if len(g.FileWrite) != 0 || g.AllowPrivate {
+	if strings.Join(g.FileWrite, ",") != "/tmp" || g.AllowPrivate {
 		t.Fatalf("writes %v private %v", g.FileWrite, g.AllowPrivate)
 	}
 	if g.Exp != exp || g.LeaseID != "lease-1" || g.Actor != "alice" || g.Host != "host-1" {

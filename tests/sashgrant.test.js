@@ -68,16 +68,20 @@ test('goPathClean matches Go path.Clean on a leading double slash', () => {
 test('the login fixture filters stars, slash, denied sysctls and unclean paths', () => {
   const built = sample();
   assert.equal(built.document, built.grant);
-  assert.deepEqual(built.grant.entitlements, ['ps', 'unit.status', 'package.query', 'sysctl.get', 'config.read', 'file.read']);
+  assert.deepEqual(built.grant.entitlements, [
+    'ps', 'unit.status', 'unit.restart', 'package.query', 'package.install',
+    'sysctl.get', 'sysctl.set', 'config.read', 'file.read', 'file.write'
+  ]);
   assert.deepEqual(built.grant.file_read, ['/var/log']);
-  assert.deepEqual(built.grant.file_write, []);
+  assert.deepEqual(built.grant.file_write, ['/tmp']);
   assert.equal(built.grant.allow_private, false);
   assert.deepEqual(built.targets, {
     units: ['nginx'],
     packages: ['curl'],
     configs: ['/etc/ssh/sshd_config'],
     sysctls: ['net.ipv4.ip_forward'],
-    files: ['/var/log']
+    files: ['/var/log'],
+    files_write: ['/tmp']
   });
   const ok = check(built.grant);
   assert.equal(ok.ok, true, ok.error);
@@ -186,7 +190,11 @@ test('the CLI writes the signed document and a fixed error', () => {
   assert.equal(ok.stdout.includes(10), false);
   const parsed = JSON.parse(ok.stdout.toString('utf8'));
   assert.equal(check(ok.stdout).ok, true);
-  assert.deepEqual(parsed.entitlements, ['ps', 'unit.status', 'package.query', 'sysctl.get', 'config.read', 'file.read']);
+  assert.deepEqual(parsed.entitlements, [
+    'ps', 'unit.status', 'unit.restart', 'package.query', 'package.install',
+    'sysctl.get', 'sysctl.set', 'config.read', 'file.read', 'file.write'
+  ]);
+  assert.deepEqual(parsed.file_write, ['/tmp']);
 
   const bad = spawnSync(process.execPath, [script], { input: '{' });
   assert.equal(bad.status, 1);

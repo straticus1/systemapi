@@ -80,11 +80,12 @@ type sashBind struct {
 // sashTargets is the channel policy delivered beside the grant. The grant
 // signature does not cover it. An empty list denies that verb.
 type sashTargets struct {
-	Units    []string `json:"units"`
-	Packages []string `json:"packages"`
-	Configs  []string `json:"configs"`
-	Sysctls  []string `json:"sysctls"`
-	Files    []string `json:"files"`
+	Units      []string `json:"units"`
+	Packages   []string `json:"packages"`
+	Configs    []string `json:"configs"`
+	Sysctls    []string `json:"sysctls"`
+	Files      []string `json:"files"`
+	FilesWrite []string `json:"files_write"`
 }
 
 func sashStatusCode(err error) string {
@@ -335,11 +336,12 @@ func readSashPub(path string) ([]byte, error) {
 
 func copySashTargets(t sashTargets) sashTargets {
 	return sashTargets{
-		Units:    append([]string(nil), t.Units...),
-		Packages: append([]string(nil), t.Packages...),
-		Configs:  append([]string(nil), t.Configs...),
-		Sysctls:  append([]string(nil), t.Sysctls...),
-		Files:    append([]string(nil), t.Files...),
+		Units:      append([]string(nil), t.Units...),
+		Packages:   append([]string(nil), t.Packages...),
+		Configs:    append([]string(nil), t.Configs...),
+		Sysctls:    append([]string(nil), t.Sysctls...),
+		Files:      append([]string(nil), t.Files...),
+		FilesWrite: append([]string(nil), t.FilesWrite...),
 	}
 }
 

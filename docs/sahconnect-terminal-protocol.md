@@ -164,10 +164,13 @@ expires. A dead server therefore cannot leave a shell running for long.
   carry `actor`. The actor rides the authenticated agent socket; it is not
   in the signed lease. On Linux, `pty` and `pty_root` may also carry a
   signed `sash/1` `grant` object (not a string) and `sash_targets`
-  (`units`, `packages`, `configs`, `sysctls`, `files`). The grant is signed
-  with `SASH_GRANT_ED25519_SEED`, which the agent does not hold. Those
-  policy lists ride beside the grant; they are not fields inside the signed
-  document. darwin and windows ignore both and keep the passwd shell.
+  (`units`, `packages`, `configs`, `sysctls`, `files`, `files_write`).
+  A write entitlement is on the grant only when its matching list is
+  non-empty. `journal` is not. The grant is signed with
+  `SASH_GRANT_ED25519_SEED`, which the agent does not hold. Those policy
+  lists ride beside the grant; they are not fields inside the signed
+  document. `files_write` is not a signed-document field. darwin and
+  windows ignore both and keep the passwd shell.
 - **Agent.** `--pty-user-map <file>` maps each identity to its own Unix
   account (`identity = unixuser` lines; the file is `0600` or stricter and
   owned by root or the agent user). Terminal, file and xfer sessions resolve
