@@ -178,7 +178,10 @@ the helper units); until it exists every helper write fails closed. The
 control-plane key it installs is the trust anchor for every helper write, so it
 must be an out-of-band pinned value (the install bundle, or read by the
 operator from the control plane), never copied from `agent.json`, which the
-agent can write. The script cross-checks the pinned key and the (required,
+agent can write. `scripts/control-pubkey.js` derives it on the operator's machine
+from `SYSTEMAPI_ED25519_SEED` in the operator's copy of the production env file
+(parsed, never sourced; prints only the public key); the deploy kit's
+`agent/door.sh helper-trust` passes it to the script with the host id from the API. The script cross-checks the pinned key and the (required,
 also pinned) `--host-id` against `agent.json`, refuses on a mismatch, refuses a symlinked trust
 file, trust dir or state file, and writes `0644 root:root` through a same-dir
 temp file and rename. `loadHelperTrust` checks only the trust file and its

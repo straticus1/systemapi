@@ -8,6 +8,7 @@
 //   node /tmp/sah_sys.mjs sys:package '{"name":"cowsay","action":"query"}'
 //   node /tmp/sah_sys.mjs sys:config  '{"action":"read","target":"/etc/hostname"}'
 //   node /tmp/sah_sys.mjs sys:service '{"unit":"cron.service","action":"restart"}'
+//   SAH_HOST=sahtest1 node /tmp/sah_sys.mjs sys:tweak '{"verb":"sysctl-get","key":"vm.stat_interval"}'
 //
 // The binding object must match the host's policy allowlist (deny by default)
 // or the server answers *_denied.
@@ -15,7 +16,9 @@ import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 
 const API = process.env.SAHCORE_API || 'https://api.systemapi.io';
-const NAME = 'miniapps1';
+// SAH_HOST picks the host by name (default miniapps1, as before).
+const NAME = process.env.SAH_HOST || 'miniapps1';
+if (!/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(NAME)) { console.error('SAH_HOST must be a host name (lowercase letters, digits, -)'); process.exit(2); }
 const PURPOSE = process.argv[2];
 const BIND = process.argv[3];
 const FIELD = { 'sys:service': 'service', 'sys:package': 'package', 'sys:config': 'config', 'sys:tweak': 'tweak' }[PURPOSE];
