@@ -67,7 +67,7 @@ test('an admin sets the scopes of a key owned by a member of their tenant, audit
     assert.equal(rows.length, 1);
     assert.equal(rows[0].tenant_id, 'acme');
     assert.equal(rows[0].actor, 'user-1');
-    assert.deepEqual(rows[0].payload, { key_id: 'k-op', scopes: ['exec:run', 'hosts:read'], previous_scopes: ['hosts:read'], tenants: ['acme'] });
+    assert.deepEqual(rows[0].payload, { key_id: 'k-op', scopes: ['exec:run', 'hosts:read'], previous_scopes: ['hosts:read'], owner_tenant_count: 1 });
     assert.equal((await r.reg.verifyAudit()).ok, true);
   } finally { await r.close(); }
 });
@@ -92,7 +92,10 @@ test('an owner in two tenants needs an admin of both: admin of one only gets 404
     await r.reg.addMember('beta', 'user-1', 'admin', null); // now admin of both
     const ok = await r.post('admin-acme', 'k-op', { scopes: ['exec:run'] });
     assert.equal(ok.status, 200);
-    assert.deepEqual(scopeAudits(r.reg).at(-1).payload.tenants, ['acme', 'beta']);
+    const row = scopeAudits(r.reg).at(-1);
+    assert.equal(row.tenant_id, 'acme');
+    assert.equal(row.payload.owner_tenant_count, 2);
+    assert.ok(!JSON.stringify(row).includes('beta'), 'the acme row names no other tenant');
   } finally { await r.close(); }
 });
 
@@ -199,5 +202,21 @@ test('revoke: the audit row of a key whose owner is in two tenants names neither
     assert.ok(!text.includes('"k-op"'), text);
     // An acme member reading acme's audit sees no beta row either.
     assert.equal((await r.reg.listAudit(['acme'], 100)).some((a) => JSON.stringify(a).includes('beta')), false);
+  } finally { await r.close(); }
+});
+
+// The owner's memberships are read inside the scope change, not before it.
+test('scopes: a membership the owner gains after the key lookup is seen by the change (404, scopes unchanged, no audit row)', async () => {
+  const r = await rig();
+  try {
+    const lookup = r.fm.db.query;
+    r.fm.db.query = async (sql, params) => {
+      const out = await lookup(sql, params);
+      await r.reg.addMember('beta', 'user-3', 'viewer', null); // lands between lookup and change
+      return out;
+    };
+    assert.equal((await r.post('admin-acme', 'k-op', { scopes: ['admin'] })).status, 404);
+    assert.deepEqual(r.reg.scopes.get('k-op'), ['hosts:read']);
+    assert.equal(scopeAudits(r.reg).length, 0);
   } finally { await r.close(); }
 });

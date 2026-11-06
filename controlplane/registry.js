@@ -98,7 +98,7 @@ const STATE_LOCK_NS = 0x53544154;
 // The per-member lock (namespace 'MEMB', key hashtext(user_id)): every write
 // that changes which tenants a member id belongs to (addMember, createTenant,
 // bootstrapAdmin) and every check that authorizes on that set inside a write
-// (revokeKeyAudited) take it, so the set cannot change between the check and
+// (revokeKeyAudited, setScopesAudited) take it, so the set cannot change between the check and
 // the write. Taken before the audit chain lock.
 const MEMBER_LOCK_NS = 0x4d454d42;
 
@@ -106,10 +106,10 @@ async function memberLockInTx(client, userId) {
   await client.query('SELECT pg_advisory_xact_lock($1::int, hashtext($2))', [MEMBER_LOCK_NS, String(userId)]);
 }
 
-// The owner tenants a key revoke may act on: every tenant the owner belongs
-// to must be one the actor administers, else 404 (the key is not theirs to
-// see). Shared by both registries so the rule is one rule.
-function revokeOwnerTenants(memberTenantIds, adminTenants) {
+// The owner tenants a key revoke or scope change may act on: every tenant
+// the owner belongs to must be one the actor administers, else 404 (the key
+// is not theirs to see). Shared by both registries so the rule is one rule.
+function administeredOwnerTenants(memberTenantIds, adminTenants) {
   const tenants = [...new Set(memberTenantIds)].sort();
   if (tenants.length === 0 || !tenants.every((t) => adminTenants.includes(t))) throw http(404, 'not_found');
   return tenants;
@@ -252,15 +252,16 @@ function keyRevokeAuditEntry(tenantId, actor, keyId, wasActive, ownerTenantCount
 }
 
 // The audit row for a key scope change: the key id (its public part), the
-// tenant the admin acted through, the new and the previous scope sets.
-
-function keyScopesAuditEntry(tenantId, actor, keyId, scopes, previous, tenants = [tenantId]) {
+// tenant the admin acted through (the first of the owner's), the new and the
+// previous scope sets, and how many tenants the owner is in. Like the revoke
+// row it names no other tenant: this tenant's members can read it.
+function keyScopesAuditEntry(tenantId, actor, keyId, scopes, previous, ownerTenantCount = 1) {
   return {
     tenant_id: tenantId,
     host_id: null,
     actor,
     action: 'key_scopes_set',
-    payload: { key_id: keyId, scopes: [...scopes].sort(), previous_scopes: [...previous].sort(), tenants: [...tenants].sort() }
+    payload: { key_id: keyId, scopes: [...scopes].sort(), previous_scopes: [...previous].sort(), owner_tenant_count: ownerTenantCount }
   };
 }
 
@@ -1436,11 +1437,14 @@ class MemoryRegistry {
     this.scopes.set(keyId, [...scopes]);
   }
 
-  // The audit row first: if it fails, the scopes stay as they were.
-  async setScopesAudited({ keyId, scopes, tenantId, tenants, actor }) {
+  // The audit row first: if it fails, the scopes stay as they were. The
+  // owner's memberships are read with no await before the audit write.
+  async setScopesAudited({ keyId, scopes, ownerUserId, adminTenants, actor }) {
+    const tenants = administeredOwnerTenants(this.tenantIdsOf(ownerUserId), adminTenants);
     const previous = this.scopes.get(keyId) || [];
-    await this.appendAudit(keyScopesAuditEntry(tenantId, actor, keyId, scopes, previous, tenants));
+    await this.appendAudit(keyScopesAuditEntry(tenants[0], actor, keyId, scopes, previous, tenants.length));
     this.scopes.set(keyId, [...scopes]);
+    return { tenant_id: tenants[0], owner_tenant_count: tenants.length };
   }
 
   // The memory registry holds no key rows (verifyApiKey needs the database),
@@ -1456,7 +1460,7 @@ class MemoryRegistry {
   // The owner's memberships are read here, with no await before the audit
   // write, so no membership change interleaves between check and revoke.
   async revokeKeyAudited({ keyId, ownerUserId, adminTenants, actor }) {
-    const tenants = revokeOwnerTenants(this.tenantIdsOf(ownerUserId), adminTenants);
+    const tenants = administeredOwnerTenants(this.tenantIdsOf(ownerUserId), adminTenants);
     await this.appendAudit(keyRevokeAuditEntry(tenants[0], actor, keyId, !this.revokedKeys.has(keyId), tenants.length));
     this.revokedKeys.add(keyId);
     return { tenant_id: tenants[0], owner_tenant_count: tenants.length };
@@ -3303,19 +3307,33 @@ class PgRegistry {
     return res.rows.length > 0;
   }
 
-  // One transaction: lock the key's scope rows, replace them, append the
-  // audit row (the chain lock last). Any failure rolls all of it back.
-  async setScopesAudited({ keyId, scopes, tenantId, tenants, actor }) {
+  // One transaction: lock the key row (it must name ownerUserId), take the
+  // member lock and check the owner's memberships (every owner tenant
+  // administered by the actor, else 404), lock the key's scope rows, replace
+  // them, append the audit row (the chain lock last). Any failure rolls all
+  // of it back.
+  // Threats: as revokeKeyAudited: a TOCTOU where the owner joins a tenant the
+  // actor does not administer between the check and the write (so the new
+  // scopes would apply there), a key row swapped to another owner, and
+  // foreign tenant names in this tenant's audit (a count only). Does NOT
+  // re-check the actor's own admin role inside the transaction.
+  async setScopesAudited({ keyId, scopes, ownerUserId, adminTenants, actor }) {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+      const key = await client.query('SELECT user_id FROM playground_api_keys WHERE key_id = $1 FOR UPDATE', [keyId]);
+      if (key.rowCount === 0 || key.rows[0].user_id !== ownerUserId) throw http(404, 'not_found');
+      await memberLockInTx(client, ownerUserId);
+      const mem = await client.query('SELECT tenant_id FROM cp_members WHERE user_id = $1', [ownerUserId]);
+      const tenants = administeredOwnerTenants(mem.rows.map((r) => r.tenant_id), adminTenants);
       const cur = await client.query('SELECT scope FROM cp_api_scopes WHERE key_id = $1 ORDER BY scope FOR UPDATE', [keyId]);
       await client.query('DELETE FROM cp_api_scopes WHERE key_id = $1', [keyId]);
       for (const scope of scopes) {
         await client.query('INSERT INTO cp_api_scopes (key_id, scope) VALUES ($1, $2)', [keyId, scope]);
       }
-      await auditInsert(client, keyScopesAuditEntry(tenantId, actor, keyId, scopes, cur.rows.map((r) => r.scope), tenants));
+      await auditInsert(client, keyScopesAuditEntry(tenants[0], actor, keyId, scopes, cur.rows.map((r) => r.scope), tenants.length));
       await client.query('COMMIT');
+      return { tenant_id: tenants[0], owner_tenant_count: tenants.length };
     } catch (err) {
       try { await client.query('ROLLBACK'); } catch { /* connection already failed */ }
       throw err;
@@ -3343,7 +3361,7 @@ class PgRegistry {
       if (cur.rowCount === 0 || cur.rows[0].user_id !== ownerUserId) throw http(404, 'not_found');
       await memberLockInTx(client, ownerUserId);
       const mem = await client.query('SELECT tenant_id FROM cp_members WHERE user_id = $1', [ownerUserId]);
-      const tenants = revokeOwnerTenants(mem.rows.map((r) => r.tenant_id), adminTenants);
+      const tenants = administeredOwnerTenants(mem.rows.map((r) => r.tenant_id), adminTenants);
       await client.query('UPDATE playground_api_keys SET is_active = false WHERE key_id = $1', [keyId]);
       await auditInsert(client, keyRevokeAuditEntry(tenants[0], actor, keyId, cur.rows[0].is_active === true, tenants.length));
       await client.query('COMMIT');

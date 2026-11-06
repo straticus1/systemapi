@@ -1415,23 +1415,20 @@ function mount(app, fleet) {
 
   // A key's scopes apply in every tenant its owner belongs to, so only an
   // admin of every one of those tenants may set them (an admin of one tenant
-  // cannot widen what the key does in another). The change and its audit row
-  // are one transaction; the row names the first of those tenants and lists
-  // them all.
+  // cannot widen what the key does in another). The owner's memberships are
+  // checked inside the change's transaction (setScopesAudited, 404
+  // otherwise), with the audit row; the row is written in the first of those
+  // tenants and holds only their count.
   app.post('/api/v1/keys/:keyId/scopes', wrap(async (req, res) => {
     const principal = await authenticate(req, fleet);
     const admins = adminTenantIds(principal);
     if (admins.length === 0) throw http(403, 'scope_denied');
     const owner = await lookupKeyOwner(fleet, req.params.keyId);
     if (!owner) throw http(404, 'not_found');
-    const ownerMemberships = await fleet.registry.membershipsForUser(owner.user_id);
-    const ownerTenants = [...new Set(ownerMemberships.map((m) => m.tenant_id))].sort();
-    if (ownerTenants.length === 0 || !ownerTenants.every((t) => admins.includes(t))) throw http(404, 'not_found');
-    const via = ownerTenants[0];
     const requested = Array.isArray(req.body && req.body.scopes) ? req.body.scopes : null;
     if (!requested || requested.some((s) => typeof s !== 'string' || !ALL.includes(s))) throw http(400, 'bad_scope');
     const scopes = [...new Set(requested)];
-    await fleet.registry.setScopesAudited({ keyId: req.params.keyId, scopes, tenantId: via, tenants: ownerTenants, actor: String(principal.userId) });
+    await fleet.registry.setScopesAudited({ keyId: req.params.keyId, scopes, ownerUserId: owner.user_id, adminTenants: admins, actor: String(principal.userId) });
     res.json({ key_id: req.params.keyId, scopes });
   }));
 

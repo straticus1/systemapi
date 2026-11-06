@@ -1397,13 +1397,19 @@ test('upsertSoftwareBatch writes a whole inventory in one statement and returns 
 
 test('setScopesAudited replaces a key\'s scopes and writes the audit row in one transaction', async () => {
   const key = `kscope${crypto.randomBytes(3).toString('hex')}`;
+  const owner = `sowner${crypto.randomBytes(3).toString('hex')}`;
+  await registry.addMember('acme', owner, 'viewer', null);
+  await pool.query(`INSERT INTO playground_api_keys (key_id, key_hash, user_id, name, api_site) VALUES ($1, 'x', $2, 's', 'systemapi')`, [key, owner]);
+  const set = (reg, scopes) => reg.setScopesAudited({ keyId: key, scopes, ownerUserId: owner, adminTenants: ['acme'], actor: 'user-1' });
   await registry.setScopes(key, ['hosts:read']);
-  await registry.setScopesAudited({ keyId: key, scopes: ['exec:run', 'hosts:read'], tenantId: 'acme', actor: 'user-1' });
+  await set(registry, ['exec:run', 'hosts:read']);
   const rows = (await pool.query('SELECT scope FROM cp_api_scopes WHERE key_id = $1 ORDER BY scope', [key])).rows.map((r) => r.scope);
   assert.deepEqual(rows, ['exec:run', 'hosts:read']);
   const audit = (await pool.query("SELECT payload FROM cp_audit WHERE action = 'key_scopes_set' AND payload->>'key_id' = $1", [key])).rows;
   assert.equal(audit.length, 1);
   assert.deepEqual(audit[0].payload.previous_scopes, ['hosts:read']);
+  assert.equal(audit[0].payload.owner_tenant_count, 1);
+  assert.equal('tenants' in audit[0].payload, false);
   // The audit insert fails after the scope rows changed: both roll back.
   const failing = new PgRegistry({
     async connect() {
@@ -1418,9 +1424,49 @@ test('setScopesAudited replaces a key\'s scopes and writes the audit row in one 
     },
     query: (sql, params) => pool.query(sql, params)
   }, { NODE_ENV: 'production' });
-  await assert.rejects(failing.setScopesAudited({ keyId: key, scopes: ['admin'], tenantId: 'acme', actor: 'user-1' }), /audit down/);
+  await assert.rejects(set(failing, ['admin']), /audit down/);
   const after = (await pool.query('SELECT scope FROM cp_api_scopes WHERE key_id = $1 ORDER BY scope', [key])).rows.map((r) => r.scope);
   assert.deepEqual(after, ['exec:run', 'hosts:read']);
+  assert.equal((await registry.verifyAudit()).ok, true);
+});
+
+// Threats: a scope change authorized on a stale membership set (the new
+// scopes would apply in a tenant the admin does not administer).
+test('setScopesAudited: a membership write holding the member lock is seen by the check (404, scopes unchanged); a wrong owner is refused', async () => {
+  const sfx = crypto.randomBytes(3).toString('hex');
+  const [ta, tb, owner, key] = [`ssa${sfx}`, `ssb${sfx}`, `ssowner${sfx}`, `sskey${sfx}`];
+  await pool.query('INSERT INTO cp_tenants (tenant_id, display_name, owner_user_id) VALUES ($1, $1, $3), ($2, $2, $3)', [ta, tb, 'ss-admin']);
+  await registry.addMember(ta, owner, 'viewer', null);
+  await pool.query(`INSERT INTO playground_api_keys (key_id, key_hash, user_id, name, api_site) VALUES ($1, 'x', $2, 'ss', 'systemapi')`, [key, owner]);
+  await registry.setScopes(key, ['hosts:read']);
+  const scopes = async () => (await pool.query('SELECT scope FROM cp_api_scopes WHERE key_id = $1 ORDER BY scope', [key])).rows.map((r) => r.scope);
+  const audits = async () => (await pool.query("SELECT count(*)::int AS n FROM cp_audit WHERE action = 'key_scopes_set' AND payload->>'key_id' = $1", [key])).rows[0].n;
+  const tx = await pool.connect();
+  try {
+    await tx.query('BEGIN');
+    await tx.query('SELECT pg_advisory_xact_lock($1::int, hashtext($2))', [0x4d454d42, owner]);
+    await tx.query("INSERT INTO cp_members (tenant_id, user_id, role) VALUES ($1, $2, 'viewer')", [tb, owner]);
+    const settled = registry.setScopesAudited({ keyId: key, scopes: ['admin'], ownerUserId: owner, adminTenants: [ta], actor: 'ss-admin' })
+      .then(() => 'resolved', (err) => err);
+    await new Promise((r) => setTimeout(r, 200));
+    assert.deepEqual(await scopes(), ['hosts:read'], 'the change waits on the member lock');
+    await tx.query('COMMIT');
+    const out = await settled;
+    assert.equal(out.status, 404, String(out));
+  } finally {
+    tx.release();
+  }
+  assert.deepEqual(await scopes(), ['hosts:read']);
+  assert.equal(await audits(), 0);
+  await assert.rejects(registry.setScopesAudited({ keyId: key, scopes: ['admin'], ownerUserId: 'someone-else', adminTenants: [ta, tb], actor: 'ss-admin' }),
+    (err) => err.status === 404);
+  // An admin of both: allowed; the row is in the first tenant and names no other.
+  await registry.setScopesAudited({ keyId: key, scopes: ['exec:run'], ownerUserId: owner, adminTenants: [ta, tb], actor: 'ss-admin' });
+  assert.deepEqual(await scopes(), ['exec:run']);
+  const row = (await pool.query("SELECT tenant_id, payload FROM cp_audit WHERE action = 'key_scopes_set' AND payload->>'key_id' = $1", [key])).rows[0];
+  assert.equal(row.tenant_id, ta);
+  assert.equal(row.payload.owner_tenant_count, 2);
+  assert.ok(!JSON.stringify(row.payload).includes(tb));
   assert.equal((await registry.verifyAudit()).ok, true);
 });
 
