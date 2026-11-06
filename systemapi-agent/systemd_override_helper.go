@@ -128,7 +128,8 @@ type overrideHelperRes struct {
 // the concrete drop-in name, body, path and the sys_tweak lease payload that
 // must authorize it. It returns code != "" on refusal. Shared by the agent-side
 // handoff and the helper subcommand; trusts nothing and fails closed. The
-// lease itself is checked only in the helper (helperAuthorize).
+// lease itself is checked by helperPreflight (agent) and helperAuthorize
+// (helper).
 func overrideResolve(req overrideHelperReq) (name, content, path, payload, code string) {
 	if !serviceNameRE.MatchString(req.Unit) {
 		return "", "", "", "", "unit_denied"
@@ -225,11 +226,12 @@ func resourceLimitSetViaHelper(unit, limit, value string, lease *Lease) error {
 // committed helper unit, and reads back its result. It re-validates defensively
 // before the handoff and never writes /etc itself.
 func overrideSetViaHelper(req overrideHelperReq) error {
-	if _, _, _, _, code := overrideResolve(req); code != "" {
+	_, _, _, payload, code := overrideResolve(req)
+	if code != "" {
 		return fmt.Errorf("unit override refused: %s", code)
 	}
-	if req.Lease == nil {
-		return fmt.Errorf("unit override refused: lease_missing")
+	if code := helperPreflight("sys_tweak", payload, req.Lease, time.Now()); code != "" {
+		return fmt.Errorf("unit override refused: %s", code)
 	}
 	if err := os.MkdirAll(overrideHelperStateDir, 0o700); err != nil {
 		return fmt.Errorf("handoff dir: %w", err)

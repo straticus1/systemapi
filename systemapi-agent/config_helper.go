@@ -186,8 +186,8 @@ func configTargetDenied(target string) bool {
 
 // configRevalidate is the shape re-validation shared by the agent-side
 // handoff and the helper subcommand. It returns "" when the target and size
-// are acceptable, or a stable error code. The lease check is separate
-// (helperAuthorize) and runs only in the helper.
+// are acceptable, or a stable error code. The lease checks are separate:
+// helperPreflight on the agent side, helperAuthorize in the helper.
 func configRevalidate(target, content string) string {
 	if !configTargetShapeOK(target) || configTargetDenied(target) {
 		return "target_denied"
@@ -236,7 +236,9 @@ var configHelperWrite = func(path, content string) error {
 
 // configWriteViaHelper is the agent-side handoff for sys:config write. The
 // channel has already verified the lease (which binds target + content hash)
-// and applied checkSysConfigPolicy; this re-validates defensively, writes a
+// and applied checkSysConfigPolicy; this re-validates defensively, re-checks
+// the lease (helperPreflight: a sys_config write lease for exactly this target
+// and content hash, so no other lease can start the unit), writes a
 // 0600 request carrying the original lease, triggers the committed helper
 // unit, and reads back its result. It never writes /etc itself (the agent's
 // sandbox forbids it). Request and result files are removed before returning.
@@ -244,8 +246,12 @@ func configWriteViaHelper(target, content string, lease *Lease) error {
 	if code := configRevalidate(target, content); code != "" {
 		return fmt.Errorf("config write refused: %s", code)
 	}
-	if lease == nil {
-		return fmt.Errorf("config write refused: lease_missing")
+	payload, err := sysConfigLeasePayload("write", target, sysSHA256Hex(content))
+	if err != nil {
+		return fmt.Errorf("config write refused: target_denied")
+	}
+	if code := helperPreflight("sys_config", payload, lease, time.Now()); code != "" {
+		return fmt.Errorf("config write refused: %s", code)
 	}
 	if err := os.MkdirAll(configHelperStateDir, 0o700); err != nil {
 		return fmt.Errorf("handoff dir: %w", err)
