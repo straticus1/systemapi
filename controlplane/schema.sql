@@ -124,6 +124,23 @@ CREATE TABLE IF NOT EXISTS cp_audit (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Signed audit-chain checkpoints (controlplane/anchor.js): the head at seq
+-- when the note was signed, the note text as written to the WORM sinks, and
+-- each sink's put outcome (a fixed code). A copy only: the sinks hold the
+-- record an off-box verifier trusts.
+CREATE TABLE IF NOT EXISTS cp_audit_checkpoints (
+  id BIGSERIAL PRIMARY KEY,
+  deployment TEXT NOT NULL,
+  seq BIGINT NOT NULL,
+  head TEXT NOT NULL,
+  note_time BIGINT NOT NULL,
+  note TEXT NOT NULL,
+  sink_status JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS cp_audit_checkpoints_deployment_idx ON cp_audit_checkpoints (deployment, id DESC);
+
 CREATE TABLE IF NOT EXISTS cp_api_scopes (
   key_id TEXT NOT NULL,
   scope TEXT NOT NULL,

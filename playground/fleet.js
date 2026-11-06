@@ -60,6 +60,7 @@ const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 const { demoKeyAllowed, agentAuthFromRequest, ticketFromRequest, originAllowed } = require('../controlplane/httpauth');
 const { validateTenant, validateHostId, validateHostname, validateSSHPublicKey } = require('../controlplane/sshkey');
 const { consumeTicket } = require('../controlplane/tickets');
+const { errName: anchorErrName } = require('../controlplane/anchor');
 const { issueLease, terminalPayload } = require('../controlplane/lease');
 const { fingerprint, randomToken } = require('../controlplane/token');
 const { zscore } = require('../controlplane/stats');
@@ -661,15 +662,23 @@ class FleetManager {
         attempt().catch((err) => console.error('[Fleet] terminal end audit failed:', err.message));
     }
 
+    // A break-glass start is anchored right away (controlplane/anchor.js).
     async auditTerminal(session, action, payload) {
         if (!this.registry) throw new Error('registry_unavailable');
-        return this.registry.appendAudit({
+        const row = await this.registry.appendAudit({
             tenant_id: session.tenantId,
             host_id: session.hostId,
             actor: session.actor,
             action,
             payload
         });
+        // The row is written; an anchor failure must not end the session.
+        try {
+            if (this.anchor) this.anchor.noteAudit(row);
+        } catch (err) {
+            console.error(`[anchor] trigger failed: ${anchorErrName(err)}`);
+        }
+        return row;
     }
 
     // Returns the live session only when this agent connection owns it.
