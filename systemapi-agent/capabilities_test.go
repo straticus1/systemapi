@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -108,7 +110,7 @@ func TestCapProbesOkAndDegraded(t *testing.T) {
 		{"config other", "config", func(e *capEnv) { e.configOpen = func() error { return leakyErr } }, "probe_error"},
 		{"config_write config", "config_write", func(e *capEnv) { e.configOpen = func() error { return syscall.ENOSYS } }, "enosys_openat2"},
 		{"config_write unit", "config_write", func(e *capEnv) {
-			e.unitLoaded = func(u string) (bool, error) { return u != configHelperTemplate, nil }
+			e.unitLoaded = func(u string) (bool, error) { return u != configHelperProbeUnit, nil }
 		}, "helper_unit_missing"},
 		{"config_write manager", "config_write", func(e *capEnv) {
 			e.unitLoaded = func(string) (bool, error) { return false, leakyErr }
@@ -116,11 +118,11 @@ func TestCapProbesOkAndDegraded(t *testing.T) {
 		{"config_write trust", "config_write", func(e *capEnv) { e.trust = func() error { return leakyErr } }, "helper_trust_missing"},
 		{"tweak read", "tweak", func(e *capEnv) { e.tweakRead = func() error { return leakyErr } }, "probe_error"},
 		{"sysctl_write unit", "sysctl_write", func(e *capEnv) {
-			e.unitLoaded = func(u string) (bool, error) { return u != sysctlHelperTemplate, nil }
+			e.unitLoaded = func(u string) (bool, error) { return u != sysctlHelperProbeUnit, nil }
 		}, "helper_unit_missing"},
 		{"sysctl_write trust", "sysctl_write", func(e *capEnv) { e.trust = func() error { return leakyErr } }, "helper_trust_missing"},
 		{"override_write unit", "override_write", func(e *capEnv) {
-			e.unitLoaded = func(u string) (bool, error) { return u != overrideHelperTemplate, nil }
+			e.unitLoaded = func(u string) (bool, error) { return u != overrideHelperProbeUnit, nil }
 		}, "helper_unit_missing"},
 		{"override_write manager", "override_write", func(e *capEnv) {
 			e.unitLoaded = func(string) (bool, error) { return false, leakyErr }
@@ -141,7 +143,7 @@ func TestCapProbesOkAndDegraded(t *testing.T) {
 	}
 	// One helper missing does not block the others.
 	e := fakeCapEnv()
-	e.unitLoaded = func(u string) (bool, error) { return u != sysctlHelperTemplate, nil }
+	e.unitLoaded = func(u string) (bool, error) { return u != sysctlHelperProbeUnit, nil }
 	got := capsByName(probeCapabilities(e, nil))
 	if got["config_write"].State != capStateOK || got["override_write"].State != capStateOK {
 		t.Fatalf("a missing sysctl helper degraded others: %+v", got)
@@ -1120,5 +1122,78 @@ func TestCapReportsOverTheConnection(t *testing.T) {
 	}
 	if dials[0][1] != "file,xfer" {
 		t.Fatalf("degraded header with reports off: %q", dials[0][1])
+	}
+}
+
+// The helper probes ask systemctl about an instance (systemd refuses `show`
+// on a bare template) and map its answer: loaded -> ok, not-found or any
+// other state -> helper_unit_missing, a failed or empty answer ->
+// manager_unreachable.
+func TestCapHelperProbeAsksAnInstance(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("needs sh for real systemctl-style exit codes")
+	}
+	exit4 := exec.Command("sh", "-c", "exit 4").Run()
+	exit1 := exec.Command("sh", "-c", "exit 1").Run()
+	cases := []struct {
+		name   string
+		out    string
+		err    error
+		state  string
+		reason string
+	}{
+		{"template present", "loaded", nil, capStateOK, ""},
+		{"template missing", "not-found", nil, capStateDegraded, "helper_unit_missing"},
+		{"masked", "masked", nil, capStateDegraded, "helper_unit_missing"},
+		{"bad unit file", "error", nil, capStateDegraded, "helper_unit_missing"},
+		{"no such unit exit", "", exit4, capStateDegraded, "helper_unit_missing"},
+		{"systemctl failed", "", exit1, capStateDegraded, "manager_unreachable"},
+		{"systemctl missing", "", errCapMissing, capStateDegraded, "manager_unreachable"},
+		{"empty answer", "", nil, capStateDegraded, "manager_unreachable"},
+	}
+	want := map[string]string{
+		"config_write":   "sah-config-helper@probe.service",
+		"sysctl_write":   "sah-sysctl-helper@probe.service",
+		"override_write": "sah-systemd-override-helper@probe.service",
+	}
+	for _, c := range cases {
+		for capName, unit := range want {
+			var asked [][]string
+			e := fakeCapEnv()
+			e.unitLoaded = func(u string) (bool, error) {
+				return capUnitLoaded(func(args ...string) (string, error) {
+					asked = append(asked, args)
+					return c.out, c.err
+				}, u)
+			}
+			r := probeOne(t, e, capName)
+			if r.State != c.state || r.Reason != c.reason {
+				t.Errorf("%s %s: %+v, want %s %s", c.name, capName, r, c.state, c.reason)
+			}
+			var mine []string
+			for _, a := range asked {
+				if a[len(a)-1] == unit {
+					mine = a
+				}
+			}
+			if strings.Join(mine, " ") != "show -p LoadState --value "+unit {
+				t.Errorf("%s %s: systemctl asked %q, want an instance query for %s", c.name, capName, asked, unit)
+			}
+			for _, a := range asked {
+				if strings.HasSuffix(a[len(a)-1], "@.service") {
+					t.Errorf("%s %s: bare template queried: %q", c.name, capName, a)
+				}
+			}
+		}
+	}
+}
+
+// The probe instance must never be a real request id, or a probe could
+// name (and load over) a live request's helper unit.
+func TestCapHelperProbeInstanceIsNotARequestID(t *testing.T) {
+	for _, re := range []*regexp.Regexp{configHelperIDRE, sysctlHelperIDRE, overrideHelperIDRE} {
+		if re.MatchString(capHelperProbeInstance) {
+			t.Fatalf("probe instance %q matches request id %s", capHelperProbeInstance, re)
+		}
 	}
 }

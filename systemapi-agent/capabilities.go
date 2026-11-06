@@ -30,6 +30,7 @@ import (
 	"log"
 	"math/big"
 	"os"
+	"os/exec"
 	"regexp"
 	"runtime"
 	"sort"
@@ -79,11 +80,19 @@ var capReasons = map[string]bool{
 	"probe_error":          true,
 }
 
-// The privileged helper templates the write-side capabilities depend on.
+// The privileged helper templates the write-side capabilities depend on are
+// probed through an instance: systemd refuses `show` on a bare template
+// name (sah-x-helper@.service), while loading an instance parses the
+// template without starting it (a missing template gives LoadState
+// not-found). capHelperProbeInstance can never be a real request id: those
+// are exactly 32 lowercase hex characters (the *HelperIDRE), and "probe"
+// is neither that length nor hex, so the probe never names, loads over or
+// races a live request's unit.
 const (
-	configHelperTemplate   = configHelperUnitPrefix + ".service"
-	sysctlHelperTemplate   = sysctlHelperUnitPrefix + ".service"
-	overrideHelperTemplate = overrideHelperUnitPrefix + ".service"
+	capHelperProbeInstance  = "probe"
+	configHelperProbeUnit   = configHelperUnitPrefix + capHelperProbeInstance + ".service"
+	sysctlHelperProbeUnit   = sysctlHelperUnitPrefix + capHelperProbeInstance + ".service"
+	overrideHelperProbeUnit = overrideHelperUnitPrefix + capHelperProbeInstance + ".service"
 )
 
 // errCapMissing marks a probe target that does not exist (a binary or a
@@ -126,8 +135,9 @@ type capEnv struct {
 	// managerUp checks that backend answers, read-only: systemctl show -p
 	// Version, rc-service --version, or the launchd backend's own check.
 	managerUp func(backend string) error
-	// unitLoaded reports whether a unit's LoadState is "loaded"; an error
-	// means the manager did not answer.
+	// unitLoaded reports whether a unit's LoadState is "loaded" (false for
+	// not-found, masked, error, ...); an error means the manager did not
+	// answer.
 	unitLoaded func(unit string) (bool, error)
 	// trust checks the helpers' trust file.
 	trust func() error
@@ -160,10 +170,10 @@ var capRegistry = map[string]func(e *capEnv, prev capResult) capResult{
 	"config_write": probeConfigWrite,
 	"tweak":        probeTweak,
 	"sysctl_write": func(e *capEnv, _ capResult) capResult {
-		return probeHelperWrite(e, "sysctl_write", sysctlHelperTemplate)
+		return probeHelperWrite(e, "sysctl_write", sysctlHelperProbeUnit)
 	},
 	"override_write": func(e *capEnv, _ capResult) capResult {
-		return probeHelperWrite(e, "override_write", overrideHelperTemplate)
+		return probeHelperWrite(e, "override_write", overrideHelperProbeUnit)
 	},
 	"service":        probeService,
 	"package":        probePackage,
@@ -243,7 +253,8 @@ func linuxSystemd(e *capEnv, name string) (capResult, bool) {
 	return capResult{}, true
 }
 
-// helperReady checks a helper template is loaded and the trust file usable.
+// helperReady checks a helper template is loaded (via its probe instance)
+// and the trust file usable.
 func helperReady(e *capEnv, name, unit string) capResult {
 	loaded, err := e.unitLoaded(unit)
 	if err != nil {
@@ -265,7 +276,7 @@ func probeConfigWrite(e *capEnv, _ capResult) capResult {
 	if c := probeConfig(e, capResult{}); c.State != capStateOK {
 		return capDegraded("config_write", c.Reason)
 	}
-	return helperReady(e, "config_write", configHelperTemplate)
+	return helperReady(e, "config_write", configHelperProbeUnit)
 }
 
 func probeHelperWrite(e *capEnv, name, unit string) capResult {
@@ -770,14 +781,8 @@ func realCapEnv() *capEnv {
 			}
 			return s.Name()
 		},
-		managerUp: capManagerUp,
-		unitLoaded: func(unit string) (bool, error) {
-			v, err := capSystemctl("show", "-p", "LoadState", "--value", unit)
-			if err != nil {
-				return false, err
-			}
-			return v == "loaded", nil
-		},
+		managerUp:      capManagerUp,
+		unitLoaded:     func(unit string) (bool, error) { return capUnitLoaded(capSystemctl, unit) },
 		trust:          checkHelperTrustFile,
 		xferConfigured: func() bool { return xferCfg.bin != "" && (runtime.GOOS == "linux" || xferCfg.allowDarwin) },
 		xferBin:        func() error { return checkXferBin(xferCfg.bin, os.Geteuid()) },
@@ -806,6 +811,28 @@ func statDir(dir string) error {
 		return errCapMissing
 	}
 	return nil
+}
+
+// capUnitLoaded asks systemctl for a unit's LoadState. systemd answers
+// `show` for a unit it cannot find with LoadState=not-found and exit 0, so a
+// missing helper template is (false, nil); any other non-"loaded" state
+// (masked, error, bad-setting) is also (false, nil). Only a failed or empty
+// answer (no binary, bus or manager down, timeout) is an error. Exit 4 ("no
+// such unit") is treated as not loaded too, in case a systemctl reports a
+// missing unit that way.
+func capUnitLoaded(systemctl func(args ...string) (string, error), unit string) (bool, error) {
+	v, err := systemctl("show", "-p", "LoadState", "--value", unit)
+	var ee *exec.ExitError
+	if errors.As(err, &ee) && ee.ExitCode() == 4 {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if v == "" {
+		return false, errors.New("no LoadState")
+	}
+	return v == "loaded", nil
 }
 
 // capSystemctl runs a read-only systemctl query (fixed argv, absolute path,
