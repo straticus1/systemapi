@@ -17,7 +17,10 @@ package main
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -27,9 +30,9 @@ type preflightCase struct {
 	// lease signs a lease for this helper over the given target/content
 	// variant ("" = the one run uses).
 	lease func(t *testing.T, priv ed25519.PrivateKey, host, variant string, exp int64) *Lease
-	// setup points the handoff dir and write seam at temp state and installs
-	// trigger as the helper's trigger seam.
-	setup func(t *testing.T, trigger func(id string) error)
+	// setup points the handoff dir and write seam at temp state, installs
+	// trigger as the helper's trigger seam, and returns the handoff dir.
+	setup func(t *testing.T, trigger func(id string) error) string
 	run   func(lease *Lease) error
 	// helper runs the real helper subcommand for id in-process.
 	helper func(id string)
@@ -53,12 +56,13 @@ func preflightCases() []preflightCase {
 				}
 				return signLease(t, priv, host, "sys_config", payload, exp)
 			},
-			setup: func(t *testing.T, trigger func(string) error) {
-				withConfigHelperStateDir(t)
+			setup: func(t *testing.T, trigger func(string) error) string {
+				dir := withConfigHelperStateDir(t)
 				withFakeConfigWrite(t, nil)
 				prev := configHelperTrigger
 				configHelperTrigger = trigger
 				t.Cleanup(func() { configHelperTrigger = prev })
+				return dir
 			},
 			run: func(l *Lease) error {
 				return configWriteViaHelper("/etc/nginx/nginx.conf", "server {}\n", l)
@@ -81,12 +85,13 @@ func preflightCases() []preflightCase {
 				}
 				return signLease(t, priv, host, "sys_tweak", payload, exp)
 			},
-			setup: func(t *testing.T, trigger func(string) error) {
-				withHelperStateDir(t)
+			setup: func(t *testing.T, trigger func(string) error) string {
+				dir := withHelperStateDir(t)
 				withFakeWrite(t, nil)
 				prev := sysctlHelperTrigger
 				sysctlHelperTrigger = trigger
 				t.Cleanup(func() { sysctlHelperTrigger = prev })
+				return dir
 			},
 			run:    func(l *Lease) error { return sysctlSetViaHelper("vm.swappiness", "10", l) },
 			helper: func(id string) { runSysctlHelper([]string{id}) },
@@ -107,18 +112,57 @@ func preflightCases() []preflightCase {
 				}
 				return signLease(t, priv, host, "sys_tweak", payload, exp)
 			},
-			setup: func(t *testing.T, trigger func(string) error) {
-				withOverrideHelperStateDir(t)
+			setup: func(t *testing.T, trigger func(string) error) string {
+				dir := withOverrideHelperStateDir(t)
 				withFakeOverrideWrite(t, nil)
 				prev := overrideHelperTrigger
 				overrideHelperTrigger = trigger
 				t.Cleanup(func() { overrideHelperTrigger = prev })
+				return dir
 			},
 			run: func(l *Lease) error {
 				return unitOverrideSetViaHelper("nginx.service", "limit-nofile", "[Service]\nLimitNOFILE=1024\n", l)
 			},
 			helper: func(id string) { runOverrideHelper([]string{id}) },
 		},
+		{
+			name: "resource-limit",
+			lease: func(t *testing.T, priv ed25519.PrivateKey, host, variant string, exp int64) *Lease {
+				unit, value := "nginx.service", "1024"
+				switch variant {
+				case "target":
+					unit = "redis.service"
+				case "content":
+					value = "2048"
+				}
+				payload, err := sysTweakLeasePayload("resource-limit-set", "", value, unit, "LimitNOFILE", "", "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				return signLease(t, priv, host, "sys_tweak", payload, exp)
+			},
+			setup: func(t *testing.T, trigger func(string) error) string {
+				dir := withOverrideHelperStateDir(t)
+				withFakeOverrideWrite(t, nil)
+				prev := overrideHelperTrigger
+				overrideHelperTrigger = trigger
+				t.Cleanup(func() { overrideHelperTrigger = prev })
+				return dir
+			},
+			run: func(l *Lease) error {
+				return resourceLimitSetViaHelper("nginx.service", "LimitNOFILE", "1024", l)
+			},
+			helper: func(id string) { runOverrideHelper([]string{id}) },
+		},
+	}
+}
+
+// assertNoHandoff fails unless dir (removed before the call) still does not
+// exist: a denial wrote no request file and did not create the handoff dir.
+func assertNoHandoff(t *testing.T, dir string) {
+	t.Helper()
+	if _, err := os.Lstat(dir); !os.IsNotExist(err) {
+		t.Fatalf("handoff dir %s exists after a denial (err=%v)", dir, err)
 	}
 }
 
@@ -157,21 +201,29 @@ func TestHelperPreflightRefusesBeforeTrigger(t *testing.T) {
 		for _, bc := range bad {
 			t.Run(hc.name+"/"+bc.name, func(t *testing.T) {
 				priv := newHelperSigner(t)
-				hc.setup(t, func(string) error { t.Error("helper triggered"); return nil })
+				dir := hc.setup(t, func(string) error { t.Error("helper triggered"); return nil })
+				if err := os.Remove(dir); err != nil {
+					t.Fatal(err)
+				}
 				err := hc.run(bc.lease(t, priv))
 				if err == nil || !strings.HasSuffix(err.Error(), ": "+bc.code) {
 					t.Fatalf("err=%v, want code %s", err, bc.code)
 				}
+				assertNoHandoff(t, dir)
 			})
 		}
 		t.Run(hc.name+"/not enrolled", func(t *testing.T) {
 			priv := newHelperSigner(t)
 			l := hc.lease(t, priv, ptyTestHost, "", inFuture(time.Minute))
 			clearIdentity()
-			hc.setup(t, func(string) error { t.Error("helper triggered"); return nil })
+			dir := hc.setup(t, func(string) error { t.Error("helper triggered"); return nil })
+			if err := os.Remove(dir); err != nil {
+				t.Fatal(err)
+			}
 			if err := hc.run(l); err == nil || !strings.HasSuffix(err.Error(), ": not_enrolled") {
 				t.Fatalf("err=%v, want not_enrolled", err)
 			}
+			assertNoHandoff(t, dir)
 		})
 	}
 }
@@ -227,5 +279,45 @@ func TestHelperPreflightAfterChannelGate(t *testing.T) {
 	}
 	if calls != 2 {
 		t.Fatalf("trigger calls=%d, want 2 (second refused by the helper)", calls)
+	}
+}
+
+// Two concurrent handoffs with one valid lease: exactly one triggers the
+// helper, the other is refused as a replay by the pre-flight.
+func TestHelperPreflightConcurrentOneLease(t *testing.T) {
+	for _, hc := range preflightCases() {
+		t.Run(hc.name, func(t *testing.T) {
+			priv := newHelperSigner(t)
+			var calls atomic.Int32
+			hc.setup(t, func(id string) error { calls.Add(1); hc.helper(id); return nil })
+			l := hc.lease(t, priv, ptyTestHost, "", inFuture(time.Minute))
+			var wg sync.WaitGroup
+			start := make(chan struct{})
+			errs := make([]error, 2)
+			for i := range errs {
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+					<-start
+					errs[i] = hc.run(l)
+				}(i)
+			}
+			close(start)
+			wg.Wait()
+			ok, replay := 0, 0
+			for _, err := range errs {
+				switch {
+				case err == nil:
+					ok++
+				case strings.HasSuffix(err.Error(), ": replay"):
+					replay++
+				default:
+					t.Errorf("unexpected err: %v", err)
+				}
+			}
+			if ok != 1 || replay != 1 || calls.Load() != 1 {
+				t.Fatalf("ok=%d replay=%d triggers=%d, want 1/1/1", ok, replay, calls.Load())
+			}
+		})
 	}
 }
