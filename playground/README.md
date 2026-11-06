@@ -105,8 +105,9 @@ resolves to a loopback, private, link-local (cloud metadata), CGNAT, multicast
 or reserved address; the check runs on the DNS answer the socket connects to.
 Redirects are returned, not followed; `Host`, hop-by-hop and `X-Forwarded-*`
 headers are dropped; responses over 1 MiB fail. Methods: GET, POST, PUT,
-PATCH, DELETE, HEAD, OPTIONS. `PLAYGROUND_ALLOW_PRIVATE_EGRESS=1` lifts the
-address check outside production only (local development).
+PATCH, DELETE, HEAD, OPTIONS. `PLAYGROUND_ALLOW_PRIVATE_EGRESS=1` admits
+loopback and private addresses outside production only (local development);
+link-local (metadata) and the other ranges stay refused.
 
 ### API Key Management
 - `POST /playground/api-keys` - Create new API key (auth required). Called with an API key, the new key is always tenant-bound: to the caller key's tenant if it has one (a different `tenant_id` is 403), else to the body's `tenant_id` (must be one of the caller's tenants, 403 otherwise), else to the caller's only tenant; with none or several and no `tenant_id`, 400 `tenant_required`. JWT callers get unbound keys (they have no tenant powers).

@@ -18,7 +18,7 @@ const { issueTicket, TTL_MS: TICKET_TTL_MS } = require('./tickets');
 const { CHANNEL_PURPOSES, SYS_PURPOSES, PURPOSE_SCOPES, validateBinding, policyDecision, sysctlDenied, SYSCTL_KEY_RE } = require('./channels');
 const { fingerprint, randomToken, tokenEqual } = require('./token');
 const { sealSecret, openSecret } = require('./seal');
-const { assertWebhookURL } = require('./webhook');
+const { assertWebhookURL, resolveWebhookURL, webhookAgents } = require('./webhook');
 const { bucketName, linearForecast, toCSV, cronValid, zscore } = require('./stats');
 const { listPlaybooks, readPlaybook } = require('./playbooks');
 const xfer = require('../playground/xfer');
@@ -537,7 +537,17 @@ async function deliverWebhooks(fleet, tenantId, body) {
     return;
   }
   const raw = JSON.stringify(body);
+  const env = fleet.env || {};
+  // fleet.egressResolve: test seam for the delivery lookup (dns.lookup shape).
+  const agents = hooks.length > 0 ? webhookAgents(env, fleet.egressResolve) : null;
   for (const hook of hooks) {
+    // A URL stored before the current rules is re-checked on every send.
+    try {
+      assertWebhookURL(hook.url, env);
+    } catch (err) {
+      console.error('[control] webhook target refused:', err.message);
+      continue;
+    }
     let secret;
     try {
       secret = openSecret(hook.secret, fleet.env || {});
@@ -549,13 +559,17 @@ async function deliverWebhooks(fleet, tenantId, body) {
     axios.post(hook.url, raw, {
       timeout: 5000,
       maxRedirects: 0,
+      proxy: false,
+      httpAgent: agents.httpAgent,
+      httpsAgent: agents.httpsAgent,
       headers: {
         'Content-Type': 'application/json',
         'X-SystemAPI-Signature': `sha256=${mac}`
       },
       validateStatus: () => true
     }).catch((err) => {
-      console.error('[control] webhook delivery failed:', err.message);
+      const refused = err.code === 'EGRESS_BLOCKED' || (err.cause && err.cause.code === 'EGRESS_BLOCKED');
+      console.error('[control] webhook delivery failed:', refused ? 'blocked_address' : err.message);
     });
   }
 }
@@ -1292,7 +1306,7 @@ function mount(app, fleet) {
     const tenantId = req.body && req.body.tenant_id;
     if (!tenantIds(principal).includes(tenantId)) throw http(404, 'not_found');
     requireScope(fleet, principal, tenantId, 'admin');
-    const url = assertWebhookURL(req.body.url, fleet.env || process.env);
+    const url = await resolveWebhookURL(req.body.url, fleet.env || process.env, fleet.egressResolve);
     const secret = randomToken(32);
     const row = {
       id: `wh_${randomToken(16)}`,

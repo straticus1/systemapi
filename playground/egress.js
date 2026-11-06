@@ -14,9 +14,11 @@
  * the check); any blocked address in the answer refuses the whole name. IP
  * literals (which skip lookup) are checked before the request. Redirects
  * are never followed and env proxies are ignored.
+ * Also used for webhook delivery (controlplane/webhook.js).
  * Does NOT limit which public hosts are reached beyond the base origin, or
  * defend against a hostile operator-set base URL; allowPrivate (tests, local
- * development, never production) turns the address check off.
+ * development, never production) admits loopback, RFC 1918, CGNAT and ULA,
+ * never link-local/metadata or the other ranges.
  */
 
 'use strict';
@@ -26,26 +28,37 @@ const http = require('node:http');
 const https = require('node:https');
 const net = require('node:net');
 
-// Two lists: net.BlockList matches an IPv4 query against an IPv4-mapped
-// IPv6 rule (::ffff:0:0/96 would block every IPv4 address), so each family
-// is checked only against its own rules.
-const BLOCKED_V4 = new net.BlockList();
-const BLOCKED_V6 = new net.BlockList();
+// Per-family lists: net.BlockList matches an IPv4 query against an
+// IPv4-mapped IPv6 rule (::ffff:0:0/96 would block every IPv4 address), so
+// each family is checked only against its own rules. ALWAYS is refused in
+// every mode; PRIVATE (loopback, RFC 1918, CGNAT, ULA) only unless
+// allowPrivate. Link-local (cloud metadata) is always refused.
+const ALWAYS_V4 = new net.BlockList();
+const PRIVATE_V4 = new net.BlockList();
+const ALWAYS_V6 = new net.BlockList();
+const PRIVATE_V6 = new net.BlockList();
 for (const [addr, prefix] of [
-  ['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16],
-  ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.0.2.0', 24], ['192.88.99.0', 24], ['192.168.0.0', 16],
+  ['0.0.0.0', 8], ['169.254.0.0', 16], ['192.0.0.0', 24], ['192.0.2.0', 24], ['192.88.99.0', 24],
   ['198.18.0.0', 15], ['198.51.100.0', 24], ['203.0.113.0', 24], ['224.0.0.0', 4], ['240.0.0.0', 4]
-]) BLOCKED_V4.addSubnet(addr, prefix, 'ipv4');
+]) ALWAYS_V4.addSubnet(addr, prefix, 'ipv4');
+for (const [addr, prefix] of [['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['172.16.0.0', 12], ['192.168.0.0', 16]]) {
+  PRIVATE_V4.addSubnet(addr, prefix, 'ipv4');
+}
+ALWAYS_V6.addAddress('::', 'ipv6');
+ALWAYS_V6.addRange('::2', '::ffff:ffff', 'ipv6'); // IPv4-compatible (::a.b.c.d)
 for (const [addr, prefix] of [
-  ['::', 96], ['::ffff:0:0', 96], ['64:ff9b::', 96], ['64:ff9b:1::', 48], ['100::', 64],
-  ['2001::', 32], ['2001:db8::', 32], ['2002::', 16], ['fc00::', 7], ['fe80::', 10], ['fec0::', 10], ['ff00::', 8]
-]) BLOCKED_V6.addSubnet(addr, prefix, 'ipv6');
+  ['::ffff:0:0', 96], ['64:ff9b::', 96], ['64:ff9b:1::', 48], ['100::', 64], ['2001::', 32], ['2001:db8::', 32],
+  ['2002::', 16], ['fe80::', 10], ['fec0::', 10], ['ff00::', 8]
+]) ALWAYS_V6.addSubnet(addr, prefix, 'ipv6');
+PRIVATE_V6.addAddress('::1', 'ipv6');
+PRIVATE_V6.addSubnet('fc00::', 7, 'ipv6');
 
-function blockedAddress(address) {
+function blockedAddress(address, { allowPrivate = false } = {}) {
   const host = String(address).replace(/^\[(.*)\]$/, '$1').replace(/%.*$/, '');
   const family = net.isIP(host);
   if (family === 0) return true;
-  return family === 4 ? BLOCKED_V4.check(host, 'ipv4') : BLOCKED_V6.check(host, 'ipv6');
+  if (family === 4) return ALWAYS_V4.check(host, 'ipv4') || (!allowPrivate && PRIVATE_V4.check(host, 'ipv4'));
+  return ALWAYS_V6.check(host, 'ipv6') || (!allowPrivate && PRIVATE_V6.check(host, 'ipv6'));
 }
 
 function egressError(code) {
@@ -54,14 +67,14 @@ function egressError(code) {
 
 // A net/tls lookup that resolves once, refuses the name if any answer is
 // blocked, and hands the socket exactly the vetted addresses.
-function guardedLookup(resolve = dns.lookup) {
+function guardedLookup(resolve = dns.lookup, { allowPrivate = false } = {}) {
   return (hostname, options, callback) => {
     if (typeof options === 'function') { callback = options; options = {}; }
     const opts = typeof options === 'number' ? { family: options } : (options || {});
     resolve(hostname, { family: opts.family || 0, all: true, verbatim: true }, (err, addresses) => {
       if (err) return callback(err);
       const list = Array.isArray(addresses) ? addresses : [];
-      if (list.length === 0 || list.some((a) => blockedAddress(a.address))) return callback(egressError('blocked_address'));
+      if (list.length === 0 || list.some((a) => blockedAddress(a.address, { allowPrivate }))) return callback(egressError('blocked_address'));
       if (opts.all) return callback(null, list);
       return callback(null, list[0].address, list[0].family);
     });
@@ -85,7 +98,7 @@ function targetURL(baseURL, endpoint, { allowPrivate = false } = {}) {
   }
   if (url.origin !== base.origin || url.username || url.password) throw bad();
   const host = url.hostname.replace(/^\[(.*)\]$/, '$1');
-  if (!allowPrivate && net.isIP(host) && blockedAddress(host)) {
+  if (net.isIP(host) && blockedAddress(host, { allowPrivate })) {
     throw Object.assign(egressError('blocked_address'), { status: 403 });
   }
   return url.toString();
@@ -93,8 +106,7 @@ function targetURL(baseURL, endpoint, { allowPrivate = false } = {}) {
 
 // Agents whose sockets connect only through guardedLookup.
 function agents({ allowPrivate = false, resolve } = {}) {
-  if (allowPrivate) return { httpAgent: new http.Agent(), httpsAgent: new https.Agent() };
-  const lookup = guardedLookup(resolve);
+  const lookup = guardedLookup(resolve, { allowPrivate });
   return { httpAgent: new http.Agent({ lookup }), httpsAgent: new https.Agent({ lookup }) };
 }
 

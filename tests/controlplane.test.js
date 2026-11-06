@@ -724,6 +724,8 @@ test('webhook secrets are sealed and a missing key stores nothing', async () => 
 
   const fm = fleet();
   await seed(fm);
+  // hooks.example resolves to a public address (no network in tests).
+  fm.egressResolve = (host, opts, cb) => cb(null, [{ address: '93.184.215.14', family: 4 }]);
   const { server, url } = await listen(appFor(fm, await ssoUser(fm, 'user-1', { email: 'a@example', groups: [] })));
   try {
     const missing = await call(`${url}/api/v1/webhooks`, {

@@ -494,7 +494,7 @@ Rollout and rollback: `docs/sah-sysscript-jobs.md`.
 | GET | `/api/v1/audit`, `/api/v1/audit/verify`, `/api/v1/audit/export` |
 | GET | `/api/v1/security-events` |
 | GET | `/api/v1/compliance/export` |
-| GET/POST | `/api/v1/webhooks`; `DELETE /api/v1/webhooks/:id` |
+| GET/POST | `/api/v1/webhooks`; `DELETE /api/v1/webhooks/:id` (POST: the URL and its DNS answer must not be link-local/metadata, nor, in production, loopback, RFC 1918, CGNAT, ULA or reserved; 400 `blocked_url` / `unresolvable_url`. Delivery re-checks and connects only to a checked address, no redirects) |
 | POST | `/api/v1/tenants/:tenant/members` |
 | PUT/DELETE | `/api/v1/tenants/:tenant/members/:user/sso` (admin; audited) |
 | POST | `/api/v1/keys/:keyId/scopes` |

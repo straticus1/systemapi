@@ -1,8 +1,19 @@
-// Threats: SSRF from a user-configured webhook (cloud metadata, link-local,
-// and, in production, loopback). Production requires https. One shot, no
-// redirects. Does NOT store the secret. The router seals it with
+// Threats: SSRF from a user-configured webhook: cloud metadata and
+// link-local (always), and in production loopback, RFC 1918, CGNAT, ULA and
+// every other range playground/egress.js refuses; a DNS name that resolves
+// (or later rebinds) to one of them. The URL is checked at create time on
+// its literal host and on its DNS answer (unresolvable is refused), and every
+// delivery re-checks the stored URL and connects through egress agents whose
+// lookup refuses a blocked answer and pins the checked address. Production
+// requires https. One shot, no redirects, no env proxy. Outside production,
+// loopback and private addresses stay allowed (local receivers, tests), as
+// before. Does NOT store the secret. The router seals it with
 // controlplane/seal.js before insert. GET never returns the secret.
 'use strict';
+
+const dns = require('node:dns');
+const net = require('node:net');
+const egress = require('../playground/egress');
 
 function parseIPv4(host) {
   const match = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(host);
@@ -12,6 +23,7 @@ function parseIPv4(host) {
   return (((parts[0] << 24) >>> 0) + (parts[1] << 16) + (parts[2] << 8) + parts[3]) >>> 0;
 }
 
+// Used by controlplane/oauth.js.
 function hostIPv4(host) {
   const direct = parseIPv4(host);
   if (direct != null) return direct;
@@ -22,6 +34,15 @@ function hostIPv4(host) {
   return ((hi << 16) | lo) >>> 0;
 }
 
+function blocked() {
+  return Object.assign(new Error('blocked_url'), { status: 400 });
+}
+
+function allowPrivate(env) {
+  return env.NODE_ENV !== 'production';
+}
+
+// The synchronous part: shape, scheme, names and IP literals.
 function assertWebhookURL(raw, env) {
   let url;
   try {
@@ -38,25 +59,32 @@ function assertWebhookURL(raw, env) {
     throw Object.assign(new Error('https_required'), { status: 400 });
   }
   const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
-  if (host === 'metadata.google.internal' || host.endsWith('.internal')) {
-    throw Object.assign(new Error('blocked_url'), { status: 400 });
-  }
-  const v4 = hostIPv4(host);
-  if (v4 != null) {
-    const linkLocal = (v4 >>> 16) === 0xa9fe;
-    const loop = (v4 >>> 24) === 0x7f;
-    if (linkLocal || host === '169.254.169.254') {
-      throw Object.assign(new Error('blocked_url'), { status: 400 });
-    }
-    if (prod && loop) throw Object.assign(new Error('blocked_url'), { status: 400 });
-  }
-  if (prod && (host === 'localhost' || host === '::1')) {
-    throw Object.assign(new Error('blocked_url'), { status: 400 });
-  }
-  if (host.startsWith('fe80:') || host.startsWith('fe80%')) {
-    throw Object.assign(new Error('blocked_url'), { status: 400 });
-  }
+  if (host === 'metadata.google.internal' || host.endsWith('.internal')) throw blocked();
+  if (prod && (host === 'localhost' || host.endsWith('.localhost'))) throw blocked();
+  if (net.isIP(host) && egress.blockedAddress(host, { allowPrivate: allowPrivate(env) })) throw blocked();
   return url;
 }
 
-module.exports = { assertWebhookURL, hostIPv4 };
+// Create time: assertWebhookURL, then the name's DNS answer (one lookup,
+// every address checked; a name that does not resolve is refused).
+async function resolveWebhookURL(raw, env, resolve = dns.lookup) {
+  const url = assertWebhookURL(raw, env);
+  const host = url.hostname.replace(/^\[|\]$/g, '');
+  if (net.isIP(host)) return url;
+  const addresses = await new Promise((done) => {
+    resolve(host, { all: true, verbatim: true }, (err, list) => done(err ? null : list));
+  });
+  if (!Array.isArray(addresses) || addresses.length === 0) {
+    throw Object.assign(new Error('unresolvable_url'), { status: 400 });
+  }
+  if (addresses.some((a) => egress.blockedAddress(a.address, { allowPrivate: allowPrivate(env) }))) throw blocked();
+  return url;
+}
+
+// Delivery agents: the socket's lookup refuses a blocked answer and connects
+// to the address it checked.
+function webhookAgents(env, resolve) {
+  return egress.agents({ allowPrivate: allowPrivate(env), resolve });
+}
+
+module.exports = { assertWebhookURL, resolveWebhookURL, webhookAgents, hostIPv4 };

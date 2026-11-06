@@ -22,6 +22,9 @@ test('blockedAddress: loopback, private, CGNAT, link-local, metadata, ULA and IP
   for (const a of ['8.8.8.8', '1.1.1.1', '172.67.136.253', '2606:4700:4700::1111']) {
     assert.equal(egress.blockedAddress(a), false, a);
   }
+  // allowPrivate admits loopback and private ranges only: link-local (metadata) and the rest stay blocked.
+  for (const a of ['127.0.0.1', '10.0.0.5', '192.168.1.1', '::1', 'fd00::1']) assert.equal(egress.blockedAddress(a, { allowPrivate: true }), false, a);
+  for (const a of ['169.254.169.254', 'fe80::1', '0.0.0.0', '::', '::ffff:127.0.0.1', '224.0.0.1']) assert.equal(egress.blockedAddress(a, { allowPrivate: true }), true, a);
 });
 
 test('targetURL: only paths on the base origin; IP-literal bases in blocked ranges are 403', () => {
@@ -35,6 +38,7 @@ test('targetURL: only paths on the base origin; IP-literal bases in blocked rang
     assert.throws(() => egress.targetURL(b, '/x'), (err) => err.status === 403 && err.code === 'EGRESS_BLOCKED', b);
   }
   assert.equal(egress.targetURL('http://127.0.0.1:3000', '/x', { allowPrivate: true }), 'http://127.0.0.1:3000/x');
+  assert.throws(() => egress.targetURL('http://169.254.169.254', '/x', { allowPrivate: true }), (err) => err.status === 403);
   assert.throws(() => egress.targetURL('file:///etc', '/passwd'), (err) => err.status === 400);
 });
 
