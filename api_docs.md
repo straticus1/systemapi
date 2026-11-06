@@ -241,15 +241,20 @@ narrowing is not dangerous; restoring one is. A dangerous write needs
 units).
 
 A write answers `{host_id, tenant, action, version, audit_seq, dangerous,
-renewed}`. It and its audit row (`channel_policy_set|clear|inherit|revert`,
+renewed, ended}`. It and its audit row (`channel_policy_set|clear|inherit|revert`,
 `channel_policy_tenant_*` with `host_id` null) are one transaction; the row
 carries `policy_schema: 2`, all six previous and new kinds, the reason, the
 actor (member id), `via` (`key`, `token`, `session`), `key_fp` (sha256 of
 the key id, or null), `dangerous`, and `revert_of` for a revert. Then every
 live tcp, mesh, file and xfer session on the affected hosts (this replica)
-is renewed at once: one the policy no longer allows ends with `stopped`
-(audited by its own end row) instead of at its next 30 s renewal.
-`renewed` is how many were re-checked. Writes, dry runs included, are capped
+is renewed at once, and the answer waits for it: one the policy no longer
+allows ends with `stopped` (audited by its own end row) instead of at its
+next 30 s renewal. A renewal already in flight when the write lands runs
+again after it, against the new policy. On this renewal a failed lookup
+ends the session (fail closed); the periodic one only skips. `renewed` is
+how many passed and got a new lease, `ended` how many were stopped. A
+change made with the break-glass `scripts/channel-policy.js` renews
+nothing: live sessions see it at their next 30 s renewal. Writes, dry runs included, are capped
 at `SYSTEMAPI_POLICY_WRITE_RATE` per minute (default 60, 1-600; 429
 `rate_limited`).
 

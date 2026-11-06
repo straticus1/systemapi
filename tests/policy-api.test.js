@@ -638,12 +638,92 @@ test('a narrowing through the API stops a live tcp, mesh and file session at onc
     const started = Date.now();
     const cleared = await call(r, 'POST', `${P()}/clear`, { body: { reason: 'close', if_version: set.body.version } });
     assert.equal(cleared.status, 200);
-    assert.equal(cleared.body.renewed, 4);
+    // The mesh session itself passes (no target); its stream, the tcp and
+    // the file session end.
+    assert.equal(cleared.body.renewed, 1);
+    assert.equal(cleared.body.ended, 3);
     await waitUntil('tcp stopped', () => tcp.box.frames.find((f) => f.type === 'tcp_close' && f.payload.reason === 'stopped'));
     await waitUntil('mesh stream stopped', () => mesh.box.frames.find((f) => f.type === 'mesh_close' && f.stream === 1));
     await waitUntil('file stopped', () => frames('file_stop').length > 0 || file.box.closeCode !== null);
     assert.ok(Date.now() - started < 3000);
     await waitUntil('tcp_end rows', () => r.fm.registry.audit.filter((row) => row.action === 'tcp_end' && row.payload.reason === 'stopped').length === 2);
+  } finally {
+    await r.close();
+  }
+});
+
+// A live tcp session on port 5432 of HOST_A; returns the client box and the
+// server-side session.
+async function liveTcp(r, agent) {
+  const frames = (type) => agent.box.frames.filter((f) => f.type === type);
+  const seen = frames('tcp_open').length;
+  const ticket = issueTicket(r.fm.tickets, { hostId: HOST_A, purpose: 'tcp:open', tenantId: 'acme', actor: 'user-1', auth: null, target: { host: 'local', port: 5432 } });
+  const tcp = client(r, `/api/v1/systems/tcp/${HOST_A}?ticket=${ticket}&purpose=tcp:open`);
+  const open = await waitUntil('tcp_open', () => frames('tcp_open')[seen]);
+  agent.ws.send(JSON.stringify({ type: 'tcp_status', session_id: open.session_id, payload: { status: 'connected', peer: '127.0.0.1:5432' } }));
+  await waitUntil('tcp connected', () => tcp.box.frames.find((f) => f.type === 'tcp_status' && f.payload.status === 'connected'));
+  const s = [...r.fm.tcp.sessions.values()].find((x) => x.id === open.session_id);
+  assert.ok(s);
+  return { tcp, s };
+}
+
+test('a policy write that lands while a renewal is in flight re-checks after it and ends the session', async () => {
+  const r = await rig();
+  try {
+    const v0 = await version(r);
+    const set = await call(r, 'PUT', P(), { body: { reason: 'open', if_version: v0, grants: { tcp_local: [5432] } } });
+    assert.equal(set.status, 200, JSON.stringify(set.body));
+    const agent = await connectAgent(r);
+    const { tcp, s } = await liveTcp(r, agent);
+    // The periodic renewal reads the (still open) policy, then stalls.
+    const reg = r.fm.registry;
+    const orig = reg.channelPolicies.bind(reg);
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    let armed = true;
+    let stalled = false;
+    reg.channelPolicies = async (id) => {
+      const value = await orig(id);
+      if (armed) {
+        armed = false;
+        stalled = true;
+        await gate;
+      }
+      return value;
+    };
+    const periodic = r.fm.tcp.renew(s);
+    await waitUntil('renewal stalled', () => stalled);
+    const rows = policyRows(r).length;
+    const clearing = call(r, 'POST', `${P()}/clear`, { body: { reason: 'close', if_version: set.body.version } });
+    await waitUntil('clear written', () => policyRows(r).length === rows + 1);
+    release();
+    const cleared = await clearing;
+    assert.equal(cleared.status, 200, JSON.stringify(cleared.body));
+    assert.deepEqual([cleared.body.renewed, cleared.body.ended], [0, 1]);
+    assert.equal(await periodic, 'ended');
+    await waitUntil('tcp stopped', () => tcp.box.frames.find((f) => f.type === 'tcp_close' && f.payload.reason === 'stopped'));
+  } finally {
+    await r.close();
+  }
+});
+
+test('a failed lookup ends a session on a policy renewal (fail closed) but only skips a periodic one', async () => {
+  const r = await rig();
+  try {
+    const v0 = await version(r);
+    const set = await call(r, 'PUT', P(), { body: { reason: 'open', if_version: v0, grants: { tcp_local: [5432] } } });
+    assert.equal(set.status, 200, JSON.stringify(set.body));
+    const agent = await connectAgent(r);
+    const { tcp, s } = await liveTcp(r, agent);
+    const reg = r.fm.registry;
+    const orig = reg.channelPolicies.bind(reg);
+    reg.channelPolicies = async () => { throw new Error('db down'); };
+    assert.equal(await r.fm.tcp.renew(s), 'skipped');
+    assert.equal(s.ended, false);
+    const counts = await r.fm.renewPolicySessions((hostId) => hostId === HOST_A);
+    assert.deepEqual(counts, { renewed: 0, ended: 1 });
+    reg.channelPolicies = orig;
+    await waitUntil('tcp stopped', () => tcp.box.frames.find((f) => f.type === 'tcp_close' && f.payload.reason === 'stopped'));
   } finally {
     await r.close();
   }

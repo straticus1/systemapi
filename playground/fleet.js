@@ -1236,20 +1236,29 @@ class FleetManager {
     // Renews each matching session now instead of at its next 30 s tick.
     // Renewal re-checks the grant against the stored policy and ends one it
     // no longer allows with stopped; that session's own end row (tcp_end,
-    // file_end, xfer_result, mesh_end) audits the stop. A mesh session
-    // re-checks its scope; its streams re-check the tcp policy as tcp
-    // sessions. This replica only: a cross-replica fan-out (LISTEN/NOTIFY,
-    // as jobs) waits for a second replica. Returns how many were renewed.
-    renewPolicySessions(match) {
+    // file_end, xfer_result, mesh_end) audits the stop. A renewal already in
+    // flight runs again after it (serialRenew), and a failed lookup ends the
+    // session (fail closed). A mesh session re-checks its scope; its streams
+    // re-check the tcp policy as tcp sessions. This replica only: a
+    // cross-replica fan-out (LISTEN/NOTIFY, as jobs) waits for a second
+    // replica. Resolves to {renewed, ended}: sessions that got a new lease
+    // (or passed), and sessions ended.
+    async renewPolicySessions(match) {
         const list = this.policySessions(match);
-        for (const [kind, s] of list) {
-            const run = kind === 'tcp' ? this.tcp.renew(s)
-                : kind === 'file' ? this.file.renew(s)
-                    : kind === 'xfer' ? this.xfer.renew(s)
-                        : this.mesh.recheck(s);
-            run.catch((err) => console.error(`[Fleet] ${kind} policy renewal failed:`, err.message));
-        }
-        return list.length;
+        const results = await Promise.all(list.map(([kind, s]) => {
+            const run = kind === 'tcp' ? this.tcp.renew(s, { policy: true })
+                : kind === 'file' ? this.file.renew(s, { policy: true })
+                    : kind === 'xfer' ? this.xfer.renew(s, { policy: true })
+                        : this.mesh.recheck(s, { policy: true });
+            return run.catch((err) => {
+                console.error(`[Fleet] ${kind} policy renewal failed:`, err.code || 'renew_failed');
+                return 'failed';
+            });
+        }));
+        return {
+            renewed: results.filter((r) => r === 'renewed').length,
+            ended: results.filter((r) => r === 'ended').length
+        };
     }
 
     // True when capability is in the live agent's effective set: advertised

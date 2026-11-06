@@ -152,8 +152,10 @@ function mountPolicyRoutes(app, fleet, h) {
     return typeof fleet.policySessions === 'function' ? fleet.policySessions(match).length : 0;
   }
 
-  function renew(match) {
-    return typeof fleet.renewPolicySessions === 'function' ? fleet.renewPolicySessions(match) : 0;
+  // Resolves to {renewed, ended} once every matching session was re-checked.
+  async function renew(match) {
+    if (typeof fleet.renewPolicySessions !== 'function') return { renewed: 0, ended: 0 };
+    return fleet.renewPolicySessions(match);
   }
 
   async function hostPolicyState(host) {
@@ -243,6 +245,7 @@ function mountPolicyRoutes(app, fleet, h) {
       throw err;
     }
     notifyDangerous(host.tenant_id, host.host_id, dangerous, out.audit_seq, action);
+    const counts = await renew(match);
     res.json({
       host_id: host.host_id,
       tenant: host.tenant_id,
@@ -250,7 +253,8 @@ function mountPolicyRoutes(app, fleet, h) {
       version: out.version,
       audit_seq: out.audit_seq,
       dangerous,
-      renewed: renew(match),
+      renewed: counts.renewed,
+      ended: counts.ended,
       ...(revertOf === null ? {} : { revert_of: revertOf })
     });
   }
@@ -390,7 +394,8 @@ function mountPolicyRoutes(app, fleet, h) {
       throw err;
     }
     notifyDangerous(tenantId, null, dangerous, out.audit_seq, action);
-    res.json({ tenant: tenantId, action, version: out.version, audit_seq: out.audit_seq, dangerous, renewed: renew(match) });
+    const counts = await renew(match);
+    res.json({ tenant: tenantId, action, version: out.version, audit_seq: out.audit_seq, dangerous, renewed: counts.renewed, ended: counts.ended });
   }
 
   app.get('/api/v1/tenants/:tenant/channel-policy', wrap(async (req, res) => {

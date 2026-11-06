@@ -37,7 +37,7 @@ const { validateTcpTarget, policyDecision } = require('../controlplane/channels'
 const { TCP_WINDOW, CreditStream, creditBytes } = require('../controlplane/credit');
 const { randomToken } = require('../controlplane/token');
 const {
-    CHANNEL_FRAME_MAX, envInt, unref, sendJSON, channelUpgradeHost, recheckChannelTicket, appendAuditRetrying
+    CHANNEL_FRAME_MAX, envInt, unref, sendJSON, channelUpgradeHost, recheckChannelTicket, appendAuditRetrying, serialRenew
 } = require('./channel');
 const { TCP_PER_AGENT } = require('./tcp');
 
@@ -241,25 +241,27 @@ class MeshChannels {
     // Every 30 s the session's grant is re-checked (membership, key state,
     // mesh:open). A denial ends every stream and the session with stopped; a
     // failed lookup only skips this check.
-    async recheck(m) {
-        if (m.ended || m.rechecking) return;
-        m.rechecking = true;
-        let denied;
-        try {
-            denied = await recheckChannelTicket(this.fm.registry,
-                { actor: m.actor, tenantId: m.tenantId, auth: m.auth, hostId: m.hostId }, MESH_PURPOSE, null);
-        } finally {
-            m.rechecking = false;
-        }
-        if (m.ended) return;
-        if (denied === 'internal') {
+    // opts.policy: as TcpChannels.renew (a failed lookup ends it). Its
+    // streams are tcp sessions and re-check the tcp policy there.
+    recheck(m, opts = {}) {
+        return serialRenew(m, opts, (o) => this.recheckOnce(m, o));
+    }
+
+    async recheckOnce(m, { policy = false } = {}) {
+        if (m.ended) return 'gone';
+        const denied = await recheckChannelTicket(this.fm.registry,
+            { actor: m.actor, tenantId: m.tenantId, auth: m.auth, hostId: m.hostId }, MESH_PURPOSE, null);
+        if (m.ended) return 'gone';
+        if (denied === 'internal' && !policy) {
             console.error('[Fleet] mesh re-check skipped: unavailable');
-            return;
+            return 'skipped';
         }
         if (denied) {
             console.warn(`[Fleet] mesh ${m.id}: grant withdrawn (${denied}); ending session`);
             this.endSession(m, 'stopped');
+            return 'ended';
         }
+        return 'renewed';
     }
 
     protocolError(m) {
