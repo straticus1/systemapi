@@ -1,6 +1,7 @@
 #!/bin/sh
 # npm run test:pg: starts postgres:16 in docker on a random 127.0.0.1 port
-# with a random password, runs tests/registry-pg.test.js against it, and
+# with a random password, runs tests/registry-pg.test.js, tests/create-tenant-pg.test.js
+# and tests/bootstrap-pg.test.js against it, and
 # removes the container whatever the outcome.
 set -eu
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -19,4 +20,4 @@ until docker exec "$CID" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; do
 done
 cd "$REPO"
 SYSTEMAPI_TEST_DATABASE_URL="postgres://postgres:$PASS@127.0.0.1:$PORT/postgres" \
-  node --test tests/registry-pg.test.js
+  node --test tests/registry-pg.test.js tests/create-tenant-pg.test.js tests/bootstrap-pg.test.js
