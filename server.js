@@ -255,6 +255,9 @@ if (process.env.DB_PASSWORD && process.env.DB_PASSWORD !== '') {
             keycloakClientID: process.env.KEYCLOAK_CLIENT_ID || 'systemapi',
             apiSite: 'systemapi',
             baseURL: process.env.API_BASE_URL || 'https://api.systemapi.io',
+            // /playground/execute may reach loopback/private addresses only
+            // outside production and only when asked (local development).
+            allowPrivateEgress: process.env.PLAYGROUND_ALLOW_PRIVATE_EGRESS === '1' && process.env.NODE_ENV !== 'production',
             // fleetManager is created further down, before any request runs.
             onKeyRevoked: (keyId, actor) => fleetManager.closeAgentsForKey(keyId, 'key_revoked', actor)
         };

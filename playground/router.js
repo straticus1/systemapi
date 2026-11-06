@@ -7,6 +7,7 @@ const express = require('express');
 const axios = require('axios');
 const crypto = require('crypto');
 const CodeSnippetGenerator = require('./codeGenerator');
+const egress = require('./egress');
 
 // Use native crypto.randomUUID() instead of uuid package
 const uuidv4 = () => crypto.randomUUID();
@@ -22,8 +23,16 @@ function createPlaygroundRouter(config) {
     baseURL,
     // Optional (keyId, actor) => Promise: closes the key's live agent
     // sockets (FleetManager.closeAgentsForKey) after a delete or a lock.
-    onKeyRevoked
+    onKeyRevoked,
+    // POST /execute reaches loopback/private addresses only with this set
+    // (tests, local development; server.js never sets it in production).
+    allowPrivateEgress = false,
+    // Test seam: the DNS resolver behind the egress guard (dns.lookup shape).
+    egressResolve
   } = config;
+  const egressAgents = egress.agents({ allowPrivate: allowPrivateEgress === true, resolve: egressResolve });
+  const EXECUTE_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']);
+  const EXECUTE_MAX_BYTES = 1024 * 1024;
 
   async function keyRevoked(keyId, actor) {
     if (typeof onKeyRevoked !== 'function') return;
@@ -75,8 +84,17 @@ function createPlaygroundRouter(config) {
         });
       }
 
-      // Build full URL
-      const url = `${baseURL}${endpoint}`;
+      // The URL stays on the base URL's origin and the connection reaches
+      // no internal address (playground/egress.js, Threats there).
+      let url;
+      try {
+        url = egress.targetURL(baseURL, endpoint, { allowPrivate: allowPrivateEgress === true });
+      } catch (err) {
+        return res.status(err.status || 400).json({ success: false, error: err.status === 403 ? 'egress_blocked' : 'bad_endpoint' });
+      }
+      if (typeof method !== 'string' || !EXECUTE_METHODS.has(method.toUpperCase())) {
+        return res.status(400).json({ success: false, error: 'bad_method' });
+      }
 
       // Make the API request
       let response;
@@ -84,13 +102,26 @@ function createPlaygroundRouter(config) {
         response = await axios({
           method: method.toLowerCase(),
           url: url,
-          headers: headers || {},
+          headers: egress.forwardHeaders(headers),
           params: query_params || {},
           data: body,
           timeout: 30000,
+          maxRedirects: 0, // a 3xx is returned as-is, never followed
+          proxy: false,
+          httpAgent: egressAgents.httpAgent,
+          httpsAgent: egressAgents.httpsAgent,
+          maxContentLength: EXECUTE_MAX_BYTES,
+          maxBodyLength: EXECUTE_MAX_BYTES,
           validateStatus: () => true // Accept all status codes
         });
       } catch (error) {
+        if (error.code === 'EGRESS_BLOCKED' || (error.cause && error.cause.code === 'EGRESS_BLOCKED')) {
+          await rateLimiter.recordUsage(
+            userId, ipAddress, endpoint, method, 403,
+            Date.now() - startTime, false, 'egress_blocked'
+          );
+          return res.status(403).json({ success: false, error: 'egress_blocked', request_id: requestId });
+        }
         if (error.code === 'ECONNABORTED') {
           // Timeout
           const responseTimeMs = Date.now() - startTime;
