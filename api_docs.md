@@ -176,7 +176,10 @@ ports (no CIDR, no ranges); file roots are absolute directories at least two
 levels down, never a system root (`/proc /sys /dev /boot /etc /root`, the
 agent's and server's own state), beneath one or a parent of one, never
 `file:root`; no service or tweak unit that is the agent's or a helper's;
-config prefixes never the agent's or server's config or a unit directory;
+config prefixes never the agent's or server's config or a systemd unit
+directory (`/etc/systemd/system`, `/etc/systemd/system.control`,
+`/run/systemd/system`, `/run/systemd/system.control`,
+`/run/systemd/transient`, `/usr/lib/systemd/system`, `/lib/systemd/system`);
 no hard-denied sysctl.
 
 Auth for every route: `admin` in some tenant (else 403 `scope_denied` before
@@ -224,13 +227,17 @@ host and tenant qualify (else 404 + `idor`); only rows with `policy_schema:
 with `reason`). Without `"apply": true` it is a dry run. Same gates as a
 write.
 
-Dangerous entries (step-up): a `config` path under `/etc`, any `tweak_unit`,
-any `package`, a `service` on a protected unit (globs over full unit names,
-also covering `.socket` and `@` instances: `ssh*`, `sshd*`, `sahcore*`,
+Dangerous entries (step-up): every `config` path except the small safe
+list (at or under `/etc/nginx/sites-available`, `/etc/nginx/sites-enabled`,
+`/etc/nginx/conf.d`: included only inside nginx's http block, so no
+`load_module` or `user`; lower risk, not none), any `tweak_unit`, any
+`package`, a `service` on a protected unit (globs over full unit names, also
+covering `.socket` and `@` instances: `ssh*`, `sshd*`, `sahcore*`,
 `*cloudflared*`, `postgresql*`, `redis*`, `systemapi-agent*`,
 `sah-*-helper@*`, `dbus*`, `systemd-networkd*`, `networking*`,
-`NetworkManager*`, `systemd-resolved*`, `systemd-logind*`), and every tenant
-write (`tenant_write`). Only entries the write newly grants count: keeping or
+`NetworkManager*`, `systemd-resolved*`, `systemd-logind*`, `*.target`,
+`nftables*`, `ufw*`, `firewalld*`, `iptables*`), and every tenant write
+(`tenant_write`). Only entries the write newly grants count: keeping or
 narrowing is not dangerous; restoring one is. A dangerous write needs
 `confirm_dangerous` equal to the dry run's list (409
 `{"error":"dangerous_unconfirmed","dangerous"}`) and a session principal

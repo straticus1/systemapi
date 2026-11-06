@@ -148,8 +148,8 @@ test('dangerousEntries names only what a write newly grants', () => {
   const eff = (cols) => rules.effectiveOf(cols, null);
   const before = eff(rules.buildPolicy({ package: ['curl'], config: ['/etc/nginx'] }));
   const after = eff(rules.buildPolicy({ package: ['curl', 'nginx'], config: ['/etc/nginx', '/opt/x/conf'], service: ['ssh.service', 'nginx'] }));
-  assert.deepEqual(rules.dangerousEntries(before, after), ['package:nginx', 'service:ssh.service']);
+  assert.deepEqual(rules.dangerousEntries(before, after), ['config:/opt/x/conf', 'package:nginx', 'service:ssh.service']);
   assert.deepEqual(rules.dangerousEntries(after, before), []);
   for (const u of ['sshd', 'sshd@1.service', 'dbus-broker.service', 'cloudflared.service', 'networkmanager.service']) assert.equal(rules.unitProtected(u), true, u);
-  for (const u of ['nginx', 'openssh-backup.timer', 'myredis.service']) assert.equal(rules.unitProtected(u), false, u);
+  for (const u of ['nginx', 'openssh-backup.timer', 'myredis.service', 'nginx.timer', 'nft-helper.service']) assert.equal(rules.unitProtected(u), false, u);
 });
