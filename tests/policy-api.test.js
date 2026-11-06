@@ -513,10 +513,19 @@ test('revert refuses another host\'s, another tenant\'s and non-policy rows (404
     const plain = await reg.appendAudit({ tenant_id: 'acme', host_id: HOST_A, actor: 'x', action: 'sysscript', payload: {} });
     const v = await version(r);
     const idorBefore = reg.securityEvents.filter((e) => e.kind === 'idor').length;
-    for (const seq of [other.audit_seq, foreign.audit_seq, tenantRow.audit_seq, plain.seq, 999]) {
+    for (const seq of [other.audit_seq, foreign.audit_seq, plain.seq, 999]) {
       const res = await call(r, 'POST', `${P()}/revert`, { body: { audit_seq: seq, reason: 'r', if_version: v, apply: true } });
       assert.equal(res.status, 404, String(seq));
     }
+    assert.equal(reg.securityEvents.filter((e) => e.kind === 'idor').length, idorBefore + 4);
+    // This tenant's own default row through the host route: 409, no idor.
+    const own = await call(r, 'POST', `${P()}/revert`, { body: { audit_seq: tenantRow.audit_seq, reason: 'r', if_version: v, apply: true } });
+    assert.equal(own.status, 409);
+    assert.equal(own.body.error, 'revert_unsupported');
+    assert.equal(reg.securityEvents.filter((e) => e.kind === 'idor').length, idorBefore + 4);
+    // Another tenant's default row is still 404 + idor.
+    const theirs = await reg.setTenantChannelPolicyAudited({ tenantId: 'other', ...nulls(), actor: 'x', action: 'channel_policy_tenant_inherit', reason: 'r', extra: { policy_schema: 2 } });
+    assert.equal((await call(r, 'POST', `${P()}/revert`, { body: { audit_seq: theirs.audit_seq, reason: 'r', if_version: v, apply: true } })).status, 404);
     assert.equal(reg.securityEvents.filter((e) => e.kind === 'idor').length, idorBefore + 5);
     // A CLI row from before P2 has no marker.
     const legacy = await reg.setHostChannelPolicyAudited({ tenantId: 'acme', hostId: HOST_A, tcpPolicy: { allow: [] }, filePolicy: { roots: [] }, actor: 'cli:channel-policy', action: 'channel_policy_clear', reason: 'r' });

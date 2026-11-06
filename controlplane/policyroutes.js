@@ -319,6 +319,10 @@ function mountPolicyRoutes(app, fleet, h) {
     reasonOf(body);
     ifVersionOf(body);
     const row = await fleet.registry.policyAuditRow(body.audit_seq);
+    // This tenant's own default row: not another tenant's, so no idor; it is
+    // reverted on the tenant (re-set it there), never onto a host.
+    if (row && row.host_id === null && row.tenant_id === host.tenant_id && typeof row.action === 'string'
+      && row.action.startsWith('channel_policy_tenant_')) throw http(409, 'revert_unsupported');
     const own = row && typeof row.action === 'string' && row.action.startsWith('channel_policy_')
       && row.host_id === host.host_id && row.tenant_id === host.tenant_id;
     if (!own) {

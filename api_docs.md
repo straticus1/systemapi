@@ -221,7 +221,9 @@ the live tcp, mesh, file and xfer sessions on this replica that it reaches.
 `POST .../revert {"audit_seq": N, "reason", "if_version", "apply": false}`
 restores the six columns as they were before audit row N, exactly (an
 explicit null restores inherit). Only `channel_policy_*` rows of the same
-host and tenant qualify (else 404 + `idor`); only rows with `policy_schema:
+host and tenant qualify (else 404 + `idor`; this tenant's own
+`channel_policy_tenant_*` row is 409 `revert_unsupported`, no `idor`: set
+the tenant default again instead); only rows with `policy_schema:
 2` (written from P2 on, recording all six kinds) (else 409
 `revert_unsupported`, also when a recorded value is one the rules now refuse,
 with `reason`). Without `"apply": true` it is a dry run. Same gates as a
