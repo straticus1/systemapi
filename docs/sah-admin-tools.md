@@ -7,8 +7,12 @@ disagree about what is wired, that file wins.
 
 ## sahpolicy.py — set a host's channel policy
 
-Wraps `scripts/channel-policy.js` over ssh, because there is no HTTP route that
-writes a host policy. You type grants, not the `systemd-run` and ssh boilerplate.
+Drives the channel-policy HTTP API (`api_docs.md`, "Channel policy") with
+`SYSTEMAPI_URL` and `SYSTEMAPI_API_KEY` (or `SYSTEMAPI_TOKEN_FILE` from
+`cli/systemapi.js login --fresh`, needed for a dangerous change). No ssh to the
+control plane; `scripts/channel-policy.js` there stays the break-glass path.
+Every write does a dry run first; add `--dry-run` to stop there and
+`--confirm-dangerous` to apply a dangerous one.
 
 ```
 sahpolicy.py show    [--host miniapps1]
@@ -18,8 +22,9 @@ sahpolicy.py clear | inherit [--host miniapps1] [--reason R]
 ```
 
 - `--host` defaults to `miniapps1`. `--reason` defaults to `sahpolicy update`.
-- `add` is merge-aware: it reads the current policy and re-emits every existing
-  grant plus the new ones, so it never silently drops one. If the live policy
+- `add` is merge-aware: GET, then PUT with `if_version`, re-sending every
+  existing grant plus the new ones, so it never silently drops one (a write in
+  between is a 409, not a lost update). If the live policy
   has a shape it cannot round-trip (for example a tcp CIDR rule), it refuses
   rather than write a partial policy. Use `set` for those.
 - Grant flags, repeatable: `--service UNIT`, `--package NAME`, `--config DIR`,
