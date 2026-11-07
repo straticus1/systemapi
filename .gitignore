@@ -9,3 +9,6 @@ systemapi-agent/agent
 .omc/
 .planning/
 .env.production.bak-*
+
+# Local previews (device-login pages, screenshots)
+tmp/

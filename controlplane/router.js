@@ -15,6 +15,7 @@ const express = require('express');
 const axios = require('axios');
 const { hasScope, roleFromGroups, scopesForRole, intersectScopes, ALL } = require('./authz');
 const oauth = require('./oauth');
+const devicePage = require('./devicepage');
 const { issueLease, PTY_SESSION_RE, watchReasonOk } = require('./lease');
 const { issueTicket, TTL_MS: TICKET_TTL_MS } = require('./tickets');
 const { CHANNEL_PURPOSES, SYS_PURPOSES, PURPOSE_SCOPES, validateBinding, policyDecision, sysctlDenied, SYSCTL_KEY_RE } = require('./channels');
@@ -96,7 +97,9 @@ function noStore(res) {
   res.set('Cache-Control', 'no-store');
   res.set('Referrer-Policy', 'no-referrer');
   res.set('X-Content-Type-Options', 'nosniff');
-  res.set('Content-Security-Policy', "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
+  // Strict: the device-login pages' one inline <style> by hash, vendored
+  // fonts, no script (controlplane/devicepage.js).
+  res.set('Content-Security-Policy', devicePage.CSP);
 }
 
 function bodyString(body, name) {
@@ -687,6 +690,9 @@ function mount(app, fleet) {
     if (fleet.registry) res.json({ ready: true });
     else res.status(503).json({ ready: false });
   });
+
+  // Fonts for the device-login pages (fixed allowlist, long cache).
+  devicePage.mountAssets(app);
 
   app.post('/oauth/device', parseForm, wrap(async (req, res) => {
     noStore(res);
