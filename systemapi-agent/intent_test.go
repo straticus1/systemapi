@@ -501,7 +501,8 @@ func TestIntentReceipts(t *testing.T) {
 	}
 	// A refused lease writes no receipt.
 	n := len(got())
-	_, _ = authorizeStart(ptyTestHost, "breakglass", payload, l2, text, ctx, []string{"breakglass"}, sid, h.now)
+	_, err = authorizeStart(ptyTestHost, "breakglass", payload, l2, text, ctx, []string{"breakglass"}, sid, h.now)
+	wantErr(t, "replayed", err, "replay")
 	if len(got()) != n {
 		t.Fatal("receipt for a refused (replayed) lease")
 	}
