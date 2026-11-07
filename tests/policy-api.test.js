@@ -999,6 +999,25 @@ test('scripts/sahpolicy.py add is GET + PUT with if_version over the API and kee
     const named = await py(['add', '--host', 'web1', '--reason', 'py', '--package', 'curl', '--confirm-dangerous', 'package:curl']);
     assert.notEqual(named.code, 0);
     assert.match(named.err, /step_up_required: api_key/);
+    // A fresh device token from SYSTEMAPI_TOKEN_FILE goes as a bearer and
+    // passes step-up; a stale one is refused stale_auth.
+    const fs = require('node:fs');
+    const dir = fs.mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'sahpolicy-'));
+    try {
+      const tokenFile = require('node:path').join(dir, 'token');
+      fs.writeFileSync(tokenFile, await deviceToken(r, nowS() - 400) + '\n', { mode: 0o600 });
+      const stale = await py(['add', '--host', HOST_A, '--reason', 'py', '--package', 'curl', '--confirm-dangerous', 'package:curl'], { SYSTEMAPI_API_KEY: '', SYSTEMAPI_TOKEN_FILE: tokenFile });
+      assert.notEqual(stale.code, 0);
+      assert.match(stale.err, /step_up_required: stale_auth/);
+      fs.writeFileSync(tokenFile, await deviceToken(r, nowS()) + '\n', { mode: 0o600 });
+      const fresh = await py(['add', '--host', HOST_A, '--reason', 'py', '--package', 'curl', '--confirm-dangerous', 'package:curl'], { SYSTEMAPI_API_KEY: '', SYSTEMAPI_TOKEN_FILE: tokenFile });
+      assert.equal(fresh.code, 0, fresh.err);
+      assert.deepEqual(JSON.parse(fresh.out).dangerous, ['package:curl']);
+      assert.equal(policyRows(r).pop().payload.via, 'token');
+      assert.equal(`${fresh.out}${fresh.err}`.includes(fs.readFileSync(tokenFile, 'utf8').trim()), false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
     // Plain http only to this machine, by the exact hostname.
     const port = new URL(r.url).port;
     for (const url of [`http://localhost.evil.example:${port}`, `http://127.0.0.1@evil.example:${port}`, `http://127.0.0.1.nip.io:${port}`]) {

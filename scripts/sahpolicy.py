@@ -17,8 +17,8 @@ Grant flags (repeatable): --service UNIT  --package NAME  --config DIR
 
 Environment: SYSTEMAPI_URL, and SYSTEMAPI_API_KEY or SYSTEMAPI_TOKEN_FILE (a
 token from `cli/systemapi.js login --fresh`, needed for a dangerous change;
-the server refuses API keys for those). The key is sent only as X-API-Key and
-never printed.
+the server refuses API keys for those). A key is sent only as X-API-Key, a
+token only as Authorization: Bearer; neither is ever printed.
 
 Every write reads the current version and asks for a dry run first; it
 applies only without --dry-run, and a dangerous change (P2c) only once the
@@ -63,7 +63,9 @@ def credentials():
     if not url_ok(base):
         sys.exit("sahpolicy: SYSTEMAPI_URL must be an https:// URL")
     key = (os.environ.get("SYSTEMAPI_API_KEY") or "").strip()
+    bearer = False
     if not key:
+        bearer = True
         path = os.environ.get("SYSTEMAPI_TOKEN_FILE") or ""
         if not os.path.isabs(path):
             sys.exit("sahpolicy: set SYSTEMAPI_API_KEY or an absolute SYSTEMAPI_TOKEN_FILE")
@@ -75,14 +77,17 @@ def credentials():
             sys.exit("sahpolicy: token_file_rejected")
     if len(key) < 8 or re.search(r"\s", key):
         sys.exit("sahpolicy: the key or token is malformed")
-    return base, key
+    return base, key, bearer
 
 
 def call(cfg, method, path, body=None, query=None):
-    base, key = cfg
+    base, key, bearer = cfg
     url = base + path + ("?" + urllib.parse.urlencode(query) if query else "")
     data = None if body is None else json.dumps(body).encode()
-    headers = {"X-API-Key": key, "Accept": "application/json"}
+    # An API key as X-API-Key; a device token (SYSTEMAPI_TOKEN_FILE) as a
+    # bearer, so the server sees a session principal that can pass step-up.
+    headers = {"Authorization": "Bearer " + key} if bearer else {"X-API-Key": key}
+    headers["Accept"] = "application/json"
     if data is not None:
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
