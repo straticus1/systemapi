@@ -31,7 +31,12 @@
     "/etc/ld.so.preload",
     "/etc/systemd/system.conf",
     "/etc/systemd/system.conf.d",
-    "/etc/systemd/system.conf.d/50-env.conf"
+    "/etc/systemd/system.conf.d/50-env.conf",
+    "/run/systemd/system/systemapi-agent.service.d/x.conf",
+    "/run/systemd/transient/sah-config-helper@.service",
+    "/usr/lib/systemd/system/systemapi-agent.service",
+    "/lib/systemd/system/sah-sysctl-helper@.service",
+    "/run/systemd/system.control/systemapi-agent.service.d/50-x.conf"
   ],
   "allowed": [
     "/etc/nginx/nginx.conf",
@@ -46,6 +51,8 @@
     "/etc/systemd/timesyncd.conf",
     "/etc/ld.so.preloadx",
     "/etc/systemd/system.confx",
-    "/etc/systemd/user.conf.d/x.conf"
+    "/etc/systemd/user.conf.d/x.conf",
+    "/usr/lib/systemd/system/nginx.service.d/override.conf",
+    "/run/systemd/system/nginx.service.d/x.conf"
   ]
 }

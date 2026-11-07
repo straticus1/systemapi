@@ -61,8 +61,9 @@ func withHelperTrust(t *testing.T, pub ed25519.PublicKey, host string) string {
 	return path
 }
 
-// newHelperSigner makes a control key, trusts it for ptyTestHost, and returns
-// the private half.
+// newHelperSigner makes a control key, trusts it for ptyTestHost in both the
+// helper trust file and the agent's pinned identity (helperPreflight checks
+// the latter), and returns the private half.
 func newHelperSigner(t *testing.T) ed25519.PrivateKey {
 	t.Helper()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -70,6 +71,11 @@ func newHelperSigner(t *testing.T) ed25519.PrivateKey {
 		t.Fatal(err)
 	}
 	withHelperTrust(t, pub, ptyTestHost)
+	clearIdentity()
+	t.Cleanup(clearIdentity)
+	if err := pinControlPublicKey(base64.StdEncoding.EncodeToString(pub), ptyTestHost); err != nil {
+		t.Fatal(err)
+	}
 	return priv
 }
 

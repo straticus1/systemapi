@@ -234,6 +234,10 @@ CREATE TABLE IF NOT EXISTS cp_oauth_devices (
 );
 ALTER TABLE cp_oauth_devices ADD COLUMN IF NOT EXISTS requester_ip TEXT;
 ALTER TABLE cp_oauth_devices ADD COLUMN IF NOT EXISTS requester_ua TEXT;
+-- Step-up (plan P2c): a fresh code, and the approving session's Authentik
+-- auth_time, copied onto its access token.
+ALTER TABLE cp_oauth_devices ADD COLUMN IF NOT EXISTS fresh BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE cp_oauth_devices ADD COLUMN IF NOT EXISTS auth_time TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS cp_oauth_devices_user_idx ON cp_oauth_devices (user_id, status);
 CREATE UNIQUE INDEX IF NOT EXISTS cp_oauth_devices_state_idx ON cp_oauth_devices (state_hash) WHERE state_hash IS NOT NULL;
 
@@ -243,6 +247,7 @@ CREATE TABLE IF NOT EXISTS cp_oauth_access (
   expires_at TIMESTAMPTZ NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE cp_oauth_access ADD COLUMN IF NOT EXISTS auth_time TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS cp_oauth_links (
   user_id TEXT NOT NULL,

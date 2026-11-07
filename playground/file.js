@@ -44,7 +44,7 @@ const { FILE_PURPOSES, validateFileRoot } = require('../controlplane/channels');
 const { FILE_WINDOW, creditFrame, creditBytes, encodeData } = require('../controlplane/credit');
 const { randomToken } = require('../controlplane/token');
 const {
-    envInt, unref, sendJSON, channelUpgradeHost, recheckChannelTicket, appendAuditRetrying, ClientSink, AgentSource
+    envInt, unref, sendJSON, channelUpgradeHost, recheckChannelTicket, appendAuditRetrying, ClientSink, AgentSource, serialRenew
 } = require('./channel');
 
 const SESSION_PREFIX = 'fls_';
@@ -483,25 +483,24 @@ class FileChannels {
     // allowing ends the session with stopped and gets no new lease. A failed
     // lookup only skips this renewal: the agent ends the session when the
     // last lease lapses.
-    async renew(s) {
-        if (s.ended || !this.fm.signer || s.renewing) return;
-        s.renewing = true;
-        let denied;
-        try {
-            denied = await recheckChannelTicket(this.fm.registry,
-                { actor: s.actor, tenantId: s.tenantId, auth: s.auth, hostId: s.hostId }, s.purpose, { root: s.root });
-        } finally {
-            s.renewing = false;
-        }
-        if (s.ended) return;
-        if (denied === 'internal') {
+    // opts.policy: as TcpChannels.renew (a failed lookup ends it).
+    renew(s, opts = {}) {
+        return serialRenew(s, opts, (o) => this.renewOnce(s, o));
+    }
+
+    async renewOnce(s, { policy = false } = {}) {
+        if (s.ended || !this.fm.signer) return 'gone';
+        const denied = await recheckChannelTicket(this.fm.registry,
+            { actor: s.actor, tenantId: s.tenantId, auth: s.auth, hostId: s.hostId }, s.purpose, { root: s.root });
+        if (s.ended) return 'gone';
+        if (denied === 'internal' && !policy) {
             console.error('[Fleet] file lease renewal skipped: re-check unavailable');
-            return;
+            return 'skipped';
         }
         if (denied) {
             console.warn(`[Fleet] file ${s.id}: grant withdrawn (${denied}); ending session`);
             this.end(s, 'stopped', { notifyClient: true, notifyAgent: true });
-            return;
+            return 'ended';
         }
         try {
             const lease = issueLease(this.fm.signer, {
@@ -514,6 +513,7 @@ class FileChannels {
         } catch (err) {
             console.error('[Fleet] file lease renewal failed:', err.message);
         }
+        return 'renewed';
     }
 
     touch(s) {

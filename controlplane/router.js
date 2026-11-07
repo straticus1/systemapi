@@ -7,12 +7,15 @@
 // Host retirement is admin-only in the host's tenant, needs a reason, refuses
 // a connected host (409 host_online) unless force, and is one audited
 // registry write; a retired row never resolves by name or id.
+// The channel-policy routes (controlplane/policyroutes.js) carry their own
+// Threats note; they reuse the helpers here.
 'use strict';
 
 const express = require('express');
 const axios = require('axios');
 const { hasScope, roleFromGroups, scopesForRole, intersectScopes, ALL } = require('./authz');
 const oauth = require('./oauth');
+const devicePage = require('./devicepage');
 const { issueLease, PTY_SESSION_RE, watchReasonOk } = require('./lease');
 const { issueTicket, TTL_MS: TICKET_TTL_MS } = require('./tickets');
 const { CHANNEL_PURPOSES, SYS_PURPOSES, PURPOSE_SCOPES, validateBinding, policyDecision, sysctlDenied, SYSCTL_KEY_RE } = require('./channels');
@@ -25,6 +28,7 @@ const xfer = require('../playground/xfer');
 const { WATCH_PURPOSES, watchScopes } = require('../playground/watch');
 const { jobView, jobsEnabled, TERMINAL_JOB_STATUSES } = require('../playground/jobs');
 const { entitlementsSha256 } = require('./entitlements');
+const { mountPolicyRoutes } = require('./policyroutes');
 
 const SCRIPT_MAX = 64 * 1024;
 const JOB_TIMEOUT_DEFAULT_S = 300;
@@ -93,7 +97,9 @@ function noStore(res) {
   res.set('Cache-Control', 'no-store');
   res.set('Referrer-Policy', 'no-referrer');
   res.set('X-Content-Type-Options', 'nosniff');
-  res.set('Content-Security-Policy', "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
+  // Strict: the device-login pages' one inline <style> by hash, vendored
+  // fonts, no script (controlplane/devicepage.js).
+  res.set('Content-Security-Policy', devicePage.CSP);
 }
 
 function bodyString(body, name) {
@@ -167,6 +173,8 @@ async function authenticate(req, fleet) {
         kind: 'session',
         userId: oauthUser.user_id,
         keyScopes: null,
+        // Set only on a fresh (step-up) device token.
+        authTime: Number.isSafeInteger(oauthUser.auth_time) ? oauthUser.auth_time : null,
         memberships: memberships.map((m) => ({ ...m, effective_role: m.role }))
       };
     }
@@ -201,9 +209,12 @@ async function authenticate(req, fleet) {
     const boosted = roleFromGroups(sessionUser.groups);
     return {
       kind: 'session',
+      // A browser cookie: policy writes check CSRF (Content-Type and Origin).
+      cookie: true,
       userId,
       email: sessionUser.email,
       keyScopes: null,
+      authTime: Number.isSafeInteger(sessionUser.auth_time) ? sessionUser.auth_time : null,
       groupRole: boosted || null,
       memberships: memberships.map((m) => ({ ...m, effective_role: boosted || m.role }))
     };
@@ -696,12 +707,16 @@ function mount(app, fleet) {
     else res.status(503).json({ ready: false });
   });
 
+  // Fonts for the device-login pages (fixed allowlist, long cache).
+  devicePage.mountAssets(app);
+
   app.post('/oauth/device', parseForm, wrap(async (req, res) => {
     noStore(res);
+    // fresh=1 asks for a step-up token (plan P2c, cli login --fresh).
     const out = await oauth.startDevice(fleet.registry, bodyString(req.body, 'username'), fleet.env || {}, {
       ip: req.ip,
       ua: req.get('user-agent')
-    });
+    }, Date.now(), { fresh: bodyString(req.body, 'fresh') === '1' });
     res.json(out);
   }));
 
@@ -748,6 +763,13 @@ function mount(app, fleet) {
     if (!found || !(await oauth.sessionOwnsUser(fleet.registry, sessionUser, found.row.user_id))) {
       if (oauth.recordCodeFailure(fleet.codeTries, sessionKey, ipKey)) await oauth.denyPending(fleet.registry, member);
       res.status(403).type('html').send(oauth.entryPage(sessionUser, member, csrf, 'That code was not accepted (login_denied).'));
+      return;
+    }
+    // A fresh (step-up) code needs an SSO session at most 5 min old: a stale
+    // one is sent to Authentik to sign in again, then back here to retype it.
+    if (found.row.fresh === true && !oauth.sessionFresh(sessionUser)) {
+      delete req.session.deviceConfirm;
+      res.redirect(303, '/oauth/login?fresh=1&return_to=' + encodeURIComponent('/oauth/device/verify'));
       return;
     }
     // Approving (here or through Google/GitHub) needs the confirm page for
@@ -1498,6 +1520,10 @@ function mount(app, fleet) {
     if (!removed) throw http(404, 'not_found');
     res.json({ deleted: true });
   }));
+
+  mountPolicyRoutes(app, fleet, {
+    wrap, http, noStore, authenticate, requireScopeAnywhere, requireHost, requireScope, safeSecurity, tenantIds, deliverWebhooks
+  });
 }
 
 async function setAlert(req, res, fleet, status) {

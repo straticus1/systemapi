@@ -171,10 +171,13 @@ type ptySession struct {
 	action   string
 	actor    string
 	deadline time.Time
-	out      ptyOut
-	ptmx     *os.File
-	cmd      *exec.Cmd
-	rec      *recorder
+	// intentSHA is the intent hash of a session started with a v2 lease;
+	// every renew must carry it (authorizeRenew).
+	intentSHA string
+	out       ptyOut
+	ptmx      *os.File
+	cmd       *exec.Cmd
+	rec       *recorder
 
 	inCh chan []byte
 
@@ -205,6 +208,8 @@ type ptyStartRequest struct {
 	DeadlineUnix int64
 	Actor        string
 	Lease        *Lease
+	// Intent is the intent text of a v2 lease ("" for v1).
+	Intent string
 	// Grant is the signed sash/1 document. SashTargets is the channel
 	// policy beside it. Both are empty when the server omitted them.
 	Grant       []byte
@@ -541,7 +546,10 @@ func startPTYSession(out ptyOut, hostID, stateDir string, req ptyStartRequest, n
 		ptyStatusError(out, sid, "lease_required")
 		return
 	}
-	if err := authorizeCommand(hostID, req.Action, terminalPayload(sid, req.DeadlineUnix, "start"), req.Lease, now); err != nil {
+	intentSHA, err := authorizeStart(hostID, req.Action, terminalPayload(sid, req.DeadlineUnix, "start"), req.Lease, req.Intent,
+		intentCtx{Requester: "member:" + req.Actor, DeadlineUnix: req.DeadlineUnix, Session: true},
+		intentClasses(req.Action, "", nil), sid, now)
+	if err != nil {
 		log.Printf("pty refused: %s", err.Error())
 		ptyStatusError(out, sid, "lease_required")
 		return
@@ -605,13 +613,14 @@ func startPTYSession(out ptyOut, hostID, stateDir string, req ptyStartRequest, n
 		leaseExp = deadline
 	}
 	s := &ptySession{
-		id:       sid,
-		action:   req.Action,
-		actor:    req.Actor,
-		deadline: deadline,
-		out:      out,
-		leaseExp: leaseExp,
-		inCh:     make(chan []byte, 4096),
+		id:        sid,
+		action:    req.Action,
+		actor:     req.Actor,
+		deadline:  deadline,
+		intentSHA: intentSHA,
+		out:       out,
+		leaseExp:  leaseExp,
+		inCh:      make(chan []byte, 4096),
 	}
 
 	mode := recordingMode(ptyCfg, euid)
@@ -1011,7 +1020,8 @@ func renewPTYSession(hostID, sessionID string, lease *Lease, now time.Time) erro
 	if s == nil {
 		return errors.New("unknown_session")
 	}
-	if err := authorizeCommand(hostID, s.action, terminalPayload(s.id, s.deadline.Unix(), "renew"), lease, now); err != nil {
+	if err := authorizeRenew(hostID, s.action, terminalPayload(s.id, s.deadline.Unix(), "renew"), lease, s.intentSHA,
+		intentClasses(s.action, "", nil), s.id, now); err != nil {
 		return err
 	}
 	exp := time.Unix(lease.ExpiresUnix, 0)

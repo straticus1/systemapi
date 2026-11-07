@@ -479,7 +479,10 @@ const CONFIG_SELF_ROOTS = ['/proc', '/sys', '/dev', '/boot', '/var/lib/systemapi
 // Unit dirs whose entries systemd applies to the agent and helpers; entries
 // are matched by pattern (systemdSelfEntry), mirroring configSystemdUnitDirs,
 // configHelperUnitRE and configSystemdSelfEntry in config_helper.go.
-const SYSTEMD_UNIT_DIRS = ['/etc/systemd/system', '/etc/systemd/system.control'];
+// The runtime and vendor dirs too (/run, /usr/lib, /lib): a unit or drop-in
+// there applies to the agent and helpers just the same.
+const SYSTEMD_UNIT_DIRS = ['/etc/systemd/system', '/etc/systemd/system.control', '/run/systemd/system',
+  '/run/systemd/system.control', '/run/systemd/transient', '/usr/lib/systemd/system', '/lib/systemd/system'];
 const HELPER_UNIT_RE = /^sah-[^/]*-helper@[^/]*\.service$/;
 
 // systemdSelfEntry: name (one entry directly under a unit dir) is the agent's

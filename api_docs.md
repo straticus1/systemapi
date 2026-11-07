@@ -47,6 +47,14 @@ the router.
   and a session's fifth failure denies its member's pending logins. GET never
   approves. Codes last 10 minutes and are single use; the bearer token lasts
   an hour.
+- Step-up (for dangerous channel-policy writes, below): `POST /oauth/device`
+  with `fresh=1` (`cli/systemapi.js login --fresh`) starts a fresh code. Its
+  confirm page says the token can make dangerous policy changes, it offers
+  no Google/GitHub button, and it approves only from an SSO session whose
+  Authentik `auth_time` is at most 5 minutes old; an older session is sent
+  (303) to `/oauth/login?fresh=1`, which forces `prompt=login&max_age=300`
+  and checks `auth_time` on the ID token. Only a fresh code's token carries
+  that `auth_time`; any other token, and every API key, fails step-up.
 - Browser and CLI WebSockets: a single-use ticket from `POST /api/v1/ws-ticket`
   (`purpose` is `terminal:open`, `terminal:root` or `breakglass:open`). Tickets
   last 60 seconds, are bound to one host and purpose, and are audited. Each
@@ -122,6 +130,12 @@ no scopes.
 | POST | `/api/v1/hosts/:host_id/retire` | `admin` scope in the host's tenant. Body `{"reason": "<1-256 chars>", "force": false}`. Stamps `retired_at`, appends a `host_retired` audit row (reason, hostname, forced, last_seen_at) in the same transaction, and keeps the row. A retired host never resolves, is left out of the fleet listing and counts, has no channel policy (deny), and its `host_id` cannot re-enroll (`enroll_error host_retired`). A connected host is refused `409 {"error":"host_online","host_id":...}` unless `"force": true`, which also closes the agent socket (4403 `host_retired`) and so ends its terminal, TCP, file and xfer sessions. 200 `{"host_id","hostname","tenant","retired_at","forced","agent_closed"}`; 400 `reason_required`, `bad_reason`, `bad_force`; 403 `scope_denied`; 404 `not_found`; 409 `already_retired`. The API key the agent enrolled with is not revoked: it is the tenant's key and may serve other hosts. |
 | GET | `/api/v1/hosts/:host_id/capabilities` | `hosts:read` in the host's tenant; another tenant's host is `404 not_found` with an `idor` security event. 200 `{"host_id","health","supported","effective","expected","caps":[{"name","state","reason","since","last_report_at"}]}`. See [Capability health](#capability-health). |
 | POST | `/api/v1/hosts/:host_id/capabilities/probe` | `admin` scope in the host's tenant. Sends `capability_probe` to the live agent, which re-runs its probes and reports (old agents ignore it). 202 `{"host_id","probe":"sent"}`; 409 `host_offline` when no agent socket is held by this control plane; 403 `scope_denied`; 404 `not_found`. |
+| GET | `/api/v1/hosts/:host_id/channel-policy` | `admin`. See [Channel policy](#channel-policy). |
+| PUT | `/api/v1/hosts/:host_id/channel-policy` | `admin`. Full replace from grant lists. |
+| POST | `/api/v1/hosts/:host_id/channel-policy/clear` | `admin`. Explicit deny on all six kinds. |
+| POST | `/api/v1/hosts/:host_id/channel-policy/inherit` | `admin`. All six null (tenant default, else deny). |
+| POST | `/api/v1/hosts/:host_id/channel-policy/revert` | `admin`. Restore the columns as before audit row N. |
+| GET/PUT | `/api/v1/tenants/:tenant/channel-policy` | `admin` in that tenant. Tenant default; plus `POST .../clear` and `.../inherit`. |
 | GET | `/api/v1/fleet/export` | Same list; `?format=csv` for CSV. |
 | GET | `/api/v1/fleet/efficiency` | Average CPU and memory per host over the last 100 samples. |
 | GET | `/api/v1/fleet/:hostId/software` | Installed software reported by the agent. |
@@ -149,6 +163,119 @@ A host in the list looks like:
 is none. Memory, disk and network figures are stored as telemetry but are not
 part of this object. `/api/v1/fleet` rows and `/api/v1/hosts/resolve` also
 carry `health` (below).
+
+### Channel policy
+
+What a host's tcp, file, service, package, config and tweak channels may
+reach (six columns per host and per tenant; a host column replaces the
+tenant's, null inherits, malformed denies). These routes replace running
+`scripts/channel-policy.js` on the control-plane host, which stays as the
+break-glass path; both build policies through `controlplane/policyrules.js`,
+so the same rules apply: at most 16 entries of each kind; TCP only local
+ports (no CIDR, no ranges); file roots are absolute directories at least two
+levels down, never a system root (`/proc /sys /dev /boot /etc /root`, the
+agent's and server's own state), beneath one or a parent of one, never
+`file:root`; no service or tweak unit that is the agent's or a helper's;
+config prefixes never the agent's or server's config or a systemd unit
+directory (`/etc/systemd/system`, `/etc/systemd/system.control`,
+`/run/systemd/system`, `/run/systemd/system.control`,
+`/run/systemd/transient`, `/usr/lib/systemd/system`, `/lib/systemd/system`);
+no hard-denied sysctl.
+
+Auth for every route: `admin` in some tenant (else 403 `scope_denied` before
+any lookup), then the host in your tenants (another tenant's host, or tenant,
+is 404 `not_found` with an `idor` security event), then `admin` in its
+tenant; a retired host is 409 `host_retired`.
+
+`GET` answers `{host_id, hostname, tenant_id, host, tenant, effective,
+grants, version, dangerous}`: the six raw host and tenant columns, the
+effective values, the host's grant lists (null when a column inherits or
+holds what the rules refuse), `version` (sha256 of the canonical six host
+columns) and the dangerous entries now in force.
+
+Writes take JSON only (`Content-Type: application/json`, else 415
+`json_required`); a browser cookie session also needs an `Origin` in
+`SYSTEMAPI_ALLOWED_ORIGINS` (403 `origin_denied`). Every write body carries
+`reason` (1-256 characters, no control bytes; 400 `bad_reason`) and
+`if_version`, the `version` it replaces (400 `if_version_required`; a stale
+one is 409 `{"error":"version_conflict","version"}` and is checked again
+under the row lock). `PUT` takes `grants`:
+
+```json
+{"reason": "CHG-1", "if_version": "<64 hex>",
+ "grants": {"tcp_local": [5432], "file_read": ["/srv/logs"], "file_write": ["/srv/data"],
+            "service": ["nginx.service"], "package": [], "config": ["/etc/nginx"],
+            "tweak_sysctl": ["vm.swappiness"], "tweak_unit": []}}
+```
+
+A refused grant is 400 `{"error":"bad_policy","reason":<rule>}` with `rule`
+one of `bad_grants`, `bad_port`, `bad_path`, `too_wide`, `system_root`,
+`protected_path`, `bad_unit`, `self_unit`, `bad_package`, `bad_sysctl`,
+`too_many`, `empty` (use clear or inherit).
+
+`?dry_run=1` on any write writes nothing and answers `{dry_run: true, action,
+version, next_version, diff, dangerous, live_sessions}`: the columns that
+change (`before`/`after`), the dangerous entries the write would grant, and
+the live tcp, mesh, file and xfer sessions on this replica that it reaches.
+
+`POST .../revert {"audit_seq": N, "reason", "if_version", "apply": false}`
+restores the six columns as they were before audit row N, exactly (an
+explicit null restores inherit). Only `channel_policy_*` rows of the same
+host and tenant qualify (else 404 + `idor`; this tenant's own
+`channel_policy_tenant_*` row is 409 `revert_unsupported`, no `idor`: set
+the tenant default again instead); only rows with `policy_schema:
+2` (written from P2 on, recording all six kinds) (else 409
+`revert_unsupported`, also when a recorded value is one the rules now refuse,
+with `reason`). Without `"apply": true` it is a dry run. Same gates as a
+write.
+
+Dangerous entries (step-up): every `config` path (there is no safe config
+dir: a service running as root reads it, and even an nginx site file can
+point `access_log` at `/root/.ssh/authorized_keys` or `/etc/cron.d`,
+`include` a root-only file, or run perl or lua as root), any `tweak_unit`, any
+`package`, a `service` on a protected unit (globs over full unit names, also
+covering `.socket` and `@` instances: `ssh*`, `sshd*`, `sahcore*`,
+`*cloudflared*`, `postgresql*`, `redis*`, `systemapi-agent*`,
+`sah-*-helper@*`, `dbus*`, `systemd-networkd*`, `networking*`,
+`NetworkManager*`, `systemd-resolved*`, `systemd-logind*`, `*.target`,
+`nftables*`, `ufw*`, `firewalld*`, `iptables*`), and every tenant write
+(`tenant_write`). Only entries the write newly grants count: keeping or
+narrowing is not dangerous; restoring one is. On a host, an entry newly
+explicit on the host counts too, even when the tenant default already
+grants it (the pin outlives a later tenant narrowing). The tenant columns
+the list was judged against are checked again under the write's lock
+(`FOR SHARE`; a tenant write in between is 409 `version_conflict`). A dangerous write needs
+`confirm_dangerous` equal to the dry run's list (409
+`{"error":"dangerous_unconfirmed","dangerous"}`) and a session principal
+(cookie or device token) whose `auth_time` is at most 5 minutes old and
+at most 5 s ahead of the server clock (403
+`{"error":"step_up_required","reason":"api_key"|"stale_auth"}`, with a
+`step_up_deny` security event). It applies at once and fires a
+`channel_policy_dangerous` webhook (`classes` and `count` only, no paths or
+units).
+
+A write answers `{host_id, tenant, action, version, audit_seq, dangerous,
+renewed, ended}`. It and its audit row (`channel_policy_set|clear|inherit|revert`,
+`channel_policy_tenant_*` with `host_id` null) are one transaction; the row
+carries `policy_schema: 2`, all six previous and new kinds, the reason, the
+actor (member id), `via` (`key`, `token`, `session`), `key_fp` (sha256 of
+the key id, or null), `dangerous`, and `revert_of` for a revert. Then every
+live tcp, mesh, file and xfer session on the affected hosts (this replica)
+is renewed at once (at most 8 at a time), and the answer waits for it: one the policy no longer
+allows ends with `stopped` (audited by its own end row) instead of at its
+next 30 s renewal. A renewal already in flight when the write lands runs
+again after it, against the new policy. On this renewal a failed lookup
+ends the session (fail closed); the periodic one only skips. `renewed` is
+how many passed and got a new lease, `ended` how many were stopped. A
+change made with the break-glass `scripts/channel-policy.js` renews
+nothing: live sessions see it at their next 30 s renewal. Writes, dry runs included, are capped
+at `SYSTEMAPI_POLICY_WRITE_RATE` per minute (default 60, 1-600; 429
+`rate_limited`), and per principal (one API key, or one member) at
+`SYSTEMAPI_POLICY_WRITE_RATE_PRINCIPAL` (default 20, never above the global
+rate). A refused call counts against neither.
+
+A key used for policy writes should be created with `allowed_endpoints`
+limited to these routes; it can never make a dangerous change.
 
 ### Capability health
 

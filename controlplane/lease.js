@@ -41,6 +41,9 @@
 // are bound, check always signs "-" and apply always a plan hash, and a
 // sysscript_job lease cannot start a converge job (or the reverse). Shared
 // vectors: controlplane/testdata/converge-job-lease-vectors.json.
+// systemapi-lease-v2 (canonicalLeaseV2) adds the intent's SHA-256 as a last
+// line; verifyLease refuses a v2 lease as malformed and only verifyLeaseV2
+// accepts it. Intents and the v2 mint helpers are in controlplane/intent.js.
 'use strict';
 
 const crypto = require('node:crypto');
@@ -87,6 +90,13 @@ function canonicalLease({ hostId, action, expiresUnix, nonceHex, payloadSha256 }
   return `systemapi-lease-v1\n${hostId}\n${action}\n${expiresUnix}\n${nonceHex}\n${payloadSha256}\n`;
 }
 
+// systemapi-lease-v2 (.omc/plans/sah-signed-intent-contract.md 1.4): the v1
+// lines plus the intent hash. The prefix differs, so neither form verifies
+// as the other. Minted only by controlplane/intent.js.
+function canonicalLeaseV2({ hostId, action, expiresUnix, nonceHex, payloadSha256, intentSha256 }) {
+  return `systemapi-lease-v2\n${hostId}\n${action}\n${expiresUnix}\n${nonceHex}\n${payloadSha256}\n${intentSha256}\n`;
+}
+
 function hashEqual(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
   if (!/^[0-9a-f]{64}$/.test(a) || !/^[0-9a-f]{64}$/.test(b)) return false;
@@ -120,8 +130,24 @@ function issueLease(signer, { hostId, action, payload, ttl = 60, now = Date.now(
   };
 }
 
+// verifyLease checks a v1 lease. A lease that says v 2 or carries an
+// intent_sha256 is malformed here (verifyLeaseV2 is the only v2 path).
 function verifyLease(publicKey, lease, payload, nowMs = Date.now()) {
   if (!lease || typeof lease !== 'object') return fail('malformed');
+  if (lease.v === 2 || lease.intent_sha256 !== undefined) return fail('malformed');
+  return verifyFields(publicKey, lease, payload, nowMs, null);
+}
+
+// verifyLeaseV2 checks a systemapi-lease-v2 lease and returns its intent
+// hash. Used by tests and the shared vectors; the agent is the real verifier.
+function verifyLeaseV2(publicKey, lease, payload, nowMs = Date.now()) {
+  if (!lease || typeof lease !== 'object' || lease.v !== 2) return fail('malformed');
+  if (typeof lease.intent_sha256 !== 'string' || !SHA256_HEX_RE.test(lease.intent_sha256)) return fail('malformed');
+  const res = verifyFields(publicKey, lease, payload, nowMs, lease.intent_sha256);
+  return res.ok ? { ...res, intentSha256: lease.intent_sha256 } : res;
+}
+
+function verifyFields(publicKey, lease, payload, nowMs, intentSha256) {
   const { host_id: hostId, action, expires_unix: expiresUnix, nonce_hex: nonceHex, payload_sha256: payloadSha256, signature } = lease;
   if (typeof hostId !== 'string' || !hostId) return fail('bad_host');
   if (!ACTIONS.has(action)) return fail('bad_action');
@@ -132,7 +158,9 @@ function verifyLease(publicKey, lease, payload, nowMs = Date.now()) {
   if (expiresUnix > now + MAX_TTL_S) return fail('expiry_too_far');
   const expect = payloadHash(action, payload);
   if (!hashEqual(expect, payloadSha256)) return fail('payload_mismatch');
-  const message = canonicalLease({ hostId, action, expiresUnix, nonceHex, payloadSha256 });
+  const message = intentSha256 === null
+    ? canonicalLease({ hostId, action, expiresUnix, nonceHex, payloadSha256 })
+    : canonicalLeaseV2({ hostId, action, expiresUnix, nonceHex, payloadSha256, intentSha256 });
   let sig;
   try {
     sig = Buffer.from(signature, 'base64');
@@ -408,6 +436,9 @@ module.exports = {
   peerAddress,
   payloadHash,
   canonicalLease,
+  canonicalLeaseV2,
+  hashEqual,
   issueLease,
-  verifyLease
+  verifyLease,
+  verifyLeaseV2
 };

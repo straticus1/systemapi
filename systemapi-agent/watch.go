@@ -216,6 +216,24 @@ func handleWatchRequest(out ptyOut, hostID string, req watchRequest, now time.Ti
 		refuse("lease_required")
 		return
 	}
+	// Control is input into the session (contract 5.1, N36): never into an
+	// intent-bound session, and not into a session of a class this host pins
+	// (a damaged pin refuses it too).
+	if req.Mode == watchModeControl {
+		if s.intentSHA != "" {
+			refuse("intent_required")
+			return
+		}
+		pinned, err := pinnedFor(intentClasses(s.action, "", nil))
+		if err != nil {
+			refuse(err.Error())
+			return
+		}
+		if pinned {
+			refuse("intent_required")
+			return
+		}
+	}
 	override := req.Override
 	if override && req.Mode == watchModeControl {
 		// Read-write control always asks the user.

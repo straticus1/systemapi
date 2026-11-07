@@ -111,7 +111,8 @@ var configSelfRoots = []string{
 
 // configSystemdUnitDirs hold unit files and drop-ins systemd applies to the
 // agent and the helpers. Mirrors channel-policy.js SYSTEMD_UNIT_DIRS.
-var configSystemdUnitDirs = []string{"/etc/systemd/system", "/etc/systemd/system.control"}
+var configSystemdUnitDirs = []string{"/etc/systemd/system", "/etc/systemd/system.control", "/run/systemd/system",
+	"/run/systemd/system.control", "/run/systemd/transient", "/usr/lib/systemd/system", "/lib/systemd/system"}
 
 // configHelperUnitRE matches a mutation helper's unit, template or instance
 // (sah-config-helper@.service, sah-sysctl-helper@<id>.service, any future
@@ -141,6 +142,8 @@ type configHelperReq struct {
 	Target  string `json:"target"`
 	Content string `json:"content"`
 	Lease   *Lease `json:"lease"`
+	// Intent is the systemapi-intent-v1 text beside a v2 lease ("" for v1).
+	Intent string `json:"intent,omitempty"`
 }
 
 // configHelperRes is the helper->agent result.
@@ -186,8 +189,8 @@ func configTargetDenied(target string) bool {
 
 // configRevalidate is the shape re-validation shared by the agent-side
 // handoff and the helper subcommand. It returns "" when the target and size
-// are acceptable, or a stable error code. The lease check is separate
-// (helperAuthorize) and runs only in the helper.
+// are acceptable, or a stable error code. The lease checks are separate:
+// helperPreflight on the agent side, helperAuthorize in the helper.
 func configRevalidate(target, content string) string {
 	if !configTargetShapeOK(target) || configTargetDenied(target) {
 		return "target_denied"
@@ -236,16 +239,22 @@ var configHelperWrite = func(path, content string) error {
 
 // configWriteViaHelper is the agent-side handoff for sys:config write. The
 // channel has already verified the lease (which binds target + content hash)
-// and applied checkSysConfigPolicy; this re-validates defensively, writes a
+// and applied checkSysConfigPolicy; this re-validates defensively, re-checks
+// the lease (helperPreflight: a sys_config write lease for exactly this target
+// and content hash, so no other lease can start the unit), writes a
 // 0600 request carrying the original lease, triggers the committed helper
 // unit, and reads back its result. It never writes /etc itself (the agent's
 // sandbox forbids it). Request and result files are removed before returning.
-func configWriteViaHelper(target, content string, lease *Lease) error {
+func configWriteViaHelper(target, content string, lease *Lease, intent string) error {
 	if code := configRevalidate(target, content); code != "" {
 		return fmt.Errorf("config write refused: %s", code)
 	}
-	if lease == nil {
-		return fmt.Errorf("config write refused: lease_missing")
+	payload, err := sysConfigLeasePayload("write", target, sysSHA256Hex(content))
+	if err != nil {
+		return fmt.Errorf("config write refused: target_denied")
+	}
+	if code := helperPreflight("sys_config", payload, lease, intent, time.Now()); code != "" {
+		return fmt.Errorf("config write refused: %s", code)
 	}
 	if err := os.MkdirAll(configHelperStateDir, 0o700); err != nil {
 		return fmt.Errorf("handoff dir: %w", err)
@@ -263,7 +272,7 @@ func configWriteViaHelper(target, content string, lease *Lease) error {
 	defer os.Remove(reqPath)
 	defer os.Remove(resPath)
 
-	reqBytes, err := json.Marshal(configHelperReq{Target: target, Content: content, Lease: lease})
+	reqBytes, err := json.Marshal(configHelperReq{Target: target, Content: content, Lease: lease, Intent: intent})
 	if err != nil {
 		return err
 	}
@@ -338,7 +347,7 @@ func doConfigHelper(reqPath string) configHelperRes {
 	if err != nil {
 		return configHelperRes{Error: "target_denied"}
 	}
-	if code := helperAuthorize("sys_config", payload, req.Lease, time.Now()); code != "" {
+	if code := helperAuthorize("sys_config", payload, req.Lease, req.Intent, time.Now()); code != "" {
 		return configHelperRes{Error: code}
 	}
 	if err := configHelperWrite(req.Target, req.Content); err != nil {

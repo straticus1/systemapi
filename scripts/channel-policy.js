@@ -37,7 +37,9 @@
 // it: whoever can read the env file can already write the database. Does NOT
 // change what the agent itself allows: its --tcp-allow list and the file
 // helper's openat2 checks still apply on the host. Does NOT set tenant
-// defaults. Note: createRegistry applies the (idempotent) schema on connect,
+// defaults. Does NOT renew live sessions (it runs outside the server
+// process): a narrowing reaches open tcp, mesh, file and xfer sessions at
+// their next 30 s renewal, not at once as an API write does. Note: createRegistry applies the (idempotent) schema on connect,
 // so even `show` runs the boot-time DDL, as every script here does.
 //
 // Usage: node scripts/channel-policy.js show  --tenant <t> --host <hostname|host_id>
@@ -51,26 +53,25 @@
 
 const path = require('node:path');
 const { validateTenant } = require('../controlplane/sshkey');
-const { validateFileRoot, effectivePolicies, SERVICE_UNIT_RE, PACKAGE_NAME_RE, SYSCTL_KEY_RE, sysctlDenied,
-  CONFIG_SELF_ROOTS, systemdSelfEntry, configSelfDenied, configPrefixProtected } = require('../controlplane/channels');
+const { effectivePolicies, CONFIG_SELF_ROOTS, configSelfDenied } = require('../controlplane/channels');
+// Every rule this CLI enforces lives in controlplane/policyrules.js, shared
+// with the HTTP routes (controlplane/policyroutes.js).
+const { MAX_ENTRIES, REASON_MAX, SYSTEM_ROOTS, GRANT_KEYS, ruleError, cliLabel, buildPolicy, clearPolicy, inheritPolicy,
+  normalizeReason, POLICY_SCHEMA } = require('../controlplane/policyrules');
 
 const ACTOR = 'cli:channel-policy';
-const MAX_ENTRIES = 16;
 const HOST_RE = /^[A-Za-z0-9._-]{1,253}$/;
-const SYSTEM_ROOTS = ['/proc', '/sys', '/dev', '/boot', '/etc', '/root', '/var/lib/systemapi-agent',
-  '/etc/systemapi-agent', '/var/lib/postgresql', '/etc/sahcore'];
 const USAGE = 'usage: node scripts/channel-policy.js show|set|clear|inherit --tenant <t> --host <hostname|host_id> '
   + '[--reason <text>, required except for show] [--tcp-local <port>]... [--file-read <dir>]... [--file-write <dir>]... [--service <unit>]... [--package <name>]... [--config <dir>]... [--tweak-sysctl <key>]... [--tweak-unit <unit>]...';
-const REASON_MAX = 256;
 const COMMANDS = new Set(['show', 'set', 'clear', 'inherit']);
-// What each writing command stores in the two host columns and its audit
+// What each writing command stores in the host columns and its audit
 // action. clear is an explicit deny; inherit (null) defers to the tenant.
 const WRITES = {
-  clear: { action: 'channel_policy_clear', policy: () => ({ tcp_policy: { allow: [] }, file_policy: { roots: [] }, service_policy: { units: [] }, package_policy: { names: [] }, config_policy: { paths: [] }, tweak_policy: { sysctls: [], units: [] } }) },
-  inherit: { action: 'channel_policy_inherit', policy: () => ({ tcp_policy: null, file_policy: null, service_policy: null, package_policy: null, config_policy: null, tweak_policy: null }) }
+  clear: { action: 'channel_policy_clear', policy: clearPolicy },
+  inherit: { action: 'channel_policy_inherit', policy: inheritPolicy }
 };
 const ONCE_FLAGS = new Set(['--tenant', '--host', '--reason']);
-const LIST_FLAGS = new Set(['--tcp-local', '--file-read', '--file-write', '--service', '--package', '--config', '--tweak-sysctl', '--tweak-unit']);
+const LIST_FLAGS = new Set(GRANT_KEYS.map(cliLabel));
 function fail(code, message = code) {
   const err = new Error(message);
   err.code = code;
@@ -78,84 +79,15 @@ function fail(code, message = code) {
 }
 
 function usage(message = USAGE) {
-  return fail('usage', message);
-}
-
-function parsePort(text) {
-  if (typeof text !== 'string' || !/^[1-9][0-9]{0,4}$/.test(text)) throw usage(`bad --tcp-local: ${JSON.stringify(text)} is not a port 1-65535`);
-  const port = Number(text);
-  if (port > 65535) throw usage(`bad --tcp-local: ${text} is not a port 1-65535`);
-  return port;
-}
-
-function parseUnit(text) {
-  if (typeof text !== 'string' || !SERVICE_UNIT_RE.test(text)) {
-    throw usage(`bad --service: ${JSON.stringify(text)} is not a unit name (letters, digits, "@._:-", at most 128)`);
-  }
-  // Never the agent's own unit nor a mutation helper's: stopping or disabling
-  // the agent cuts the host off, and a helper unit is started only by the
-  // agent's handoff. systemctl reads a bare name as <name>.service.
-  if (systemdSelfEntry(text) || systemdSelfEntry(`${text}.service`)) {
-    throw usage(`bad --service: ${JSON.stringify(text)} is the agent's or a helper's unit`);
-  }
-  return text;
-}
-
-function parsePackage(text) {
-  if (typeof text !== 'string' || !PACKAGE_NAME_RE.test(text)) {
-    throw usage(`bad --package: ${JSON.stringify(text)} is not a package name (letters, digits, ".+_-", at most 128; no "*")`);
-  }
-  return text;
-}
-
-// A --config path prefix: an absolute directory of at least two components
-// (so /etc alone is too broad), not the agent's or server's own config/state.
-// Unlike --file-* it may sit under /etc, which is the point of sys:config.
-function parseConfigDir(text) {
-  if (text === '/' || text === '~') throw usage(`bad --config: "${text}" is too wide; name one directory`);
-  const checked = validateFileRoot(text, 'file:write');
-  if (!checked.ok) throw usage('bad --config: an absolute directory with no "..", ".", "//", trailing "/" or control bytes');
-  const root = checked.root;
-  if (root.split('/').length - 1 < 2) throw usage(`bad --config: "${root}" is too wide; name a directory at least two levels down`);
-  // A grant at or above a unit dir would contain the agent's and helpers' units.
-  const self = configPrefixProtected(root);
-  if (self) throw usage(`bad --config: "${root}" is, sits in or contains the protected path ${self}`);
-  return root;
-}
-
-function parseTweakSysctl(text) {
-  if (typeof text !== 'string' || !SYSCTL_KEY_RE.test(text) || sysctlDenied(text)) {
-    throw usage(`bad --tweak-sysctl: ${JSON.stringify(text)} is not an allowable sysctl key (dot-separated non-empty segments of lowercase letters, digits, "_"; not a hard-denied key)`);
-  }
-  return text;
-}
-
-function parseTweakUnit(text) {
-  if (typeof text !== 'string' || !SERVICE_UNIT_RE.test(text)) {
-    throw usage(`bad --tweak-unit: ${JSON.stringify(text)} is not a unit name`);
-  }
-  // Same refusal as the override helper's overrideResolve: never the agent's
-  // or a helper's unit, nor a drop-in that applies to them.
-  if (systemdSelfEntry(`${text}.d`)) throw usage(`bad --tweak-unit: ${JSON.stringify(text)} is the agent's or a helper's unit`);
-  return text;
-}
-
-function parseDir(flag, text) {
-  if (text === '/' || text === '~') throw usage(`bad ${flag}: "${text}" is too wide; name one directory`);
-  const checked = validateFileRoot(text, 'file:write');
-  if (!checked.ok) throw usage(`bad ${flag}: an absolute directory with no "..", ".", "//", trailing "/" or control bytes`);
-  const root = checked.root;
-  if (root.split('/').length - 1 < 2) throw usage(`bad ${flag}: "${root}" is too wide; name a directory at least two levels down`);
-  const sys = SYSTEM_ROOTS.find((s) => root === s || root.startsWith(`${s}/`) || s.startsWith(`${root}/`));
-  if (sys) throw usage(`bad ${flag}: "${root}" is, sits in or contains the system path ${sys}`);
-  return root;
+  return ruleError('usage', message);
 }
 
 function parseArgs(argv) {
   if (!Array.isArray(argv) || argv.length === 0 || !COMMANDS.has(argv[0])) throw usage();
   const command = argv[0];
   const once = {};
-  const lists = { '--tcp-local': [], '--file-read': [], '--file-write': [], '--service': [], '--package': [], '--config': [], '--tweak-sysctl': [], '--tweak-unit': [] };
+  const lists = {};
+  for (const key of GRANT_KEYS) lists[cliLabel(key)] = [];
   for (let i = 1; i < argv.length; i += 1) {
     const flag = argv[i];
     if (i + 1 >= argv.length) throw usage();
@@ -180,43 +112,23 @@ function parseArgs(argv) {
   const reason = once['--reason'];
   if (command === 'show') {
     if (reason !== undefined) throw usage('--reason is only for set, clear and inherit');
-  } else if (typeof reason !== 'string' || reason.trim() === '' || reason.length > REASON_MAX
-    || /[\u0000-\u001f\u007f]/.test(reason)) {
+  } else if (normalizeReason(reason) === null) {
     throw usage(`${command} needs --reason "<why>": 1-${REASON_MAX} characters, no control bytes`);
   }
 
   const out = { command, tenantId: once['--tenant'], host: once['--host'] };
-  if (command !== 'show') out.reason = reason.trim();
+  if (command !== 'show') out.reason = normalizeReason(reason);
   if (command !== 'set') return out;
 
-  const ports = [...new Set(lists['--tcp-local'].map(parsePort))].sort((a, b) => a - b);
-  const writes = [...new Set(lists['--file-write'].map((d) => parseDir('--file-write', d)))];
-  const reads = [...new Set(lists['--file-read'].map((d) => parseDir('--file-read', d)))]
-    .filter((d) => !writes.includes(d));
-  const units = [...new Set(lists['--service'].map(parseUnit))].sort();
-  const names = [...new Set(lists['--package'].map(parsePackage))].sort();
-  const configs = [...new Set(lists['--config'].map(parseConfigDir))].sort();
-  const tweakSysctls = [...new Set(lists['--tweak-sysctl'].map(parseTweakSysctl))].sort();
-  const tweakUnits = [...new Set(lists['--tweak-unit'].map(parseTweakUnit))].sort();
-  if (ports.length === 0 && reads.length === 0 && writes.length === 0 && units.length === 0 && names.length === 0
-    && configs.length === 0 && tweakSysctls.length === 0 && tweakUnits.length === 0) {
-    throw usage('set needs at least one --tcp-local, --file-read, --file-write, --service, --package, --config, --tweak-sysctl or --tweak-unit; use clear to deny all, inherit for the tenant default');
-  }
-  if (ports.length > MAX_ENTRIES || reads.length + writes.length > MAX_ENTRIES || units.length > MAX_ENTRIES
-    || names.length > MAX_ENTRIES || configs.length > MAX_ENTRIES || tweakSysctls.length > MAX_ENTRIES || tweakUnits.length > MAX_ENTRIES) {
-    throw usage(`at most ${MAX_ENTRIES} entries of each kind`);
-  }
-  out.tcpPolicy = { allow: ports.length ? [{ local: true, ports }] : [] };
-  out.filePolicy = {
-    roots: [
-      ...writes.map((p) => ({ path: p, read: true, write: true })),
-      ...reads.map((p) => ({ path: p, read: true, write: false }))
-    ]
-  };
-  out.servicePolicy = { units };
-  out.packagePolicy = { names };
-  out.configPolicy = { paths: configs };
-  out.tweakPolicy = { sysctls: tweakSysctls, units: tweakUnits };
+  const grants = {};
+  for (const key of GRANT_KEYS) grants[key] = lists[cliLabel(key)];
+  const policy = buildPolicy(grants, cliLabel);
+  out.tcpPolicy = policy.tcp_policy;
+  out.filePolicy = policy.file_policy;
+  out.servicePolicy = policy.service_policy;
+  out.packagePolicy = policy.package_policy;
+  out.configPolicy = policy.config_policy;
+  out.tweakPolicy = policy.tweak_policy;
   return out;
 }
 
@@ -277,7 +189,8 @@ async function run(argv, { registry }) {
       tweakPolicy: next.tweak_policy,
       actor: ACTOR,
       action,
-      reason: args.reason
+      reason: args.reason,
+      extra: { policy_schema: POLICY_SCHEMA, via: 'cli' }
     });
   } catch (err) {
     if (err.code === 'not_found' || err.code === 'bad_policy') throw err;
