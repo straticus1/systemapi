@@ -80,7 +80,7 @@ func TestCapRegistryFitsTheWireGrammar(t *testing.T) {
 	if deg != "" {
 		t.Fatalf("healthy host has degraded %q", deg)
 	}
-	want := "config,config_write,converge,file,override_write,package,pty,service,sysctl_write,sysscript_jobs,tcp,tweak,xfer"
+	want := "config,config_write,converge,file,intent_v1,override_write,package,pty,service,sysctl_write,sysscript_jobs,tcp,tweak,xfer"
 	if sup != want {
 		t.Fatalf("supported %q, want %q", sup, want)
 	}

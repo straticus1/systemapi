@@ -41,6 +41,9 @@
 // are bound, check always signs "-" and apply always a plan hash, and a
 // sysscript_job lease cannot start a converge job (or the reverse). Shared
 // vectors: controlplane/testdata/converge-job-lease-vectors.json.
+// systemapi-lease-v2 (canonicalLeaseV2) adds the intent's SHA-256 as a last
+// line; verifyLease refuses a v2 lease as malformed and only verifyLeaseV2
+// accepts it. Intents and the v2 mint helpers are in controlplane/intent.js.
 'use strict';
 
 const crypto = require('node:crypto');

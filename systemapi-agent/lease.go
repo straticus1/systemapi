@@ -27,6 +27,12 @@
 // run an apply, and neither a sysscript_job nor a converge_job lease verifies
 // as the other (the action is in the hash). The shared vectors are
 // controlplane/testdata/converge-job-lease-vectors.json.
+// An intent-bound lease is "systemapi-lease-v2" with one more line, the
+// intent's SHA-256 (.omc/plans/sah-signed-intent-contract.md 1.4). Only
+// verifyLeaseV2 accepts it; verifyLease refuses any lease that is not v1
+// (and a v1 lease carrying an intent hash) as malformed, so a path that
+// knows nothing of intents, and every older agent, fails closed on v2. The
+// intent checks themselves are in intent.go.
 package main
 
 import (

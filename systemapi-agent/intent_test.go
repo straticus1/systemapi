@@ -13,6 +13,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -503,5 +504,21 @@ func TestIntentReceipts(t *testing.T) {
 	_, _ = authorizeStart(ptyTestHost, "breakglass", payload, l2, text, ctx, []string{"breakglass"}, sid, h.now)
 	if len(got()) != n {
 		t.Fatal("receipt for a refused (replayed) lease")
+	}
+}
+
+func TestDialHeaderCarriesIntentPin(t *testing.T) {
+	a := &agentConn{header: http.Header{}, capHeaders: func() (string, string) { return "tcp,intent_v1", "" }}
+	withRequireIntent(t, "")
+	if h := a.dialHeader(); h.Get(intentPinHeader) != "" || h.Get(capabilitiesHeader) != "tcp,intent_v1" {
+		t.Fatalf("no pin: %v", h)
+	}
+	withRequireIntent(t, "sys-write\nbreakglass\n")
+	if got := a.dialHeader().Get(intentPinHeader); got != "breakglass,sys-write" {
+		t.Fatalf("pin header %q", got)
+	}
+	withRequireIntent(t, "nope\n")
+	if got := a.dialHeader().Get(intentPinHeader); got != "invalid" {
+		t.Fatalf("damaged pin header %q", got)
 	}
 }
