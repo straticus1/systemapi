@@ -50,9 +50,9 @@ import (
 const (
 	leasePrefix   = "systemapi-lease-v1\n"
 	leaseV2Prefix = "systemapi-lease-v2\n"
-	leaseMaxTTL = 300 * time.Second
-	leaseSkew   = 30 * time.Second
-	nonceTTL    = 10 * time.Minute
+	leaseMaxTTL   = 300 * time.Second
+	leaseSkew     = 30 * time.Second
+	nonceTTL      = 10 * time.Minute
 )
 
 var (
