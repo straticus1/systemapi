@@ -196,7 +196,7 @@ function fakePool(failOn) {
           const q = sql.replace(/\s+/g, ' ').trim();
           log.push({ client: id, q, params });
           if (failOn && q.startsWith(failOn)) throw new Error('boom');
-          if (q.startsWith('SELECT tcp_policy, file_policy, service_policy, package_policy, config_policy, tweak_policy FROM cp_hosts')) {
+          if (/^SELECT tcp_policy, file_policy, service_policy, package_policy, config_policy, tweak_policy(, retired_at)? FROM cp_hosts/.test(q)) {
             return { rowCount: 1, rows: [{ tcp_policy: { allow: [{ local: true, ports: [3003] }] }, file_policy: null, service_policy: { units: ['nginx.service'] }, package_policy: { names: ['nginx'] }, config_policy: { paths: ['/etc/nginx'] }, tweak_policy: { sysctls: [], units: [] } }] };
           }
           if (q.startsWith('SELECT row_hash FROM cp_audit')) return { rowCount: 0, rows: [] };
@@ -218,7 +218,7 @@ test('PgRegistry writes the policy and its audit row in one transaction on one c
   assert.equal(pool.clients, 1);
   const qs = pool.log.map((e) => e.q);
   assert.equal(qs[0], 'BEGIN');
-  assert.match(qs[1], /^SELECT tcp_policy, file_policy, service_policy, package_policy, config_policy, tweak_policy FROM cp_hosts WHERE host_id = \$1 AND tenant_id = \$2 FOR UPDATE$/);
+  assert.match(qs[1], /^SELECT tcp_policy, file_policy, service_policy, package_policy, config_policy, tweak_policy, retired_at FROM cp_hosts WHERE host_id = \$1 AND tenant_id = \$2 FOR UPDATE$/);
   assert.deepEqual(pool.log[1].params, [HOST_A, 'afterdark']);
   assert.match(qs[2], /^UPDATE cp_hosts SET tcp_policy = \$2::jsonb, file_policy = \$3::jsonb, service_policy = \$4::jsonb, package_policy = \$5::jsonb, config_policy = \$6::jsonb, tweak_policy = \$7::jsonb WHERE host_id = \$1$/);
   // The audit chain lock, then the tail read under it (registry.js auditInsert).

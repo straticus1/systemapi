@@ -76,7 +76,7 @@ test('parity: the CLI and PUT .../channel-policy store the same columns or refus
   app.use(express.json({ limit: '256kb' }));
   const server = http.createServer(app);
   const fm = new FleetManager(server, null, 'systemapi', null);
-  fm.env = { NODE_ENV: 'test' };
+  fm.env = { NODE_ENV: 'test', SYSTEMAPI_POLICY_WRITE_RATE_PRINCIPAL: '600', SYSTEMAPI_POLICY_WRITE_RATE: '600' };
   fm.registry = new MemoryRegistry({ NODE_ENV: 'test' });
   fm.verifyApiKey = async (key) => (key === 'admin-key' ? { key_id: 'k-admin', user_id: 'user-1' } : null);
   mount(app, fm);
