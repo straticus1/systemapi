@@ -106,6 +106,24 @@ func sashLeaseLive(leaseFn func() time.Time) bool {
 	return !time.Now().After(leaseFn())
 }
 
+// sashPinDenied drops the sash verbs the agent performs as root (unit.restart,
+// package.install, sysctl.set, and file.write in a root session) on a host
+// whose require-intent pin lists sys-write, or whose pin is damaged, whatever
+// the grant says (contract 5.1/5.2, N33 on the agent side).
+func sashPinDenied(g sashGrant, key string) bool {
+	switch key {
+	case "unit.restart", "package.install", "sysctl.set":
+	case "file.write":
+		if g.Purpose != sashPurposeRoot {
+			return false
+		}
+	default:
+		return false
+	}
+	pinned, err := pinnedFor([]string{"sys-write"})
+	return err != nil || pinned
+}
+
 func sashDispatch(g sashGrant, targets sashTargets, leaseFn func() time.Time, id *ptyIdentity, v sashCall) (sashResult, error) {
 	return sashDispatchAt(g, targets, leaseFn, id, v, sashHistoryRoot)
 }
@@ -117,7 +135,7 @@ func sashDispatchAt(g sashGrant, targets sashTargets, leaseFn func() time.Time, 
 	if v.Key == "history" {
 		return sashHistory(g, v, histRoot)
 	}
-	if v.Key == "journal" || !sashEntitled(g, v.Key) {
+	if v.Key == "journal" || !sashEntitled(g, v.Key) || sashPinDenied(g, v.Key) {
 		return sashResult{}, errSashDenied
 	}
 	switch v.Key {

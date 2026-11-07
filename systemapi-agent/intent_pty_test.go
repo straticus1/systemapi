@@ -89,3 +89,51 @@ func TestPTYV2RenewOnSessionWithoutIntent(t *testing.T) {
 	withRequireIntent(t, "breakglass\n")
 	wantErr(t, "pin after start", renewPTYSession(ptyTestHost, sid, signLease(t, h.priv, ptyTestHost, "breakglass", renew, inFuture(time.Minute)), time.Now()), "intent_required")
 }
+
+// watchRefusal returns the synchronous refusal code for wid, "" when none.
+func watchRefusal(h *ptyHarness, sid, wid string) string {
+	h.out.mu.Lock()
+	defer h.out.mu.Unlock()
+	for _, m := range h.out.jsons {
+		p, _ := m["payload"].(map[string]interface{})
+		if m["type"] == "watch_consent" && m["session_id"] == sid && p["watch_id"] == wid {
+			e, _ := p["error"].(string)
+			return e
+		}
+	}
+	return ""
+}
+
+// N36 on the agent: no control watch into an intent-bound session, nor into
+// a session of a pinned class.
+func TestWatchControlRefusedForIntentAndPinnedSessions(t *testing.T) {
+	h, ih := intentPTY(t)
+	sid := newSessionID(t)
+	dl := ih.now.Unix() + 3600
+	start := terminalPayload(sid, dl, "start")
+	text := ih.intent(t, "breakglass", start, dl, nil)
+	startPTYSession(h.out, ptyTestHost, h.dir, ptyStartRequest{SessionID: sid, Action: "breakglass", DeadlineUnix: dl, Actor: "alice", Intent: text,
+		Lease: signLeaseV2(t, h.priv, ptyTestHost, "breakglass", start, sha256Hex(text), inFuture(time.Minute))}, time.Now())
+	startedPayload(t, h, sid)
+	if e := watchRefusal(h, sid, h.watch(t, sid, watchModeControl, "bob", "", false)); e != "intent_required" {
+		t.Fatalf("control watch into an intent session: %q", e)
+	}
+	if e := watchRefusal(h, sid, h.watch(t, sid, watchModeView, "bob", "", false)); e != "" {
+		t.Fatalf("view watch refused: %q", e)
+	}
+
+	v1 := h.start(t, "breakglass", inFuture(time.Minute), dl)
+	startedPayload(t, h, v1)
+	withRequireIntent(t, "breakglass\n")
+	if e := watchRefusal(h, v1, h.watch(t, v1, watchModeControl, "bob", "", false)); e != "intent_required" {
+		t.Fatalf("control watch into a pinned-class session: %q", e)
+	}
+	withRequireIntent(t, "breakglass\nbogus\n")
+	if e := watchRefusal(h, v1, h.watch(t, v1, watchModeControl, "bob", "", false)); e != "intent_pin_unavailable" {
+		t.Fatalf("control watch under a damaged pin: %q", e)
+	}
+	withRequireIntent(t, "root-session\n")
+	if e := watchRefusal(h, v1, h.watch(t, v1, watchModeControl, "bob", "", false)); e != "" {
+		t.Fatalf("control watch into an unpinned class refused: %q", e)
+	}
+}
