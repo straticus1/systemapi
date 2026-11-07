@@ -85,7 +85,7 @@ async function rig({ registry = null } = {}) {
   const server = http.createServer(app);
   const metrics = newMetrics();
   const fm = new FleetManager(server, null, 'systemapi', metrics);
-  fm.env = { NODE_ENV: 'test', SYSTEMAPI_WEBHOOK_KEY: WEBHOOK_KEY };
+  fm.env = { NODE_ENV: 'test', SYSTEMAPI_WEBHOOK_KEY: WEBHOOK_KEY, SYSTEMAPI_WEBHOOK_ALLOW_PRIVATE: '1' };
   const key = privateKeyFromSeed(TEST_SEED);
   fm.signer = buildSigner(key, rawPublicKey(key));
   fm.tickets = new Map();

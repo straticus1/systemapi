@@ -75,6 +75,10 @@ commit an env file. `SYSTEMAPI_ALLOWED_ORIGINS` (comma-separated exact
 origins) sets the browser origins allowed to open a terminal WebSocket and to
 make credentialed CORS requests; CORS keeps only exact `https://` origins (plus
 `http://localhost` outside production) and is never served on `/oauth`.
+Webhook targets on loopback or private addresses (RFC 1918, CGNAT, ULA,
+`localhost`) are refused unless `SYSTEMAPI_WEBHOOK_ALLOW_PRIVATE=1` and
+`NODE_ENV` is not `production` (local receivers, tests); production ignores the
+flag. Metadata and link-local targets are refused always.
 `SYSTEMAPI_TRUST_PROXY` sets Express `trust proxy`, which decides the client
 IP shown on the device-login page and used for its rate limit. It is a hop
 count (`1` for one reverse proxy) or a comma-separated CIDR list

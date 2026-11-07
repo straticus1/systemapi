@@ -537,7 +537,7 @@ async function deliverWebhooks(fleet, tenantId, body) {
     return;
   }
   const raw = JSON.stringify(body);
-  const env = fleet.env || {};
+  const env = fleet.env || process.env;
   // fleet.egressResolve: test seam for the delivery lookup (dns.lookup shape).
   const agents = hooks.length > 0 ? webhookAgents(env, fleet.egressResolve) : null;
   for (const hook of hooks) {

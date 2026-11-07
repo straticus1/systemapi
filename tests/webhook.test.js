@@ -15,7 +15,7 @@ const { MemoryRegistry } = require('../controlplane/registry');
 const { sealSecret } = require('../controlplane/seal');
 
 const PROD = { NODE_ENV: 'production' };
-const DEV = { NODE_ENV: 'test' };
+const DEV = { NODE_ENV: 'test', SYSTEMAPI_WEBHOOK_ALLOW_PRIVATE: '1' };
 const KEY = 'cd'.repeat(32);
 const answer = (address) => (host, opts, cb) => cb(null, [{ address, family: address.includes(':') ? 6 : 4 }]);
 
@@ -36,7 +36,32 @@ test('create time: 127.0.0.1, 169.254.169.254, 10.x, [::1] and names resolving t
   assert.equal((await resolveWebhookURL('https://hooks.example/in', PROD, answer('93.184.215.14'))).hostname, 'hooks.example');
 });
 
-test('outside production loopback and private stay allowed (as before); metadata and link-local never are', async () => {
+test('private targets are opt-in: refused with the flag unset (NODE_ENV unset or test) and in production even with it', async () => {
+  for (const env of [{}, { NODE_ENV: 'test' }, { NODE_ENV: 'production', SYSTEMAPI_WEBHOOK_ALLOW_PRIVATE: '1' },
+    { SYSTEMAPI_WEBHOOK_ALLOW_PRIVATE: 'true' }]) {
+    for (const u of ['https://127.0.0.1/h', 'https://10.0.0.5/h', 'https://[::1]/h', 'https://192.168.1.10/h', 'https://[fd00::1]/h', 'https://localhost/h']) {
+      assert.throws(() => assertWebhookURL(u, env), /blocked_url/, `${u} ${JSON.stringify(env)}`);
+    }
+    await assert.rejects(resolveWebhookURL('https://hooks.example/in', env, answer('10.1.2.3')), /blocked_url/);
+    await assert.rejects(resolveWebhookURL('https://hooks.example/in', env, answer('127.0.0.1')), /blocked_url/);
+  }
+});
+
+test('delivery with NODE_ENV and the flag unset refuses a loopback target; nothing reaches the receiver', async () => {
+  let hits = 0;
+  const hook = await receiver((req, res) => { hits += 1; res.end('ok'); });
+  const fleet = await fleetWith({}, `http://127.0.0.1:${hook.port}/in`);
+  const log = errorsUntil(/webhook target refused/);
+  try {
+    await deliverWebhooks(fleet, 'acme', { event: 'x' });
+    assert.match(await log.found, /blocked_url/);
+  } finally { log.restore(); }
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(hits, 0);
+  await hook.close();
+});
+
+test('with SYSTEMAPI_WEBHOOK_ALLOW_PRIVATE=1 outside production loopback and private are allowed; metadata and link-local never are', async () => {
   assert.equal(assertWebhookURL('http://127.0.0.1:9/h', DEV).hostname, '127.0.0.1');
   assert.equal(assertWebhookURL('http://10.0.0.5/h', DEV).hostname, '10.0.0.5');
   for (const u of ['http://169.254.169.254/latest', 'https://[fe80::1]/h', 'https://metadata.google.internal/x']) {

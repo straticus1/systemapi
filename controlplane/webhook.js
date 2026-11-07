@@ -5,9 +5,9 @@
 // its literal host and on its DNS answer (unresolvable is refused), and every
 // delivery re-checks the stored URL and connects through egress agents whose
 // lookup refuses a blocked answer and pins the checked address. Production
-// requires https. One shot, no redirects, no env proxy. Outside production,
-// loopback and private addresses stay allowed (local receivers, tests), as
-// before. Does NOT store the secret. The router seals it with
+// requires https. One shot, no redirects, no env proxy. Loopback and private
+// addresses are allowed only when SYSTEMAPI_WEBHOOK_ALLOW_PRIVATE=1 outside
+// production (local receivers, tests); unset, they are refused everywhere. Does NOT store the secret. The router seals it with
 // controlplane/seal.js before insert. GET never returns the secret.
 'use strict';
 
@@ -38,8 +38,10 @@ function blocked() {
   return Object.assign(new Error('blocked_url'), { status: 400 });
 }
 
+// Opt-in: loopback and private targets only with
+// SYSTEMAPI_WEBHOOK_ALLOW_PRIVATE=1, and never in production.
 function allowPrivate(env) {
-  return env.NODE_ENV !== 'production';
+  return env.SYSTEMAPI_WEBHOOK_ALLOW_PRIVATE === '1' && env.NODE_ENV !== 'production';
 }
 
 // The synchronous part: shape, scheme, names and IP literals.
@@ -60,7 +62,7 @@ function assertWebhookURL(raw, env) {
   }
   const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
   if (host === 'metadata.google.internal' || host.endsWith('.internal')) throw blocked();
-  if (prod && (host === 'localhost' || host.endsWith('.localhost'))) throw blocked();
+  if (!allowPrivate(env) && (host === 'localhost' || host.endsWith('.localhost'))) throw blocked();
   if (net.isIP(host) && egress.blockedAddress(host, { allowPrivate: allowPrivate(env) })) throw blocked();
   return url;
 }
