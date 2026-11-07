@@ -369,7 +369,7 @@ function entryPage(sessionUser, member, csrf, notice) {
     + '<p class="lede">Only type a code from a login you started. Never type a code someone sent you.</p>'
     + '<form method="post" action="/oauth/device/verify">'
     + '<input type="hidden" name="csrf" value="' + escapeHtml(csrf) + '">'
-    + '<label>Code <input class="code" name="user_code" autocomplete="one-time-code" autocapitalize="characters" autocorrect="off" spellcheck="false" inputmode="text" maxlength="16" aria-describedby="code-hint" required></label>'
+    + '<label>Code <input class="code" name="user_code" autocomplete="off" autocapitalize="characters" autocorrect="off" spellcheck="false" inputmode="text" maxlength="16" aria-describedby="code-hint" required></label>'
     + '<p class="hint" id="code-hint">Eight letters, shown as XXXX-XXXX. Case and the dash do not matter.</p>'
     + '<div class="actions"><button class="button" type="submit">Continue</button></div></form>' + signoutBlock(csrf), {
     title: 'Enter code', eyebrow: 'Device login', heading: 'Type the <em>code</em> from your terminal.', step: 2

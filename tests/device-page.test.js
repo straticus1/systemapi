@@ -128,11 +128,11 @@ test('the security copy is still on the pages', async () => {
   assert.equal(p.sso.includes('<form'), false);
 });
 
-test('the code field is a labelled one-time-code input and the forms are unchanged', async () => {
+test('the code field is a labelled code input with autofill off (one-time-code would surface attacker-sent codes from SMS or mail) and the forms are unchanged', async () => {
   const p = await allPages();
   const input = /<label>Code <input ([^>]+)><\/label>/.exec(p.entry);
   assert.ok(input);
-  for (const attr of ['name="user_code"', 'autocomplete="one-time-code"', 'autocapitalize="characters"', 'spellcheck="false"', 'inputmode="text"', 'maxlength="16"', 'required', 'aria-describedby="code-hint"']) {
+  for (const attr of ['name="user_code"', 'autocomplete="off"', 'autocapitalize="characters"', 'spellcheck="false"', 'inputmode="text"', 'maxlength="16"', 'required', 'aria-describedby="code-hint"']) {
     assert.ok(input[1].includes(attr), attr);
   }
   assert.ok(p.entry.includes('id="code-hint"'));
