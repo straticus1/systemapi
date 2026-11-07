@@ -59,6 +59,7 @@ type fileMsg struct {
 	FileMax      int64           `json:"file_max"`
 	Actor        string          `json:"actor"`
 	Lease        *Lease          `json:"lease"`
+	Intent       string          `json:"intent"` // systemapi-intent-v1 text beside a v2 lease
 	Request      json.RawMessage `json:"request"`
 	RequestID    string          `json:"request_id"`
 	Offset       int64           `json:"offset"`
@@ -97,6 +98,9 @@ type fileSession struct {
 	deadline time.Time
 	idle     time.Duration
 	every    time.Duration
+
+	// intentSHA is the intent hash of a v2 start; renewals must carry it.
+	intentSHA string
 
 	tasks chan fileTask
 	stop  chan struct{}
@@ -249,7 +253,10 @@ func (c *channelConn) openFile(msg fileMsg, now time.Time) {
 		return
 	}
 	// The lease signs the mode and root: the agent opens only those.
-	if err := authorizeCommand(c.hostID, msg.Action, payload, msg.Lease, now); err != nil {
+	intentSHA, err := authorizeStart(c.hostID, msg.Action, payload, msg.Lease, msg.Intent,
+		intentCtx{Requester: "member:" + msg.Actor, DeadlineUnix: msg.DeadlineUnix, Session: true},
+		intentClasses(msg.Action, payload, nil), sid, now)
+	if err != nil {
 		log.Printf("file refused: %s", err.Error())
 		fileStatusError(c.out, sid, "lease_required")
 		return
@@ -275,6 +282,7 @@ func (c *channelConn) openFile(msg fileMsg, now time.Time) {
 		actor:        msg.Actor,
 		fileMax:      msg.FileMax,
 		deadline:     deadline,
+		intentSHA:    intentSHA,
 		idle:         time.Duration(msg.IdleS) * time.Second,
 		every:        fileWatchEvery,
 		tasks:        make(chan fileTask, fileTaskQueue),
@@ -317,7 +325,7 @@ func (c *channelConn) renewFile(sid string, lease *Lease, now time.Time) error {
 	if err != nil {
 		return err
 	}
-	if err := authorizeCommand(c.hostID, s.action, payload, lease, now); err != nil {
+	if err := authorizeRenew(c.hostID, s.action, payload, lease, s.intentSHA, intentClasses(s.action, payload, nil), sid, now); err != nil {
 		return err
 	}
 	exp := time.Unix(lease.ExpiresUnix, 0)

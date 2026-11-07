@@ -266,6 +266,7 @@ type xferMsg struct {
 	Actor        string `json:"actor"`
 	Reason       string `json:"reason"`
 	Lease        *Lease `json:"lease"`
+	Intent       string `json:"intent"` // systemapi-intent-v1 text beside a v2 lease
 }
 
 // xferCtlGrant is the first fd 3 line (decision 3).
@@ -587,7 +588,10 @@ func (m *xferManager) grant(c *channelConn, msg xferMsg, now time.Time) {
 		refuse("lease_required", err.Error())
 		return
 	}
-	if err := authorizeCommand(c.hostID, msg.Action, payload, msg.Lease, now); err != nil {
+	intentSHA, err := authorizeStart(c.hostID, msg.Action, payload, msg.Lease, msg.Intent,
+		intentCtx{Requester: "member:" + msg.Actor, DeadlineUnix: msg.DeadlineUnix, Session: true},
+		intentClasses(msg.Action, payload, nil), gid, now)
+	if err != nil {
 		refuse("lease_required", err.Error())
 		return
 	}
@@ -634,7 +638,7 @@ func (m *xferManager) grant(c *channelConn, msg xferMsg, now time.Time) {
 	}
 	x := &xferChild{
 		m: m, out: c.out, hostID: c.hostID, grantID: gid, transferID: msg.TransferID, action: msg.Action,
-		lease: fields, listenMode: listenMode, deadline: msg.DeadlineUnix, leaseExp: leaseExp,
+		lease: fields, intentSHA: intentSHA, listenMode: listenMode, deadline: msg.DeadlineUnix, leaseExp: leaseExp,
 		byteCap: msg.ByteCap, done: make(chan struct{}), advertise: cfg.advertise,
 		ctlq: make(chan []byte, xferCtlQueue), ctlStop: make(chan struct{}),
 		watchEvery: xferWatchEvery, progressEvery: xferProgressEvery, cancelGrace: xferCancelGrace, termGrace: xferTermGrace,
@@ -722,7 +726,7 @@ func (m *xferManager) renew(msg xferMsg, now time.Time) error {
 	if err != nil {
 		return err
 	}
-	if err := authorizeCommand(x.hostID, x.action, payload, msg.Lease, now); err != nil {
+	if err := authorizeRenew(x.hostID, x.action, payload, msg.Lease, x.intentSHA, intentClasses(x.action, payload, nil), x.grantID, now); err != nil {
 		return err
 	}
 	exp := time.Unix(msg.Lease.ExpiresUnix, 0)
@@ -752,6 +756,7 @@ type xferChild struct {
 	grantID    string
 	transferID string
 	action     string
+	intentSHA  string // the intent hash of a v2 start; renewals must carry it
 	listenMode bool
 	port       uint16
 	byteCap    int64
