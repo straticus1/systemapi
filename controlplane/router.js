@@ -559,6 +559,8 @@ async function deliverWebhooks(fleet, tenantId, body) {
     axios.post(hook.url, raw, {
       timeout: 5000,
       maxRedirects: 0,
+      maxContentLength: 64 * 1024,
+      maxBodyLength: 1024 * 1024,
       proxy: false,
       httpAgent: agents.httpAgent,
       httpsAgent: agents.httpsAgent,

@@ -161,3 +161,23 @@ test('delivery: a redirect is not followed (even to an address the rules allow)'
     await target.close();
   }
 });
+
+test('delivery: a response over 64 KiB is cut off and a body over 1 MiB is not sent', async () => {
+  const big = await receiver((req, res) => { req.resume(); req.on('end', () => res.end('x'.repeat(200 * 1024))); });
+  let log = errorsUntil(/webhook delivery failed/);
+  try {
+    await deliverWebhooks(await fleetWith(DEV, `http://127.0.0.1:${big.port}/in`), 'acme', { event: 'x' });
+    assert.match(await log.found, /maxContentLength/);
+  } finally { log.restore(); await big.close(); }
+
+  let bytes = 0;
+  const sink = await receiver((req, res) => { req.on('data', (d) => { bytes += d.length; }); req.on('end', () => res.end('ok')); });
+  log = errorsUntil(/webhook delivery failed/);
+  try {
+    await deliverWebhooks(await fleetWith(DEV, `http://127.0.0.1:${sink.port}/in`), 'acme', { event: 'x', pad: 'y'.repeat(1024 * 1024 + 1) });
+    assert.match(await log.found, /maxBodyLength/);
+  } finally { log.restore(); }
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(bytes, 0);
+  await sink.close();
+});
