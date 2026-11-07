@@ -31,6 +31,7 @@
 const { randomInt } = require('node:crypto');
 const { randomToken, tokenEqual, fingerprint } = require('./token');
 const { hostIPv4 } = require('./webhook');
+const { layout } = require('./devicepage');
 
 const DEVICE_TTL_MS = 10 * 60 * 1000;
 const ACCESS_TTL_MS = 60 * 60 * 1000;
@@ -151,19 +152,25 @@ function escapeHtml(value) {
   }[ch]));
 }
 
-function page(body) {
-  return '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
-    + '<meta name="referrer" content="no-referrer">'
-    + '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; form-action \'self\'; base-uri \'none\'; frame-ancestors \'none\'">'
-    + '<title>Sign in</title></head><body>' + body + '</body></html>';
+// body is built here with escapeHtml on every interpolated value; opts are
+// fixed strings (see controlplane/devicepage.js).
+function page(body, opts) {
+  return layout(body, opts);
 }
 
+const RESTART = '<p class="small">To try again, run <code>systemapi login</code> in your terminal.</p>';
+
 function denialPage() {
-  return page('<p>Login denied.</p>');
+  return page('<p>Login denied.</p><p class="lede">Nothing was approved on this page.</p>' + RESTART, {
+    title: 'Login denied', eyebrow: 'Stopped', heading: 'Login <em>denied.</em>', tone: 'danger'
+  });
 }
 
 function donePage() {
-  return page('<p>Signed in. Return to the client.</p>');
+  return page('<p>Signed in. Return to the client.</p>'
+    + '<p class="lede">Your terminal finishes the login on its own. You can close this page.</p>', {
+    title: 'Signed in', eyebrow: 'Done', heading: 'Signed in. <em>Return to the client.</em>'
+  });
 }
 
 function validCode(value) {
@@ -334,26 +341,39 @@ function logoutForm(csrf) {
     + '<button type="submit">Sign out</button></form>';
 }
 
+function signoutBlock(csrf) {
+  return '<div class="signout">' + logoutForm(csrf) + '</div>';
+}
+
 function ssoPage() {
   return page('<p>Sign in to approve a command-line login.</p>'
-    + '<p><a href="/oauth/login?return_to=%2Foauth%2Fdevice%2Fverify">Sign in with After Dark SSO</a></p>');
+    + '<p class="lede">Only continue if you ran <code>systemapi login</code> yourself. If someone else gave you a code to enter here, stop.</p>'
+    + '<div class="actions"><a class="button" href="/oauth/login?return_to=%2Foauth%2Fdevice%2Fverify">Sign in with After Dark SSO</a></div>', {
+    title: 'Sign in', eyebrow: 'Device login', heading: 'Approve a <em>command-line</em> login.', step: 1
+  });
 }
 
 function unboundPage(sessionUser, csrf) {
   return page('<p>Login denied (login_denied).</p><p>Your After Dark SSO account <strong>'
     + escapeHtml(sessionLabel(sessionUser)) + '</strong> is not bound to a SystemAPI member.'
-    + ' Ask an admin to bind it.</p>' + logoutForm(csrf));
+    + ' Ask an admin to bind it.</p>' + signoutBlock(csrf), {
+    title: 'Login denied', eyebrow: 'Login denied', heading: 'This account is <em>not bound.</em>', tone: 'danger'
+  });
 }
 
 function entryPage(sessionUser, member, csrf, notice) {
-  return page((notice ? '<p>' + escapeHtml(notice) + '</p>' : '')
-    + '<p>Signed in as <strong>' + escapeHtml(sessionLabel(sessionUser)) + '</strong> (member <strong>'
+  return page((notice ? '<div class="notice danger" role="alert"><p><strong>' + escapeHtml(notice) + '</strong></p></div>' : '')
+    + '<p class="whoami">Signed in as <strong>' + escapeHtml(sessionLabel(sessionUser)) + '</strong> (member <strong>'
     + escapeHtml(member) + '</strong>).</p>'
     + '<p>Type the code your command-line client shows.</p>'
+    + '<p class="lede">Only type a code from a login you started. Never type a code someone sent you.</p>'
     + '<form method="post" action="/oauth/device/verify">'
     + '<input type="hidden" name="csrf" value="' + escapeHtml(csrf) + '">'
-    + '<label>Code <input name="user_code" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="16" required></label>'
-    + '<button type="submit">Continue</button></form>' + logoutForm(csrf));
+    + '<label>Code <input class="code" name="user_code" autocomplete="one-time-code" autocapitalize="characters" autocorrect="off" spellcheck="false" inputmode="text" maxlength="16" aria-describedby="code-hint" required></label>'
+    + '<p class="hint" id="code-hint">Eight letters, shown as XXXX-XXXX. Case and the dash do not matter.</p>'
+    + '<div class="actions"><button class="button" type="submit">Continue</button></div></form>' + signoutBlock(csrf), {
+    title: 'Enter code', eyebrow: 'Device login', heading: 'Type the <em>code</em> from your terminal.', step: 2
+  });
 }
 
 async function confirmPage(registry, row, code, csrf, env) {
@@ -362,24 +382,28 @@ async function confirmPage(registry, row, code, csrf, env) {
     + '<input type="hidden" name="csrf" value="' + escapeHtml(csrf) + '">';
   const started = Number.isFinite(atMs(row.created_at)) ? new Date(atMs(row.created_at)).toISOString() : 'unknown';
   let body = '<p>A command-line client asked to sign in as <strong>' + escapeHtml(row.user_id) + '</strong>.</p>'
-    + '<ul><li>From IP: <strong>' + escapeHtml(row.requester_ip || 'unknown') + '</strong></li>'
+    + '<ul class="facts" aria-label="Who asked"><li>From IP: <strong>' + escapeHtml(row.requester_ip || 'unknown') + '</strong></li>'
     + '<li>Client: <strong>' + escapeHtml(row.requester_ua || 'unknown') + '</strong></li>'
     + '<li>Started: <strong>' + escapeHtml(started) + '</strong></li></ul>'
-    + (row.fresh === true ? '<p><strong>This code asks for a token that can make dangerous channel-policy changes'
-      + ' (root-equivalent grants, tenant-wide policy).</strong> Approve it only for a change you are making now.</p>' : '')
-    + '<p><strong>Only continue if you started this login yourself.</strong></p>'
-    + '<form method="post" action="/oauth/device/verify">' + hidden
+    + (row.fresh === true ? '<div class="notice danger"><p><strong>This code asks for a token that can make dangerous channel-policy changes'
+      + ' (root-equivalent grants, tenant-wide policy).</strong> Approve it only for a change you are making now.</p></div>' : '')
+    + '<div class="notice"><p><strong>Only continue if you started this login yourself.</strong>'
+    + ' Check that the IP, client and time match your terminal. If not, close this page.</p></div>'
+    + '<div class="actions"><form method="post" action="/oauth/device/verify">' + hidden
     + '<input type="hidden" name="confirm" value="yes">'
-    + '<button type="submit">Yes, sign in</button></form>';
+    + '<button class="button" type="submit">Yes, sign in</button></form>';
   const allowed = await linksFor(registry, row.user_id);
   for (const name of configuredNames(env)) {
     if (!allowed.includes(name) || row.fresh === true) continue;
     const label = name === 'google' ? 'Google' : 'GitHub';
     body += '<form method="post" action="/oauth/device/verify">' + hidden
       + '<input type="hidden" name="provider" value="' + name + '">'
-      + '<button type="submit">Continue with ' + label + '</button></form>';
+      + '<button class="button secondary" type="submit">Continue with ' + label + '</button></form>';
   }
-  return page(body);
+  return page(body + '</div>', {
+    title: 'Confirm login', eyebrow: row.fresh === true ? 'Device login / step-up' : 'Device login',
+    heading: 'Did <em>you</em> start this login?', step: 3, tone: row.fresh === true ? 'danger' : undefined
+  });
 }
 
 function countPendingSync(registry, userId, now) {
