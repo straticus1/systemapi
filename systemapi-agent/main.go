@@ -36,6 +36,7 @@ type CommandMessage struct {
 	Cols         int             `json:"cols,omitempty"`
 	Action       string          `json:"action,omitempty"`
 	Lease        *Lease          `json:"lease,omitempty"`
+	Intent       string          `json:"intent,omitempty"` // systemapi-intent-v1 text beside a v2 lease
 	Actor        string          `json:"actor,omitempty"`
 	Grant        json.RawMessage `json:"grant,omitempty"`
 	SashTargets  *sashTargets    `json:"sash_targets,omitempty"`
@@ -368,6 +369,7 @@ func processIncomingMessage(out ptyOut, hostID, stateDir string, message []byte)
 			DeadlineUnix: cmd.DeadlineUnix,
 			Actor:        cmd.Actor,
 			Lease:        cmd.Lease,
+			Intent:       cmd.Intent,
 			Grant:        append([]byte(nil), cmd.Grant...),
 			SashTargets:  targets,
 		}, time.Now())
