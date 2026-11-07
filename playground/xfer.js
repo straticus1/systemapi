@@ -77,7 +77,7 @@ const { issueLease, xferPayload, xferMaterial, peerAddress } = require('../contr
 const { validateFileRoot } = require('../controlplane/channels');
 const { randomToken } = require('../controlplane/token');
 const { checkPath } = require('./file');
-const { envInt, unref, sendJSON, recheckChannelTicket, appendAuditRetrying } = require('./channel');
+const { envInt, unref, sendJSON, recheckChannelTicket, appendAuditRetrying, serialRenew } = require('./channel');
 
 const PURPOSES = Object.freeze({ 'xfer:put': 'file:write', 'xfer:get': 'file:read', 'xfer:root': 'file:root' });
 const TRANSPORTS = new Set(['udp', 'quic-datagram', 'quic-stream', 'quic-bridge']);
@@ -478,25 +478,24 @@ class XferGrants {
     // Re-checks the actor's authority, then sends a fresh 60 s lease. A
     // withdrawn grant is cancelled; a failed lookup skips one renewal (the
     // agent's lease lapses if the next one fails too).
-    async renew(g) {
-        if (g.state !== 'live' || g.renewing || !this.fm.signer) return;
-        g.renewing = true;
-        let denied;
-        try {
-            denied = await recheckChannelTicket(this.fm.registry,
-                { actor: g.actor, tenantId: g.tenantId, auth: g.auth, hostId: g.hostId }, g.filePurpose, { root: g.root });
-        } finally {
-            g.renewing = false;
-        }
-        if (g.state !== 'live') return;
-        if (denied === 'internal') {
+    // opts.policy: as TcpChannels.renew (a failed lookup cancels it).
+    renew(g, opts = {}) {
+        return serialRenew(g, opts, (o) => this.renewOnce(g, o));
+    }
+
+    async renewOnce(g, { policy = false } = {}) {
+        if (g.state !== 'live' || !this.fm.signer) return 'gone';
+        const denied = await recheckChannelTicket(this.fm.registry,
+            { actor: g.actor, tenantId: g.tenantId, auth: g.auth, hostId: g.hostId }, g.filePurpose, { root: g.root });
+        if (g.state !== 'live') return 'gone';
+        if (denied === 'internal' && !policy) {
             console.error('[Fleet] xfer lease renewal skipped: re-check unavailable');
-            return;
+            return 'skipped';
         }
         if (denied) {
             console.warn(`[Fleet] xfer ${g.id}: grant withdrawn (${denied}); cancelling`);
             this.cancel(g, 'stopped');
-            return;
+            return 'ended';
         }
         try {
             const { lease, deadlineUnix } = this.lease(g, 'renew', Date.now());
@@ -504,6 +503,7 @@ class XferGrants {
         } catch (err) {
             console.error('[Fleet] xfer lease renewal failed:', err.message);
         }
+        return 'renewed';
     }
 
     // hostId is the host the sending socket enrolled as. xfer_status is

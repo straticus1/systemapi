@@ -163,8 +163,29 @@ SYSTEMAPI_URL=https://api.systemapi.io SYSTEMAPI_API_KEY=<key> node cli/systemap
   jobs wait <job-id> [--wait <s>]
   jobs cancel <job-id>
   jobs list [--host <id>] [--status <status>]
-  login <username>
+  login [--fresh] <username>
+  policy show (--host <id> | --tenant <t>)
+  policy set|diff (--host <id> | --tenant <t>) --reason <text> [--dry-run] [--confirm-dangerous] <grant flags>
+  policy clear|inherit (--host <id> | --tenant <t>) --reason <text> [--dry-run] [--confirm-dangerous]
+  policy revert --host <id> --audit-seq <n> --reason <text> [--apply] [--confirm-dangerous]
 ```
+
+`policy` drives the channel-policy routes (`api_docs.md`, "Channel policy").
+Grant flags repeat and match `scripts/channel-policy.js`: `--tcp-local
+<port>`, `--file-read <dir>`, `--file-write <dir>`, `--service <unit>`,
+`--package <name>`, `--config <dir>`, `--tweak-sysctl <key>`, `--tweak-unit
+<unit>`. Every write reads the current `version`, sends it as `if_version`,
+and runs the server's dry run first; `--dry-run` (and `diff`) prints that and
+stops. A change the dry run marks dangerous is refused (`dangerous_unconfirmed`)
+unless `--confirm-dangerous` is given, and the server then also wants a
+step-up token: run `login --fresh <user>` (re-sign in to After Dark SSO, then
+approve within 5 minutes; the page says the token can make dangerous policy
+changes) and point `SYSTEMAPI_TOKEN_FILE` at it with `SYSTEMAPI_API_KEY`
+unset. `revert` without `--apply` prints the dry run. Output is the JSON
+response. `scripts/sahpolicy.py` (`show|add|set|clear|inherit`) uses the same
+API; its `add` is GET then PUT with `if_version`.
+`scripts/channel-policy.js` stays as the break-glass path on the
+control-plane host.
 
 `retire` needs an `admin` key and posts to `POST /api/v1/hosts/<id>/retire`
 (see `api_docs.md`). Without `--force` a host whose agent is connected is

@@ -36,7 +36,7 @@ const { TCP_WINDOW, creditFrame, creditBytes, encodeData } = require('../control
 const { randomToken } = require('../controlplane/token');
 const {
     CHANNEL_FRAME_MAX, envInt, unref, sendJSON, channelUpgradeHost, recheckChannelTicket,
-    appendAuditRetrying, ClientSink, AgentSource
+    appendAuditRetrying, ClientSink, AgentSource, serialRenew
 } = require('./channel');
 
 const TCP_PURPOSE = 'tcp:open';
@@ -352,25 +352,25 @@ class TcpChannels {
     // policy stopped allowing ends the stream with stopped and gets no new
     // lease. A failed lookup only skips this renewal: the agent ends the
     // stream when the last lease lapses.
-    async renew(s) {
-        if (s.ended || !this.fm.signer || s.renewing) return;
-        s.renewing = true;
-        let denied;
-        try {
-            denied = await recheckChannelTicket(this.fm.registry,
-                { actor: s.actor, tenantId: s.tenantId, auth: s.auth, hostId: s.hostId }, s.purpose || TCP_PURPOSE, { target: s.target });
-        } finally {
-            s.renewing = false;
-        }
-        if (s.ended) return;
-        if (denied === 'internal') {
+    // opts.policy (a channel-policy write, P2d): a failed lookup ends the
+    // stream too (fail closed), since the policy just changed.
+    renew(s, opts = {}) {
+        return serialRenew(s, opts, (o) => this.renewOnce(s, o));
+    }
+
+    async renewOnce(s, { policy = false } = {}) {
+        if (s.ended || !this.fm.signer) return 'gone';
+        const denied = await recheckChannelTicket(this.fm.registry,
+            { actor: s.actor, tenantId: s.tenantId, auth: s.auth, hostId: s.hostId }, s.purpose || TCP_PURPOSE, { target: s.target });
+        if (s.ended) return 'gone';
+        if (denied === 'internal' && !policy) {
             console.error('[Fleet] tcp lease renewal skipped: re-check unavailable');
-            return;
+            return 'skipped';
         }
         if (denied) {
             console.warn(`[Fleet] tcp ${s.id}: grant withdrawn (${denied}); ending stream`);
             this.end(s, 'stopped', { notifyClient: true, notifyAgent: true });
-            return;
+            return 'ended';
         }
         try {
             const lease = issueLease(this.fm.signer, {
@@ -383,6 +383,7 @@ class TcpChannels {
         } catch (err) {
             console.error('[Fleet] tcp lease renewal failed:', err.message);
         }
+        return 'renewed';
     }
 
     touch(s) {

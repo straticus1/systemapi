@@ -111,7 +111,8 @@ var configSelfRoots = []string{
 
 // configSystemdUnitDirs hold unit files and drop-ins systemd applies to the
 // agent and the helpers. Mirrors channel-policy.js SYSTEMD_UNIT_DIRS.
-var configSystemdUnitDirs = []string{"/etc/systemd/system", "/etc/systemd/system.control"}
+var configSystemdUnitDirs = []string{"/etc/systemd/system", "/etc/systemd/system.control", "/run/systemd/system",
+	"/run/systemd/system.control", "/run/systemd/transient", "/usr/lib/systemd/system", "/lib/systemd/system"}
 
 // configHelperUnitRE matches a mutation helper's unit, template or instance
 // (sah-config-helper@.service, sah-sysctl-helper@<id>.service, any future

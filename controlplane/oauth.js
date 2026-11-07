@@ -20,6 +20,12 @@
 // member id holding the three pending slots until they expire. Code-entry
 // counters live in process memory (one node). Does NOT create members, store
 // IdP access tokens, or keep a PKCE verifier.
+// Step-up (plan P2c): a "fresh" code asks for a token able to make dangerous
+// channel-policy changes. It is approved only through After Dark SSO (never
+// Google or GitHub) by a session whose Authentik auth_time is at most
+// STEP_UP_MAX_AGE_S old, its pages say so plainly (device-code phishing is
+// the risk), and only then is that auth_time copied onto the token. Any
+// other token carries no auth_time and can never pass step-up.
 'use strict';
 
 const { randomInt } = require('node:crypto');
@@ -41,6 +47,9 @@ const CODE_TRY_WINDOW_MS = 15 * 60 * 1000;
 const CODE_TRIES_PER_SESSION = 5;
 const CODE_TRIES_PER_IP = 20;
 const RESPONSE_CAP = 8192;
+const STEP_UP_MAX_AGE_S = 300;
+// How far ahead of this clock an IdP auth_time may be (clock skew).
+const AUTH_TIME_SKEW_S = 5;
 const PROVIDERS = {
   google: {
     authorize: 'https://accounts.google.com/o/oauth2/v2/auth',
@@ -249,6 +258,18 @@ async function sessionOwnsUser(registry, sessionUser, userId) {
   return Array.isArray(rows) && rows.length > 0 && rows.every((row) => row && row.sso_sub === sessionUser.id);
 }
 
+// An auth_time (Unix seconds) at most STEP_UP_MAX_AGE_S old and not ahead
+// of the clock by more than the skew. Anything else is not fresh.
+function authTimeFresh(authTime, now = Date.now()) {
+  if (!Number.isSafeInteger(authTime) || authTime <= 0) return false;
+  const nowS = Math.floor(now / 1000);
+  return authTime <= nowS + AUTH_TIME_SKEW_S && nowS - authTime <= STEP_UP_MAX_AGE_S;
+}
+
+function sessionFresh(sessionUser, now = Date.now()) {
+  return !!sessionUser && authTimeFresh(sessionUser.auth_time, now);
+}
+
 function sessionLabel(sessionUser) {
   const name = sessionUser.email || sessionUser.name || sessionUser.id;
   return typeof name === 'string' ? name : String(sessionUser.id);
@@ -344,13 +365,15 @@ async function confirmPage(registry, row, code, csrf, env) {
     + '<ul><li>From IP: <strong>' + escapeHtml(row.requester_ip || 'unknown') + '</strong></li>'
     + '<li>Client: <strong>' + escapeHtml(row.requester_ua || 'unknown') + '</strong></li>'
     + '<li>Started: <strong>' + escapeHtml(started) + '</strong></li></ul>'
+    + (row.fresh === true ? '<p><strong>This code asks for a token that can make dangerous channel-policy changes'
+      + ' (root-equivalent grants, tenant-wide policy).</strong> Approve it only for a change you are making now.</p>' : '')
     + '<p><strong>Only continue if you started this login yourself.</strong></p>'
     + '<form method="post" action="/oauth/device/verify">' + hidden
     + '<input type="hidden" name="confirm" value="yes">'
     + '<button type="submit">Yes, sign in</button></form>';
   const allowed = await linksFor(registry, row.user_id);
   for (const name of configuredNames(env)) {
-    if (!allowed.includes(name)) continue;
+    if (!allowed.includes(name) || row.fresh === true) continue;
     const label = name === 'google' ? 'Google' : 'GitHub';
     body += '<form method="post" action="/oauth/device/verify">' + hidden
       + '<input type="hidden" name="provider" value="' + name + '">'
@@ -384,6 +407,8 @@ async function insertDevice(registry, row, now) {
       state_hash: null,
       requester_ip: row.requester_ip,
       requester_ua: row.requester_ua,
+      fresh: row.fresh === true,
+      auth_time: null,
       created_at: new Date(now).toISOString()
     };
     registry.oauthDevices.set(stored.device_hash, stored);
@@ -410,9 +435,9 @@ async function insertDevice(registry, row, now) {
     }
     await client.query(
       `INSERT INTO cp_oauth_devices
-        (device_hash, user_code_hash, user_id, status, expires_at, poll_after, requester_ip, requester_ua)
-       VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7)`,
-      [row.device_hash, row.user_code_hash, row.user_id, row.expires_at, row.poll_after, row.requester_ip, row.requester_ua]
+        (device_hash, user_code_hash, user_id, status, expires_at, poll_after, requester_ip, requester_ua, fresh)
+       VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8)`,
+      [row.device_hash, row.user_code_hash, row.user_id, row.expires_at, row.poll_after, row.requester_ip, row.requester_ua, row.fresh === true]
     );
     await client.query('COMMIT');
   } catch (err) {
@@ -429,7 +454,7 @@ async function insertDevice(registry, row, now) {
 
 // RFC 8628 response. The user code is never put in a URL: the person types
 // it on the verification page after signing in.
-async function startDevice(registry, username, env, requester = {}, now = Date.now()) {
+async function startDevice(registry, username, env, requester = {}, now = Date.now(), { fresh = false } = {}) {
   const base = publicBase(env);
   const user = await memberUser(registry, username);
   if (!user) throw http(403, 'login_denied');
@@ -445,7 +470,8 @@ async function startDevice(registry, username, env, requester = {}, now = Date.n
         expires_at: new Date(now + DEVICE_TTL_MS).toISOString(),
         poll_after: new Date(now).toISOString(),
         requester_ip: who.ip,
-        requester_ua: who.ua
+        requester_ua: who.ua,
+        fresh: fresh === true
       }, now);
     } catch (err) {
       if (err.code === 'user_code_taken') continue;
@@ -484,7 +510,7 @@ async function deviceByUserCode(registry, code) {
   }
   const res = await registry.pool.query(
     `SELECT device_hash, user_id, status, expires_at, poll_after, provider, state_hash,
-            requester_ip, requester_ua, created_at
+            requester_ip, requester_ua, created_at, fresh
      FROM cp_oauth_devices WHERE user_code_hash = $1`,
     [hash]
   );
@@ -532,18 +558,21 @@ async function linksFor(registry, userId) {
   return res.rows.map((row) => row.provider).filter((name) => PROVIDERS[name]);
 }
 
-async function markApproved(registry, deviceHash, now) {
+// authTime (Unix seconds) is kept only on a fresh row, for its token.
+async function markApproved(registry, deviceHash, now, authTime = null) {
   if (!registry.pool) {
     ensure(registry);
     const row = registry.oauthDevices.get(deviceHash);
     if (!row || row.status !== 'pending' || atMs(row.expires_at) <= now) return false;
     row.status = 'approved';
+    row.auth_time = row.fresh === true && authTime !== null ? new Date(authTime * 1000).toISOString() : null;
     return true;
   }
   const res = await registry.pool.query(
-    `UPDATE cp_oauth_devices SET status = 'approved'
+    `UPDATE cp_oauth_devices SET status = 'approved',
+       auth_time = CASE WHEN fresh THEN $3::timestamptz ELSE NULL END
      WHERE device_hash = $1 AND status = 'pending' AND expires_at > $2`,
-    [deviceHash, new Date(now).toISOString()]
+    [deviceHash, new Date(now).toISOString(), authTime === null ? null : new Date(authTime * 1000).toISOString()]
   );
   return res.rowCount === 1;
 }
@@ -554,7 +583,10 @@ async function approveUserCode(registry, typed, sessionUser, now = Date.now()) {
   const found = await pendingByTypedCode(registry, typed, now);
   if (!found || !(await sessionOwnsUser(registry, sessionUser, found.row.user_id))) throw http(403, 'login_denied');
   const row = found.row;
-  const ok = await markApproved(registry, row.device_hash, now);
+  // A fresh code needs a fresh SSO session; the verify page sends a stale
+  // one to Authentik first (reauth_required).
+  if (row.fresh === true && !sessionFresh(sessionUser, now)) throw http(403, 'reauth_required');
+  const ok = await markApproved(registry, row.device_hash, now, row.fresh === true ? sessionUser.auth_time : null);
   if (!ok) throw http(403, 'login_denied');
 }
 
@@ -577,6 +609,8 @@ async function beginExternal(registry, typed, provider, env, sessionUser, now = 
   const found = await pendingByTypedCode(registry, typed, now);
   if (!found || !(await sessionOwnsUser(registry, sessionUser, found.row.user_id))) throw http(403, 'login_denied');
   const row = found.row;
+  // Google and GitHub say nothing about an After Dark auth_time.
+  if (row.fresh === true) throw http(403, 'link_denied');
   const allowed = await linksFor(registry, row.user_id);
   if (!allowed.includes(provider)) throw http(403, 'link_denied');
   const base = publicBase(env);
@@ -860,7 +894,8 @@ async function consumeDevice(registry, deviceHash, tokenHash, expiresAt, now) {
     registry.oauthAccess.set(tokenHash, {
       token_hash: tokenHash,
       user_id: row.user_id,
-      expires_at: expiresAt
+      expires_at: expiresAt,
+      auth_time: row.auth_time || null
     });
     return row.user_id;
   }
@@ -870,7 +905,7 @@ async function consumeDevice(registry, deviceHash, tokenHash, expiresAt, now) {
     const updated = await client.query(
       `UPDATE cp_oauth_devices SET status = 'consumed'
        WHERE device_hash = $1 AND status = 'approved' AND expires_at > $2
-       RETURNING user_id`,
+       RETURNING user_id, auth_time`,
       [deviceHash, new Date(now).toISOString()]
     );
     if (updated.rowCount !== 1) {
@@ -878,8 +913,8 @@ async function consumeDevice(registry, deviceHash, tokenHash, expiresAt, now) {
       return null;
     }
     await client.query(
-      'INSERT INTO cp_oauth_access (token_hash, user_id, expires_at) VALUES ($1, $2, $3)',
-      [tokenHash, updated.rows[0].user_id, expiresAt]
+      'INSERT INTO cp_oauth_access (token_hash, user_id, expires_at, auth_time) VALUES ($1, $2, $3, $4)',
+      [tokenHash, updated.rows[0].user_id, expiresAt, updated.rows[0].auth_time || null]
     );
     await client.query('COMMIT');
     return updated.rows[0].user_id;
@@ -913,6 +948,13 @@ async function pollToken(registry, deviceCode, env, now = Date.now()) {
   return { access_token: access, token_type: 'Bearer', expires_in: 3600 };
 }
 
+// A stored auth_time as Unix seconds, or null.
+function authSeconds(value) {
+  if (value === null || value === undefined) return null;
+  const ms = atMs(value);
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
+}
+
 async function userForAccessToken(registry, presented, now = Date.now()) {
   if (!registry || typeof presented !== 'string' || presented.length < 16 || presented.length > 512) return null;
   const hash = fingerprint(presented);
@@ -920,15 +962,15 @@ async function userForAccessToken(registry, presented, now = Date.now()) {
     ensure(registry);
     const row = registry.oauthAccess.get(hash);
     if (!row || atMs(row.expires_at) <= now) return null;
-    return { user_id: row.user_id };
+    return { user_id: row.user_id, auth_time: authSeconds(row.auth_time) };
   }
   const res = await registry.pool.query(
-    'SELECT user_id, expires_at FROM cp_oauth_access WHERE token_hash = $1',
+    'SELECT user_id, expires_at, auth_time FROM cp_oauth_access WHERE token_hash = $1',
     [hash]
   );
   const row = res.rows[0];
   if (!row || atMs(row.expires_at) <= now) return null;
-  return { user_id: row.user_id };
+  return { user_id: row.user_id, auth_time: authSeconds(row.auth_time) };
 }
 
 async function createLink(registry, userId, provider) {
@@ -1053,5 +1095,8 @@ module.exports = {
   denialPage,
   donePage,
   safeReturnPath,
-  sessionOwnsUser
+  sessionOwnsUser,
+  STEP_UP_MAX_AGE_S,
+  authTimeFresh,
+  sessionFresh
 };

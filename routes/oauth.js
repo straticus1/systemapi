@@ -11,12 +11,15 @@
 // emails or subjects to the browser or the log (generic codes plus a request
 // id; the log gets only the error name and code). The session stores the
 // Authentik sub; who that sub may act as is decided by cp_members.sso_sub,
-// not here. Does NOT bind subs to members. options.customFetch exists so tests can
+// not here. Does NOT bind subs to members. /oauth/login?fresh=1 forces a
+// re-authentication (prompt=login, max_age=300, checked again on the ID
+// token) for step-up (plan P2c); the session keeps the ID token's auth_time
+// (Unix seconds) only when it is an integer. options.customFetch exists so tests can
 // trust a local mock HTTPS issuer; TLS is never turned off.
 'use strict';
 
 const express = require('express');
-const { safeReturnPath, sessionCsrf, csrfValid } = require('../controlplane/oauth');
+const { safeReturnPath, sessionCsrf, csrfValid, STEP_UP_MAX_AGE_S } = require('../controlplane/oauth');
 const { randomToken } = require('../controlplane/token');
 
 function failure(res, logger, what, err, status = 500) {
@@ -88,11 +91,13 @@ function createOAuthRouter(options = {}) {
       const code_challenge = await oidc.calculatePKCECodeChallenge(code_verifier);
       const state = oidc.randomState();
       const nonce = oidc.randomNonce();
+      const fresh = req.query.fresh === '1';
 
       req.session.oauth = {
         code_verifier,
         state,
         nonce,
+        fresh,
         // Same-origin path only; checked again at the callback.
         return_to: safeReturnPath(req.query.return_to)
       };
@@ -103,7 +108,8 @@ function createOAuthRouter(options = {}) {
         state,
         nonce,
         code_challenge,
-        code_challenge_method: 'S256'
+        code_challenge_method: 'S256',
+        ...(fresh ? { prompt: 'login', max_age: String(STEP_UP_MAX_AGE_S) } : {})
       });
 
       res.redirect(authorizationUrl.href);
@@ -122,7 +128,7 @@ function createOAuthRouter(options = {}) {
     // and nonce are gone.
     delete req.session.oauth;
     try {
-      const { code_verifier, state, nonce, return_to } = pending;
+      const { code_verifier, state, nonce, return_to, fresh } = pending;
       if (!code_verifier || !state || !nonce) {
         res.status(400).json({ error: 'login_session_missing' });
         return;
@@ -141,7 +147,9 @@ function createOAuthRouter(options = {}) {
         pkceCodeVerifier: code_verifier,
         expectedState: state,
         expectedNonce: nonce,
-        idTokenExpected: true
+        idTokenExpected: true,
+        // A step-up login must come back with an auth_time inside max_age.
+        ...(fresh === true ? { maxAge: STEP_UP_MAX_AGE_S } : {})
       });
 
       // Get user info, bound to the ID token subject
@@ -160,7 +168,8 @@ function createOAuthRouter(options = {}) {
         email: userinfo.email,
         name: userinfo.name || userinfo.preferred_username,
         groups: Array.isArray(userinfo.groups) ? userinfo.groups : [],
-        picture: userinfo.picture
+        picture: userinfo.picture,
+        auth_time: Number.isSafeInteger(claims.auth_time) ? claims.auth_time : null
       };
 
       req.session.tokens = {

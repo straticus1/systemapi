@@ -145,6 +145,115 @@ test('channel-policy writes the host policy and its audit row together, or neith
   assert.equal(await audits(), 1);
 });
 
+test('policy API writes (P2): if_version under the row lock, the tenant twin with host_id null, revert lookup, rollback', async () => {
+  const { policyVersion, pickColumns, clearPolicy, inheritPolicy } = require('../controlplane/policyrules');
+  const HOST_Q = 'a2a2a2a2-a2a2-4a2a-8a2a-a2a2a2a2a2a2';
+  await registry.enroll({ tenantId: 'pgpol', userId: 'user-pol', keyId: 'kq', hostId: HOST_Q, hostname: 'q.example', os: '', platform: '', sshPubkey: opensshEd25519(6) });
+  const hostCols = async () => pickColumns((await pool.query('SELECT tcp_policy, file_policy, service_policy, package_policy, config_policy, tweak_policy FROM cp_hosts WHERE host_id = $1', [HOST_Q])).rows[0]);
+  const named = (cols) => ({ tcpPolicy: cols.tcp_policy, filePolicy: cols.file_policy, servicePolicy: cols.service_policy, packagePolicy: cols.package_policy, configPolicy: cols.config_policy, tweakPolicy: cols.tweak_policy });
+  const v0 = policyVersion(await hostCols());
+  const out = await registry.setHostChannelPolicyAudited({ tenantId: 'pgpol', hostId: HOST_Q, ...named(clearPolicy()), actor: 'user-pol', action: 'channel_policy_clear', reason: 'pg', ifVersion: v0, extra: { policy_schema: 2, via: 'key', key_fp: 'abc' } });
+  // The version the registry returns is what a read of the jsonb columns hashes to.
+  assert.equal(out.version, policyVersion(await hostCols()));
+  const row = await registry.policyAuditRow(out.audit_seq);
+  assert.equal(row.host_id, HOST_Q);
+  assert.equal(row.tenant_id, 'pgpol');
+  assert.equal(row.payload.policy_schema, 2);
+  assert.equal(row.payload.previous_tweak_policy, null);
+  assert.equal(await registry.policyAuditRow(0), null);
+  assert.equal(await registry.policyAuditRow(2 ** 40), null);
+  // A stale version is 409 and nothing changes.
+  const auditCount = async () => (await pool.query('SELECT count(*)::int AS n FROM cp_audit')).rows[0].n;
+  const n = await auditCount();
+  await assert.rejects(registry.setHostChannelPolicyAudited({ tenantId: 'pgpol', hostId: HOST_Q, ...named(inheritPolicy()), actor: 'x', action: 'channel_policy_inherit', reason: 'pg', ifVersion: v0 }),
+    (err) => err.status === 409 && err.code === 'version_conflict');
+  assert.equal(await auditCount(), n);
+  assert.equal(policyVersion(await hostCols()), out.version);
+
+  // The tenant twin.
+  const t0 = await registry.tenantChannelPolicies('pgpol');
+  assert.deepEqual(t0, inheritPolicy());
+  assert.equal(await registry.tenantChannelPolicies('no-such-tenant'), null);
+  const next = { ...inheritPolicy(), package_policy: { names: ['curl'] } };
+  const t = await registry.setTenantChannelPolicyAudited({ tenantId: 'pgpol', ...named(next), actor: 'user-pol', action: 'channel_policy_tenant_set', reason: 'pg', ifVersion: policyVersion(t0), extra: { policy_schema: 2 } });
+  assert.deepEqual(await registry.tenantChannelPolicies('pgpol'), next);
+  assert.equal(t.version, policyVersion(await registry.tenantChannelPolicies('pgpol')));
+  const trow = await registry.policyAuditRow(t.audit_seq);
+  assert.equal(trow.host_id, null);
+  assert.equal(trow.action, 'channel_policy_tenant_set');
+  assert.equal(trow.payload.previous_package_policy, null);
+  await assert.rejects(registry.setTenantChannelPolicyAudited({ tenantId: 'pgpol', ...named(clearPolicy()), actor: 'x', action: 'channel_policy_tenant_clear', reason: 'pg', ifVersion: policyVersion(t0) }),
+    (err) => err.code === 'version_conflict');
+  await assert.rejects(registry.setTenantChannelPolicyAudited({ tenantId: 'nope', ...named(clearPolicy()), actor: 'x', action: 'channel_policy_tenant_clear', reason: 'pg' }),
+    (err) => err.status === 404);
+  // A failed audit row rolls the tenant write back.
+  await pool.query(`CREATE FUNCTION test_refuse_audit2() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN RAISE EXCEPTION 'audit refused by test'; END $$`);
+  await pool.query('CREATE TRIGGER test_refuse_audit2 BEFORE INSERT ON cp_audit FOR EACH ROW EXECUTE FUNCTION test_refuse_audit2()');
+  try {
+    await assert.rejects(registry.setTenantChannelPolicyAudited({ tenantId: 'pgpol', ...named(clearPolicy()), actor: 'x', action: 'channel_policy_tenant_clear', reason: 'pg', ifVersion: t.version }), /audit refused/);
+  } finally {
+    await pool.query('DROP TRIGGER test_refuse_audit2 ON cp_audit');
+    await pool.query('DROP FUNCTION test_refuse_audit2()');
+  }
+  assert.deepEqual(await registry.tenantChannelPolicies('pgpol'), next);
+  assert.equal((await registry.verifyAudit()).ok, true);
+});
+
+test('step-up device flow on PostgreSQL: a fresh code keeps the approver auth_time and copies it onto the token', async () => {
+  const oauth = require('../controlplane/oauth');
+  await registry.enroll({ tenantId: 'pgauth', userId: 'user-auth', keyId: 'ka', hostId: 'a3a3a3a3-a3a3-4a3a-8a3a-a3a3a3a3a3a3', hostname: 'a.example', os: '', platform: '', sshPubkey: opensshEd25519(7) });
+  await pool.query("UPDATE cp_members SET sso_sub = 'sub-auth' WHERE user_id = 'user-auth'");
+  const env = { NODE_ENV: 'test', SYSTEMAPI_PUBLIC_URL: 'https://api.systemapi.test' };
+  const at = Math.floor(Date.now() / 1000) - 3;
+  const fresh = await oauth.startDevice(registry, 'user-auth', env, {}, Date.now(), { fresh: true });
+  await assert.rejects(oauth.approveUserCode(registry, fresh.user_code, { id: 'sub-auth', auth_time: at - 600 }), (err) => err.code === 'reauth_required');
+  await oauth.approveUserCode(registry, fresh.user_code, { id: 'sub-auth', auth_time: at });
+  const token = await oauth.pollToken(registry, fresh.device_code, env);
+  assert.equal((await oauth.userForAccessToken(registry, token.access_token)).auth_time, at);
+  const plain = await oauth.startDevice(registry, 'user-auth', env, {});
+  await oauth.approveUserCode(registry, plain.user_code, { id: 'sub-auth', auth_time: at });
+  const plainToken = await oauth.pollToken(registry, plain.device_code, env);
+  assert.equal((await oauth.userForAccessToken(registry, plainToken.access_token)).auth_time, null);
+});
+
+test('policy API host writes: tenantVersion checked under FOR SHARE (a tenant write in flight is waited for), retired is 409', async () => {
+  const { policyVersion, clearPolicy, inheritPolicy } = require('../controlplane/policyrules');
+  const HOST_S = 'a4a4a4a4-a4a4-4a4a-8a4a-a4a4a4a4a4a4';
+  await registry.enroll({ tenantId: 'pgshare', userId: 'user-share', keyId: 'ks', hostId: HOST_S, hostname: 's.example', os: '', platform: '', sshPubkey: opensshEd25519(14) });
+  const named = (cols) => ({ tcpPolicy: cols.tcp_policy, filePolicy: cols.file_policy, servicePolicy: cols.service_policy, packagePolicy: cols.package_policy, configPolicy: cols.config_policy, tweakPolicy: cols.tweak_policy });
+  const t0 = policyVersion(await registry.tenantChannelPolicies('pgshare'));
+  const write = (tenantVersion) => registry.setHostChannelPolicyAudited({ tenantId: 'pgshare', hostId: HOST_S, ...named(clearPolicy()), actor: 'x', action: 'channel_policy_clear', reason: 'pg', ifVersion: undefined, tenantVersion, extra: { policy_schema: 2 } });
+  // A stale tenant version is 409 and writes nothing.
+  const n = (await pool.query('SELECT count(*)::int AS n FROM cp_audit')).rows[0].n;
+  await assert.rejects(write('0'.repeat(64)), (err) => err.status === 409 && err.code === 'version_conflict');
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM cp_audit')).rows[0].n, n);
+  // A tenant write holding the row: the host write waits for it, then sees
+  // the new tenant columns and refuses.
+  const other = await pool.connect();
+  try {
+    await other.query('BEGIN');
+    await other.query('SELECT 1 FROM cp_tenants WHERE tenant_id = $1 FOR UPDATE', ['pgshare']);
+    let settled = false;
+    const pending = write(t0).then(() => { settled = 'ok'; }, (err) => { settled = err.code; });
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(settled, false, 'the host write must wait for the tenant row');
+    await other.query('UPDATE cp_tenants SET package_policy = $2::jsonb WHERE tenant_id = $1', ['pgshare', JSON.stringify({ names: ['curl'] })]);
+    await other.query('COMMIT');
+    await pending;
+    assert.equal(settled, 'version_conflict');
+  } finally {
+    other.release();
+  }
+  const t1 = policyVersion(await registry.tenantChannelPolicies('pgshare'));
+  const ok = await write(t1);
+  assert.ok(ok.audit_seq > 0);
+  // Retired: 409 host_retired under the row lock.
+  await registry.retireHost({ tenantId: 'pgshare', hostId: HOST_S, actor: 'x', reason: 'gone', forced: false });
+  await assert.rejects(registry.setHostChannelPolicyAudited({ tenantId: 'pgshare', hostId: HOST_S, ...named(inheritPolicy()), actor: 'x', action: 'channel_policy_inherit', reason: 'pg' }),
+    (err) => err.status === 409 && err.code === 'host_retired');
+});
+
 test('channel-policy main() against the database prints the summary and never the credentials', async () => {
   const { main } = require('../scripts/channel-policy');
   // Its own host row, so the test does not depend on the enroll test running first.
@@ -188,7 +297,8 @@ test('retireHost stamps retired_at with its host_retired row, or neither; a reti
   const base = { tenantId: 'acme', userId: 'user-1', keyId: 'k1', os: '', platform: '' };
   await registry.enroll({ ...base, hostId: OLD, hostname: 'r.example', sshPubkey: opensshEd25519(6) });
   await registry.enroll({ ...base, hostId: NEW, hostname: 'r.example', sshPubkey: opensshEd25519(7) });
-  const retiredRows = async () => (await pool.query("SELECT count(*)::int AS n FROM cp_audit WHERE action = 'host_retired'")).rows[0].n;
+  // Only this test's hosts: other tests retire hosts of their own.
+  const retiredRows = async () => (await pool.query("SELECT count(*)::int AS n FROM cp_audit WHERE action = 'host_retired' AND host_id = ANY($1::text[])", [[OLD, NEW]])).rows[0].n;
 
   await assert.rejects(registry.retireHost({ tenantId: 'other', hostId: OLD, actor: 'u', reason: 'x' }), (err) => err.status === 404);
   await assert.rejects(registry.retireHost({ tenantId: 'acme', hostId: OLD, actor: 'u', reason: ' ' }), (err) => err.code === 'reason_required');
@@ -209,7 +319,7 @@ test('retireHost stamps retired_at with its host_retired row, or neither; a reti
   assert.ok(row.retired_at instanceof Date);
   assert.equal(row.status, 'offline');
   assert.equal(await retiredRows(), 1);
-  const audit = (await pool.query("SELECT tenant_id, host_id, actor, payload FROM cp_audit WHERE action = 'host_retired'")).rows[0];
+  const audit = (await pool.query("SELECT tenant_id, host_id, actor, payload FROM cp_audit WHERE action = 'host_retired' AND host_id = $1", [OLD])).rows[0];
   assert.match(audit.payload.last_seen_at, /^\d{4}-\d\d-\d\dT[\d:.]+Z$/);
   assert.deepEqual({ ...audit, payload: { ...audit.payload, last_seen_at: 'x' } },
     { tenant_id: 'acme', host_id: OLD, actor: 'user-1', payload: { reason: 're-enrolled', hostname: 'r.example', forced: false, last_seen_at: 'x' } });
@@ -634,6 +744,12 @@ test('jobs: two FleetManagers on one database: submit on one, the agent on the o
     await regOne.setScopes(`ko${tag}`, ['exec:run', 'hosts:read']);
     const a = await connectAgent(two, hostId, { tenant, key: 'pg-agent' });
     assert.ok(a.frames.some((f) => f.type === 'enrolled'));
+    // enrolled goes out before the presence row is written: wait for it.
+    await waitUntil('presence on two', async () => {
+      const row = await regOne.hostAgent(hostId);
+      return row && row.instance === two.fm.jobs.instanceId && row.caps.length > 0
+        && row.conn_id === two.fm.jobs.connIds.get(two.fm.connectedAgents.get(hostId));
+    }, 8000);
     const agentRow = await regOne.hostAgent(hostId);
     assert.equal(agentRow.instance, two.fm.jobs.instanceId);
     assert.equal(agentRow.conn_id, two.fm.jobs.connIds.get(two.fm.connectedAgents.get(hostId)));

@@ -305,7 +305,38 @@ class AgentSource {
     }
 }
 
+// One renewal at a time per session (plan P2d). A call while one is in
+// flight does not drop: it queues one re-run (a policy write that lands
+// mid-renewal must still be checked against the new policy) and resolves
+// with that run's result. once(opts) answers 'renewed', 'ended', 'skipped' or
+// 'gone'; opts.policy is sticky across queued calls.
+function serialRenew(s, opts, once) {
+    if (s.renewing) {
+        s.renewAgain = { policy: Boolean((s.renewAgain && s.renewAgain.policy) || (opts && opts.policy)) };
+        return s.renewRun;
+    }
+    s.renewing = true;
+    s.renewRun = (async () => {
+        let cur = opts || {};
+        let out;
+        try {
+            for (;;) {
+                out = await once(cur);
+                if (!s.renewAgain || out === 'ended' || out === 'gone') break;
+                cur = s.renewAgain;
+                s.renewAgain = null;
+            }
+        } finally {
+            s.renewing = false;
+            s.renewAgain = null;
+        }
+        return out;
+    })();
+    return s.renewRun;
+}
+
 module.exports = {
+    serialRenew,
     CHANNEL_FRAME_MAX,
     CLIENT_BUFFER_MAX,
     envInt,
