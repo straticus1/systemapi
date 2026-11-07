@@ -4,6 +4,8 @@ package main
 // approval classes the agent derives per lease (contract 3.1, 5.1).
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -123,5 +125,78 @@ func TestIntentClasses(t *testing.T) {
 		if got := strings.Join(intentClasses(c.action, c.payload, c.ents), ","); got != c.want {
 			t.Fatalf("%s %q: %q, want %q", c.action, c.payload, got, c.want)
 		}
+	}
+}
+
+// N33 on the agent: the root-run sash verbs are dropped on a sys-write pin
+// (or a damaged pin) whatever the grant says.
+func TestSashRootVerbsDroppedOnSysWritePin(t *testing.T) {
+	withRequireIntent(t, "")
+	restarts := 0
+	prevRestart := sashUnitRestart
+	sashUnitRestart = func(string) (string, error) { restarts++; return "ok", nil }
+	t.Cleanup(func() { sashUnitRestart = prevRestart })
+	restart := func(purpose string) error {
+		_, err := sashDispatch(sashGrant{Purpose: purpose, Entitlements: []string{"unit.restart"}}, sashTargets{Units: []string{"nginx"}}, sashLiveLease(), nil,
+			sashCall{Key: "unit.restart", Argv: []string{"unit", "restart", "nginx"}})
+		return err
+	}
+	if err := restart(sashPurposeOpen); err != nil || restarts != 1 {
+		t.Fatalf("no pin: %v %d", err, restarts)
+	}
+	for _, body := range []string{"sys-write\n", "breakglass\nbogus\n"} {
+		withRequireIntent(t, body)
+		for _, p := range []string{sashPurposeOpen, sashPurposeRoot} {
+			if err := restart(p); err == nil {
+				t.Fatalf("pin %q purpose %s: restart allowed", body, p)
+			}
+		}
+	}
+	if restarts != 1 {
+		t.Fatalf("helper called %d times", restarts)
+	}
+	g := sashGrant{Entitlements: []string{"package.install", "sysctl.set", "file.write"}}
+	withRequireIntent(t, "sys-write\n")
+	for _, k := range []string{"package.install", "sysctl.set"} {
+		if !sashPinDenied(g, k) {
+			t.Fatalf("%s not dropped", k)
+		}
+	}
+	g.Purpose = sashPurposeOpen
+	if sashPinDenied(g, "file.write") {
+		t.Fatal("plain pty file.write dropped (it runs as the pty user)")
+	}
+	g.Purpose = sashPurposeRoot
+	if !sashPinDenied(g, "file.write") {
+		t.Fatal("pty_root file.write kept")
+	}
+	if sashPinDenied(g, "unit.status") || sashPinDenied(g, "file.read") {
+		t.Fatal("read verb dropped")
+	}
+	withRequireIntent(t, "breakglass\n")
+	if sashPinDenied(g, "unit.restart") {
+		t.Fatal("dropped without a sys-write pin")
+	}
+}
+
+// A missing pin file in an untrusted directory is not "no pin".
+func TestRequireIntentMissingFileUntrustedDir(t *testing.T) {
+	path := withRequireIntent(t, "")
+	if got, err := loadRequireIntent(); err != nil || len(got) != 0 {
+		t.Fatalf("trusted dir, no file: %v %v", got, err)
+	}
+	if err := os.Chmod(filepath.Dir(path), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(filepath.Dir(path), 0o755) })
+	if _, err := loadRequireIntent(); err == nil {
+		t.Fatal("world-writable pin dir with no file accepted as no pin")
+	}
+	if requireIntentHeader() != "invalid" {
+		t.Fatal("header")
+	}
+	requireIntentPath = filepath.Join(t.TempDir(), "absent", "require-intent")
+	if got, err := loadRequireIntent(); err != nil || got != nil {
+		t.Fatalf("no directory: %v %v", got, err)
 	}
 }

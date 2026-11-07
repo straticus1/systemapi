@@ -34,6 +34,11 @@ package main
 // v2 lease for the same intent with a fresh nonce is accepted. Does NOT
 // protect against root on this host, which can edit the pin and the journal.
 // Nothing on the control plane sends v2 yet.
+//
+// A partial pin protects little: a pin naming breakglass or sash-config but
+// not both root-session and sys-write leaves v1 root sessions and v1 sys
+// writes open, and either can delete or rewrite the pin itself. Pin all four
+// classes (or at least root-session and sys-write beside the others).
 
 import (
 	"errors"
@@ -260,15 +265,13 @@ func checkIntentStart(intentText string, lease *Lease, ctx intentCtx, now time.T
 // (nil, nil). Anything else that is not a trusted, regular file of known
 // class names, one per line, at most requireIntentMax bytes, is an error.
 func loadRequireIntent() (map[string]bool, error) {
-	f, err := os.OpenFile(requireIntentPath, os.O_RDONLY|openNoFollow, 0)
+	// The directory is checked even when the file is missing: in a directory
+	// someone else can write, a missing pin may have been deleted. A host
+	// without the directory at all has no pin.
+	dirInfo, err := os.Lstat(filepath.Dir(requireIntentPath))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	dirInfo, err := os.Lstat(filepath.Dir(requireIntentPath))
 	if err != nil {
 		return nil, err
 	}
@@ -278,6 +281,14 @@ func loadRequireIntent() (map[string]bool, error) {
 	if err := trustedNode(dirInfo); err != nil {
 		return nil, fmt.Errorf("pin dir: %w", err)
 	}
+	f, err := os.OpenFile(requireIntentPath, os.O_RDONLY|openNoFollow, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
 		return nil, err
