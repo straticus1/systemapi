@@ -250,7 +250,8 @@ test('dry_run returns the diff, the dangerous list and the live session count, a
 });
 
 test('malformed bodies and every rule the CLI enforces are refused with a fixed code', async () => {
-  const r = await rig();
+  // Many refused writes from one key: lift its per-principal cap.
+  const r = await rig({ SYSTEMAPI_POLICY_WRITE_RATE_PRINCIPAL: '60' });
   try {
     const v0 = await version(r);
     const put = (body) => call(r, 'PUT', P(), { body: { reason: 'r', if_version: v0, ...body } });
@@ -636,6 +637,31 @@ test('the global write cap answers 429 past SYSTEMAPI_POLICY_WRITE_RATE per minu
     assert.equal(capped.body.error, 'rate_limited');
     // Reads are not capped.
     assert.equal((await call(r, 'GET', P())).status, 200);
+  } finally {
+    await r.close();
+  }
+});
+
+test('the per-principal write cap sits under the global one; a refused call spends neither', async () => {
+  const { principalWriteRate } = require('../controlplane/policyroutes');
+  assert.equal(principalWriteRate({}), 20);
+  assert.equal(principalWriteRate({ SYSTEMAPI_POLICY_WRITE_RATE: '5' }), 5);
+  assert.equal(principalWriteRate({ SYSTEMAPI_POLICY_WRITE_RATE_PRINCIPAL: '0' }), 20);
+  const r = await rig({ SYSTEMAPI_POLICY_WRITE_RATE: '4', SYSTEMAPI_POLICY_WRITE_RATE_PRINCIPAL: '3' });
+  try {
+    const v0 = await version(r);
+    const dry = (opts) => call(r, 'POST', `${P()}/clear?dry_run=1`, { ...opts, body: { reason: 'r', if_version: v0 } });
+    for (let i = 0; i < 3; i += 1) assert.equal((await dry({})).status, 200);
+    for (let i = 0; i < 2; i += 1) {
+      const capped = await dry({});
+      assert.equal(capped.status, 429);
+      assert.equal(capped.body.error, 'rate_limited');
+    }
+    // Another principal has its own bucket, but the global cap still holds.
+    const token = await deviceToken(r, null);
+    assert.equal((await dry({ bearer: token })).status, 200);
+    assert.equal((await dry({ bearer: token })).status, 429);
+    assert.equal(r.fm.policyWriteTimes.length, 4);
   } finally {
     await r.close();
   }

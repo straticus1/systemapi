@@ -270,7 +270,9 @@ how many passed and got a new lease, `ended` how many were stopped. A
 change made with the break-glass `scripts/channel-policy.js` renews
 nothing: live sessions see it at their next 30 s renewal. Writes, dry runs included, are capped
 at `SYSTEMAPI_POLICY_WRITE_RATE` per minute (default 60, 1-600; 429
-`rate_limited`).
+`rate_limited`), and per principal (one API key, or one member) at
+`SYSTEMAPI_POLICY_WRITE_RATE_PRINCIPAL` (default 20, never above the global
+rate). A refused call counts against neither.
 
 A key used for policy writes should be created with `allowed_endpoints`
 limited to these routes; it can never make a dangerous change.

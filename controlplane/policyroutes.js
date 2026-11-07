@@ -22,7 +22,8 @@
 // must match, only policy_schema 2 rows), live sessions outliving a
 // narrowing (every write renews this replica's sessions on the affected
 // hosts at once), and write floods (SYSTEMAPI_POLICY_WRITE_RATE per minute,
-// default 60). Webhooks and logs carry classes and counts, never paths,
+// default 60, and SYSTEMAPI_POLICY_WRITE_RATE_PRINCIPAL per principal under
+// it, default 20). Webhooks and logs carry classes and counts, never paths,
 // units or raw errors. Does NOT fan out to other replicas (one today), does
 // NOT require a second approver (a follow-up once there is a second admin),
 // and does NOT stop a compromised admin session inside its 5 min step-up
@@ -36,26 +37,55 @@ const rules = require('./policyrules');
 const TENANT_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
 const WRITE_RATE_DEFAULT = 60;
 const WRITE_RATE_CAP = 600;
+const PRINCIPAL_RATE_DEFAULT = 20;
+// Principal buckets kept before the empty ones are swept.
+const PRINCIPAL_BUCKETS_SWEEP = 256;
 const WRITE_WINDOW_MS = 60 * 1000;
 
 // SYSTEMAPI_POLICY_WRITE_RATE: policy write requests (dry runs included) per
 // minute on this replica. Default 60; anything but an integer 1-600 falls
 // back to it.
 function writeRate(env) {
-  const raw = env && env.SYSTEMAPI_POLICY_WRITE_RATE;
+  return rateEnv(env && env.SYSTEMAPI_POLICY_WRITE_RATE, WRITE_RATE_DEFAULT);
+}
+
+// SYSTEMAPI_POLICY_WRITE_RATE_PRINCIPAL: the same, per principal (one key or
+// one member), so one flooding caller cannot spend the whole replica's
+// budget. Default 20, never above the global rate.
+function principalWriteRate(env) {
+  return Math.min(rateEnv(env && env.SYSTEMAPI_POLICY_WRITE_RATE_PRINCIPAL, PRINCIPAL_RATE_DEFAULT), writeRate(env));
+}
+
+function rateEnv(raw, fallback) {
   const n = raw === undefined || raw === '' ? NaN : Number(raw);
-  return Number.isInteger(n) && n >= 1 && n <= WRITE_RATE_CAP ? n : WRITE_RATE_DEFAULT;
+  return Number.isInteger(n) && n >= 1 && n <= WRITE_RATE_CAP ? n : fallback;
 }
 
 function mountPolicyRoutes(app, fleet, h) {
   const { wrap, http, noStore, authenticate, requireScopeAnywhere, requireHost, requireScope, safeSecurity, tenantIds, deliverWebhooks } = h;
 
-  function rateGate() {
+  // The principal's bucket, then the replica's; a refused call spends
+  // neither.
+  function rateGate(principal) {
     const now = Date.now();
+    const expire = (times) => { while (times.length && now - times[0] >= WRITE_WINDOW_MS) times.shift(); };
     if (!fleet.policyWriteTimes) fleet.policyWriteTimes = [];
+    if (!fleet.policyWriteByPrincipal) fleet.policyWriteByPrincipal = new Map();
+    const buckets = fleet.policyWriteByPrincipal;
+    if (buckets.size > PRINCIPAL_BUCKETS_SWEEP) {
+      for (const [k, t] of buckets) {
+        expire(t);
+        if (t.length === 0) buckets.delete(k);
+      }
+    }
+    const who = principal.keyId ? `key:${principal.keyId}` : `user:${principal.userId}`;
+    const mine = buckets.get(who) || [];
+    expire(mine);
     const times = fleet.policyWriteTimes;
-    while (times.length && now - times[0] >= WRITE_WINDOW_MS) times.shift();
-    if (times.length >= writeRate(fleet.env)) throw http(429, 'rate_limited');
+    expire(times);
+    if (mine.length >= principalWriteRate(fleet.env) || times.length >= writeRate(fleet.env)) throw http(429, 'rate_limited');
+    mine.push(now);
+    buckets.set(who, mine);
     times.push(now);
   }
 
@@ -287,7 +317,7 @@ function mountPolicyRoutes(app, fleet, h) {
     const host = await loadHost(req, principal);
     const body = writeBody(req, principal);
     const dryRun = dryRunOf(req);
-    rateGate();
+    rateGate(principal);
     reasonOf(body);
     ifVersionOf(body);
     const next = ruled(() => rules.buildPolicy(body.grants, rules.apiLabel));
@@ -301,7 +331,7 @@ function mountPolicyRoutes(app, fleet, h) {
       const host = await loadHost(req, principal);
       const body = writeBody(req, principal);
       const dryRun = dryRunOf(req);
-      rateGate();
+      rateGate(principal);
       await hostWrite(req, res, principal, host, body, policy(), `channel_policy_${verb}`, { dryRun });
     }));
   }
@@ -315,7 +345,7 @@ function mountPolicyRoutes(app, fleet, h) {
     const body = writeBody(req, principal);
     if (body.apply !== undefined && typeof body.apply !== 'boolean') throw http(400, 'bad_apply');
     if (!Number.isSafeInteger(body.audit_seq) || body.audit_seq < 1) throw http(400, 'bad_audit_seq');
-    rateGate();
+    rateGate(principal);
     reasonOf(body);
     ifVersionOf(body);
     const row = await fleet.registry.policyAuditRow(body.audit_seq);
@@ -424,7 +454,7 @@ function mountPolicyRoutes(app, fleet, h) {
     const { tenantId, cols } = await loadTenant(req, principal);
     const body = writeBody(req, principal);
     const dryRun = dryRunOf(req);
-    rateGate();
+    rateGate(principal);
     reasonOf(body);
     ifVersionOf(body);
     const next = ruled(() => rules.buildPolicy(body.grants, rules.apiLabel));
@@ -438,10 +468,10 @@ function mountPolicyRoutes(app, fleet, h) {
       const { tenantId, cols } = await loadTenant(req, principal);
       const body = writeBody(req, principal);
       const dryRun = dryRunOf(req);
-      rateGate();
+      rateGate(principal);
       await tenantWrite(req, res, principal, tenantId, cols, body, policy(), `channel_policy_tenant_${verb}`, dryRun);
     }));
   }
 }
 
-module.exports = { mountPolicyRoutes, writeRate };
+module.exports = { mountPolicyRoutes, writeRate, principalWriteRate };
