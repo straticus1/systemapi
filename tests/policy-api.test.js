@@ -896,13 +896,21 @@ test('cli policy: set, show, diff, dangerous refusal and --confirm-dangerous wit
     assert.deepEqual(JSON.parse(diff.out).dangerous, ['package:curl']);
     const refused = await runCli(r, ['policy', 'set', '--host', HOST_A, '--reason', 'x', '--package', 'curl'], key);
     assert.equal(refused.code, 1);
-    assert.match(refused.err, /dangerous_unconfirmed/);
-    const keyConfirm = await runCli(r, ['policy', 'set', '--host', HOST_A, '--reason', 'x', '--package', 'curl', '--confirm-dangerous'], key);
+    assert.match(refused.err, /dangerous: package:curl/);
+    assert.match(refused.err, /dangerous_unconfirmed: rerun with --confirm-dangerous package:curl/);
+    // A bare flag is a usage error; a list that differs is refused.
+    assert.equal((await runCli(r, ['policy', 'set', '--host', HOST_A, '--reason', 'x', '--package', 'curl', '--confirm-dangerous'], key)).code, 2);
+    for (const wrong of ['package:nginx', 'package:curl,package:nginx', 'tweak_unit:x']) {
+      const mismatch = await runCli(r, ['policy', 'set', '--host', HOST_A, '--reason', 'x', '--package', 'curl', '--confirm-dangerous', wrong], key);
+      assert.equal(mismatch.code, 1, wrong);
+      assert.match(mismatch.err, /dangerous_mismatch/);
+    }
+    const keyConfirm = await runCli(r, ['policy', 'set', '--host', HOST_A, '--reason', 'x', '--package', 'curl', '--confirm-dangerous', 'package:curl'], key);
     assert.equal(keyConfirm.code, 1);
     assert.match(keyConfirm.err, /step_up_required: api_key/);
     const tokenFile = require('node:path').join(dir, 'token');
     fs.writeFileSync(tokenFile, await deviceToken(r, nowS()) + '\n', { mode: 0o600 });
-    const ok = await runCli(r, ['policy', 'set', '--host', HOST_A, '--reason', 'x', '--package', 'curl', '--confirm-dangerous'], { SYSTEMAPI_TOKEN_FILE: tokenFile });
+    const ok = await runCli(r, ['policy', 'set', '--host', HOST_A, '--reason', 'x', '--package', 'curl', '--confirm-dangerous', 'package:curl'], { SYSTEMAPI_TOKEN_FILE: tokenFile });
     assert.equal(ok.code, 0, ok.err);
     assert.deepEqual(JSON.parse(ok.out).dangerous, ['package:curl']);
     const revertDry = await runCli(r, ['policy', 'revert', '--host', HOST_A, '--audit-seq', String(applied.audit_seq), '--reason', 'undo'], key);

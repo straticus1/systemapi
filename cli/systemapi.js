@@ -19,8 +19,10 @@
 // policy show|set|diff|clear|inherit|revert drive /api/v1/hosts/<id>/channel-policy
 // (or /api/v1/tenants/<t>/channel-policy with --tenant). Every write first
 // reads the version and asks for a dry run; it applies only without
-// --dry-run, and a dangerous change only with --confirm-dangerous (and a
-// token from login --fresh: the server refuses API keys for those). With no
+// --dry-run, and a dangerous change only once the dry run's list was shown
+// and confirmed: --confirm-dangerous <the exact comma list>, or y at an
+// interactive y/N prompt (and a token from login --fresh: the server refuses
+// API keys for those). With no
 // SYSTEMAPI_API_KEY, policy reads the token from SYSTEMAPI_TOKEN_FILE.
 'use strict';
 
@@ -67,11 +69,11 @@ function usage() {
     '  jobs list [--host <id>] [--status <status>]',
     '  login [--fresh] <username>',
     '  policy show (--host <id> | --tenant <t>)',
-    '  policy set|diff (--host <id> | --tenant <t>) --reason <text> [--dry-run] [--confirm-dangerous] <grant flags>',
+    '  policy set|diff (--host <id> | --tenant <t>) --reason <text> [--dry-run] [--confirm-dangerous <list>] <grant flags>',
     '    grant flags (repeatable): --tcp-local <port> --file-read <dir> --file-write <dir> --service <unit>',
     '      --package <name> --config <dir> --tweak-sysctl <key> --tweak-unit <unit>',
-    '  policy clear|inherit (--host <id> | --tenant <t>) --reason <text> [--dry-run] [--confirm-dangerous]',
-    '  policy revert --host <id> --audit-seq <n> --reason <text> [--apply] [--confirm-dangerous]'
+    '  policy clear|inherit (--host <id> | --tenant <t>) --reason <text> [--dry-run] [--confirm-dangerous <list>]',
+    '  policy revert --host <id> --audit-seq <n> --reason <text> [--apply] [--confirm-dangerous <list>]'
   ].join('\n');
 }
 
@@ -609,11 +611,11 @@ const TENANT_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
 function parsePolicyArgs(argv) {
   const verb = argv[0];
   if (!POLICY_VERBS.has(verb)) fail(2, usage());
-  const opts = { verb, host: '', tenant: '', reason: '', auditSeq: null, dryRun: false, apply: false, confirm: false, grants: {} };
+  const opts = { verb, host: '', tenant: '', reason: '', auditSeq: null, dryRun: false, apply: false, confirm: null, grants: {} };
   for (let i = 1; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === '--dry-run' || arg === '--apply' || arg === '--confirm-dangerous') {
-      const field = arg === '--dry-run' ? 'dryRun' : arg === '--apply' ? 'apply' : 'confirm';
+    if (arg === '--dry-run' || arg === '--apply') {
+      const field = arg === '--dry-run' ? 'dryRun' : 'apply';
       if (opts[field]) fail(2, usage());
       opts[field] = true;
       continue;
@@ -626,6 +628,11 @@ function parsePolicyArgs(argv) {
       const key = POLICY_GRANT_FLAGS.get(arg);
       if (value.length > 4096) fail(2, 'invalid ' + arg);
       (opts.grants[key] = opts.grants[key] || []).push(key === 'tcp_local' && /^[1-9][0-9]{0,4}$/.test(value) ? Number(value) : value);
+    } else if (arg === '--confirm-dangerous') {
+      // The exact list the dry run names, comma separated.
+      if (opts.confirm !== null || value.length > 16 * 1024) fail(2, usage());
+      opts.confirm = value.split(',').map((e) => e.trim()).filter((e) => e !== '');
+      if (opts.confirm.length === 0) fail(2, 'missing value for --confirm-dangerous');
     } else if (arg === '--host' || arg === '--tenant' || arg === '--reason' || arg === '--audit-seq') {
       const field = { '--host': 'host', '--tenant': 'tenant', '--reason': 'reason', '--audit-seq': 'auditSeq' }[arg];
       if (opts[field]) fail(2, usage());
@@ -637,7 +644,7 @@ function parsePolicyArgs(argv) {
   if (Boolean(opts.host) === Boolean(opts.tenant)) fail(2, usage());
   if (opts.tenant && (!TENANT_RE.test(opts.tenant) || verb === 'revert')) fail(2, usage());
   if (verb === 'show') {
-    if (opts.reason || opts.dryRun || opts.apply || opts.confirm || opts.auditSeq) fail(2, usage());
+    if (opts.reason || opts.dryRun || opts.apply || opts.confirm !== null || opts.auditSeq) fail(2, usage());
   } else if (!opts.reason.trim()) {
     fail(2, verb + ' needs --reason');
   }
@@ -666,6 +673,18 @@ function policyConfig() {
   }
   if (token.length < 16 || token.length > 512 || /\s/.test(token)) fail(2, 'token_file_rejected');
   return { url: controlUrl(), key: token };
+}
+
+// One line from the terminal; true only for y or yes.
+async function askYes(question) {
+  const readline = require('node:readline');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    const answer = await new Promise((resolve) => rl.question(question, resolve));
+    return /^(y|yes)$/i.test(String(answer).trim());
+  } finally {
+    rl.close();
+  }
 }
 
 async function policy(argv) {
@@ -697,12 +716,21 @@ async function policy(argv) {
     await emit(JSON.stringify(dry.parsed) + '\n', cfg.key);
     return;
   }
-  if (dry.parsed.dangerous.length > 0) {
-    if (!opts.confirm) {
+  const dangerous = dry.parsed.dangerous;
+  if (dangerous.length > 0) {
+    if (!dangerous.every((e) => typeof e === 'string')) fail(1, 'bad_response');
+    const list = [...dangerous].sort().join(',');
+    await note('dangerous: ' + list, cfg.key);
+    if (opts.confirm !== null) {
+      if ([...new Set(opts.confirm)].sort().join(',') !== list) {
+        await emit(JSON.stringify(dry.parsed) + '\n', cfg.key);
+        fail(1, 'dangerous_mismatch: --confirm-dangerous must name exactly: ' + visible(list, cfg.key));
+      }
+    } else if (!(process.stdin.isTTY && process.stderr.isTTY && (await askYes('apply these dangerous grants? [y/N] ')))) {
       await emit(JSON.stringify(dry.parsed) + '\n', cfg.key);
-      fail(1, 'dangerous_unconfirmed: rerun with --confirm-dangerous (and a login --fresh token)');
+      fail(1, 'dangerous_unconfirmed: rerun with --confirm-dangerous ' + visible(list, cfg.key) + ' (and a login --fresh token)');
     }
-    body.confirm_dangerous = dry.parsed.dangerous;
+    body.confirm_dangerous = dangerous;
   }
   if (opts.verb === 'revert') body.apply = true;
   const done = await request(cfg, method, pathname, body);
