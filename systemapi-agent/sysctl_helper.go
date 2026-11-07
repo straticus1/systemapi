@@ -154,7 +154,7 @@ func sysctlSetViaHelper(key, value string, lease *Lease) error {
 	if err != nil {
 		return fmt.Errorf("sysctl not allowed")
 	}
-	if code := helperPreflight("sys_tweak", payload, lease, time.Now()); code != "" {
+	if code := helperPreflight("sys_tweak", payload, lease, "", time.Now()); code != "" {
 		return fmt.Errorf("sysctl set refused: %s", code)
 	}
 	if err := os.MkdirAll(sysctlHelperStateDir, 0o700); err != nil {
@@ -255,7 +255,7 @@ func doSysctlHelper(reqPath string) sysctlHelperRes {
 	if err != nil {
 		return sysctlHelperRes{Error: "key_denied"}
 	}
-	if code := helperAuthorize("sys_tweak", payload, req.Lease, time.Now()); code != "" {
+	if code := helperAuthorize("sys_tweak", payload, req.Lease, "", time.Now()); code != "" {
 		return sysctlHelperRes{Error: code}
 	}
 	if err := sysctlHelperWrite(path, req.Value); err != nil {

@@ -334,7 +334,7 @@ func processIncomingMessage(out ptyOut, hostID, stateDir string, message []byte)
 			writeCommandResult(out, cmd.RequestID, "script_too_large", "", false)
 			return
 		}
-		if err := authorizeCommand(hostID, "sysscript", cmd.Script, cmd.Lease, time.Now()); err != nil {
+		if _, err := authorizeStart(hostID, "sysscript", cmd.Script, cmd.Lease, cmd.Intent, intentCtx{}, intentClasses("sysscript", "", cmd.Entitlements), "", time.Now()); err != nil {
 			log.Printf("sysscript refused: %s", err.Error())
 			writeCommandResult(out, cmd.RequestID, err.Error(), "", false)
 			return

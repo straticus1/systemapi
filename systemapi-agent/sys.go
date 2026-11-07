@@ -148,6 +148,7 @@ type sysServiceMsg struct {
 	Unit      string `json:"unit"`
 	Action    string `json:"action"`
 	Lease     *Lease `json:"lease"`
+	Intent    string `json:"intent"` // systemapi-intent-v1 text beside a v2 lease
 }
 
 // handleSys dispatches the sys channel frames. It reports whether typ was a
@@ -226,7 +227,7 @@ func (c *channelConn) sysService(ctx context.Context, msg sysServiceMsg, now tim
 		sysResultError(c.out, rid, "lease_required")
 		return
 	}
-	if err := authorizeCommand(c.hostID, "sys_service", payload, msg.Lease, now); err != nil {
+	if _, err := authorizeStart(c.hostID, "sys_service", payload, msg.Lease, msg.Intent, intentCtx{}, intentClasses("sys_service", payload, nil), "", now); err != nil {
 		log.Printf("sys_service refused: %s", err.Error())
 		sysResultError(c.out, rid, "lease_required")
 		return
@@ -270,6 +271,7 @@ type sysPackageMsg struct {
 	Name      string `json:"name"`
 	Action    string `json:"action"`
 	Lease     *Lease `json:"lease"`
+	Intent    string `json:"intent"` // systemapi-intent-v1 text beside a v2 lease
 }
 
 // sysPackageArgv builds the fixed argv for one verb from the host's package
@@ -308,7 +310,7 @@ func (c *channelConn) sysPackage(ctx context.Context, msg sysPackageMsg, now tim
 		sysResultError(c.out, rid, "lease_required")
 		return
 	}
-	if err := authorizeCommand(c.hostID, "sys_package", payload, msg.Lease, now); err != nil {
+	if _, err := authorizeStart(c.hostID, "sys_package", payload, msg.Lease, msg.Intent, intentCtx{}, intentClasses("sys_package", payload, nil), "", now); err != nil {
 		log.Printf("sys_package refused: %s", err.Error())
 		sysResultError(c.out, rid, "lease_required")
 		return
@@ -351,6 +353,7 @@ type sysConfigMsg struct {
 	Target    string `json:"target"`
 	Content   string `json:"content"`
 	Lease     *Lease `json:"lease"`
+	Intent    string `json:"intent"` // systemapi-intent-v1 text beside a v2 lease
 }
 
 // sysConfig reads, writes or reloads one config target. read returns the file
@@ -377,7 +380,7 @@ func (c *channelConn) sysConfig(ctx context.Context, msg sysConfigMsg, now time.
 		sysResultError(c.out, rid, "lease_required")
 		return
 	}
-	if err := authorizeCommand(c.hostID, "sys_config", payload, msg.Lease, now); err != nil {
+	if _, err := authorizeStart(c.hostID, "sys_config", payload, msg.Lease, msg.Intent, intentCtx{}, intentClasses("sys_config", payload, nil), "", now); err != nil {
 		log.Printf("sys_config refused: %s", err.Error())
 		sysResultError(c.out, rid, "lease_required")
 		return
@@ -405,7 +408,7 @@ func (c *channelConn) sysConfig(ctx context.Context, msg sysConfigMsg, now time.
 		// verifies it itself (helper_auth.go). read and reload are NOT helper'd: read
 		// is a read, and reload runs `systemctl reload` over systemd like a
 		// service restart and already works.
-		actErr = configWriteViaHelper(msg.Target, msg.Content, msg.Lease)
+		actErr = configWriteViaHelper(msg.Target, msg.Content, msg.Lease, msg.Intent)
 	case "reload":
 		var out string
 		reloadCtx, cancel := context.WithTimeout(ctx, sysOpTimeout)
@@ -438,6 +441,7 @@ type sysTweakMsg struct {
 	Name      string `json:"name"`
 	Content   string `json:"content"`
 	Lease     *Lease `json:"lease"`
+	Intent    string `json:"intent"` // systemapi-intent-v1 text beside a v2 lease
 }
 
 // sysTweak applies one kernel/service knob: sysctl get/set, a resource limit,
@@ -465,7 +469,7 @@ func (c *channelConn) sysTweak(_ context.Context, msg sysTweakMsg, now time.Time
 		sysResultError(c.out, rid, "lease_required")
 		return
 	}
-	if err := authorizeCommand(c.hostID, "sys_tweak", payload, msg.Lease, now); err != nil {
+	if _, err := authorizeStart(c.hostID, "sys_tweak", payload, msg.Lease, msg.Intent, intentCtx{}, intentClasses("sys_tweak", payload, nil), "", now); err != nil {
 		log.Printf("sys_tweak refused: %s", err.Error())
 		sysResultError(c.out, rid, "lease_required")
 		return

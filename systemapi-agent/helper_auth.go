@@ -106,7 +106,8 @@ var errReplay = errors.New("replay")
 // helperAuthorize returns "" when lease authorizes action+payload on this
 // host and its nonce was not used before (it is consumed now), else a stable
 // error code. The caller rebuilds payload from what it is about to write.
-func helperAuthorize(action, payload string, lease *Lease, now time.Time) string {
+// intentText is the intent beside a v2 lease ("" for v1); see helperLeaseCheck.
+func helperAuthorize(action, payload string, lease *Lease, intentText string, now time.Time) string {
 	if lease == nil {
 		return "lease_missing"
 	}
@@ -114,14 +115,46 @@ func helperAuthorize(action, payload string, lease *Lease, now time.Time) string
 	if err != nil {
 		return "trust_unavailable"
 	}
-	if err := verifyLease(pub, lease, host, action, payload, now); err != nil {
-		return "lease_" + err.Error()
+	if code := helperLeaseCheck(pub, host, action, payload, lease, intentText, now); code != "" {
+		return code
 	}
 	if err := consumeHelperNonce(lease.NonceHex, lease.ExpiresUnix, now); err != nil {
 		if errors.Is(err, errReplay) {
 			return "replay"
 		}
 		return "replay_store"
+	}
+	return ""
+}
+
+// helperLeaseCheck is the lease rule shared by helperAuthorize and
+// helperPreflight (contract 1.6). A v1 lease with no intent is today's
+// check, unless the require-intent pin names the action's class
+// (intent_required). A v2 lease is verifyLeaseV2 plus checkIntentStart with
+// an empty context (helpers are one-shot and know only the host). A damaged
+// pin refuses every approval-class action (intent_pin_unavailable).
+func helperLeaseCheck(pub ed25519.PublicKey, host, action, payload string, lease *Lease, intentText string, now time.Time) string {
+	pinned, err := pinnedFor(intentClasses(action, payload, nil))
+	if err != nil {
+		return err.Error()
+	}
+	if lease.V == 2 {
+		if _, err := verifyLeaseV2(pub, lease, host, action, payload, now); err != nil {
+			return "lease_" + err.Error()
+		}
+		if _, err := checkIntentStart(intentText, lease, intentCtx{}, now); err != nil {
+			return err.Error()
+		}
+		return ""
+	}
+	if intentText != "" {
+		return "intent_unexpected"
+	}
+	if pinned {
+		return "intent_required"
+	}
+	if err := verifyLease(pub, lease, host, action, payload, now); err != nil {
+		return "lease_" + err.Error()
 	}
 	return ""
 }
@@ -154,7 +187,7 @@ const helperDispatchPrefix = "helper:"
 // cannot both pass; that entry is separate from the one authorizeCommand
 // records, so a lease that passed the channel gate still passes here. A
 // restart clears the cache; the helper's durable store still refuses a replay.
-func helperPreflight(action, payload string, lease *Lease, now time.Time) string {
+func helperPreflight(action, payload string, lease *Lease, intentText string, now time.Time) string {
 	if lease == nil {
 		return "lease_missing"
 	}
@@ -165,8 +198,8 @@ func helperPreflight(action, payload string, lease *Lease, now time.Time) string
 	if len(pub) != ed25519.PublicKeySize || host == "" {
 		return "not_enrolled"
 	}
-	if err := verifyLease(pub, lease, host, action, payload, now); err != nil {
-		return "lease_" + err.Error()
+	if code := helperLeaseCheck(pub, host, action, payload, lease, intentText, now); code != "" {
+		return code
 	}
 	if err := rememberNonce(helperDispatchPrefix+lease.NonceHex, now); err != nil {
 		return "replay"

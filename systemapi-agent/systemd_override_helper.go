@@ -230,7 +230,7 @@ func overrideSetViaHelper(req overrideHelperReq) error {
 	if code != "" {
 		return fmt.Errorf("unit override refused: %s", code)
 	}
-	if code := helperPreflight("sys_tweak", payload, req.Lease, time.Now()); code != "" {
+	if code := helperPreflight("sys_tweak", payload, req.Lease, "", time.Now()); code != "" {
 		return fmt.Errorf("unit override refused: %s", code)
 	}
 	if err := os.MkdirAll(overrideHelperStateDir, 0o700); err != nil {
@@ -316,7 +316,7 @@ func doOverrideHelper(reqPath string) overrideHelperRes {
 	if code != "" {
 		return overrideHelperRes{Error: code}
 	}
-	if code := helperAuthorize("sys_tweak", payload, req.Lease, time.Now()); code != "" {
+	if code := helperAuthorize("sys_tweak", payload, req.Lease, "", time.Now()); code != "" {
 		return overrideHelperRes{Error: code}
 	}
 	if err := overrideHelperWrite(path, content); err != nil {
