@@ -65,6 +65,21 @@ test.after(async () => {
   await admin.end();
 });
 
+test('two concurrent enrolls by a member of no tenant into two new tenants: exactly one creates its tenant (member lock)', async () => {
+  const user = `user-race-${crypto.randomBytes(4).toString('hex')}`;
+  const tenants = [`race-a-${crypto.randomBytes(3).toString('hex')}`, `race-b-${crypto.randomBytes(3).toString('hex')}`];
+  const results = await Promise.allSettled(tenants.map((tenantId, i) => registry.enroll({
+    tenantId, userId: user, keyId: `k-race-${i}`, hostId: crypto.randomUUID(), hostname: `race${i}.example`,
+    os: '', platform: '', sshPubkey: opensshEd25519(40 + i)
+  })));
+  assert.equal(results.filter((r) => r.status === 'fulfilled').length, 1, JSON.stringify(results.map((r) => r.status)));
+  const refused = results.find((r) => r.status === 'rejected');
+  assert.equal(refused.reason.status, 403);
+  assert.equal(refused.reason.message, 'tenant_create_denied');
+  const members = await pool.query('SELECT tenant_id FROM cp_members WHERE user_id = $1', [user]);
+  assert.equal(members.rowCount, 1);
+});
+
 test('a re-enroll with the same key and host id but another SSH key is refused and the row is unchanged', async () => {
   const pub = opensshEd25519(3);
   const base = { tenantId: 'acme', userId: 'user-1', keyId: 'k1', hostId: HOST_A, os: 'linux', platform: 'amd64' };

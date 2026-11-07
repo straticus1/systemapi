@@ -97,7 +97,7 @@ const DRIFT_CLAIM_LOCK_KEY = 3;
 const STATE_LOCK_NS = 0x53544154;
 // The per-member lock (namespace 'MEMB', key hashtext(user_id)): every write
 // that changes which tenants a member id belongs to (addMember, createTenant,
-// bootstrapAdmin) and every check that authorizes on that set inside a write
+// bootstrapAdmin, enroll) and every check that authorizes on that set inside a write
 // (revokeKeyAudited, setScopesAudited) take it, so the set cannot change between the check and
 // the write. Taken before the audit chain lock.
 const MEMBER_LOCK_NS = 0x4d454d42;
@@ -2562,6 +2562,9 @@ class PgRegistry {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+      // Under the member lock: the first-tenant check below and the member
+      // insert must not race another write to this member's tenant set.
+      await memberLockInTx(client, userId);
       const mem = await client.query('SELECT tenant_id FROM cp_members WHERE user_id = $1', [userId]);
       const ins = await client.query(
         `INSERT INTO cp_tenants (tenant_id, display_name, owner_user_id)
