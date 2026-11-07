@@ -25,6 +25,11 @@ test('blockedAddress: loopback, private, CGNAT, link-local, metadata, ULA and IP
   // allowPrivate admits loopback and private ranges only: link-local (metadata) and the rest stay blocked.
   for (const a of ['127.0.0.1', '10.0.0.5', '192.168.1.1', '::1', 'fd00::1']) assert.equal(egress.blockedAddress(a, { allowPrivate: true }), false, a);
   for (const a of ['169.254.169.254', 'fe80::1', '0.0.0.0', '::', '::ffff:127.0.0.1', '224.0.0.1']) assert.equal(egress.blockedAddress(a, { allowPrivate: true }), true, a);
+  // IPv4-translated (::ffff:0:a.b.c.d, RFC 2765 SIIT) embeds IPv4 too: blocked always.
+  for (const a of ['::ffff:0:7f00:1', '::ffff:0:a00:1', '::ffff:0:a9fe:a9fe', '::ffff:0:808:808', '::ffff:0:127.0.0.1']) {
+    assert.equal(egress.blockedAddress(a), true, a);
+    assert.equal(egress.blockedAddress(a, { allowPrivate: true }), true, a);
+  }
 });
 
 test('targetURL: only paths on the base origin; IP-literal bases in blocked ranges are 403', () => {

@@ -47,7 +47,7 @@ for (const [addr, prefix] of [['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0',
 ALWAYS_V6.addAddress('::', 'ipv6');
 ALWAYS_V6.addRange('::2', '::ffff:ffff', 'ipv6'); // IPv4-compatible (::a.b.c.d)
 for (const [addr, prefix] of [
-  ['::ffff:0:0', 96], ['64:ff9b::', 96], ['64:ff9b:1::', 48], ['100::', 64], ['2001::', 32], ['2001:db8::', 32],
+  ['::ffff:0:0', 96], ['::ffff:0:0:0', 96], ['64:ff9b::', 96], ['64:ff9b:1::', 48], ['100::', 64], ['2001::', 32], ['2001:db8::', 32],
   ['2002::', 16], ['fe80::', 10], ['fec0::', 10], ['ff00::', 8]
 ]) ALWAYS_V6.addSubnet(addr, prefix, 'ipv6');
 PRIVATE_V6.addAddress('::1', 'ipv6');
