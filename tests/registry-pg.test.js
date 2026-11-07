@@ -200,10 +200,27 @@ test('policy API writes (P2): if_version under the row lock, the tenant twin wit
   assert.equal((await registry.verifyAudit()).ok, true);
 });
 
+test('step-up device flow on PostgreSQL: a fresh code keeps the approver auth_time and copies it onto the token', async () => {
+  const oauth = require('../controlplane/oauth');
+  await registry.enroll({ tenantId: 'pgauth', userId: 'user-auth', keyId: 'ka', hostId: 'a3a3a3a3-a3a3-4a3a-8a3a-a3a3a3a3a3a3', hostname: 'a.example', os: '', platform: '', sshPubkey: opensshEd25519(7) });
+  await pool.query("UPDATE cp_members SET sso_sub = 'sub-auth' WHERE user_id = 'user-auth'");
+  const env = { NODE_ENV: 'test', SYSTEMAPI_PUBLIC_URL: 'https://api.systemapi.test' };
+  const at = Math.floor(Date.now() / 1000) - 3;
+  const fresh = await oauth.startDevice(registry, 'user-auth', env, {}, Date.now(), { fresh: true });
+  await assert.rejects(oauth.approveUserCode(registry, fresh.user_code, { id: 'sub-auth', auth_time: at - 600 }), (err) => err.code === 'reauth_required');
+  await oauth.approveUserCode(registry, fresh.user_code, { id: 'sub-auth', auth_time: at });
+  const token = await oauth.pollToken(registry, fresh.device_code, env);
+  assert.equal((await oauth.userForAccessToken(registry, token.access_token)).auth_time, at);
+  const plain = await oauth.startDevice(registry, 'user-auth', env, {});
+  await oauth.approveUserCode(registry, plain.user_code, { id: 'sub-auth', auth_time: at });
+  const plainToken = await oauth.pollToken(registry, plain.device_code, env);
+  assert.equal((await oauth.userForAccessToken(registry, plainToken.access_token)).auth_time, null);
+});
+
 test('policy API host writes: tenantVersion checked under FOR SHARE (a tenant write in flight is waited for), retired is 409', async () => {
   const { policyVersion, clearPolicy, inheritPolicy } = require('../controlplane/policyrules');
-  const HOST_S = 'a3a3a3a3-a3a3-4a3a-8a3a-a3a3a3a3a3a3';
-  await registry.enroll({ tenantId: 'pgshare', userId: 'user-share', keyId: 'ks', hostId: HOST_S, hostname: 's.example', os: '', platform: '', sshPubkey: opensshEd25519(7) });
+  const HOST_S = 'a4a4a4a4-a4a4-4a4a-8a4a-a4a4a4a4a4a4';
+  await registry.enroll({ tenantId: 'pgshare', userId: 'user-share', keyId: 'ks', hostId: HOST_S, hostname: 's.example', os: '', platform: '', sshPubkey: opensshEd25519(14) });
   const named = (cols) => ({ tcpPolicy: cols.tcp_policy, filePolicy: cols.file_policy, servicePolicy: cols.service_policy, packagePolicy: cols.package_policy, configPolicy: cols.config_policy, tweakPolicy: cols.tweak_policy });
   const t0 = policyVersion(await registry.tenantChannelPolicies('pgshare'));
   const write = (tenantVersion) => registry.setHostChannelPolicyAudited({ tenantId: 'pgshare', hostId: HOST_S, ...named(clearPolicy()), actor: 'x', action: 'channel_policy_clear', reason: 'pg', ifVersion: undefined, tenantVersion, extra: { policy_schema: 2 } });
@@ -280,7 +297,8 @@ test('retireHost stamps retired_at with its host_retired row, or neither; a reti
   const base = { tenantId: 'acme', userId: 'user-1', keyId: 'k1', os: '', platform: '' };
   await registry.enroll({ ...base, hostId: OLD, hostname: 'r.example', sshPubkey: opensshEd25519(6) });
   await registry.enroll({ ...base, hostId: NEW, hostname: 'r.example', sshPubkey: opensshEd25519(7) });
-  const retiredRows = async () => (await pool.query("SELECT count(*)::int AS n FROM cp_audit WHERE action = 'host_retired'")).rows[0].n;
+  // Only this test's hosts: other tests retire hosts of their own.
+  const retiredRows = async () => (await pool.query("SELECT count(*)::int AS n FROM cp_audit WHERE action = 'host_retired' AND host_id = ANY($1::text[])", [[OLD, NEW]])).rows[0].n;
 
   await assert.rejects(registry.retireHost({ tenantId: 'other', hostId: OLD, actor: 'u', reason: 'x' }), (err) => err.status === 404);
   await assert.rejects(registry.retireHost({ tenantId: 'acme', hostId: OLD, actor: 'u', reason: ' ' }), (err) => err.code === 'reason_required');
@@ -301,7 +319,7 @@ test('retireHost stamps retired_at with its host_retired row, or neither; a reti
   assert.ok(row.retired_at instanceof Date);
   assert.equal(row.status, 'offline');
   assert.equal(await retiredRows(), 1);
-  const audit = (await pool.query("SELECT tenant_id, host_id, actor, payload FROM cp_audit WHERE action = 'host_retired'")).rows[0];
+  const audit = (await pool.query("SELECT tenant_id, host_id, actor, payload FROM cp_audit WHERE action = 'host_retired' AND host_id = $1", [OLD])).rows[0];
   assert.match(audit.payload.last_seen_at, /^\d{4}-\d\d-\d\dT[\d:.]+Z$/);
   assert.deepEqual({ ...audit, payload: { ...audit.payload, last_seen_at: 'x' } },
     { tenant_id: 'acme', host_id: OLD, actor: 'user-1', payload: { reason: 're-enrolled', hostname: 'r.example', forced: false, last_seen_at: 'x' } });
@@ -726,6 +744,12 @@ test('jobs: two FleetManagers on one database: submit on one, the agent on the o
     await regOne.setScopes(`ko${tag}`, ['exec:run', 'hosts:read']);
     const a = await connectAgent(two, hostId, { tenant, key: 'pg-agent' });
     assert.ok(a.frames.some((f) => f.type === 'enrolled'));
+    // enrolled goes out before the presence row is written: wait for it.
+    await waitUntil('presence on two', async () => {
+      const row = await regOne.hostAgent(hostId);
+      return row && row.instance === two.fm.jobs.instanceId && row.caps.length > 0
+        && row.conn_id === two.fm.jobs.connIds.get(two.fm.connectedAgents.get(hostId));
+    }, 8000);
     const agentRow = await regOne.hostAgent(hostId);
     assert.equal(agentRow.instance, two.fm.jobs.instanceId);
     assert.equal(agentRow.conn_id, two.fm.jobs.connIds.get(two.fm.connectedAgents.get(hostId)));
@@ -1880,21 +1904,4 @@ test('audit checkpoints: one per interval across replicas, the head read under t
       [fresh.seq, JSON.stringify(original.payload), original.row_hash]);
   }
   assert.equal((await registry.verifyAudit()).ok, true);
-});
-
-test('step-up device flow on PostgreSQL: a fresh code keeps the approver auth_time and copies it onto the token', async () => {
-  const oauth = require('../controlplane/oauth');
-  await registry.enroll({ tenantId: 'pgauth', userId: 'user-auth', keyId: 'ka', hostId: 'a3a3a3a3-a3a3-4a3a-8a3a-a3a3a3a3a3a3', hostname: 'a.example', os: '', platform: '', sshPubkey: opensshEd25519(7) });
-  await pool.query("UPDATE cp_members SET sso_sub = 'sub-auth' WHERE user_id = 'user-auth'");
-  const env = { NODE_ENV: 'test', SYSTEMAPI_PUBLIC_URL: 'https://api.systemapi.test' };
-  const at = Math.floor(Date.now() / 1000) - 3;
-  const fresh = await oauth.startDevice(registry, 'user-auth', env, {}, Date.now(), { fresh: true });
-  await assert.rejects(oauth.approveUserCode(registry, fresh.user_code, { id: 'sub-auth', auth_time: at - 600 }), (err) => err.code === 'reauth_required');
-  await oauth.approveUserCode(registry, fresh.user_code, { id: 'sub-auth', auth_time: at });
-  const token = await oauth.pollToken(registry, fresh.device_code, env);
-  assert.equal((await oauth.userForAccessToken(registry, token.access_token)).auth_time, at);
-  const plain = await oauth.startDevice(registry, 'user-auth', env, {});
-  await oauth.approveUserCode(registry, plain.user_code, { id: 'sub-auth', auth_time: at });
-  const plainToken = await oauth.pollToken(registry, plain.device_code, env);
-  assert.equal((await oauth.userForAccessToken(registry, plainToken.access_token)).auth_time, null);
 });
