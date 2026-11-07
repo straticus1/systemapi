@@ -200,6 +200,9 @@ function sendJSON(ws, obj) {
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
 }
 
+// Policy-triggered renewals in flight at once (renewPolicySessions).
+const POLICY_RENEW_CONCURRENCY = 8;
+
 class FleetManager {
     constructor(server, db, apiSite = 'systemapi', prometheusMetrics = null) {
         this.wss = new WebSocket.Server({ noServer: true, maxPayload: AGENT_FRAME_MAX });
@@ -1243,18 +1246,30 @@ class FleetManager {
     // cross-replica fan-out (LISTEN/NOTIFY, as jobs) waits for a second
     // replica. Resolves to {renewed, ended}: sessions that got a new lease
     // (or passed), and sessions ended.
+    // At most POLICY_RENEW_CONCURRENCY at a time: a big tenant write must not
+    // drain the database pool, or healthy sessions would fail their lookup
+    // and end under the fail-closed rule.
     async renewPolicySessions(match) {
         const list = this.policySessions(match);
-        const results = await Promise.all(list.map(([kind, s]) => {
-            const run = kind === 'tcp' ? this.tcp.renew(s, { policy: true })
-                : kind === 'file' ? this.file.renew(s, { policy: true })
-                    : kind === 'xfer' ? this.xfer.renew(s, { policy: true })
-                        : this.mesh.recheck(s, { policy: true });
-            return run.catch((err) => {
-                console.error(`[Fleet] ${kind} policy renewal failed:`, err.code || 'renew_failed');
-                return 'failed';
-            });
-        }));
+        const results = new Array(list.length);
+        let next = 0;
+        const worker = async () => {
+            while (next < list.length) {
+                const i = next++;
+                const [kind, s] = list[i];
+                try {
+                    results[i] = await (kind === 'tcp' ? this.tcp.renew(s, { policy: true })
+                        : kind === 'file' ? this.file.renew(s, { policy: true })
+                            : kind === 'xfer' ? this.xfer.renew(s, { policy: true })
+                                : this.mesh.recheck(s, { policy: true }));
+                } catch (err) {
+                    console.error(`[Fleet] ${kind} policy renewal failed:`, err.code || 'renew_failed');
+                    results[i] = 'failed';
+                }
+            }
+        };
+        const width = Math.min(POLICY_RENEW_CONCURRENCY, list.length);
+        await Promise.all(Array.from({ length: width }, worker));
         return {
             renewed: results.filter((r) => r === 'renewed').length,
             ended: results.filter((r) => r === 'ended').length

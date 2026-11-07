@@ -821,6 +821,38 @@ test('a failed lookup ends a session on a policy renewal (fail closed) but only 
   }
 });
 
+test('policy renewals run at most 8 at a time and every session is processed', async () => {
+  const r = await rig();
+  try {
+    const fm = r.fm;
+    const list = Array.from({ length: 21 }, (_, i) => [['tcp', 'file', 'xfer', 'mesh'][i % 4], { id: i }]);
+    fm.policySessions = () => list;
+    let inFlight = 0;
+    let peak = 0;
+    const seen = new Set();
+    const fake = async (s) => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      inFlight -= 1;
+      seen.add(s.id);
+      if (s.id === 3) throw Object.assign(new Error('x'), { code: 'boom' });
+      return s.id % 2 ? 'ended' : 'renewed';
+    };
+    fm.tcp.renew = fake;
+    fm.file.renew = fake;
+    fm.xfer.renew = fake;
+    fm.mesh.recheck = fake;
+    const counts = await fm.renewPolicySessions(() => true);
+    assert.equal(seen.size, 21);
+    assert.equal(peak, 8);
+    // ids 0..20: 11 even (renewed), 10 odd of which id 3 failed.
+    assert.deepEqual(counts, { renewed: 11, ended: 9 });
+  } finally {
+    await r.close();
+  }
+});
+
 test('step-up device flow: a fresh code needs a fresh SSO session, never Google/GitHub, and its token carries auth_time', async () => {
   const r = await rig();
   try {

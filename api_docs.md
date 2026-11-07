@@ -261,7 +261,7 @@ carries `policy_schema: 2`, all six previous and new kinds, the reason, the
 actor (member id), `via` (`key`, `token`, `session`), `key_fp` (sha256 of
 the key id, or null), `dangerous`, and `revert_of` for a revert. Then every
 live tcp, mesh, file and xfer session on the affected hosts (this replica)
-is renewed at once, and the answer waits for it: one the policy no longer
+is renewed at once (at most 8 at a time), and the answer waits for it: one the policy no longer
 allows ends with `stopped` (audited by its own end row) instead of at its
 next 30 s renewal. A renewal already in flight when the write lands runs
 again after it, against the new policy. On this renewal a failed lookup
