@@ -595,6 +595,15 @@ func (m *xferManager) grant(c *channelConn, msg xferMsg, now time.Time) {
 		refuse("lease_required", err.Error())
 		return
 	}
+	var intentMaxDeadline int64
+	if intentSHA != "" {
+		f, perr := parseIntent(msg.Intent)
+		if perr != nil {
+			refuse("lease_required", perr.Error())
+			return
+		}
+		intentMaxDeadline = f.MaxSessionDeadline
+	}
 	// Unsigned fields must agree with the signed ones.
 	wantPurpose := "xfer:" + msg.Dir
 	if msg.Action == "xfer_root" {
@@ -638,7 +647,7 @@ func (m *xferManager) grant(c *channelConn, msg xferMsg, now time.Time) {
 	}
 	x := &xferChild{
 		m: m, out: c.out, hostID: c.hostID, grantID: gid, transferID: msg.TransferID, action: msg.Action,
-		lease: fields, intentSHA: intentSHA, listenMode: listenMode, deadline: msg.DeadlineUnix, leaseExp: leaseExp,
+		lease: fields, intentSHA: intentSHA, intentMax: intentMaxDeadline, listenMode: listenMode, deadline: msg.DeadlineUnix, leaseExp: leaseExp,
 		byteCap: msg.ByteCap, done: make(chan struct{}), advertise: cfg.advertise,
 		ctlq: make(chan []byte, xferCtlQueue), ctlStop: make(chan struct{}),
 		watchEvery: xferWatchEvery, progressEvery: xferProgressEvery, cancelGrace: xferCancelGrace, termGrace: xferTermGrace,
@@ -721,6 +730,9 @@ func (m *xferManager) renew(msg xferMsg, now time.Time) error {
 	if msg.DeadlineUnix < cur {
 		return errors.New("deadline_backwards")
 	}
+	if x.intentSHA != "" && msg.DeadlineUnix > x.intentMax {
+		return errors.New("intent_deadline")
+	}
 	fields.Phase, fields.DeadlineUnix = "renew", msg.DeadlineUnix
 	payload, err := xferLeasePayload(fields)
 	if err != nil {
@@ -757,6 +769,7 @@ type xferChild struct {
 	transferID string
 	action     string
 	intentSHA  string // the intent hash of a v2 start; renewals must carry it
+	intentMax  int64  // the intent's max_session_deadline_unix; renewals never pass it
 	listenMode bool
 	port       uint16
 	byteCap    int64

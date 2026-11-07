@@ -76,26 +76,38 @@ func TestXferRootIntentRenew(t *testing.T) {
 		IdleS: 10, MaxS: 60, ByteCap: 1, Profile: "internet", Transport: "udp", Peer: "listen", Material: strings.Repeat("b", 64),
 	}
 	sha := sha256Hex("intent")
-	x := &xferChild{m: m, hostID: ptyTestHost, grantID: fields.GrantID, action: "xfer_root", intentSHA: sha, lease: fields,
+	x := &xferChild{m: m, hostID: ptyTestHost, grantID: fields.GrantID, action: "xfer_root", intentSHA: sha, intentMax: dl, lease: fields,
 		deadline: dl, ctlq: make(chan []byte, 8), ctlStop: make(chan struct{}), done: make(chan struct{})}
 	m.mu.Lock()
 	m.live[x.grantID] = x
 	m.mu.Unlock()
-	next := dl + 30
-	rf := fields
-	rf.Phase, rf.DeadlineUnix = "renew", next
-	renew, err := xferLeasePayload(rf)
-	if err != nil {
-		t.Fatal(err)
+	renewTo := func(d int64) string {
+		rf := fields
+		rf.Phase, rf.DeadlineUnix = "renew", d
+		p, err := xferLeasePayload(rf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
 	}
-	msg := func(l *Lease) xferMsg { return xferMsg{GrantID: x.grantID, DeadlineUnix: next, Lease: l} }
-	wantErr(t, "xfer N22", m.renew(msg(signLease(t, ih.priv, ptyTestHost, "xfer_root", renew, inFuture(time.Minute))), time.Now()), "intent_required")
-	wantErr(t, "xfer N21", m.renew(msg(signLeaseV2(t, ih.priv, ptyTestHost, "xfer_root", renew, sha256Hex("x"), inFuture(time.Minute))), time.Now()), "intent_mismatch")
-	if err := m.renew(msg(signLeaseV2(t, ih.priv, ptyTestHost, "xfer_root", renew, sha, inFuture(time.Minute))), time.Now()); err != nil {
-		t.Fatalf("xfer v2 renew: %v", err)
+	msg := func(d int64, l *Lease) xferMsg { return xferMsg{GrantID: x.grantID, DeadlineUnix: d, Lease: l} }
+	// A renew past the intent's max_session_deadline is refused, even with
+	// a correctly signed v2 lease carrying the right intent hash.
+	later := renewTo(dl + 30)
+	wantErr(t, "xfer past intent deadline", m.renew(msg(dl+30, signLeaseV2(t, ih.priv, ptyTestHost, "xfer_root", later, sha, inFuture(time.Minute))), time.Now()), "intent_deadline")
+	at := renewTo(dl)
+	wantErr(t, "xfer N22", m.renew(msg(dl, signLease(t, ih.priv, ptyTestHost, "xfer_root", at, inFuture(time.Minute))), time.Now()), "intent_required")
+	wantErr(t, "xfer N21", m.renew(msg(dl, signLeaseV2(t, ih.priv, ptyTestHost, "xfer_root", at, sha256Hex("x"), inFuture(time.Minute))), time.Now()), "intent_mismatch")
+	if err := m.renew(msg(dl, signLeaseV2(t, ih.priv, ptyTestHost, "xfer_root", at, sha, inFuture(time.Minute))), time.Now()); err != nil {
+		t.Fatalf("xfer v2 renew at the intent deadline: %v", err)
 	}
-	x.intentSHA = ""
-	wantErr(t, "xfer N23", m.renew(msg(signLeaseV2(t, ih.priv, ptyTestHost, "xfer_root", renew, sha, inFuture(time.Minute))), time.Now()), "intent_unexpected")
+	// Without an intent the old forward-moving renew rules apply.
+	x.intentSHA, x.intentMax = "", 0
+	wantErr(t, "xfer N23", m.renew(msg(dl+30, signLeaseV2(t, ih.priv, ptyTestHost, "xfer_root", later, sha, inFuture(time.Minute))), time.Now()), "intent_unexpected")
 	// The pin refuses a v1 renew of a root transfer with no intent.
-	wantErr(t, "xfer pinned v1", m.renew(msg(signLease(t, ih.priv, ptyTestHost, "xfer_root", renew, inFuture(time.Minute))), time.Now()), "intent_required")
+	wantErr(t, "xfer pinned v1", m.renew(msg(dl+30, signLease(t, ih.priv, ptyTestHost, "xfer_root", later, inFuture(time.Minute))), time.Now()), "intent_required")
+	withRequireIntent(t, "")
+	if err := m.renew(msg(dl+30, signLease(t, ih.priv, ptyTestHost, "xfer_root", later, inFuture(time.Minute))), time.Now()); err != nil {
+		t.Fatalf("unpinned v1 renew forward: %v", err)
+	}
 }
