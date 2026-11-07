@@ -60,7 +60,8 @@ function assertWebhookURL(raw, env) {
   if (prod && url.protocol !== 'https:') {
     throw Object.assign(new Error('https_required'), { status: 400 });
   }
-  const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  // A trailing dot names the same host (localhost., metadata.google.internal.).
+  const host = url.hostname.replace(/^\[|\]$/g, '').replace(/\.$/, '').toLowerCase();
   if (host === 'metadata.google.internal' || host.endsWith('.internal')) throw blocked();
   if (!allowPrivate(env) && (host === 'localhost' || host.endsWith('.localhost'))) throw blocked();
   if (net.isIP(host) && egress.blockedAddress(host, { allowPrivate: allowPrivate(env) })) throw blocked();

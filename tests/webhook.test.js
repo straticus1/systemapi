@@ -36,6 +36,19 @@ test('create time: 127.0.0.1, 169.254.169.254, 10.x, [::1] and names resolving t
   assert.equal((await resolveWebhookURL('https://hooks.example/in', PROD, answer('93.184.215.14'))).hostname, 'hooks.example');
 });
 
+test('a trailing dot does not get a name past the checks (localhost., metadata.google.internal., .internal.)', () => {
+  for (const env of [PROD, {}]) {
+    for (const u of ['https://localhost./h', 'https://LOCALHOST./h', 'https://a.localhost./h']) {
+      assert.throws(() => assertWebhookURL(u, env), /blocked_url/, u);
+    }
+  }
+  for (const env of [PROD, DEV, {}]) {
+    for (const u of ['https://metadata.google.internal./computeMetadata/v1/', 'https://Metadata.Google.Internal./x', 'https://svc.internal./x']) {
+      assert.throws(() => assertWebhookURL(u, env), /blocked_url/, u);
+    }
+  }
+});
+
 test('private targets are opt-in: refused with the flag unset (NODE_ENV unset or test) and in production even with it', async () => {
   for (const env of [{}, { NODE_ENV: 'test' }, { NODE_ENV: 'production', SYSTEMAPI_WEBHOOK_ALLOW_PRIVATE: '1' },
     { SYSTEMAPI_WEBHOOK_ALLOW_PRIVATE: 'true' }]) {
