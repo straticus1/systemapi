@@ -353,7 +353,7 @@ function createPlaygroundRouter(config) {
       try {
         // Verify ownership
         const checkResult = await client.query(`
-          SELECT user_id FROM playground_api_keys
+          SELECT user_id, tenant_id FROM playground_api_keys
           WHERE key_id = $1 AND api_site = $2
         `, [keyId, apiSite]);
 
@@ -363,6 +363,12 @@ function createPlaygroundRouter(config) {
 
         if (checkResult.rows[0].user_id !== req.userId) {
           return res.status(403).json({ error: 'Forbidden', message: 'You do not own this API key' });
+        }
+
+        // A tenant-bound key manages only keys bound to its own tenant: not
+        // the owner's unbound keys or keys of the owner's other tenants.
+        if (req.authKind === 'api_key' && req.apiKeyTenantId && checkResult.rows[0].tenant_id !== req.apiKeyTenantId) {
+          return res.status(403).json({ error: 'key_tenant_mismatch' });
         }
 
         // Soft delete (set is_active = false)
@@ -403,7 +409,7 @@ function createPlaygroundRouter(config) {
       try {
         // Verify ownership
         const checkResult = await client.query(`
-          SELECT user_id FROM playground_api_keys
+          SELECT user_id, tenant_id FROM playground_api_keys
           WHERE key_id = $1 AND api_site = $2
         `, [keyId, apiSite]);
 
@@ -413,6 +419,12 @@ function createPlaygroundRouter(config) {
 
         if (checkResult.rows[0].user_id !== req.userId) {
           return res.status(403).json({ error: 'Forbidden', message: 'You do not own this API key' });
+        }
+
+        // A tenant-bound key manages only keys bound to its own tenant: not
+        // the owner's unbound keys or keys of the owner's other tenants.
+        if (req.authKind === 'api_key' && req.apiKeyTenantId && checkResult.rows[0].tenant_id !== req.apiKeyTenantId) {
+          return res.status(403).json({ error: 'key_tenant_mismatch' });
         }
 
         // Update lock status

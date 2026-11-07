@@ -262,8 +262,8 @@ function keysPool() {
       const r = rows.filter((k) => k.key_id === params[0] && k.api_site === params[1] && k.is_active && !k.is_locked);
       return { rows: r, rowCount: r.length };
     }
-    if (q.startsWith('SELECT user_id FROM playground_api_keys WHERE key_id = $1 AND api_site = $2')) {
-      const r = rows.filter((k) => k.key_id === params[0] && k.api_site === params[1]);
+    if (q.startsWith('SELECT user_id, tenant_id FROM playground_api_keys WHERE key_id = $1 AND api_site = $2')) {
+      const r = rows.filter((k) => k.key_id === params[0] && k.api_site === params[1]).map((k) => ({ user_id: k.user_id, tenant_id: k.tenant_id ?? null }));
       return { rows: r, rowCount: r.length };
     }
     if (q.includes('FROM playground_api_keys WHERE user_id = $1 AND api_site = $2')) {
@@ -417,6 +417,65 @@ test('POST /api-keys with an API key: the new key is bound to the caller key\'s 
     assert.equal((await mint(none, { name: 'z' })).status, 400);
     assert.equal(pool.rows.filter((k) => k.tenant_id == null && !['ak_live_multikey00000', 'ak_live_singlekey0000', 'ak_live_nomemberkey00'].includes(k.key_id)).length, 0,
       'no unbound key was minted for a key caller');
+  } finally {
+    server.close();
+  }
+});
+
+// Threats: a tenant-bound key (an agent key) deleting, locking or unlocking
+// the owner's keys bound to another tenant or unbound (e.g. unlocking a key an
+// admin locked). Same tenant only; unbound key callers keep owner rules.
+test('DELETE and PATCH lock /api-keys/:keyId with a tenant-bound key: only keys bound to the same tenant', async () => {
+  const pool = keysPool();
+  const addKey = async (keyId, userId, tenantId, extra = {}) => {
+    const secret = `${keyId}.${keyId}secret`;
+    pool.rows.push({ key_id: keyId, key_hash: await bcrypt.hash(secret, 4), user_id: userId, name: keyId, api_site: 'systemapi',
+      tenant_id: tenantId, is_active: true, is_locked: false, created_at: new Date(), ...extra });
+    return secret;
+  };
+  const bound = await addKey('ak_live_boundacme0000', 'agent-1', 'acme');
+  await addKey('ak_live_siblingacme00', 'agent-1', 'acme');
+  await addKey('ak_live_siblingbeta00', 'agent-1', 'beta');
+  await addKey('ak_live_unboundsib000', 'agent-1', null, { is_locked: true });
+  const unbound = await addKey('ak_live_unboundcall00', 'agent-1', null);
+  pool.members.push({ tenant_id: 'acme', user_id: 'agent-1' }, { tenant_id: 'beta', user_id: 'agent-1' });
+
+  const revoked = [];
+  const app = express();
+  app.use(express.json());
+  app.use('/playground', createPlaygroundRouter({ db: pool, redis: null, keycloakURL: 'https://unused.test', keycloakRealm: 'unused', keycloakClientID: 'systemapi-client', apiSite: 'systemapi', baseURL: 'http://127.0.0.1',
+    onKeyRevoked: async (keyId) => { revoked.push(keyId); } }));
+  const server = await new Promise((resolve) => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
+  const base = `http://127.0.0.1:${server.address().port}/playground`;
+  const call = (secret, method, path, body) => fetch(`${base}${path}`, { method, headers: { 'x-api-key': secret, 'content-type': 'application/json' }, body: body && JSON.stringify(body) })
+    .then(async (res) => ({ status: res.status, body: await res.json() }));
+  const row = (keyId) => pool.rows.find((k) => k.key_id === keyId);
+  try {
+    for (const target of ['ak_live_siblingbeta00', 'ak_live_unboundsib000']) {
+      const del = await call(bound, 'DELETE', `/api-keys/${target}`);
+      assert.equal(del.status, 403, target);
+      assert.equal(del.body.error, 'key_tenant_mismatch');
+      for (const locked of [true, false]) {
+        const lock = await call(bound, 'PATCH', `/api-keys/${target}/lock`, { locked });
+        assert.equal(lock.status, 403, `${target} ${locked}`);
+        assert.equal(lock.body.error, 'key_tenant_mismatch');
+      }
+    }
+    assert.equal(row('ak_live_siblingbeta00').is_active, true);
+    assert.equal(row('ak_live_siblingbeta00').is_locked, false);
+    assert.equal(row('ak_live_unboundsib000').is_active, true);
+    assert.equal(row('ak_live_unboundsib000').is_locked, true, 'a bound key cannot unlock an unbound key');
+    assert.deepEqual(revoked, [], 'refusals close nothing');
+
+    // Same tenant: allowed.
+    assert.equal((await call(bound, 'PATCH', '/api-keys/ak_live_siblingacme00/lock', { locked: true })).status, 200);
+    assert.equal(row('ak_live_siblingacme00').is_locked, true);
+    assert.equal((await call(bound, 'DELETE', '/api-keys/ak_live_siblingacme00')).status, 200);
+    assert.equal(row('ak_live_siblingacme00').is_active, false);
+
+    // An unbound key of the same owner keeps the owner rule.
+    assert.equal((await call(unbound, 'PATCH', '/api-keys/ak_live_siblingbeta00/lock', { locked: true })).status, 200);
+    assert.equal(row('ak_live_siblingbeta00').is_locked, true);
   } finally {
     server.close();
   }
