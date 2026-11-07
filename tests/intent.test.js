@@ -124,18 +124,43 @@ test('mintIntentStartLease binds the intent, refuses a mismatched payload and a 
   assert.equal(code(() => I.mintIntentStartLease(null, { intentText: v.intent, action: v.action, payload: v.payload, now })), 'signer_unavailable');
 });
 
-test('mintIntentRenewLease signs only renew payloads with the stored intent hash, no use_by', () => {
+test('mintIntentRenewLease signs only renew payloads of the stored intent, no use_by, never past its deadline', () => {
   const v = vec.vectors[0];
+  const host = vec.host_id;
   // N20 (CP side): a renew after use_by is still minted.
   const now = (v.fields.use_by_unix + 600) * 1000;
-  const l = I.mintIntentRenewLease(signer, { hostId: vec.host_id, action: v.action, payload: v.renew.payload, intentSha256: v.intent_sha256, now });
+  const l = I.mintIntentRenewLease(signer, { hostId: host, action: v.action, payload: v.renew.payload, intentText: v.intent, now });
   assert.equal(l.v, 2);
   assert.equal(l.intent_sha256, v.intent_sha256);
   assert.equal(L.verifyLeaseV2(pub, l, v.renew.payload, now).ok, true);
-  assert.equal(code(() => I.mintIntentRenewLease(signer, { hostId: vec.host_id, action: v.action, payload: v.payload, intentSha256: v.intent_sha256, now })), 'bad_phase');
-  assert.equal(code(() => I.mintIntentRenewLease(signer, { hostId: vec.host_id, action: v.action, payload: v.renew.payload, intentSha256: '', now })), 'intent_required');
-  assert.equal(code(() => I.mintIntentRenewLease(signer, { hostId: vec.host_id, action: 'sys_config', payload: v.renew.payload, intentSha256: v.intent_sha256, now })), 'bad_action');
+  assert.equal(code(() => I.mintIntentRenewLease(signer, { hostId: host, action: v.action, payload: v.payload, intentText: v.intent, now })), 'bad_phase');
+  assert.equal(code(() => I.mintIntentRenewLease(signer, { hostId: host, action: v.action, payload: v.renew.payload, intentText: '', now })), 'intent_required');
+  assert.equal(code(() => I.mintIntentRenewLease(signer, { hostId: host, action: 'sys_config', payload: v.renew.payload, intentText: v.intent, now })), 'bad_action');
+  assert.equal(code(() => I.mintIntentRenewLease(signer, { hostId: host, action: 'pty_root', payload: v.renew.payload, intentText: v.intent, now })), 'intent_mismatch');
+  assert.equal(code(() => I.mintIntentRenewLease(signer, { hostId: '44444444-4444-4444-8444-444444444444', action: v.action, payload: v.renew.payload, intentText: v.intent, now })), 'intent_mismatch');
+  // A renew payload whose deadline passes max_session_deadline is refused.
+  const msd = v.fields.max_session_deadline_unix;
+  const past = L.terminalPayload('pts_AAAAAAAAAAAAAAAAAAAAAA', msd + 30, 'renew');
+  assert.equal(code(() => I.mintIntentRenewLease(signer, { hostId: host, action: v.action, payload: past, intentText: v.intent, now })), 'intent_deadline');
   const f = vec.vectors.find((x) => x.name === 'file_root_start');
-  const fl = I.mintIntentRenewLease(signer, { hostId: vec.host_id, action: 'file_root', payload: f.renew.payload, intentSha256: f.intent_sha256, now });
+  const fl = I.mintIntentRenewLease(signer, { hostId: host, action: 'file_root', payload: f.renew.payload, intentText: f.intent, now });
   assert.equal(L.verifyLeaseV2(pub, fl, f.renew.payload, now).ok, true);
+});
+
+test('mintIntentRenewLease refuses an xfer_root renew past the intent deadline', () => {
+  const sha = (s) => L.sha256Hex(Buffer.from(s, 'utf8'));
+  const base = Math.floor(vec.now_ms / 1000);
+  const msd = base + 900;
+  const xp = (deadline, phase) => L.xferPayload({
+    grantId: 'xfr_AAAAAAAAAAAA', deadlineUnix: deadline, phase, dir: 'put', root: '/', path: 'a', size: 1,
+    sha256: 'a'.repeat(64), overwrite: false, transferId: '0123456789abcdef', expiresUnix: base + 60,
+    idleS: 10, maxS: 60, byteCap: 1, profile: 'internet', transport: 'udp', peer: 'listen', material: 'b'.repeat(64)
+  });
+  const intentText = I.buildIntent({
+    ...vec.vectors[0].fields, action: 'xfer_root', payload_sha256: L.payloadHash('xfer_root', xp(msd, 'start')),
+    max_session_deadline_unix: msd, reason_sha256: sha('x')
+  });
+  const args = (deadline) => ({ hostId: vec.host_id, action: 'xfer_root', payload: xp(deadline, 'renew'), intentText, now: vec.now_ms });
+  assert.equal(I.mintIntentRenewLease(signer, args(msd)).v, 2);
+  assert.equal(code(() => I.mintIntentRenewLease(signer, args(msd + 30))), 'intent_deadline');
 });

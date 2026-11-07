@@ -166,15 +166,22 @@ function mintIntentStartLease(signer, { intentText, action, payload, ttl = 60, n
 }
 
 // mintIntentRenewLease signs a v2 RENEW lease for a live session that was
-// started with an intent: the stored intent hash, the session's own renew
-// payload, no approval lookup and no use_by (contract 4.4). The payload's
-// phase line (line 3) must be "renew", so this can never mint a start.
-function mintIntentRenewLease(signer, { hostId, action, payload, intentSha256: stored, ttl = 60, now = Date.now() } = {}) {
+// started with an intent: the session's stored intent text, its own renew
+// payload, no approval lookup and no use_by (contract 4.4). The intent must
+// name this host and action, the payload's phase line (line 3) must be
+// "renew", so this can never mint a start, and the payload's deadline (line
+// 2) must not pass the intent's max_session_deadline_unix (an xfer renew
+// moves its deadline forward; it never moves past the approved one).
+function mintIntentRenewLease(signer, { hostId, action, payload, intentText, ttl = 60, now = Date.now() } = {}) {
   if (!RENEW_PHASE_ACTIONS.has(action)) throw refuse('bad_action');
   if (typeof hostId !== 'string' || !HOST_ID_RE.test(hostId)) throw refuse('bad_host');
-  if (typeof stored !== 'string' || !SHA256_HEX_RE.test(stored)) throw refuse('intent_required');
-  if (typeof payload !== 'string' || payload.split('\n')[2] !== 'renew') throw refuse('bad_phase');
-  return signV2(signer, { hostId, action, payloadSha256: lease.payloadHash(action, payload), intentSha256: stored, ttl, now });
+  if (typeof intentText !== 'string' || intentText === '') throw refuse('intent_required');
+  const intent = parseIntent(intentText);
+  if (intent.host_id !== hostId || intent.action !== action) throw refuse('intent_mismatch');
+  const lines = typeof payload === 'string' ? payload.split('\n') : [];
+  if (lines[2] !== 'renew') throw refuse('bad_phase');
+  if (!DECIMAL_RE.test(lines[1] || '') || Number(lines[1]) > intent.max_session_deadline_unix) throw refuse('intent_deadline');
+  return signV2(signer, { hostId, action, payloadSha256: lease.payloadHash(action, payload), intentSha256: intentSha256(intentText), ttl, now });
 }
 
 module.exports = {
