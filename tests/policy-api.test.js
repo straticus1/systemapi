@@ -445,6 +445,13 @@ test('pinning a tenant-granted dangerous entry on the host needs step-up; the te
   }
 });
 
+test('step-up freshness: auth_time at most 5 min old and at most 5 s ahead of the clock', () => {
+  const now = Date.now();
+  const s = Math.floor(now / 1000);
+  for (const at of [s, s - 300, s + 5]) assert.equal(oauth.authTimeFresh(at, now), true, String(at - s));
+  for (const at of [s - 301, s + 6, s + 60, 0, -1, 1.5, '1', null]) assert.equal(oauth.authTimeFresh(at, now), false, String(at));
+});
+
 test('CSRF: a cookie session needs JSON and an allowed Origin; a form body is refused for everyone', async () => {
   const r = await rig();
   try {

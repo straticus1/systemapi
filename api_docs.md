@@ -247,7 +247,8 @@ the list was judged against are checked again under the write's lock
 (`FOR SHARE`; a tenant write in between is 409 `version_conflict`). A dangerous write needs
 `confirm_dangerous` equal to the dry run's list (409
 `{"error":"dangerous_unconfirmed","dangerous"}`) and a session principal
-(cookie or device token) whose `auth_time` is at most 5 minutes old (403
+(cookie or device token) whose `auth_time` is at most 5 minutes old and
+at most 5 s ahead of the server clock (403
 `{"error":"step_up_required","reason":"api_key"|"stale_auth"}`, with a
 `step_up_deny` security event). It applies at once and fires a
 `channel_policy_dangerous` webhook (`classes` and `count` only, no paths or

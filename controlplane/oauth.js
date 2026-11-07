@@ -49,7 +49,7 @@ const CODE_TRIES_PER_IP = 20;
 const RESPONSE_CAP = 8192;
 const STEP_UP_MAX_AGE_S = 300;
 // How far ahead of this clock an IdP auth_time may be (clock skew).
-const AUTH_TIME_SKEW_S = 60;
+const AUTH_TIME_SKEW_S = 5;
 const PROVIDERS = {
   google: {
     authorize: 'https://accounts.google.com/o/oauth2/v2/auth',
