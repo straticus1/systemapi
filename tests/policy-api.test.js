@@ -388,10 +388,10 @@ test('dangerous classes: protected unit globs, bare names and sockets; /etc conf
       'redis.service', 'dbus.socket', 'systemd-networkd.service', 'networking.service', 'NetworkManager.service',
       'systemd-resolved.service', 'systemd-logind.service'];
     assert.deepEqual((await dry({ service: units })).body.dangerous, units.map((u) => `service:${u}`).sort());
-    assert.deepEqual((await dry({ service: ['nginx.service', 'myssh.service'], config: ['/etc/nginx/conf.d', '/etc/nginx/sites-enabled/app'], tweak_sysctl: ['vm.swappiness'] })).body.dangerous, []);
-    // Every config path outside the safe list, /etc or not.
-    assert.deepEqual((await dry({ config: ['/etc/nginx', '/opt/app/etc', '/srv/app/conf', '/var/spool/cron', '/etc/nginx/conf.dx'] })).body.dangerous,
-      ['config:/etc/nginx', 'config:/etc/nginx/conf.dx', 'config:/opt/app/etc', 'config:/srv/app/conf', 'config:/var/spool/cron']);
+    assert.deepEqual((await dry({ service: ['nginx.service', 'myssh.service'], tweak_sysctl: ['vm.swappiness'] })).body.dangerous, []);
+    // Every config path, /etc or not; nginx site and conf.d dirs too.
+    assert.deepEqual((await dry({ config: ['/etc/nginx/conf.d', '/etc/nginx/sites-enabled/app', '/opt/app/etc', '/srv/app/conf', '/var/spool/cron'] })).body.dangerous,
+      ['config:/etc/nginx/conf.d', 'config:/etc/nginx/sites-enabled/app', 'config:/opt/app/etc', 'config:/srv/app/conf', 'config:/var/spool/cron']);
     // Targets and the firewall.
     const more = ['multi-user.target', 'nftables.service', 'ufw', 'firewalld.service', 'iptables.service', 'netfilter-persistent.service'];
     assert.deepEqual((await dry({ service: more })).body.dangerous, more.slice(0, 5).map((u) => `service:${u}`).sort());

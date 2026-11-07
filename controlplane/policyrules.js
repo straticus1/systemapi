@@ -50,12 +50,6 @@ const GRANT_NAMES = Object.freeze(['tcp_local', 'file_read', 'file_write', 'serv
 const PROTECTED_UNIT_GLOBS = Object.freeze(['ssh*', 'sshd*', 'sahcore*', '*cloudflared*', 'postgresql*', 'redis*',
   'systemapi-agent*', 'sah-*-helper@*', 'dbus*', 'systemd-networkd*', 'networking*', 'NetworkManager*',
   'systemd-resolved*', 'systemd-logind*', '*.target', 'nftables*', 'ufw*', 'firewalld*', 'iptables*']);
-// Config prefixes whose grant is not dangerous (P2c): nginx's site and
-// conf.d dirs, included only inside its http block (no load_module, no
-// user directive there). Every other config path, under /etc or not, is
-// dangerous: a root-run service reads it. Lower risk, not no risk: a site
-// can still proxy or serve what nginx can reach.
-const SAFE_CONFIG_PREFIXES = Object.freeze(['/etc/nginx/sites-available', '/etc/nginx/sites-enabled', '/etc/nginx/conf.d']);
 const PROTECTED_UNIT_RES = PROTECTED_UNIT_GLOBS.map((g) => new RegExp(`^${g.split('*').map((s) => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*')}$`, 'i'));
 // The marker every policy audit row carries from P2 on: all six previous
 // and new kinds are recorded explicitly, so a revert never reads "not
@@ -342,17 +336,15 @@ function unitProtected(unit) {
   return PROTECTED_UNIT_RES.some((re) => re.test(unit) || re.test(full));
 }
 
-function configSafe(p) {
-  return SAFE_CONFIG_PREFIXES.some((a) => p === a || p.startsWith(`${a}/`));
-}
-
-// Every root-equivalent entry an effective policy holds (P2c): a config path
-// outside SAFE_CONFIG_PREFIXES, any tweak unit (a drop-in can override
+// Every root-equivalent entry an effective policy holds (P2c): any config
+// path (no config dir is safe: a root-run service reads it, and even an
+// nginx site file can point access_log at /root/.ssh/authorized_keys or
+// /etc/cron.d, include a root-only file, or run perl/lua as root), any tweak unit (a drop-in can override
 // ExecStart), any package (maintainer scripts run as root), a service grant
 // on a protected unit.
 function dangerousOf(eff) {
   const out = new Set();
-  for (const p of eff.config.paths) if (!configSafe(p)) out.add(`config:${p}`);
+  for (const p of eff.config.paths) out.add(`config:${p}`);
   for (const u of eff.tweak.units) out.add(`tweak_unit:${u}`);
   for (const n of eff.package.names) out.add(`package:${n}`);
   for (const u of eff.service.units) if (unitProtected(u)) out.add(`service:${u}`);
@@ -414,7 +406,6 @@ module.exports = {
   COLUMNS,
   GRANT_KEYS,
   PROTECTED_UNIT_GLOBS,
-  SAFE_CONFIG_PREFIXES,
   POLICY_SCHEMA,
   TENANT_WRITE,
   VERSION_RE,

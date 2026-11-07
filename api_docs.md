@@ -229,10 +229,10 @@ the tenant default again instead); only rows with `policy_schema:
 with `reason`). Without `"apply": true` it is a dry run. Same gates as a
 write.
 
-Dangerous entries (step-up): every `config` path except the small safe
-list (at or under `/etc/nginx/sites-available`, `/etc/nginx/sites-enabled`,
-`/etc/nginx/conf.d`: included only inside nginx's http block, so no
-`load_module` or `user`; lower risk, not none), any `tweak_unit`, any
+Dangerous entries (step-up): every `config` path (there is no safe config
+dir: a service running as root reads it, and even an nginx site file can
+point `access_log` at `/root/.ssh/authorized_keys` or `/etc/cron.d`,
+`include` a root-only file, or run perl or lua as root), any `tweak_unit`, any
 `package`, a `service` on a protected unit (globs over full unit names, also
 covering `.socket` and `@` instances: `ssh*`, `sshd*`, `sahcore*`,
 `*cloudflared*`, `postgresql*`, `redis*`, `systemapi-agent*`,
