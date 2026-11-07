@@ -1,0 +1,378 @@
+{
+  "comment": "Shared by tests/intent.test.js and systemapi-agent/intent_test.go (.omc/plans/sah-signed-intent-contract.md 1.1-1.5): the systemapi-intent-v1 canonical text and hash, and systemapi-lease-v2 start and renew leases over it, must agree byte for byte in Node and Go; every invalid intent must be refused by both parsers. Signed with keys.js TEST_SEED.",
+  "public_raw_b64": "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc=",
+  "host_id": "11111111-1111-4111-8111-111111111111",
+  "now_ms": 1700000000000,
+  "vectors": [
+    {
+      "name": "breakglass_start",
+      "fields": {
+        "request_id": "apr_AAAAAAAAAAAAAAAAAAAAAA",
+        "tenant_id": "acme",
+        "host_id": "11111111-1111-4111-8111-111111111111",
+        "requester": "member:alice@example.com",
+        "not_before_unix": 1699999940,
+        "use_by_unix": 1700000840,
+        "reason_sha256": "3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c",
+        "approver_set_version": 3,
+        "threshold_k": 1,
+        "action": "breakglass",
+        "payload_sha256": "0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae",
+        "max_session_deadline_unix": 1700007200
+      },
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700000840\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\n",
+      "intent_sha256": "ab250037a26ffe9485af17492f17b8247a693f014f9fd3fe643b654f8e592d8d",
+      "action": "breakglass",
+      "payload": "pts_AAAAAAAAAAAAAAAAAAAAAA\n1700007200\nstart",
+      "start": {
+        "message": "systemapi-lease-v2\n11111111-1111-4111-8111-111111111111\nbreakglass\n1700000060\nabababababababababababababababab\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\nab250037a26ffe9485af17492f17b8247a693f014f9fd3fe643b654f8e592d8d\n",
+        "lease": {
+          "v": 2,
+          "host_id": "11111111-1111-4111-8111-111111111111",
+          "action": "breakglass",
+          "expires_unix": 1700000060,
+          "nonce_hex": "abababababababababababababababab",
+          "payload_sha256": "0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae",
+          "intent_sha256": "ab250037a26ffe9485af17492f17b8247a693f014f9fd3fe643b654f8e592d8d",
+          "signature": "b66PelrDHjgTPZ71zOwLCNj6QtaL2qjoPUZgm7aiME0R12PRTbBq0tahELqz3QWsbays/rUia2kLlrdauAq6Bw=="
+        }
+      },
+      "renew": {
+        "payload": "pts_AAAAAAAAAAAAAAAAAAAAAA\n1700007200\nrenew",
+        "message": "systemapi-lease-v2\n11111111-1111-4111-8111-111111111111\nbreakglass\n1700000060\ncdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\n89929c2c061ac6c076a85b00c0e8260f90ea3478e1f43254b325b4803fb6f333\nab250037a26ffe9485af17492f17b8247a693f014f9fd3fe643b654f8e592d8d\n",
+        "lease": {
+          "v": 2,
+          "host_id": "11111111-1111-4111-8111-111111111111",
+          "action": "breakglass",
+          "expires_unix": 1700000060,
+          "nonce_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+          "payload_sha256": "89929c2c061ac6c076a85b00c0e8260f90ea3478e1f43254b325b4803fb6f333",
+          "intent_sha256": "ab250037a26ffe9485af17492f17b8247a693f014f9fd3fe643b654f8e592d8d",
+          "signature": "iEgoLm9+fy2i4SdJ4NDabHCxKGkI6fgA6QEt4lzs1jVKExnbvvW/g2BJI2BGqkoztpo91D9xIuVtQDK6VqnQDA=="
+        }
+      }
+    },
+    {
+      "name": "pty_root_start",
+      "fields": {
+        "request_id": "apr_AAAAAAAAAAAAAAAAAAAAAA",
+        "tenant_id": "acme",
+        "host_id": "11111111-1111-4111-8111-111111111111",
+        "requester": "member:alice@example.com",
+        "not_before_unix": 1699999940,
+        "use_by_unix": 1700000840,
+        "reason_sha256": "3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c",
+        "approver_set_version": 3,
+        "threshold_k": 1,
+        "action": "pty_root",
+        "payload_sha256": "67bea04493a55302f8c63e64c61c9a8b13fbd7166be770d31a5ae889bc73c57f",
+        "max_session_deadline_unix": 1700028800
+      },
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\npty_root\n67bea04493a55302f8c63e64c61c9a8b13fbd7166be770d31a5ae889bc73c57f\n1699999940\n1700000840\n1700028800\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\n",
+      "intent_sha256": "f3beba87f05c3741657481e617e5fd5d54969012dbe17a5f4459d6603e0a1ed0",
+      "action": "pty_root",
+      "payload": "pts_AAAAAAAAAAAAAAAAAAAAAA\n1700028800\nstart",
+      "start": {
+        "message": "systemapi-lease-v2\n11111111-1111-4111-8111-111111111111\npty_root\n1700000060\nabababababababababababababababab\n67bea04493a55302f8c63e64c61c9a8b13fbd7166be770d31a5ae889bc73c57f\nf3beba87f05c3741657481e617e5fd5d54969012dbe17a5f4459d6603e0a1ed0\n",
+        "lease": {
+          "v": 2,
+          "host_id": "11111111-1111-4111-8111-111111111111",
+          "action": "pty_root",
+          "expires_unix": 1700000060,
+          "nonce_hex": "abababababababababababababababab",
+          "payload_sha256": "67bea04493a55302f8c63e64c61c9a8b13fbd7166be770d31a5ae889bc73c57f",
+          "intent_sha256": "f3beba87f05c3741657481e617e5fd5d54969012dbe17a5f4459d6603e0a1ed0",
+          "signature": "bMnK8q0+5HZCbcwCFkrhc3Yc8TfTArtLmc6zOYS0QaXU9ghtfOdxnTOOB+86bfCFzJn9RnpthFGc2KuHWHTTBw=="
+        }
+      },
+      "renew": {
+        "payload": "pts_AAAAAAAAAAAAAAAAAAAAAA\n1700028800\nrenew",
+        "message": "systemapi-lease-v2\n11111111-1111-4111-8111-111111111111\npty_root\n1700000060\ncdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\nac57c6c7b1fbad3300ef7f8e17b6eb9353a0d61281c4d4652e7468dcd564a1d3\nf3beba87f05c3741657481e617e5fd5d54969012dbe17a5f4459d6603e0a1ed0\n",
+        "lease": {
+          "v": 2,
+          "host_id": "11111111-1111-4111-8111-111111111111",
+          "action": "pty_root",
+          "expires_unix": 1700000060,
+          "nonce_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+          "payload_sha256": "ac57c6c7b1fbad3300ef7f8e17b6eb9353a0d61281c4d4652e7468dcd564a1d3",
+          "intent_sha256": "f3beba87f05c3741657481e617e5fd5d54969012dbe17a5f4459d6603e0a1ed0",
+          "signature": "qcVUt3sRGquTla4zLSErYgCyC+fdfaWQoS2idkz2xQsnqtVcLSNHWvfG4wGKuYB/MBSfDjEIl7knvO15Sp25BA=="
+        }
+      }
+    },
+    {
+      "name": "file_root_start",
+      "fields": {
+        "request_id": "apr_AAAAAAAAAAAAAAAAAAAAAA",
+        "tenant_id": "acme",
+        "host_id": "11111111-1111-4111-8111-111111111111",
+        "requester": "member:alice@example.com",
+        "not_before_unix": 1699999940,
+        "use_by_unix": 1700000840,
+        "reason_sha256": "3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c",
+        "approver_set_version": 3,
+        "threshold_k": 1,
+        "action": "file_root",
+        "payload_sha256": "9feaaabf03b51f2c55b7568b02f54ed45e51c9dfe36a1255389a826e3ada018e",
+        "max_session_deadline_unix": 1700028800
+      },
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\nfile_root\n9feaaabf03b51f2c55b7568b02f54ed45e51c9dfe36a1255389a826e3ada018e\n1699999940\n1700000840\n1700028800\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\n",
+      "intent_sha256": "d205a3fae0428d649b209ab213dbf8c7da3a048d49dc68f48121410f67db328a",
+      "action": "file_root",
+      "payload": "fls_BBBBBBBBBBBBBBBBBBBBBB\n1700028800\nstart\nwrite\n/",
+      "start": {
+        "message": "systemapi-lease-v2\n11111111-1111-4111-8111-111111111111\nfile_root\n1700000060\nabababababababababababababababab\n9feaaabf03b51f2c55b7568b02f54ed45e51c9dfe36a1255389a826e3ada018e\nd205a3fae0428d649b209ab213dbf8c7da3a048d49dc68f48121410f67db328a\n",
+        "lease": {
+          "v": 2,
+          "host_id": "11111111-1111-4111-8111-111111111111",
+          "action": "file_root",
+          "expires_unix": 1700000060,
+          "nonce_hex": "abababababababababababababababab",
+          "payload_sha256": "9feaaabf03b51f2c55b7568b02f54ed45e51c9dfe36a1255389a826e3ada018e",
+          "intent_sha256": "d205a3fae0428d649b209ab213dbf8c7da3a048d49dc68f48121410f67db328a",
+          "signature": "0VXYCwBNirQVgfGQI181vBOo/NZU23NWW2RUgLbHqq1ieN6FecLKy8h5pGFKIHb5wZq36NBqCfLjJ0SlMBhWCA=="
+        }
+      },
+      "renew": {
+        "payload": "fls_BBBBBBBBBBBBBBBBBBBBBB\n1700028800\nrenew\nwrite\n/",
+        "message": "systemapi-lease-v2\n11111111-1111-4111-8111-111111111111\nfile_root\n1700000060\ncdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\nf3fcc0a0147cabbd9461d543f8c09b4024d5e5696043a22ab589ae7fbdf6ebb3\nd205a3fae0428d649b209ab213dbf8c7da3a048d49dc68f48121410f67db328a\n",
+        "lease": {
+          "v": 2,
+          "host_id": "11111111-1111-4111-8111-111111111111",
+          "action": "file_root",
+          "expires_unix": 1700000060,
+          "nonce_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+          "payload_sha256": "f3fcc0a0147cabbd9461d543f8c09b4024d5e5696043a22ab589ae7fbdf6ebb3",
+          "intent_sha256": "d205a3fae0428d649b209ab213dbf8c7da3a048d49dc68f48121410f67db328a",
+          "signature": "QRhGxfgoWpWM60NDGjDs8Y4XG7xdStxCsXxsolK19XM77QmgI0TM16latDNTMADthGNIFSE6wYqdu1hswL4WBQ=="
+        }
+      }
+    },
+    {
+      "name": "sys_config_write",
+      "fields": {
+        "request_id": "apr_AAAAAAAAAAAAAAAAAAAAAA",
+        "tenant_id": "acme",
+        "host_id": "11111111-1111-4111-8111-111111111111",
+        "requester": "member:alice@example.com",
+        "not_before_unix": 1699999940,
+        "use_by_unix": 1700000840,
+        "reason_sha256": "3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c",
+        "approver_set_version": 3,
+        "threshold_k": 1,
+        "action": "sys_config",
+        "payload_sha256": "d6d4ecb2da481c0a13d17ecb6dad8f6f7c3f8868d617ee1e2333ebc7b9b0aba5",
+        "max_session_deadline_unix": 0
+      },
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\nsys_config\nd6d4ecb2da481c0a13d17ecb6dad8f6f7c3f8868d617ee1e2333ebc7b9b0aba5\n1699999940\n1700000840\n0\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\n",
+      "intent_sha256": "72c1a3dedaa1299267876a0bff5c53cd758d7c525bb3282a1a47b5ce144e1ff8",
+      "action": "sys_config",
+      "payload": "write\n/etc/nginx/nginx.conf\n42ef7680f3b46d9d8bec8446356ae73487fa8a921fbb98551c205446e1b60fc3",
+      "start": {
+        "message": "systemapi-lease-v2\n11111111-1111-4111-8111-111111111111\nsys_config\n1700000060\nabababababababababababababababab\nd6d4ecb2da481c0a13d17ecb6dad8f6f7c3f8868d617ee1e2333ebc7b9b0aba5\n72c1a3dedaa1299267876a0bff5c53cd758d7c525bb3282a1a47b5ce144e1ff8\n",
+        "lease": {
+          "v": 2,
+          "host_id": "11111111-1111-4111-8111-111111111111",
+          "action": "sys_config",
+          "expires_unix": 1700000060,
+          "nonce_hex": "abababababababababababababababab",
+          "payload_sha256": "d6d4ecb2da481c0a13d17ecb6dad8f6f7c3f8868d617ee1e2333ebc7b9b0aba5",
+          "intent_sha256": "72c1a3dedaa1299267876a0bff5c53cd758d7c525bb3282a1a47b5ce144e1ff8",
+          "signature": "eQlWFU40tHRoNMasTbhWrgLOpapgxjV/a67LQHd+029oJAi6Y66GIZRsSfadm3rw4r4oPZ7D/SBwxPEXRziPBQ=="
+        }
+      }
+    },
+    {
+      "name": "sys_package_install",
+      "fields": {
+        "request_id": "apr_AAAAAAAAAAAAAAAAAAAAAA",
+        "tenant_id": "acme",
+        "host_id": "11111111-1111-4111-8111-111111111111",
+        "requester": "member:alice@example.com",
+        "not_before_unix": 1699999940,
+        "use_by_unix": 1700000840,
+        "reason_sha256": "3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c",
+        "approver_set_version": 3,
+        "threshold_k": 1,
+        "action": "sys_package",
+        "payload_sha256": "106b17b831e0af1e802f09399f2fc4248f9bd8708c6841d2e8e80935e1e50faf",
+        "max_session_deadline_unix": 0
+      },
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\nsys_package\n106b17b831e0af1e802f09399f2fc4248f9bd8708c6841d2e8e80935e1e50faf\n1699999940\n1700000840\n0\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\n",
+      "intent_sha256": "b02fd44f9e8777d7e607d9b34ccf7361b7b671ade0eb88c919a2de4fc5012816",
+      "action": "sys_package",
+      "payload": "nginx\ninstall",
+      "start": {
+        "message": "systemapi-lease-v2\n11111111-1111-4111-8111-111111111111\nsys_package\n1700000060\nabababababababababababababababab\n106b17b831e0af1e802f09399f2fc4248f9bd8708c6841d2e8e80935e1e50faf\nb02fd44f9e8777d7e607d9b34ccf7361b7b671ade0eb88c919a2de4fc5012816\n",
+        "lease": {
+          "v": 2,
+          "host_id": "11111111-1111-4111-8111-111111111111",
+          "action": "sys_package",
+          "expires_unix": 1700000060,
+          "nonce_hex": "abababababababababababababababab",
+          "payload_sha256": "106b17b831e0af1e802f09399f2fc4248f9bd8708c6841d2e8e80935e1e50faf",
+          "intent_sha256": "b02fd44f9e8777d7e607d9b34ccf7361b7b671ade0eb88c919a2de4fc5012816",
+          "signature": "4RGR5uS+ZwsIzuySZQY58qC7JdjVP553/EcXXDVU4APkjFHYskuMFILiY56cB1jqjzy0VDjuWCF+YoUdnV5uCg=="
+        }
+      }
+    },
+    {
+      "name": "policy_grant_no_lease",
+      "fields": {
+        "request_id": "apr_AAAAAAAAAAAAAAAAAAAAAA",
+        "tenant_id": "acme",
+        "host_id": "11111111-1111-4111-8111-111111111111",
+        "requester": "member:alice@example.com",
+        "not_before_unix": 1699999940,
+        "use_by_unix": 1700000840,
+        "reason_sha256": "3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c",
+        "approver_set_version": 3,
+        "threshold_k": 1,
+        "action": "policy_grant",
+        "payload_sha256": "0f1ab215f9084e1e900eaefe21c282cbe4554d76b9c90e66c4f5d4a9a4b72b3a",
+        "max_session_deadline_unix": 0
+      },
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\npolicy_grant\n0f1ab215f9084e1e900eaefe21c282cbe4554d76b9c90e66c4f5d4a9a4b72b3a\n1699999940\n1700000840\n0\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\n",
+      "intent_sha256": "26df3ba7d0f806a1dc5ddfb3a629b6617eae2a1c968e6f82b8b1761e23fffe58",
+      "action": "policy_grant"
+    }
+  ],
+  "invalid": [
+    {
+      "name": "newline_injection_in_requester",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice\nmember:bob\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700000840\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\n"
+    },
+    {
+      "name": "space_in_field",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice bob\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700000840\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\n"
+    },
+    {
+      "name": "tab_in_field",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAA\tAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700000840\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\n"
+    },
+    {
+      "name": "control_byte_in_field",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\u0001\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700000840\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\n"
+    },
+    {
+      "name": "del_byte_in_field",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700000840\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\n"
+    },
+    {
+      "name": "non_ascii_in_field",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacmé\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700000840\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\n"
+    },
+    {
+      "name": "crlf_line_ends",
+      "intent": "systemapi-intent-v1\r\napr_AAAAAAAAAAAAAAAAAAAAAA\r\nacme\r\n11111111-1111-4111-8111-111111111111\r\nmember:alice@example.com\r\nbreakglass\r\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\r\n1699999940\r\n1700000840\r\n1700007200\r\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\r\n3\r\n1\r\n"
+    },
+    {
+      "name": "missing_trailing_lf",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700000840\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1"
+    },
+    {
+      "name": "extra_trailing_lf",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700000840\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\n\n"
+    },
+    {
+      "name": "empty_field",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700000840\n1700007200\n\n3\n1\n"
+    },
+    {
+      "name": "wrong_domain_prefix",
+      "intent": "systemapi-intent-v2\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700000840\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\n"
+    },
+    {
+      "name": "lease_prefix_as_intent",
+      "intent": "systemapi-lease-v2\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700000840\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\n"
+    },
+    {
+      "name": "fields_reordered_tenant_host",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\n11111111-1111-4111-8111-111111111111\nacme\nmember:alice@example.com\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700000840\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\n"
+    },
+    {
+      "name": "fields_reordered_times",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1700000840\n1699999940\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\n"
+    },
+    {
+      "name": "leading_zero_number",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700000840\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n01\n"
+    },
+    {
+      "name": "signed_number",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700000840\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n+3\n1\n"
+    },
+    {
+      "name": "number_above_safe_integer",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700000840\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n9007199254740993\n1\n"
+    },
+    {
+      "name": "uppercase_hex",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\nbreakglass\n0C868F7DE2B015CB574CCD8EFA261CFBFE58F81524389ABF323C797DF33BE3AE\n1699999940\n1700000840\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\n"
+    },
+    {
+      "name": "unknown_action",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\npty\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700000840\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\n"
+    },
+    {
+      "name": "requester_without_member_prefix",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nalice@example.com\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700000840\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\n"
+    },
+    {
+      "name": "requester_empty_user",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700000840\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\n"
+    },
+    {
+      "name": "requester_key_principal",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nkey:abc\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700000840\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\n"
+    },
+    {
+      "name": "request_id_bad_shape",
+      "intent": "systemapi-intent-v1\napr_short\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700000840\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\n"
+    },
+    {
+      "name": "host_id_uppercase",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\nAAAAAAAA-1111-4111-8111-111111111111\nmember:alice@example.com\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700000840\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\n"
+    },
+    {
+      "name": "threshold_zero",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700000840\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n0\n"
+    },
+    {
+      "name": "threshold_ten",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700000840\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n10\n"
+    },
+    {
+      "name": "approver_set_version_zero",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700000840\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n0\n1\n"
+    },
+    {
+      "name": "use_by_before_not_before",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1699999939\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\n"
+    },
+    {
+      "name": "window_over_3600",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700003541\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\n"
+    },
+    {
+      "name": "breakglass_session_over_cap",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700000840\n1700014341\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\n"
+    },
+    {
+      "name": "session_deadline_before_use_by",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700000840\n1700000839\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\n"
+    },
+    {
+      "name": "one_shot_with_session_deadline",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\nsys_config\nd6d4ecb2da481c0a13d17ecb6dad8f6f7c3f8868d617ee1e2333ebc7b9b0aba5\n1699999940\n1700000840\n1700000900\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\n"
+    },
+    {
+      "name": "thirteen_lines_plus_one",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700000840\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n1\nextra\n"
+    },
+    {
+      "name": "twelve_lines",
+      "intent": "systemapi-intent-v1\napr_AAAAAAAAAAAAAAAAAAAAAA\nacme\n11111111-1111-4111-8111-111111111111\nmember:alice@example.com\nbreakglass\n0c868f7de2b015cb574ccd8efa261cfbfe58f81524389abf323c797df33be3ae\n1699999940\n1700000840\n1700007200\n3434f557c6eeb63f3c044e239cb26efc63ff3d0a724f70cd644ef40e40bf255c\n3\n"
+    }
+  ]
+}
