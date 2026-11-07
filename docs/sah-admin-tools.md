@@ -10,9 +10,15 @@ disagree about what is wired, that file wins.
 Drives the channel-policy HTTP API (`api_docs.md`, "Channel policy") with
 `SYSTEMAPI_URL` and `SYSTEMAPI_API_KEY` (or `SYSTEMAPI_TOKEN_FILE` from
 `cli/systemapi.js login --fresh`, needed for a dangerous change). No ssh to the
-control plane; `scripts/channel-policy.js` there stays the break-glass path.
-Every write does a dry run first; add `--dry-run` to stop there and
-`--confirm-dangerous` to apply a dangerous one.
+control plane; `scripts/channel-policy.js` there stays the break-glass path
+(its writes renew no live session: they see the change at their next 30 s
+renewal). Every write does a dry run first; add `--dry-run` to stop there. A
+dangerous change prints the dry run's list on stderr and applies only with
+`--confirm-dangerous` naming exactly that comma list (for example
+`--confirm-dangerous package:curl,service:ssh.service`), or a `y` at the y/N
+prompt when run on a terminal. `cli/systemapi.js policy` does the same.
+`SYSTEMAPI_URL` must be `https://`; plain `http://` only to `127.0.0.1`,
+`localhost` or `::1`, matched on the exact parsed hostname.
 
 ```
 sahpolicy.py show    [--host miniapps1]

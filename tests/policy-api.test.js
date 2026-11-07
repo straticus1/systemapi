@@ -938,9 +938,9 @@ test('scripts/sahpolicy.py add is GET + PUT with if_version over the API and kee
   }
   const r = await rig();
   const { spawn } = require('node:child_process');
-  const py = (args) => new Promise((resolve) => {
+  const py = (args, env = {}) => new Promise((resolve) => {
     const child = spawn('python3', [require('node:path').join(__dirname, '..', 'scripts', 'sahpolicy.py'), ...args], {
-      env: { PATH: process.env.PATH, SYSTEMAPI_URL: r.url, SYSTEMAPI_API_KEY: 'admin-key' }
+      env: { PATH: process.env.PATH, SYSTEMAPI_URL: r.url, SYSTEMAPI_API_KEY: 'admin-key', ...env }
     });
     let out = '';
     let err = '';
@@ -958,7 +958,22 @@ test('scripts/sahpolicy.py add is GET + PUT with if_version over the API and kee
     assert.deepEqual(got.grants.file_read, ['/srv/logs']);
     const dangerous = await py(['add', '--host', 'web1', '--reason', 'py', '--package', 'curl']);
     assert.notEqual(dangerous.code, 0);
-    assert.match(dangerous.err, /dangerous change/);
+    assert.match(dangerous.err, /dangerous: package:curl/);
+    assert.match(dangerous.err, /dangerous change; rerun with --confirm-dangerous package:curl/);
+    const mismatch = await py(['add', '--host', 'web1', '--reason', 'py', '--package', 'curl', '--confirm-dangerous', 'package:nginx']);
+    assert.notEqual(mismatch.code, 0);
+    assert.match(mismatch.err, /dangerous_mismatch/);
+    // The exact list passes the client; the server then wants step-up.
+    const named = await py(['add', '--host', 'web1', '--reason', 'py', '--package', 'curl', '--confirm-dangerous', 'package:curl']);
+    assert.notEqual(named.code, 0);
+    assert.match(named.err, /step_up_required: api_key/);
+    // Plain http only to this machine, by the exact hostname.
+    const port = new URL(r.url).port;
+    for (const url of [`http://localhost.evil.example:${port}`, `http://127.0.0.1@evil.example:${port}`, `http://127.0.0.1.nip.io:${port}`]) {
+      const res = await py(['show', '--host', HOST_A], { SYSTEMAPI_URL: url });
+      assert.notEqual(res.code, 0, url);
+      assert.match(res.err, /must be an https:\/\/ URL/, url);
+    }
     assert.equal(`${first.out}${second.out}${dangerous.out}${dangerous.err}`.includes('admin-key'), false);
   } finally {
     await r.close();

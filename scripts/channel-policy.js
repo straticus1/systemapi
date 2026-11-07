@@ -37,7 +37,9 @@
 // it: whoever can read the env file can already write the database. Does NOT
 // change what the agent itself allows: its --tcp-allow list and the file
 // helper's openat2 checks still apply on the host. Does NOT set tenant
-// defaults. Note: createRegistry applies the (idempotent) schema on connect,
+// defaults. Does NOT renew live sessions (it runs outside the server
+// process): a narrowing reaches open tcp, mesh, file and xfer sessions at
+// their next 30 s renewal, not at once as an API write does. Note: createRegistry applies the (idempotent) schema on connect,
 // so even `show` runs the boot-time DDL, as every script here does.
 //
 // Usage: node scripts/channel-policy.js show  --tenant <t> --host <hostname|host_id>

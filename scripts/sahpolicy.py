@@ -9,7 +9,7 @@ the break-glass path there.
   sahpolicy.py add  [--host miniapps1] [--reason R] <grant flags>     # merge: keep existing, add these
   sahpolicy.py set  [--host miniapps1] [--reason R] <grant flags>     # replace: exactly these
   sahpolicy.py clear | inherit [--host miniapps1] [--reason R]
-  any write: [--dry-run] [--confirm-dangerous]
+  any write: [--dry-run] [--confirm-dangerous LIST]
 
 Grant flags (repeatable): --service UNIT  --package NAME  --config DIR
   --tweak-sysctl KEY  --tweak-unit UNIT  --tcp-local PORT
@@ -21,8 +21,10 @@ the server refuses API keys for those). The key is sent only as X-API-Key and
 never printed.
 
 Every write reads the current version and asks for a dry run first; it
-applies only without --dry-run, and a dangerous change (P2c) only with
---confirm-dangerous. `add` is GET + PUT with if_version: it re-sends every
+applies only without --dry-run, and a dangerous change (P2c) only once the
+dry run's list was shown (stderr) and confirmed: --confirm-dangerous with
+exactly that comma list, or y at a y/N prompt on a terminal. Plain http is
+allowed only to 127.0.0.1, localhost or ::1 (exact hostname). `add` is GET + PUT with if_version: it re-sends every
 existing grant plus yours, so it never drops one. If the live policy holds a
 shape the API cannot round-trip (e.g. a tcp CIDR rule) or a column that
 inherits, the server's `grants` is null and `add` refuses rather than set a
@@ -40,9 +42,25 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+# Plain http only to this machine, by the exact parsed hostname (so
+# http://localhost.evil.example or http://127.0.0.1@evil.example is refused).
+LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def url_ok(base):
+    try:
+        u = urllib.parse.urlsplit(base)
+        u.port  # raises on a bad port
+    except ValueError:
+        return False
+    if u.username is not None or u.password is not None or not u.hostname or u.query or u.fragment:
+        return False
+    return u.scheme == "https" or (u.scheme == "http" and u.hostname in LOCAL_HOSTS)
+
+
 def credentials():
     base = (os.environ.get("SYSTEMAPI_URL") or "").strip().rstrip("/")
-    if not (base.startswith("https://") or base.startswith("http://127.0.0.1") or base.startswith("http://localhost")):
+    if not url_ok(base):
         sys.exit("sahpolicy: SYSTEMAPI_URL must be an https:// URL")
     key = (os.environ.get("SYSTEMAPI_API_KEY") or "").strip()
     if not key:
@@ -121,6 +139,16 @@ def merge(existing, new):
     return out
 
 
+def ask_yes(question):
+    sys.stderr.write(question)
+    sys.stderr.flush()
+    try:
+        answer = sys.stdin.readline(64)
+    except (OSError, ValueError):
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
 def write(cfg, base, verb, reason, version, grants, dry_run, confirm):
     body = {"reason": reason, "if_version": version}
     method, path = ("PUT", base) if verb == "set" else ("POST", f"{base}/{verb}")
@@ -131,11 +159,21 @@ def write(cfg, base, verb, reason, version, grants, dry_run, confirm):
         fail(dry)
     if dry_run:
         return dry
-    if dry.get("dangerous"):
-        if not confirm:
+    dangerous = dry.get("dangerous")
+    if dangerous:
+        if not isinstance(dangerous, list) or not all(isinstance(e, str) for e in dangerous):
+            sys.exit("sahpolicy: bad_response")
+        listed = ",".join(sorted(dangerous))
+        sys.stderr.write("sahpolicy: dangerous: " + listed + "\n")
+        if confirm is not None:
+            named = sorted(set(e.strip() for e in confirm.split(",") if e.strip()))
+            if ",".join(named) != listed:
+                sys.stdout.write(json.dumps(dry, indent=2) + "\n")
+                sys.exit("sahpolicy: dangerous_mismatch: --confirm-dangerous must name exactly: " + listed)
+        elif not (sys.stdin.isatty() and sys.stderr.isatty() and ask_yes("apply these dangerous grants? [y/N] ")):
             sys.stdout.write(json.dumps(dry, indent=2) + "\n")
-            sys.exit("sahpolicy: dangerous change; rerun with --confirm-dangerous and a `login --fresh` token")
-        body["confirm_dangerous"] = dry["dangerous"]
+            sys.exit("sahpolicy: dangerous change; rerun with --confirm-dangerous " + listed + " and a `login --fresh` token")
+        body["confirm_dangerous"] = dangerous
     status, done = call(cfg, method, path, body)
     if status != 200:
         fail(done)
@@ -148,7 +186,8 @@ def main():
     ap.add_argument("--host", default="miniapps1")
     ap.add_argument("--reason", default="sahpolicy update")
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--confirm-dangerous", action="store_true")
+    # The exact dangerous list the dry run names, comma separated.
+    ap.add_argument("--confirm-dangerous", metavar="LIST", default=None)
     for g in GRANTS:
         ap.add_argument(f"--{g}", action="append", metavar=g.upper())
     args = ap.parse_args()
