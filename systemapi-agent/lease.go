@@ -48,7 +48,8 @@ import (
 )
 
 const (
-	leasePrefix = "systemapi-lease-v1\n"
+	leasePrefix   = "systemapi-lease-v1\n"
+	leaseV2Prefix = "systemapi-lease-v2\n"
 	leaseMaxTTL = 300 * time.Second
 	leaseSkew   = 30 * time.Second
 	nonceTTL    = 10 * time.Minute
@@ -72,11 +73,21 @@ type Lease struct {
 	ExpiresUnix int64  `json:"expires_unix"`
 	NonceHex    string `json:"nonce_hex"`
 	PayloadSHA  string `json:"payload_sha256"`
-	Signature   string `json:"signature"`
+	// IntentSHA is set on a systemapi-lease-v2 lease only (intent.go). A v1
+	// lease never has it, a v2 lease must.
+	IntentSHA string `json:"intent_sha256,omitempty"`
+	Signature string `json:"signature"`
 }
 
 func canonicalLease(hostID, action string, expiresUnix int64, nonceHex, payloadSHA string) string {
 	return leasePrefix + hostID + "\n" + action + "\n" + strconv.FormatInt(expiresUnix, 10) + "\n" + nonceHex + "\n" + payloadSHA + "\n"
+}
+
+// canonicalLeaseV2 is the systemapi-lease-v2 text
+// (.omc/plans/sah-signed-intent-contract.md 1.4): the v1 lines plus the
+// intent hash. The prefix differs, so neither form verifies as the other.
+func canonicalLeaseV2(hostID, action string, expiresUnix int64, nonceHex, payloadSHA, intentSHA string) string {
+	return leaseV2Prefix + hostID + "\n" + action + "\n" + strconv.FormatInt(expiresUnix, 10) + "\n" + nonceHex + "\n" + payloadSHA + "\n" + intentSHA + "\n"
 }
 
 func payloadHash(action, payload string) string {
@@ -595,15 +606,41 @@ func convergeJobLeasePayload(jobID string, deadlineUnix int64, timeoutS int, bun
 	return base + "\n" + mode + "\n" + expectPlan, nil
 }
 
-// verifyLease checks the signature and the time window. It does not record
-// the nonce; authorizeCommand does that after a successful verify.
+// verifyLease checks the signature and the time window of a v1 lease. It does
+// not record the nonce; authorizeCommand does that after a successful verify.
+// A v2 lease, or a v1 lease carrying an intent hash, is malformed here, so an
+// agent path that knows nothing of intents never accepts one.
 func verifyLease(pub ed25519.PublicKey, lease *Lease, expectedHost, expectedAction, payload string, now time.Time) error {
 	if lease == nil || len(pub) != ed25519.PublicKeySize {
 		return errors.New("malformed")
 	}
-	if lease.V != 1 {
+	if lease.V != 1 || lease.IntentSHA != "" {
 		return errors.New("malformed")
 	}
+	return verifyLeaseFields(pub, lease, expectedHost, expectedAction, payload, now)
+}
+
+// verifyLeaseV2 is verifyLease for a systemapi-lease-v2 lease: the same
+// checks over the v2 canonical form, for an action that can carry an intent.
+// It returns the lease's intent hash. It does not check the intent itself
+// (checkIntentStart) and does not record the nonce.
+func verifyLeaseV2(pub ed25519.PublicKey, lease *Lease, expectedHost, expectedAction, payload string, now time.Time) (string, error) {
+	if lease == nil || len(pub) != ed25519.PublicKeySize {
+		return "", errors.New("malformed")
+	}
+	if lease.V != 2 || !hashHexRe.MatchString(lease.IntentSHA) {
+		return "", errors.New("malformed")
+	}
+	if !intentLeaseAction(expectedAction) {
+		return "", errors.New("bad_action")
+	}
+	if err := verifyLeaseFields(pub, lease, expectedHost, expectedAction, payload, now); err != nil {
+		return "", err
+	}
+	return lease.IntentSHA, nil
+}
+
+func verifyLeaseFields(pub ed25519.PublicKey, lease *Lease, expectedHost, expectedAction, payload string, now time.Time) error {
 	if lease.HostID == "" || subtle.ConstantTimeCompare([]byte(lease.HostID), []byte(expectedHost)) != 1 {
 		return errors.New("bad_host")
 	}
@@ -632,6 +669,9 @@ func verifyLease(pub ed25519.PublicKey, lease *Lease, expectedHost, expectedActi
 		return errors.New("bad_signature")
 	}
 	msg := canonicalLease(lease.HostID, lease.Action, lease.ExpiresUnix, lease.NonceHex, lease.PayloadSHA)
+	if lease.V == 2 {
+		msg = canonicalLeaseV2(lease.HostID, lease.Action, lease.ExpiresUnix, lease.NonceHex, lease.PayloadSHA, lease.IntentSHA)
+	}
 	if !ed25519.Verify(pub, []byte(msg), sig) {
 		return errors.New("bad_signature")
 	}
@@ -675,6 +715,64 @@ func authorizeCommand(expectedHost, action, payload string, lease *Lease, now ti
 	}
 	if err := verifyLease(pub, lease, expectedHost, action, payload, now); err != nil {
 		return err
+	}
+	return rememberNonce(lease.NonceHex, now)
+}
+
+// enrolledIdentity returns the pinned control key and host, or not_enrolled,
+// and refuses another host (authorizeCommand's first checks).
+func enrolledIdentity(expectedHost string) (ed25519.PublicKey, error) {
+	identityMu.Lock()
+	pub := controlPub
+	host := enrolledHostID
+	identityMu.Unlock()
+	if len(pub) != ed25519.PublicKeySize || host == "" {
+		return nil, errors.New("not_enrolled")
+	}
+	if subtle.ConstantTimeCompare([]byte(host), []byte(expectedHost)) != 1 {
+		return nil, errors.New("bad_host")
+	}
+	return pub, nil
+}
+
+// authorizeIntentStart is authorizeCommand for an intent-bound START lease
+// (contract 1.5): verifyLeaseV2, checkIntentStart against intentText and the
+// caller's context, then the nonce. It returns the intent hash the caller
+// stores on the session for its renewals.
+func authorizeIntentStart(expectedHost, action, payload string, lease *Lease, intentText string, ctx intentCtx, now time.Time) (string, error) {
+	pub, err := enrolledIdentity(expectedHost)
+	if err != nil {
+		return "", err
+	}
+	sha, err := verifyLeaseV2(pub, lease, expectedHost, action, payload, now)
+	if err != nil {
+		return "", err
+	}
+	if _, err := checkIntentStart(intentText, lease, ctx, now); err != nil {
+		return "", err
+	}
+	if err := rememberNonce(lease.NonceHex, now); err != nil {
+		return "", err
+	}
+	return sha, nil
+}
+
+// authorizeIntentRenew is authorizeCommand for a v2 RENEW lease of a session
+// started with an intent: verifyLeaseV2 and the lease's intent hash equal to
+// the stored one (constant time), then the nonce. There is no payload-vs-
+// intent check (the intent hashes the START payload) and no use_by check (a
+// session approved at minute 14 may run to its deadline).
+func authorizeIntentRenew(expectedHost, action, payload string, lease *Lease, storedIntentSHA string, now time.Time) error {
+	pub, err := enrolledIdentity(expectedHost)
+	if err != nil {
+		return err
+	}
+	sha, err := verifyLeaseV2(pub, lease, expectedHost, action, payload, now)
+	if err != nil {
+		return err
+	}
+	if !hashEqual(sha, storedIntentSHA) {
+		return errors.New("intent_mismatch")
 	}
 	return rememberNonce(lease.NonceHex, now)
 }
