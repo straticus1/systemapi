@@ -65,7 +65,7 @@ func preflightCases() []preflightCase {
 				return dir
 			},
 			run: func(l *Lease) error {
-				return configWriteViaHelper("/etc/nginx/nginx.conf", "server {}\n", l)
+				return configWriteViaHelper("/etc/nginx/nginx.conf", "server {}\n", l, "")
 			},
 			helper: func(id string) { runConfigHelper([]string{id}) },
 		},

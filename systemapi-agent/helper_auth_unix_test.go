@@ -97,7 +97,7 @@ func TestHelpersRefuseUntrustedHandoffDir(t *testing.T) {
 			prevTrig := configHelperTrigger
 			configHelperTrigger = func(string) error { t.Error("config helper triggered"); return nil }
 			t.Cleanup(func() { configHelperTrigger = prevTrig })
-			if err := configWriteViaHelper("/etc/nginx/nginx.conf", "x\n", lease); err == nil {
+			if err := configWriteViaHelper("/etc/nginx/nginx.conf", "x\n", lease, ""); err == nil {
 				t.Fatal("config: agent side accepted the handoff dir")
 			}
 			if code := runConfigHelper([]string{testHelperID}); code != 2 {

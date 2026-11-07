@@ -34,7 +34,7 @@ const REPORT_INTERVAL_MAX_S = 3600;
 
 const KNOWN_CAPABILITIES = Object.freeze([
   'pty', 'file', 'tcp', 'xfer', 'service', 'config', 'package', 'tweak',
-  'sysscript_jobs', 'converge', 'config_write', 'sysctl_write', 'override_write'
+  'sysscript_jobs', 'converge', 'config_write', 'sysctl_write', 'override_write', 'intent_v1'
 ]);
 const KNOWN = new Set(KNOWN_CAPABILITIES);
 const CAPABILITY_STATES = new Set(['ok', 'degraded', 'absent']);
@@ -44,7 +44,9 @@ const CAPABILITY_REASONS = new Set([
 ]);
 // Job routing, the converge claim gate and the presence row read these from
 // the dial header; a report or the degraded header never withdraws them.
-const HEADER_ONLY = new Set(['sysscript_jobs', 'converge']);
+// intent_v1 (the agent verifies systemapi-lease-v2) is a property of the
+// binary, so it follows the header too.
+const HEADER_ONLY = new Set(['sysscript_jobs', 'converge', 'intent_v1']);
 // The sys write tokens (P1a). An agent that advertises none of them is an old
 // agent: its writes gate on config/tweak as before.
 const WRITE_CAPABILITIES = Object.freeze(['config_write', 'sysctl_write', 'override_write']);

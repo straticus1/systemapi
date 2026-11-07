@@ -142,6 +142,8 @@ type configHelperReq struct {
 	Target  string `json:"target"`
 	Content string `json:"content"`
 	Lease   *Lease `json:"lease"`
+	// Intent is the systemapi-intent-v1 text beside a v2 lease ("" for v1).
+	Intent string `json:"intent,omitempty"`
 }
 
 // configHelperRes is the helper->agent result.
@@ -243,7 +245,7 @@ var configHelperWrite = func(path, content string) error {
 // 0600 request carrying the original lease, triggers the committed helper
 // unit, and reads back its result. It never writes /etc itself (the agent's
 // sandbox forbids it). Request and result files are removed before returning.
-func configWriteViaHelper(target, content string, lease *Lease) error {
+func configWriteViaHelper(target, content string, lease *Lease, intent string) error {
 	if code := configRevalidate(target, content); code != "" {
 		return fmt.Errorf("config write refused: %s", code)
 	}
@@ -251,7 +253,7 @@ func configWriteViaHelper(target, content string, lease *Lease) error {
 	if err != nil {
 		return fmt.Errorf("config write refused: target_denied")
 	}
-	if code := helperPreflight("sys_config", payload, lease, time.Now()); code != "" {
+	if code := helperPreflight("sys_config", payload, lease, intent, time.Now()); code != "" {
 		return fmt.Errorf("config write refused: %s", code)
 	}
 	if err := os.MkdirAll(configHelperStateDir, 0o700); err != nil {
@@ -270,7 +272,7 @@ func configWriteViaHelper(target, content string, lease *Lease) error {
 	defer os.Remove(reqPath)
 	defer os.Remove(resPath)
 
-	reqBytes, err := json.Marshal(configHelperReq{Target: target, Content: content, Lease: lease})
+	reqBytes, err := json.Marshal(configHelperReq{Target: target, Content: content, Lease: lease, Intent: intent})
 	if err != nil {
 		return err
 	}
@@ -345,7 +347,7 @@ func doConfigHelper(reqPath string) configHelperRes {
 	if err != nil {
 		return configHelperRes{Error: "target_denied"}
 	}
-	if code := helperAuthorize("sys_config", payload, req.Lease, time.Now()); code != "" {
+	if code := helperAuthorize("sys_config", payload, req.Lease, req.Intent, time.Now()); code != "" {
 		return configHelperRes{Error: code}
 	}
 	if err := configHelperWrite(req.Target, req.Content); err != nil {

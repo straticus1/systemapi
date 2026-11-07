@@ -79,6 +79,10 @@ func (a *agentConn) dialHeader() http.Header {
 	}
 	h.Del(capabilitiesHeader)
 	h.Del(capabilitiesDegradedHeader)
+	h.Del(intentPinHeader)
+	if pin := requireIntentHeader(); pin != "" {
+		h.Set(intentPinHeader, pin)
+	}
 	sup, deg := a.capHeaders()
 	if sup != "" {
 		h.Set(capabilitiesHeader, sup)

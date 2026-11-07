@@ -43,6 +43,9 @@ import (
 const (
 	capabilitiesHeader         = "X-SystemAPI-Capabilities"
 	capabilitiesDegradedHeader = "X-SystemAPI-Capabilities-Degraded"
+	// intentPinHeader carries the require-intent classes (intent.go
+	// requireIntentHeader): sorted, comma-joined, or "invalid".
+	intentPinHeader = "X-SystemAPI-Intent-Pin"
 
 	capStateOK       = "ok"
 	capStateDegraded = "degraded"
@@ -179,6 +182,9 @@ var capRegistry = map[string]func(e *capEnv, prev capResult) capResult{
 	"package":        probePackage,
 	"sysscript_jobs": probeSysscriptJobs,
 	"converge":       probeConverge,
+	// intent_v1: this agent verifies systemapi-lease-v2 and intents
+	// (intent.go). A property of the binary, so always ok.
+	"intent_v1": func(e *capEnv, _ capResult) capResult { return capOK("intent_v1") },
 }
 
 // openat2Reason maps an openat2 failure: ENOSYS (an old kernel) and EPERM (a

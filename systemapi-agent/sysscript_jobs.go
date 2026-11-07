@@ -728,7 +728,7 @@ func (m *jobManager) startJob(hostID string, cmd *CommandMessage, now time.Time)
 		m.rejectJob(id, err.Error())
 		return
 	}
-	if err := authorizeCommand(hostID, action, payload, cmd.Lease, now); err != nil {
+	if _, err := authorizeStart(hostID, action, payload, cmd.Lease, cmd.Intent, intentCtx{}, intentClasses(action, payload, cmd.Entitlements), id, now); err != nil {
 		if err.Error() == "replay" && m.answerHeld(id) {
 			return
 		}

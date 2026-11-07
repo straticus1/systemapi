@@ -226,7 +226,7 @@ func TestConfigWriteViaHelperHandoffAndCleanup(t *testing.T) {
 
 	content := "server {}\n"
 	req := signedConfigReq(t, "/etc/nginx/nginx.conf", content)
-	if err := configWriteViaHelper("/etc/nginx/nginx.conf", content, req.Lease); err != nil {
+	if err := configWriteViaHelper("/etc/nginx/nginx.conf", content, req.Lease, ""); err != nil {
 		t.Fatalf("configWriteViaHelper: %v", err)
 	}
 	if len(*calls) != 1 || (*calls)[0][1] != content {
@@ -249,7 +249,7 @@ func TestConfigWriteViaHelperRejectsSelfRootBeforeHandoff(t *testing.T) {
 	t.Cleanup(func() { configHelperTrigger = prev })
 
 	req := signedConfigReq(t, "/etc/nginx/nginx.conf", "x\n")
-	if err := configWriteViaHelper("/etc/systemapi-agent/api-key", "x\n", req.Lease); err == nil {
+	if err := configWriteViaHelper("/etc/systemapi-agent/api-key", "x\n", req.Lease, ""); err == nil {
 		t.Fatal("expected refusal for a self-root target")
 	}
 	if triggered {
@@ -264,7 +264,7 @@ func TestConfigWriteViaHelperRejectsMissingLeaseBeforeHandoff(t *testing.T) {
 	configHelperTrigger = func(id string) error { triggered = true; return nil }
 	t.Cleanup(func() { configHelperTrigger = prev })
 
-	if err := configWriteViaHelper("/etc/nginx/nginx.conf", "x\n", nil); err == nil {
+	if err := configWriteViaHelper("/etc/nginx/nginx.conf", "x\n", nil, ""); err == nil {
 		t.Fatal("expected refusal without a lease")
 	}
 	if triggered {

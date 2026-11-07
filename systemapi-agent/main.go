@@ -36,6 +36,7 @@ type CommandMessage struct {
 	Cols         int             `json:"cols,omitempty"`
 	Action       string          `json:"action,omitempty"`
 	Lease        *Lease          `json:"lease,omitempty"`
+	Intent       string          `json:"intent,omitempty"` // systemapi-intent-v1 text beside a v2 lease
 	Actor        string          `json:"actor,omitempty"`
 	Grant        json.RawMessage `json:"grant,omitempty"`
 	SashTargets  *sashTargets    `json:"sash_targets,omitempty"`
@@ -333,7 +334,7 @@ func processIncomingMessage(out ptyOut, hostID, stateDir string, message []byte)
 			writeCommandResult(out, cmd.RequestID, "script_too_large", "", false)
 			return
 		}
-		if err := authorizeCommand(hostID, "sysscript", cmd.Script, cmd.Lease, time.Now()); err != nil {
+		if _, err := authorizeStart(hostID, "sysscript", cmd.Script, cmd.Lease, cmd.Intent, intentCtx{}, intentClasses("sysscript", "", cmd.Entitlements), "", time.Now()); err != nil {
 			log.Printf("sysscript refused: %s", err.Error())
 			writeCommandResult(out, cmd.RequestID, err.Error(), "", false)
 			return
@@ -368,6 +369,7 @@ func processIncomingMessage(out ptyOut, hostID, stateDir string, message []byte)
 			DeadlineUnix: cmd.DeadlineUnix,
 			Actor:        cmd.Actor,
 			Lease:        cmd.Lease,
+			Intent:       cmd.Intent,
 			Grant:        append([]byte(nil), cmd.Grant...),
 			SashTargets:  targets,
 		}, time.Now())
